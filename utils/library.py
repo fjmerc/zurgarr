@@ -1877,14 +1877,45 @@ def _dedup_shows_by_external_id(shows):
         # Episodes lacking a 'file' key (legacy list-of-tuples shape
         # from _normalize_episodes_for_merge produces empty info dicts)
         # are skipped — _build_season_data would crash on them.
+        #
+        # Each episode is stamped with a 'source' from its OWN sibling
+        # (scanner episodes carry none): a local sibling's episodes come
+        # out 'local', a debrid sibling's 'debrid'.  The old single
+        # group-wide default ('debrid' whenever any sibling was debrid)
+        # mislabelled the local sibling's episodes as cloud-sourced.  An
+        # episode held by both a local and a debrid sibling combines to
+        # 'both' while keeping the larger file's info.
+        def _combine_ep_source(a, b):
+            def _to_set(x):
+                if x == 'both':
+                    return {'local', 'debrid'}
+                return {x} if x in ('local', 'debrid') else set()
+            u = _to_set(a) | _to_set(b)
+            if u == {'local', 'debrid'}:
+                return 'both'
+            return next(iter(u)) if u else 'debrid'
+
         merged_eps = {}
         for item in group:
+            item_src = item.get('source')
+            sibling_default = item_src if item_src in ('local', 'debrid') else 'debrid'
             for ep_key, ep_info in (item.get('_episodes') or {}).items():
                 if not isinstance(ep_info, dict) or 'file' not in ep_info:
                     continue
+                src = ep_info.get('source') or sibling_default
                 existing = merged_eps.get(ep_key)
-                if existing is None or _episode_size(ep_info) > _episode_size(existing):
-                    merged_eps[ep_key] = ep_info
+                if existing is None:
+                    info = dict(ep_info)
+                    info['source'] = src
+                    merged_eps[ep_key] = info
+                elif _episode_size(ep_info) > _episode_size(existing):
+                    info = dict(ep_info)
+                    info['source'] = _combine_ep_source(existing.get('source'), src)
+                    merged_eps[ep_key] = info
+                else:
+                    # merged_eps values are always our own copies — safe to
+                    # mutate in place.
+                    existing['source'] = _combine_ep_source(existing.get('source'), src)
         merged['_episodes'] = merged_eps
         merged['seasons'] = len({ek[0] for ek in merged_eps})
         merged['episodes'] = len(merged_eps)
@@ -1915,6 +1946,31 @@ def _dedup_shows_by_external_id(shows):
         # missing on shows with unmonitored seasons.
 
         merged['source'] = merged_source
+
+        # Carry debrid-provider identity across the merge.  The survivor
+        # may be the LOCAL sibling (src_rank local < debrid), which never
+        # carries source_debrid — without this, the merged 'both' item is
+        # provider-less: no RD/TB badge, invisible to provider filters,
+        # and its bytes vanish from the storage chips.  Collect every
+        # provider seen across the group (best-ranked first, so the
+        # survivor's own provider stays primary when it has one); a
+        # second distinct provider becomes the alt, matching the
+        # alt-mount merge semantics upstream.
+        provs = []
+        for s in sorted(group, key=_rank):
+            p = s.get('source_debrid')
+            if p and p not in provs:
+                provs.append(p)
+            ap = s.get('alt_source_debrid') if s.get('has_alt_source') else None
+            if ap and ap not in provs:
+                provs.append(ap)
+        if provs:
+            if not merged.get('source_debrid'):
+                merged['source_debrid'] = provs[0]
+            others = [p for p in provs if p != merged['source_debrid']]
+            if others and not merged.get('has_alt_source'):
+                merged['has_alt_source'] = True
+                merged['alt_source_debrid'] = others[0]
 
         # Use the earliest date_added (skip zero = stat failure) — most
         # honest "when did this enter the user's library" timestamp.

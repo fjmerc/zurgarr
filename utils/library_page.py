@@ -54,6 +54,14 @@ __NAV_HTML__
 
 /* Controls row */
 .controls{display:flex;gap:8px;align-items:center;padding:12px 0;flex-wrap:wrap}
+/* Storage-by-source chips — informational totals that double as filter shortcuts */
+.storage-chips{display:flex;gap:6px;align-items:center;margin-left:auto}
+.storage-chip{background:none;border:1px solid var(--border);border-radius:10px;padding:2px 9px;font-size:.75em;color:var(--text2);cursor:pointer;white-space:nowrap;transition:border-color .15s,color .15s}
+.storage-chip b{font-weight:600;color:var(--text)}
+.storage-chip:hover{border-color:var(--text3)}
+.storage-chip.active{border-color:var(--blue);color:var(--blue)}
+.storage-chip.active b{color:var(--blue)}
+@media(max-width:640px){.storage-chips{margin-left:0;width:100%;flex-wrap:wrap}}
 /* Give search its own full-width row on narrow screens so the filter/sort
    controls wrap as one predictable group beneath it instead of raggedly. */
 @media(max-width:560px){.controls .search-wrap{flex-basis:100%}}
@@ -546,7 +554,7 @@ body.has-bulk-bar{padding-bottom:60px}
            oninput="_syncSearchClear();clearTimeout(_searchTimer);_searchTimer=setTimeout(applyFilters,150)" aria-label="Search titles">
     <button type="button" class="search-clear" id="search-clear" aria-label="Clear search" title="Clear (Esc)" onclick="clearLibrarySearch()">&times;</button>
   </div>
-  <select class="filter-select" id="source-filter" onchange="applyFilters()" aria-label="Filter by source">
+  <select class="filter-select" id="source-filter" onchange="_pendingSourceFilter=null;applyFilters()" aria-label="Filter by source">
     <option value="">All Sources</option>
     <option value="local">Local Only</option>
     <option value="debrid">Cloud Only</option>
@@ -576,6 +584,8 @@ body.has-bulk-bar{padding-bottom:60px}
   <button class="btn-select" id="btn-select" onclick="toggleSelectMode()" aria-pressed="false">Select</button>
   <button class="btn btn-ghost" id="btn-refresh" data-kb="refresh" onclick="triggerRefresh()" title="Refresh library (R)">Refresh</button>
   <span class="scan-info" id="scan-info"></span>
+  <div class="storage-chips" id="storage-chips" style="display:none" role="group" aria-label="Storage by source"
+       title="Content held per source across movies and shows. Items stored in two places count toward each."></div>
 </div>
 </div>
 
@@ -1231,7 +1241,8 @@ function _formatBytes(bytes) {
   if (bytes < 1024) return bytes + ' B';
   if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
   if (bytes < 1073741824) return (bytes / 1048576).toFixed(1) + ' MB';
-  return (bytes / 1073741824).toFixed(1) + ' GB';
+  if (bytes < 1099511627776) return (bytes / 1073741824).toFixed(1) + ' GB';
+  return (bytes / 1099511627776).toFixed(2) + ' TB';
 }
 
 
@@ -1417,6 +1428,188 @@ function _getItemTotalSize(item) {
   return total;
 }
 
+// ---------------------------------------------------------------------------
+// Storage-by-source chips + provider filter options
+// ---------------------------------------------------------------------------
+var _PROVIDER_ORDER = ['realdebrid', 'alldebrid', 'torbox'];
+
+// A persisted provider:* source filter whose <option> didn't exist at
+// init (options are built from library data). Held here until
+// _updateProviderFilterOptions can apply it; cleared by any user
+// interaction with the source filter. While it is outstanding,
+// applyFilters must NOT persist the (empty) select value over it.
+var _pendingSourceFilter = null;
+
+function _itemProviders(item) {
+  // Providers holding a copy of this item (primary mount + alt mount).
+  if (item.source !== 'debrid' && item.source !== 'both') return [];
+  var provs = [];
+  if (item.source_debrid) provs.push(item.source_debrid);
+  if (item.has_alt_source && item.alt_source_debrid && provs.indexOf(item.alt_source_debrid) === -1) {
+    provs.push(item.alt_source_debrid);
+  }
+  return provs;
+}
+
+// Add "On RD"/"On TB"/... options to the source filter for every provider
+// seen in the library data. Options are only ever added (no churn), and a
+// persisted provider filter saved before this run is re-applied once its
+// option exists — the init-time restore silently no-ops on a missing option.
+function _updateProviderFilterOptions() {
+  var sel = document.getElementById('source-filter');
+  if (!sel) return;
+  var seen = {};
+  _allMovies.concat(_allShows).forEach(function(item) {
+    _itemProviders(item).forEach(function(p) { seen[p] = true; });
+  });
+  var provs = Object.keys(seen).sort(function(a, b) {
+    var ia = _PROVIDER_ORDER.indexOf(a), ib = _PROVIDER_ORDER.indexOf(b);
+    return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib) || a.localeCompare(b);
+  });
+  function _provRank(name) {
+    var r = _PROVIDER_ORDER.indexOf(name);
+    return r === -1 ? 99 : r;
+  }
+  provs.forEach(function(p) {
+    var val = 'provider:' + p;
+    var before = null;
+    for (var i = 0; i < sel.options.length; i++) {
+      var v = sel.options[i].value;
+      if (v === val) return;
+      // keep provider options in _PROVIDER_ORDER even when a provider
+      // first appears in a later refresh
+      if (!before && v.indexOf('provider:') === 0 && _provRank(v.slice(9)) > _provRank(p)) {
+        before = sel.options[i];
+      }
+    }
+    var opt = document.createElement('option');
+    opt.value = val;
+    opt.textContent = 'On ' + (_SVC_ABBR[p] || p);
+    if (before) sel.insertBefore(opt, before); else sel.appendChild(opt);
+  });
+  if (_pendingSourceFilter) {
+    if (sel.value) {
+      // user picked something else while the restore was outstanding
+      _pendingSourceFilter = null;
+    } else {
+      for (var j = 0; j < sel.options.length; j++) {
+        if (sel.options[j].value === _pendingSourceFilter) {
+          sel.value = _pendingSourceFilter;
+          _pendingSourceFilter = null;
+          break;
+        }
+      }
+    }
+  }
+}
+
+// Total bytes held per source across movies + shows, independent of the
+// active tab and filters. Local-vs-cloud attribution is per-episode for
+// shows: a mixed show only counts its debrid episodes toward its
+// provider(s) and its local episodes toward Local. Content that exists
+// in two places (a 'both'-source episode/movie, or a dual-provider item)
+// counts toward EACH side that holds it — the chips answer "how much
+// does each source hold", not "how much unique content exists".
+// Precision caveat: provider attribution is item-level (has_alt_source /
+// alt_source_debrid are set per show, and episodes carry no provider
+// field), so a dual-provider show attributes ALL its debrid episodes to
+// both providers even if the alt mount only holds some of them.
+function _computeStorageTotals() {
+  var totals = {local: 0, providers: {}};
+  function addProv(provs, sz) {
+    for (var i = 0; i < provs.length; i++) {
+      totals.providers[provs[i]] = (totals.providers[provs[i]] || 0) + sz;
+    }
+  }
+  _allMovies.concat(_allShows).forEach(function(item) {
+    if (item.source === 'wanted') return;
+    var provs = _itemProviders(item);
+    var sd = item.season_data;
+    if (item.type === 'show' && sd && sd.length) {
+      sd.forEach(function(season) {
+        (season.episodes || []).forEach(function(ep) {
+          var sz = ep.size_bytes || 0;
+          if (!sz) return;
+          if (ep.source === 'local' || ep.source === 'both') totals.local += sz;
+          if (ep.source === 'debrid' || ep.source === 'both') addProv(provs, sz);
+        });
+      });
+    } else {
+      var msz = item.size_bytes || 0;
+      if (!msz) return;
+      if (item.source === 'local' || item.source === 'both') totals.local += msz;
+      if (item.source === 'debrid' || item.source === 'both') addProv(provs, msz);
+    }
+  });
+  return totals;
+}
+
+var _lastStorageChipSig = null;
+
+function _updateStorageChips() {
+  var box = document.getElementById('storage-chips');
+  if (!box) return;
+  var totals = _computeStorageTotals();
+  // Skip the innerHTML rebuild when totals are unchanged — this runs on
+  // every smart-poll tick (incl. {quiet:true} paths that exist precisely
+  // to avoid DOM churn), and rebuilding would drop focus/clicks on chips.
+  var sf = document.getElementById('source-filter');
+  var sig = JSON.stringify(totals);
+  if (sig === _lastStorageChipSig) {
+    _syncStorageChipActive(sf ? sf.value : '');
+    return;
+  }
+  _lastStorageChipSig = sig;
+  var provs = Object.keys(totals.providers).sort(function(a, b) {
+    var ia = _PROVIDER_ORDER.indexOf(a), ib = _PROVIDER_ORDER.indexOf(b);
+    return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib) || a.localeCompare(b);
+  });
+  var html = '';
+  if (totals.local > 0) {
+    html += '<button type="button" class="storage-chip" data-filter="local" aria-pressed="false">'
+      + 'Local <b>' + _formatBytes(totals.local) + '</b></button>';
+  }
+  provs.forEach(function(p) {
+    // No inline onclick: the filter value rides in data-filter (plain
+    // attribute context, escAttr is sufficient) and a delegated listener
+    // on the container reads it back — nothing is ever compiled as JS.
+    html += '<button type="button" class="storage-chip" data-filter="provider:' + escAttr(p) + '" aria-pressed="false">'
+      + esc(_SVC_ABBR[p] || p) + ' <b>' + _formatBytes(totals.providers[p]) + '</b></button>';
+  });
+  box.innerHTML = html;
+  box.style.display = html ? '' : 'none';
+  _syncStorageChipActive(sf ? sf.value : '');
+}
+
+// Chip click = filter shortcut: apply the matching source filter, or clear
+// it when the chip is already active. Delegated so chip rebuilds never
+// re-bind handlers.
+(function() {
+  var box = document.getElementById('storage-chips');
+  if (!box) return;
+  box.addEventListener('click', function(ev) {
+    var chip = ev.target.closest ? ev.target.closest('.storage-chip') : null;
+    if (!chip || !box.contains(chip)) return;
+    var val = chip.getAttribute('data-filter') || '';
+    var sel = document.getElementById('source-filter');
+    if (!sel || !val) return;
+    _pendingSourceFilter = null;  // explicit user choice overrides a parked restore
+    sel.value = (sel.value === val) ? '' : val;
+    applyFilters();
+  });
+})();
+
+function _syncStorageChipActive(source) {
+  var box = document.getElementById('storage-chips');
+  if (!box) return;
+  var chips = box.querySelectorAll('.storage-chip');
+  for (var i = 0; i < chips.length; i++) {
+    var on = chips[i].getAttribute('data-filter') === source;
+    chips[i].classList.toggle('active', on);
+    chips[i].setAttribute('aria-pressed', on ? 'true' : 'false');
+  }
+}
+
 function applyFilters() {
   _lastCheckedIndex = -1;
   const query  = document.getElementById('search-input').value.trim().toLowerCase();
@@ -1444,6 +1637,13 @@ function applyFilters() {
     filtered = filtered.filter(function(item) {
       if (source === 'local')  return item.source === 'local'  || item.source === 'both';
       if (source === 'debrid') return item.source === 'debrid' || item.source === 'both';
+      if (source.indexOf('provider:') === 0) {
+        // "On RD"/"On TB": item has a copy on that provider (primary or alt)
+        if (item.source !== 'debrid' && item.source !== 'both') return false;
+        var prov = source.slice(9);
+        return item.source_debrid === prov
+          || (item.has_alt_source && item.alt_source_debrid === prov);
+      }
       return true;
     });
   }
@@ -1507,13 +1707,17 @@ function applyFilters() {
     });
   }
 
-  // Persist preferences
+  // Persist preferences.  While a provider:* restore is still parked in
+  // _pendingSourceFilter (its option not built yet), the select reads ''
+  // — persisting that would permanently destroy the saved filter on
+  // every cold start (first payload is always the empty-scan shape).
   try {
     localStorage.setItem('pd_library_sort', sortBy);
-    localStorage.setItem('pd_library_source', source);
+    if (!_pendingSourceFilter) localStorage.setItem('pd_library_source', source);
     localStorage.setItem('pd_library_status', status);
     localStorage.setItem('pd_library_year', yearRange);
   } catch(e) {}
+  _syncStorageChipActive(source);
 
   renderGrid(filtered);
   updateBadges(filtered.length);
@@ -2097,6 +2301,8 @@ function _applyLibraryData(data, opts) {
   _searchEnabled  = !!data.search_enabled;
   _lastScan       = data.last_scan || null;
   _scanDurationMs = data.scan_duration_ms || null;
+  _updateProviderFilterOptions();
+  _updateStorageChips();
   // Sync the scanning indicator from the server so a background scan
   // (cold-start or scheduler-triggered) drives the "Refreshing…" UI even
   // when the user didn't click the manual Refresh button.  Suppress when
@@ -4757,7 +4963,16 @@ try {
   var _savedYear = localStorage.getItem('pd_library_year');
   if (_savedSort === 'year') _savedSort = 'year-new'; // migrate old value
   if (_savedSort) document.getElementById('sort-select').value = _savedSort;
-  if (_savedSource) document.getElementById('source-filter').value = _savedSource;
+  if (_savedSource) {
+    var _sfEl = document.getElementById('source-filter');
+    _sfEl.value = _savedSource;
+    if (_sfEl.selectedIndex === -1) {
+      // provider:* option not built yet (needs library data) — park the
+      // value and show "All Sources" instead of a blank select box.
+      _pendingSourceFilter = _savedSource;
+      _sfEl.value = '';
+    }
+  }
   if (_savedStatus) document.getElementById('status-filter').value = _savedStatus;
   if (_savedYear) document.getElementById('year-filter').value = _savedYear;
 } catch(e) {}

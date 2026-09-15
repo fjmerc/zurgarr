@@ -5246,6 +5246,78 @@ class TestDedupShowsByExternalId:
         assert shows[0]['size_bytes'] == 3_000_000, \
             f'size_bytes must sum merged episode sizes, got {shows[0]["size_bytes"]}'
 
+    def test_local_survivor_inherits_provider_identity(self):
+        """A local entry outranks a debrid entry (src_rank local < debrid),
+        so ``merged = dict(best)`` starts from the local sibling — which
+        never carries source_debrid.  The merged 'both' item must inherit
+        provider identity from the dropped debrid sibling, or provider
+        badges/filters/storage chips all treat it as provider-less."""
+        from utils.library import _dedup_shows_by_external_id
+        shows = [
+            {'title': 'Andor', 'imdb_id': 'tt9253284', 'source': 'local',
+             'path': '/local/tv/Andor',
+             '_episodes': {(1, 1): self._ep('Andor.S01E01.mkv', 1_000)}},
+            {'title': 'Star Wars Andor', 'imdb_id': 'tt9253284',
+             'source': 'debrid', 'source_debrid': 'realdebrid',
+             'path': '/data/zurgarr/shows/Star Wars Andor',
+             '_episodes': {(1, 2): self._ep('Andor.S01E02.mkv', 2_000)}},
+        ]
+        _dedup_shows_by_external_id(shows)
+        assert len(shows) == 1
+        m = shows[0]
+        assert m['source'] == 'both'
+        assert m.get('source_debrid') == 'realdebrid'
+
+    def test_cross_provider_siblings_set_alt_source(self):
+        """Same show on RD and TB under different parsed names (so the
+        alt-mount merge upstream missed it): the survivor keeps its own
+        provider and gains has_alt_source/alt_source_debrid for the other."""
+        from utils.library import _dedup_shows_by_external_id
+        shows = [
+            {'title': 'F1 The Series', 'imdb_id': 'tt5', 'source': 'debrid',
+             'source_debrid': 'realdebrid', 'path': '/data/zurgarr/a',
+             '_episodes': {(1, 1): self._ep('a.mkv', 2_000)}},
+            {'title': 'F1', 'imdb_id': 'tt5', 'source': 'debrid',
+             'source_debrid': 'torbox', 'path': '/data/torbox/b',
+             '_episodes': {(1, 1): self._ep('b.mkv', 1_000)}},
+        ]
+        _dedup_shows_by_external_id(shows)
+        assert len(shows) == 1
+        m = shows[0]
+        assert m.get('source_debrid') in ('realdebrid', 'torbox')
+        assert m.get('has_alt_source') is True
+        alt = m.get('alt_source_debrid')
+        assert alt in ('realdebrid', 'torbox') and alt != m['source_debrid']
+
+    def test_episode_sources_stamped_per_sibling(self):
+        """Local-scan episodes carry no per-ep 'source' key; the old
+        merge applied one global default ('debrid' whenever any sibling
+        was debrid), mislabelling the local sibling's episodes as
+        cloud-sourced.  Each sibling's episodes must default to that
+        sibling's own source, and an episode held by BOTH siblings must
+        come out as 'both'."""
+        from utils.library import _dedup_shows_by_external_id
+        shows = [
+            {'title': 'Andor', 'imdb_id': 'tt9253284', 'source': 'local',
+             'path': '/local/tv/Andor',
+             '_episodes': {(1, 1): self._ep('local-e1.mkv', 1_000),
+                           (1, 3): self._ep('local-e3.mkv', 1_000)}},
+            {'title': 'Star Wars Andor', 'imdb_id': 'tt9253284',
+             'source': 'debrid', 'source_debrid': 'realdebrid',
+             'path': '/data/zurgarr/shows/Star Wars Andor',
+             '_episodes': {(1, 2): self._ep('debrid-e2.mkv', 2_000),
+                           (1, 3): self._ep('debrid-e3.mkv', 5_000)}},
+        ]
+        _dedup_shows_by_external_id(shows)
+        assert len(shows) == 1
+        eps = {(s['number'], e['number']): e
+               for s in shows[0]['season_data'] for e in s['episodes']}
+        assert eps[(1, 1)]['source'] == 'local'
+        assert eps[(1, 2)]['source'] == 'debrid'
+        # E3 exists on both sides -> 'both' (winner file is the larger debrid copy)
+        assert eps[(1, 3)]['source'] == 'both'
+        assert eps[(1, 3)]['file'] == 'debrid-e3.mkv'
+
     def test_distinct_imdb_ids_left_alone(self):
         from utils.library import _dedup_shows_by_external_id
         shows = [
