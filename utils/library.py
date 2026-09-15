@@ -4190,7 +4190,7 @@ class LibraryScanner:
                             from utils.notifications import notify
                             notify('library_refresh',
                                    f"Source switch: {show['title']}",
-                                   f"Switched {result['switched']} episode(s) to debrid streaming")
+                                   f"Switched {result['switched']} episode(s) to cloud streaming")
                         except Exception:
                             pass
 
@@ -4294,7 +4294,7 @@ class LibraryScanner:
                         from utils.notifications import notify
                         notify('library_refresh',
                                f"Source switch: {movie['title']}",
-                               f"Switched movie to debrid streaming")
+                               f"Switched movie to cloud streaming")
                     except Exception:
                         pass
 

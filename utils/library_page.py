@@ -386,7 +386,7 @@ __NAV_HTML__
 .badge-migrating::before{content:'';display:inline-block;width:6px;height:6px;border-radius:50%;background:#2dd4bf;margin-right:4px;vertical-align:middle;animation:pulse-dot 1s ease-in-out infinite}
 [data-theme="light"] .badge-migrating{color:#0d9488;border-color:#0d948840;background:linear-gradient(90deg,#0d94881a 0%,#0d94880a 50%,#0d94881a 100%);background-size:200% 100%}
 [data-theme="light"] .badge-migrating::before{background:#0d9488}
-/* Debrid N/A is the one "you must act" state — solid fill so it out-ranks the
+/* Cloud N/A is the one "you must act" state — solid fill so it out-ranks the
    flat descriptive pills (quality/size); the fill itself is a non-hue cue. */
 .badge-unavailable{display:inline-block;padding:2px 8px;border-radius:10px;font-size:.72em;font-weight:600;color:#fff;border:1px solid #b62324;background:#b62324;vertical-align:middle}
 [data-theme="light"] .badge-unavailable{background:#cf222e;border-color:#cf222e;color:#fff}
@@ -549,7 +549,7 @@ body.has-bulk-bar{padding-bottom:60px}
   <select class="filter-select" id="source-filter" onchange="applyFilters()" aria-label="Filter by source">
     <option value="">All Sources</option>
     <option value="local">Local Only</option>
-    <option value="debrid">Debrid Only</option>
+    <option value="debrid">Cloud Only</option>
   </select>
   <select class="filter-select" id="status-filter" onchange="applyFilters()" aria-label="Filter by status" style="display:none">
     <option value="">All Status</option>
@@ -587,7 +587,7 @@ body.has-bulk-bar{padding-bottom:60px}
   <button class="wanted-pill wanted-pill--recent" data-preset="recent" onclick="toggleWantedPreset('recent')">Recently Added <span class="pill-count" id="pill-count-recent"></span></button>
 </div>
 <div class="wanted-actions" id="wanted-actions" style="display:none">
-  <button class="btn btn-ghost btn-sm" id="wanted-search-btn" onclick="wantedSearchAll()" style="display:none">Search All on Debrid</button>
+  <button class="btn btn-ghost btn-sm" id="wanted-search-btn" onclick="wantedSearchAll()" style="display:none">Search All on Cloud</button>
   <button class="btn btn-ghost btn-sm" id="wanted-download-btn" onclick="wantedDownloadAll()" style="display:none">Download All Locally</button>
   <span class="wanted-progress" id="wanted-progress"></span>
 </div>
@@ -610,7 +610,7 @@ body.has-bulk-bar{padding-bottom:60px}
   <span class="bulk-count" id="bulk-count">0 selected</span>
   <select class="filter-select" id="bulk-pref-select" aria-label="Set bulk source preference">
     <option value="">Set Preference...</option>
-    <option value="prefer-debrid">Prefer Debrid</option>
+    <option value="prefer-debrid">Prefer Cloud</option>
     <option value="prefer-local">Prefer Local</option>
     <option value="none">Clear Preference</option>
   </select>
@@ -1014,7 +1014,7 @@ function bulkApplyPreference() {
   var pref = sel.value;
   var items = _getSelectedItemsList();
   if (!items.length) return;
-  var prefLabel = pref === 'prefer-debrid' ? 'Prefer Debrid' : pref === 'prefer-local' ? 'Prefer Local' : 'No Preference';
+  var prefLabel = pref === 'prefer-debrid' ? 'Prefer Cloud' : pref === 'prefer-local' ? 'Prefer Local' : 'No Preference';
   showConfirm('Apply preference to selection',
     'Set preference to "' + prefLabel + '" for ' + items.length + ' item(s)?',
     {confirmLabel: 'Apply'}).then(function(ok) {
@@ -1099,7 +1099,7 @@ function bulkSearchMissing() {
     return;
   }
   var totalShows = new Set(tasks.map(function(t) { return normTitle(t.item.title); })).size;
-  showConfirm('Search selected on debrid',
+  showConfirm('Search selected on cloud',
     'Search for missing content across ' + totalShows + ' item(s) (' + tasks.length + ' request(s))?',
     {confirmLabel: 'Search'}).then(function(ok) {
     if (!ok) return;
@@ -1171,14 +1171,14 @@ function switchTab(name) {
 // Filtering & rendering
 // ---------------------------------------------------------------------------
 function buildBadges(source, item) {
-  // Base location badge (Local / Debrid / Both / Wanted)
+  // Base location badge (Local / Cloud / Both / Wanted)
   var html;
   if (source === 'both') {
-    html = '<span class="badge-local"><span class="badge-full">Local</span><span class="badge-mini">L</span></span><span class="badge-debrid"><span class="badge-full">Debrid</span><span class="badge-mini">D</span></span>';
+    html = '<span class="badge-local"><span class="badge-full">Local</span><span class="badge-mini">L</span></span><span class="badge-debrid"><span class="badge-full">Cloud</span><span class="badge-mini">C</span></span>';
   } else if (source === 'local') {
     html = '<span class="badge-local"><span class="badge-full">Local</span><span class="badge-mini">L</span></span>';
   } else if (source === 'debrid') {
-    html = '<span class="badge-debrid"><span class="badge-full">Debrid</span><span class="badge-mini">D</span></span>';
+    html = '<span class="badge-debrid"><span class="badge-full">Cloud</span><span class="badge-mini">C</span></span>';
   } else if (source === 'wanted') {
     // Ghost entries from Radarr (monitored but no file). Reuse the red
     // .badge-missing styling that episode-level missing entries use.
@@ -1349,7 +1349,7 @@ function buildCard(item, index) {
     var pe = _pending[nk];
     var dir = pe.direction || '';
     if (dir === 'debrid-unavailable') {
-      pendingBadge = '<span class="badge-unavailable">Debrid N/A</span>';
+      pendingBadge = '<span class="badge-unavailable">Cloud N/A</span>';
     } else if (dir === 'to-local-fallback') {
       pendingBadge = '<span class="badge-fallback">Downloading Locally</span>';
     } else {
@@ -1372,7 +1372,7 @@ function buildCard(item, index) {
     if (hasMissingPending) {
       pendingBadge = '<span class="badge-pending">Searching</span>';
     } else {
-      var upDir = dir === 'to-local' ? 'Local' : 'Debrid';
+      var upDir = dir === 'to-local' ? 'Local' : 'Cloud';
       pendingBadge = '<span class="badge-migrating"><span class="badge-full">Migrating to ' + upDir + '</span><span class="badge-mini">\u2197</span></span>';
     }
     } // end else (not debrid-unavailable/local-fallback)
@@ -2639,7 +2639,7 @@ function _renderMovieDetail(movie, meta) {
   html += '<div class="card-badges">';
   html += buildBadges(movie.source, movie);
   if (moviePeDir === 'debrid-unavailable') {
-    html += ' <span class="badge-unavailable">Debrid N/A</span>';
+    html += ' <span class="badge-unavailable">Cloud N/A</span>';
   } else if (moviePeDir === 'to-local-fallback') {
     html += ' <span class="badge-fallback">Downloading Locally</span>';
   }
@@ -2672,12 +2672,12 @@ function _renderMovieDetail(movie, meta) {
     html += '<option value="none"' + (moviePref === 'none' ? ' selected' : '') + '>No Preference</option>';
     html += '<option value="prefer-local"' + (moviePref === 'prefer-local' ? ' selected' : '') + '>Prefer Local</option>';
     if (_downloadServices.movie === 'radarr') {
-      html += '<option value="prefer-debrid"' + (moviePref === 'prefer-debrid' ? ' selected' : '') + '>Prefer Debrid</option>';
+      html += '<option value="prefer-debrid"' + (moviePref === 'prefer-debrid' ? ' selected' : '') + '>Prefer Cloud</option>';
     }
     html += '</select>';
     html += '<button class="btn btn-primary" id="movie-pref-apply-btn" style="display:none" onclick="applyMoviePreference()">Apply</button>';
     html += '</div>';
-    html += '<details class="pref-help"><summary>What do these do?</summary><strong>Prefer Local</strong> &mdash; switches the movie to a local copy.<br><strong>Prefer Debrid</strong> &mdash; removes the local copy and streams from debrid.</details>';
+    html += '<details class="pref-help"><summary>What do these do?</summary><strong>Prefer Local</strong> &mdash; switches the movie to a local copy.<br><strong>Prefer Cloud</strong> &mdash; removes the local copy and streams from the cloud.</details>';
     html += '<div class="detail-action-row">';
     if (moviePeDir === 'debrid-unavailable') {
       html += '<button class="btn btn-ghost btn-sm" onclick="_confirmBtn(this,function(){downloadMovieLocalFallback()})">Download Locally</button>';
@@ -2689,7 +2689,7 @@ function _renderMovieDetail(movie, meta) {
       html += '<button class="btn btn-ghost btn-sm btn-switch" onclick="_confirmBtn(this,function(){downloadMovie(' + (movieDebridPref === undefined ? '' : movieDebridPref) + ')})">' + movieDlLabel + '</button>';
     }
     if ((movie.source === 'local' || movie.source === 'both') && _downloadServices.movie === 'radarr') {
-      html += '<button class="btn btn-ghost btn-sm btn-switch" onclick="_confirmBtn(this,function(){removeMovie()})">Switch to Debrid</button>';
+      html += '<button class="btn btn-ghost btn-sm btn-switch" onclick="_confirmBtn(this,function(){removeMovie()})">Switch to Cloud</button>';
     }
     html += '</div>';
   } else if (movie.source === 'debrid') {
@@ -2882,7 +2882,7 @@ function _renderSeasonEpisodes(season, si) {
     }
     var isMigrating = isPending && !isMissing && !!ep.source;
     if (isUnavailable) {
-      html += '<span class="badge-unavailable"><span class="badge-full">Debrid N/A</span><span class="badge-mini">\u2715</span></span>';
+      html += '<span class="badge-unavailable"><span class="badge-full">Cloud N/A</span><span class="badge-mini">\u2715</span></span>';
     } else if (isLocalFallback) {
       html += '<span class="badge-fallback"><span class="badge-full">Local Fallback</span><span class="badge-mini">\u21B3</span></span>';
     } else if (isMigrating) {
@@ -2930,9 +2930,9 @@ function _renderSeasonEpisodes(season, si) {
       if (ep.source === 'debrid') {
         html += '<button class="btn btn-ghost btn-sm btn-switch" aria-label="Switch ' + epLabel + ' to Local" onclick="_confirmBtn(this,function(){downloadEp(' + season.number + ',' + ep.number + ',false)})">Switch to Local</button>';
       } else if (ep.source === 'local') {
-        html += '<button class="btn btn-ghost btn-sm btn-switch" aria-label="Switch ' + epLabel + ' to Debrid" onclick="_confirmBtn(this,function(){removeEp(' + season.number + ',' + ep.number + ')})">Switch to Debrid</button>';
+        html += '<button class="btn btn-ghost btn-sm btn-switch" aria-label="Switch ' + epLabel + ' to Cloud" onclick="_confirmBtn(this,function(){removeEp(' + season.number + ',' + ep.number + ')})">Switch to Cloud</button>';
       } else if (ep.source === 'both') {
-        html += '<button class="btn btn-ghost btn-sm btn-switch" aria-label="Switch ' + epLabel + ' to Debrid" onclick="_confirmBtn(this,function(){removeEp(' + season.number + ',' + ep.number + ')})">Switch to Debrid</button>';
+        html += '<button class="btn btn-ghost btn-sm btn-switch" aria-label="Switch ' + epLabel + ' to Cloud" onclick="_confirmBtn(this,function(){removeEp(' + season.number + ',' + ep.number + ')})">Switch to Cloud</button>';
       } else if (isMissing && (!ep.air_date || new Date(ep.air_date + 'T00:00:00').getTime() <= Date.now())) {
         html += '<button class="btn btn-ghost btn-sm" aria-label="Search ' + epLabel + '" onclick="_confirmBtn(this,function(){downloadEp(' + season.number + ',' + ep.number + ',true)})">Search</button>';
       }
@@ -3061,11 +3061,11 @@ function _renderShowDetail(show, meta) {
   html += '<select class="pref-select" id="show-pref-select" onchange="onPrefSelectChange(this.value)">';
   html += '<option value="none"' + (curPref === 'none' ? ' selected' : '') + '>No Preference</option>';
   html += '<option value="prefer-local"' + (curPref === 'prefer-local' ? ' selected' : '') + '>Prefer Local</option>';
-  html += '<option value="prefer-debrid"' + (curPref === 'prefer-debrid' ? ' selected' : '') + '>Prefer Debrid</option>';
+  html += '<option value="prefer-debrid"' + (curPref === 'prefer-debrid' ? ' selected' : '') + '>Prefer Cloud</option>';
   html += '</select>';
   html += '<button class="btn btn-primary" id="show-pref-apply-btn" style="display:none" onclick="applyPreference()">Apply</button>';
   html += '</div>';
-  html += '<details class="pref-help"><summary>What do these do?</summary><strong>Prefer Local</strong> &mdash; switches debrid-only episodes to local copies.<br><strong>Prefer Debrid</strong> &mdash; removes local copies and streams from debrid.</details>';
+  html += '<details class="pref-help"><summary>What do these do?</summary><strong>Prefer Local</strong> &mdash; switches cloud-only episodes to local copies.<br><strong>Prefer Cloud</strong> &mdash; removes local copies and streams from the cloud.</details>';
   var showActionBtns = [];
   if (_downloadServices.show === 'sonarr') {
     showActionBtns.push('<button class="btn btn-ghost btn-sm btn-danger" title="Delete from Sonarr" onclick="event.stopPropagation();deleteItem(\'show\')">&#128465; Delete</button>');
@@ -3139,7 +3139,7 @@ function _renderShowDetail(show, meta) {
       for (var lci = 0; lci < season.episodes.length; lci++) {
         if (season.episodes[lci].source === 'local' || season.episodes[lci].source === 'both') localCount++;
       }
-      var rmLabel = 'Switch ' + localCount + ' to Debrid';
+      var rmLabel = 'Switch ' + localCount + ' to Cloud';
       html += '<button class="btn btn-ghost btn-sm btn-switch" onclick="event.stopPropagation();_confirmBtn(this,function(){rmSeason(' + si + ')})">' + rmLabel + '</button>';
     }
     html += '</span>';
@@ -3232,7 +3232,7 @@ var _HS_ICONS = {
 var _HS_LABELS = {
   grabbed:'Grabbed', cached:'Cached', symlink_created:'Symlinked', debrid_add:'Added to Debrid',
   compromise_grabbed:'Quality Compromise',
-  failed:'Failed', debrid_add_failed:'Add Failed', symlink_failed:'Symlink Failed', debrid_unavailable:'Debrid N/A',
+  failed:'Failed', debrid_add_failed:'Add Failed', symlink_failed:'Symlink Failed', debrid_unavailable:'Cloud N/A',
   search_triggered:'Search', rescan_triggered:'Rescan', local_fallback_triggered:'Local Fallback',
   switched_source:'Source Switch', arr_deleted:'Deleted', blocklist_added:'Blocklisted',
   task_completed:'Task Done', cleanup:'Cleanup', repair:'Repair', blocklisted:'Skipped'
@@ -3549,7 +3549,7 @@ function applyPreference() {
     // Case 3: mixed — download debrid-only, then remove debrid for both-source
     var svcLabel2 = _svcNames[showSvc] || showSvc;
     showConfirm('Switch to Local', 'Switch ' + totalDlEps + ' episode(s) to local via ' + svcLabel2
-      + ' and remove debrid duplicates? Torrents still needed by episodes without a local copy are kept automatically.').then(function(confirmed) {
+      + ' and remove cloud duplicates? Torrents still needed by episodes without a local copy are kept automatically.').then(function(confirmed) {
       if (!confirmed) return;
       _runSequential(dlTasks).then(function(ok) {
         if (!ok) return false;
@@ -3624,7 +3624,7 @@ function applyPreference() {
         _setPending(capturedTitle, searchEps, 'to-debrid');
         _searchForDebrid(capturedTitle, capturedTmdbId, searchEps, function(ok) {
           if (ok) {
-            _showMsg('Preference saved. Searching for debrid copies of ' + totalSearchable + ' episode(s).', 'success');
+            _showMsg('Preference saved. Searching for cloud copies of ' + totalSearchable + ' episode(s).', 'success');
           } else {
             _showMsg('Preference saved but search failed for some episodes.', 'error');
           }
@@ -3635,14 +3635,14 @@ function applyPreference() {
     }
 
     // Mixed case: some episodes can switch now, others need searching
-    var confirmMsg2 = 'Switch ' + totalSwitchable + ' episode(s) to debrid streaming?'
+    var confirmMsg2 = 'Switch ' + totalSwitchable + ' episode(s) to cloud streaming?'
       + '\n\nLocal files will be removed. Playback will stream from your debrid service instead.';
-    if (totalSearchable > 0) confirmMsg2 += '\n\n' + totalSearchable + ' additional episode(s) will be searched for debrid copies.';
-    showConfirm('Switch to Debrid', confirmMsg2, {danger: true, confirmLabel: 'Switch'}).then(function(confirmed) {
+    if (totalSearchable > 0) confirmMsg2 += '\n\n' + totalSearchable + ' additional episode(s) will be searched for cloud copies.';
+    showConfirm('Switch to Cloud', confirmMsg2, {danger: true, confirmLabel: 'Switch'}).then(function(confirmed) {
       if (!confirmed) return;
       _actionInFlight = true;
       _setActionsDisabled(true);
-      _showMsgHtml('<span class="scanning-dot"></span>Switching to debrid...');
+      _showMsgHtml('<span class="scanning-dot"></span>Switching to cloud...');
       var capturedTitle2 = _detailItem.title;
       var capturedTmdbId2 = tmdbId;
       fetch('/api/library/switch-to-debrid', {
@@ -3662,7 +3662,7 @@ function applyPreference() {
               _setPending(capturedTitle2, searchEps, 'to-debrid');
               _searchForDebrid(capturedTitle2, capturedTmdbId2, searchEps, function(ok) {
                 if (ok) {
-                  _showMsg('Switched ' + res.d.switched + ' episode(s). Searching for debrid copies of ' + totalSearchable + ' more.', 'success');
+                  _showMsg('Switched ' + res.d.switched + ' episode(s). Searching for cloud copies of ' + totalSearchable + ' more.', 'success');
                 } else {
                   _showMsg('Switched ' + res.d.switched + ' episode(s) but search failed for remaining.', 'error');
                 }
@@ -3670,7 +3670,7 @@ function applyPreference() {
                 _setActionsDisabled(false);
               });
             } else {
-              _showMsg('Switched ' + res.d.switched + ' episode(s) to debrid streaming.', 'success');
+              _showMsg('Switched ' + res.d.switched + ' episode(s) to cloud streaming.', 'success');
               _scheduleRefresh(1000);
               _setActionsDisabled(false);
             }
@@ -4032,7 +4032,7 @@ function removeMovie() {
         prefer_debrid: true
       }).then(function(ok) {
         if (ok) {
-          _showMsg('Preference saved. Searching for debrid copy.', 'success');
+          _showMsg('Preference saved. Searching for cloud copy.', 'success');
         } else {
           _showMsg('Preference saved but search failed.', 'error');
         }
@@ -4045,7 +4045,7 @@ function removeMovie() {
     var capturedBothTitle = _detailItem.title;
     _actionInFlight = true;
     _setActionsDisabled(true);
-    _showMsgHtml('<span class="scanning-dot"></span>Switching to debrid...');
+    _showMsgHtml('<span class="scanning-dot"></span>Switching to cloud...');
     _savePref(nk, 'prefer-debrid').then(function(saved) {
       if (!saved) { _showMsg('Failed to save preference.', 'error'); return; }
       _actionInFlight = false;
@@ -4054,7 +4054,7 @@ function removeMovie() {
         episodes: []
       }).then(function(ok) {
         if (!ok) { _savePref(nk, oldPref); }
-        else { _showMsg('Switched to debrid streaming.', 'success'); }
+        else { _showMsg('Switched to cloud streaming.', 'success'); }
         _scheduleRefresh(1000);
       });
     }).catch(function(e) {
@@ -4104,19 +4104,19 @@ function applyMoviePreference() {
             prefer_debrid: true
           }).then(function(ok) {
             if (ok) {
-              _showMsg('Preference saved. Searching for debrid copy.', 'success');
+              _showMsg('Preference saved. Searching for cloud copy.', 'success');
             } else {
               _showMsg('Preference saved but search failed.', 'error');
             }
             _scheduleRefresh(1000);
           });
         } else {
-          _showMsg('Preference saved. Configure Radarr or Overseerr to search for debrid copies.', 'success');
+          _showMsg('Preference saved. Configure Radarr or Overseerr to search for cloud copies.', 'success');
         }
       });
     } else {
       // source=both — replace local file with link to debrid mount
-      showConfirm('Switch to Debrid', 'Switch ' + _detailItem.title + ' to debrid streaming?'
+      showConfirm('Switch to Cloud', 'Switch ' + _detailItem.title + ' to cloud streaming?'
         + '\n\nLocal file will be removed. Playback will stream from your debrid service.',
         {danger: true, confirmLabel: 'Switch'}).then(function(confirmed) {
         if (!confirmed) return;
@@ -4124,7 +4124,7 @@ function applyMoviePreference() {
         var capturedBothTitle = _detailItem.title;
         _actionInFlight = true;
         _setActionsDisabled(true);
-        _showMsgHtml('<span class="scanning-dot"></span>Switching to debrid...');
+        _showMsgHtml('<span class="scanning-dot"></span>Switching to cloud...');
         _savePref(nk, pref).then(function(saved) {
           if (!saved) return;
           // Clear before _postRemove which has its own _actionInFlight guard
@@ -4135,7 +4135,7 @@ function applyMoviePreference() {
             episodes: []
           }).then(function(ok) {
             if (!ok) { _savePref(nk, oldPref); }
-            else { _showMsg('Switched to debrid streaming. To get a local copy back, use the Switch to Local button.', 'success'); }
+            else { _showMsg('Switched to cloud streaming. To get a local copy back, use the Switch to Local button.', 'success'); }
             _scheduleRefresh(1000);
           });
         }).catch(function(e) {
@@ -4225,7 +4225,7 @@ function _postRemove(payload) {
       _showMsg('Error: ' + errMsg, 'error');
       return false;
     } else {
-      _showMsg('Switched ' + (d.removed || 0) + ' file(s) to debrid streaming. To switch back to local, trigger a search in your media manager.', 'success');
+      _showMsg('Switched ' + (d.removed || 0) + ' file(s) to cloud streaming. To switch back to local, trigger a search in your media manager.', 'success');
       _scheduleRefresh(1000);
       return true;
     }
@@ -4260,7 +4260,7 @@ function _showDebridConfirmation(torrents, keptList, title, onConfirm, onCancel)
   if (torrents.length > 10) html += '<li style="color:var(--text3)">... and ' + (torrents.length - 10) + ' more</li>';
   html += '</ul>';
   if (keptList && keptList.length) {
-    html += '<div style="font-size:.82em;color:var(--text2);margin:6px 0 2px">' + esc(String(keptList.length)) + ' torrent(s) kept (only debrid copy of episodes not yet local):</div>';
+    html += '<div style="font-size:.82em;color:var(--text2);margin:6px 0 2px">' + esc(String(keptList.length)) + ' torrent(s) kept (only cloud copy of episodes not yet local):</div>';
     html += '<ul class="confirm-list">';
     for (var k = 0; k < keptList.length && k < 5; k++) {
       html += '<li style="color:var(--text3)">' + esc(keptList[k].filename || keptList[k].id) + ' — ' + esc(keptList[k].kept_reason || '') + '</li>';
@@ -4313,7 +4313,7 @@ function _postRemoveDebrid(title, year, mediaType) {
         // finish the removal automatically once the downloads land.
         // Resolve the truthy 'deferred' sentinel so applyPreference()
         // saves the preference instead of discarding it.
-        _showMsg('Nothing deleted yet: ' + keptList.length + ' torrent(s) are the only debrid copy of episodes without a local file. They will be removed automatically once the downloads land.', 'info');
+        _showMsg('Nothing deleted yet: ' + keptList.length + ' torrent(s) are the only cloud copy of episodes without a local file. They will be removed automatically once the downloads land.', 'info');
         return 'deferred';
       }
       var em = 'No debrid torrents found for this title.';
@@ -4344,7 +4344,7 @@ function _postRemoveDebrid(title, year, mediaType) {
             // yet, but the preference is still the right call: it will
             // finish converging once the downloads land. Resolve the
             // truthy 'deferred' sentinel so the caller saves the pref.
-            _showMsg(res2.d.message || 'Nothing deleted yet: all requested items are the only debrid copy of episodes without a local file. They will be removed automatically once the downloads land.', 'info');
+            _showMsg(res2.d.message || 'Nothing deleted yet: all requested items are the only cloud copy of episodes without a local file. They will be removed automatically once the downloads land.', 'info');
             resolve('deferred');
           } else if (res2.d.status === 'partial') {
             var nFailed = (res2.d.failed || []).length;

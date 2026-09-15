@@ -986,7 +986,7 @@ def filter_safe_torrent_deletes(matches, unsafe_episodes):
                               for s, e in sorted(blocking)[:5])
             if len(blocking) > 5:
                 shown += f' (+{len(blocking) - 5} more)'
-            entry['kept_reason'] = f'only debrid copy of {shown}'
+            entry['kept_reason'] = f'only cloud copy of {shown}'
             kept.append(entry)
         else:
             deletable.append(m)

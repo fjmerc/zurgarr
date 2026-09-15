@@ -2411,7 +2411,7 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
                 if not to_switch and not_on_debrid > 0:
                     self._send_json_response(200, json.dumps({
                         'status': 'none_available',
-                        'message': f'{not_on_debrid} episode(s) have no debrid copy available',
+                        'message': f'{not_on_debrid} episode(s) have no cloud copy available',
                         'switched': 0,
                         'not_on_debrid': not_on_debrid,
                     }))
@@ -2422,11 +2422,11 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
                 if not_on_debrid > 0:
                     result['not_on_debrid'] = not_on_debrid
                     result['message'] = (
-                        f"Switched {result['switched']} episode(s) to debrid. "
-                        f"{not_on_debrid} episode(s) kept local (no debrid copy)."
+                        f"Switched {result['switched']} episode(s) to cloud. "
+                        f"{not_on_debrid} episode(s) kept local (no cloud copy)."
                     )
                 else:
-                    result['message'] = f"Switched {result['switched']} episode(s) to debrid."
+                    result['message'] = f"Switched {result['switched']} episode(s) to cloud."
 
                 if result.get('switched', 0) > 0:
                     cleared_eps = [
@@ -2686,7 +2686,7 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
                     result['message'] += f' ({len(failed)} failed)'
                 if skipped:
                     result['skipped'] = skipped
-                    result['message'] += f' ({len(skipped)} kept — sole debrid copy)'
+                    result['message'] += f' ({len(skipped)} kept — sole cloud copy)'
 
                 status_code = 200 if deleted > 0 else 400
                 self._send_json_response(status_code, json.dumps(result))
