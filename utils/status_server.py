@@ -1159,20 +1159,23 @@ function update(){
     updateBar('mem-fill',d.system.memory_percent||0);
     // System — CPU
     var _cpuTrack=document.getElementById('cpu-track');
+    var _cpuItem=_cpuTrack?_cpuTrack.parentElement:null;
     if(d.system.cpu_percent!==undefined){
       document.getElementById('cpu-used').textContent=d.system.cpu_percent.toFixed(1)+'%';
       document.getElementById('cpu-label').textContent='CPU';
       if(_cpuTrack)_cpuTrack.style.display='';
+      if(_cpuItem)_cpuItem.classList.remove('no-track');
       updateBar('cpu-fill',d.system.cpu_percent);
     }else if(d.system.cpu_usage_usec!==undefined){
       document.getElementById('cpu-used').textContent=(d.system.cpu_usage_usec/1000000).toFixed(1)+'s';
       document.getElementById('cpu-label').textContent='CPU Time';
       if(_cpuTrack)_cpuTrack.style.display='none';  // cumulative counter, not a 0-100 ratio
+      if(_cpuItem)_cpuItem.classList.add('no-track');  // collapse the head's reserved track margin
     }
     // System — Disk
     if(d.system.disk_used_bytes!==undefined&&d.system.disk_total_bytes!==undefined){
-      document.getElementById('disk-used').textContent=(d.system.disk_percent||0)+'%';
-      document.getElementById('disk-label').textContent=fmtBytes(d.system.disk_used_bytes)+' / '+fmtBytes(d.system.disk_total_bytes);
+      document.getElementById('disk-used').textContent=fmtBytes(d.system.disk_used_bytes)+' / '+fmtBytes(d.system.disk_total_bytes);
+      document.getElementById('disk-label').textContent='Disk ('+(d.system.disk_percent||0)+'%)';
       updateBar('disk-fill',d.system.disk_percent||0);
     }
     // System — Uptime
@@ -1365,6 +1368,7 @@ th{color:var(--text2);font-weight:500;font-size:.75em;text-transform:uppercase;l
    bars instead of three donut gauges. */
 .usage-list{display:flex;flex-direction:column;gap:14px;margin-bottom:4px}
 .usage-head{display:flex;justify-content:space-between;align-items:baseline;gap:10px;margin-bottom:5px}
+.usage-item.no-track .usage-head{margin-bottom:0}
 .usage-label{font-size:.8em;color:var(--text2);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .usage-val{font-size:.95em;font-weight:600;color:var(--text);font-variant-numeric:tabular-nums;flex:none}
 .usage-track{height:8px;background:var(--border);border-radius:4px;overflow:hidden}
