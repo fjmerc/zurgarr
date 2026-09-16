@@ -472,6 +472,178 @@ def check_services():
 
 
 # ---------------------------------------------------------------------------
+# Recent Events feed — merges in-memory lifecycle events (process crashes,
+# config reloads, scheduler errors, dashboard startup) with the user-facing
+# history activity log (media grabbed, symlinks created, mounts repaired,
+# searches failed) so the Status page shows what actually happened rather
+# than a stream of routine scheduler heartbeats.
+# ---------------------------------------------------------------------------
+
+# History event `type` -> Recent Events severity.  Anything unlisted is info.
+#
+# Failures in the blackhole workflow (failed / blocklisted / uncached
+# torrents, symlink failures) are routine, high-volume outcomes — the arr
+# simply searches for another release — so they surface as *warnings*:
+# visible in the feed, but they never flip the Status card's events-health
+# indicator to amber.  That amber state stays reserved for genuine system
+# errors (process crashes, config-reload failures, scheduler errors), which
+# arrive as in-memory error-level events and are the only ones counted in
+# ``error_count`` — so the card health and the error count stay in agreement.
+_ACTIVITY_WARN_TYPES = frozenset({
+    'failed', 'symlink_failed', 'blocklisted', 'blocklist_added',
+    'switched_source', 'duplicate', 'debrid_unavailable', 'uncached_rejected',
+    'debrid_add_failed', 'release_incomplete', 'cleanup',
+})
+# Routine periodic summaries — kept off the feed so they don't reintroduce
+# the heartbeat noise we just removed from the scheduler side.  They remain
+# on the Activity page and the scheduler card.
+_ACTIVITY_SKIP_TYPES = frozenset({'task_completed'})
+
+
+def _to_local_naive_iso(ts_str):
+    """Normalize an ISO timestamp to naive-local 'YYYY-MM-DDTHH:MM:SS'.
+
+    In-memory events store naive-local time; history events store UTC-aware
+    time.  Rendering both as naive-local gives the WebUI a clean local clock
+    time and lets the merged feed sort consistently regardless of source.
+    """
+    if not ts_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts_str)
+    except (ValueError, TypeError):
+        return ts_str
+    if dt.tzinfo is not None:
+        dt = dt.astimezone().replace(tzinfo=None)
+    return dt.isoformat(timespec='seconds')
+
+
+def _activity_event_to_display(e):
+    """Map a history-log event to the Recent Events display shape.
+
+    Returns a ``{timestamp, component, message, level}`` dict, or ``None``
+    for events that are routine noise or can't be rendered.
+    """
+    etype = e.get('type', '') or ''
+    if etype in _ACTIVITY_SKIP_TYPES:
+        return None
+
+    # A history event with no parseable timestamp can't be placed in a
+    # time-ordered feed (and would break the client-side render, which
+    # splits on the timestamp) — drop it rather than emit a null ts.
+    ts = _to_local_naive_iso(e.get('ts'))
+    if not ts:
+        return None
+
+    meta = e.get('meta') if isinstance(e.get('meta'), dict) else {}
+    component = (meta.get('arr_service') or e.get('source') or 'activity')
+
+    # History events are never 'error' severity — see _ACTIVITY_WARN_TYPES.
+    level = 'warning' if etype in _ACTIVITY_WARN_TYPES else 'info'
+
+    try:
+        from utils.activity_format import format_event
+        short = (format_event(e) or {}).get('short') or ''
+    except Exception:
+        short = ''
+    short = short.strip()
+
+    title = (e.get('media_title') or e.get('title') or '').strip()
+    ep = e.get('episode')
+    label = f"{title} {ep}".strip() if ep else title
+
+    if label and short:
+        message = f"{label} — {short}"
+    elif label:
+        message = f"{label} — {etype.replace('_', ' ')}".strip(' —')
+    elif short:
+        message = short
+    else:
+        message = etype.replace('_', ' ')
+    if not message:
+        return None
+
+    return {
+        'timestamp': ts,
+        'component': component,
+        'message': message,
+        'level': level,
+    }
+
+
+# history.query() reads and parses the entire history JSONL, so we cache the
+# mapped activity events for a few seconds — the status page polls every ~10s
+# per connected browser and we only need the newest handful.  In-memory
+# lifecycle events are always merged fresh on top so a crash surfaces at once.
+_activity_cache = []
+_activity_cache_time = 0.0
+_ACTIVITY_CACHE_TTL = 5  # seconds
+
+
+def _recent_activity_events(limit=15):
+    """Return the newest history activity events in display shape (cached)."""
+    global _activity_cache, _activity_cache_time
+    now = time.time()
+    if now - _activity_cache_time < _ACTIVITY_CACHE_TTL and _activity_cache:
+        return _activity_cache
+    out = []
+    try:
+        from utils import history
+        # Fetch a wider raw window than the display cap: _activity_event_to_display
+        # drops routine task_completed summaries (and any timestamp-less rows),
+        # so querying exactly ``limit`` raw events could yield fewer than ``limit``
+        # displayable ones even when more relevant events exist just past the cut.
+        for e in history.query(limit=limit * 4).get('events', []):
+            disp = _activity_event_to_display(e)
+            if disp is not None:
+                out.append(disp)
+            if len(out) >= limit:
+                break
+    except Exception as exc:
+        logger.debug("History unavailable for Recent Events: %s", exc)
+        return _activity_cache  # serve last-good rather than dropping activity
+    _activity_cache = out
+    _activity_cache_time = now
+    return out
+
+
+def _merge_recent_events(inmem_events, limit=15):
+    """Merge in-memory lifecycle events with the history activity log.
+
+    ``inmem_events`` already carry the ``{timestamp, component, message,
+    level}`` display shape; the (cached) history events are mapped in and
+    both are sorted newest-first.  Never raises — a missing/broken history
+    log just yields the in-memory events.
+    """
+    merged = []
+    for ev in inmem_events:
+        merged.append({
+            'timestamp': _to_local_naive_iso(ev.get('timestamp')),
+            'component': ev.get('component', ''),
+            'message': ev.get('message', ''),
+            'level': ev.get('level', 'info'),
+        })
+    merged.extend(_recent_activity_events(limit))
+
+    # Newest first; events with no parseable timestamp sort last.
+    merged.sort(key=lambda x: x.get('timestamp') or '', reverse=True)
+
+    # Guarantee genuine system errors (process crashes, config-reload
+    # failures, scheduler errors) survive the cap — a burst of routine
+    # activity must never crowd a real error off the feed.  Keep all errors
+    # (newest first), then fill the remaining slots with the newest of the
+    # rest, and re-sort the kept set by time for display.
+    errors = [m for m in merged if m.get('level') == 'error']
+    if len(errors) >= limit:
+        kept = errors[:limit]
+    else:
+        others = [m for m in merged if m.get('level') != 'error']
+        kept = errors + others[:limit - len(errors)]
+    kept.sort(key=lambda x: x.get('timestamp') or '', reverse=True)
+    return kept
+
+
+# ---------------------------------------------------------------------------
 # Status data singleton
 # ---------------------------------------------------------------------------
 
@@ -601,7 +773,7 @@ class StatusData:
             'mounts': mounts,
             'services': check_services(),
             'system': get_system_stats(),
-            'recent_events': events,
+            'recent_events': _merge_recent_events(events),
             'error_count': error_count,
             'provider_health': provider_health,
             'library': library_stats,
@@ -1207,8 +1379,9 @@ function update(){
     const validLevels=new Set(['info','warning','error']);
     let e='';d.recent_events.forEach(x=>{
       const lvl=validLevels.has(x.level)?x.level:'info';
-      const t=x.timestamp.split('T')[1]||x.timestamp;
-      const ago=timeAgo(x.timestamp);
+      const ts=x.timestamp||'';
+      const t=ts.split('T')[1]||ts;
+      const ago=timeAgo(ts);
       e+='<div class="event '+lvl+'"><span class="time" title="'+esc(ago)+'">'+esc(t)+'</span><span class="comp">'+esc(x.component)+'</span><span class="msg">'+esc(x.message)+'</span></div>';
     });
     if(!e){

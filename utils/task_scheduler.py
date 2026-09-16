@@ -227,12 +227,18 @@ class TaskScheduler:
         try:
             from utils.status_server import status_data
             status = last_result.get('status', 'unknown')
-            msg = last_result.get('message', '')
-            items = last_result.get('items')
-            detail = f" — {msg}" if msg else ''
-            detail += f" ({items} items)" if items is not None else ''
-            level = 'error' if status == 'error' else 'info'
-            status_data.add_event('scheduler', f"Task '{task_name}' {status}{detail}", level=level)
+            # Only surface scheduler *errors* in the Status page's Recent
+            # Events feed.  Routine successful runs — especially high-frequency
+            # monitors like mount_liveness (~every 70s) — are heartbeat noise
+            # that drowns out meaningful activity.  Successful results still
+            # live in the logs and in the scheduler card's last_result; the
+            # Recent Events feed is fed from the history activity log instead.
+            if status == 'error':
+                msg = last_result.get('message', '')
+                items = last_result.get('items')
+                detail = f" — {msg}" if msg else ''
+                detail += f" ({items} items)" if items is not None else ''
+                status_data.add_event('scheduler', f"Task '{task_name}' {status}{detail}", level='error')
         except Exception:
             pass
 
