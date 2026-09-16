@@ -185,8 +185,11 @@ __NAV_HTML__
 [data-theme="light"] .badge-debrid{background:#7c3aed1a;border-color:#7c3aed40;color:#7c3aed}
 /* Cloud location badge renders as a cloud glyph instead of the word "Cloud"
    (accessible name kept via title/aria-label on the span). */
-.badge-cloud{display:inline-flex;align-items:center;padding:3px 7px}
+.badge-cloud{display:inline-flex;align-items:center;padding:3px 7px;color:#fff;background:#ffffff14;border-color:#ffffff2e}
 .badge-cloud .badge-svg{display:block;width:13px;height:13px}
+/* Light theme: a pure-white glyph would vanish on the light card, so the
+   Cloud badge falls back to a neutral slate that stays legible. */
+[data-theme="light"] .badge-cloud{color:#57606a;background:#57606a14;border-color:#57606a40}
 
 /* Plan 39 phase 4: per-debrid provider badges (RD / TB / AD). */
 .badge-provider{display:inline-block;padding:2px 8px;border-radius:10px;font-size:.72em;font-weight:600;vertical-align:middle;margin-left:4px}
