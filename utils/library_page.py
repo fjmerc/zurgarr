@@ -774,10 +774,10 @@ function relativeTime(isoStr) {
 
 function updateScanInfo() {
   const el = document.getElementById('scan-info');
-  if (_scanning) {
-    el.innerHTML = '<span class="scanning-dot"></span>Scanning…';
-    return;
-  }
+  // The Refresh button is the single scanning indicator (it swaps to a
+  // spinner + "Scanning…" and disables while a scan runs), so this line
+  // never repeats "Scanning…" — it stays on the last-scanned timestamp,
+  // which is still useful context mid-scan and avoids the double label.
   if (_lastScan) {
     el.textContent = 'Last scanned: ' + relativeTime(_lastScan);
   } else {
