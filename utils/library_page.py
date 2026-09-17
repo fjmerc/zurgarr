@@ -190,22 +190,24 @@ __NAV_HTML__
 /* Light theme: a pure-white glyph would vanish on the light card, so the
    Cloud badge falls back to a neutral slate that stays legible. */
 [data-theme="light"] .badge-cloud{color:#57606a;background:#57606a14;border-color:#57606a40}
-/* Local location badge as a hard-drive glyph, neutral to match Cloud. The
-   .badge-iconic modifier overrides .badge-local's green so it can't collide
-   with the RD provider pill; the two neutral location glyphs (HDD/cloud) read
-   as one register, with color reserved for provider + status badges. */
-.badge-local.badge-iconic{display:inline-flex;align-items:center;padding:3px 7px;color:#fff;background:#ffffff14;border-color:#ffffff2e}
+/* Local location badge: a folder glyph in a warm manila/tan (the literal
+   "manila folder" cue for an on-disk file). The .badge-iconic modifier
+   overrides .badge-local's base green. Manila is distinct from every provider
+   pill (RD teal / TB blue / AD orange) so it never reads as a provider color;
+   dark theme uses a light tan, light theme a darker khaki so it stays legible
+   on the pale card. */
+.badge-local.badge-iconic{display:inline-flex;align-items:center;padding:3px 7px;color:#dcc079;background:#dcc0790f;border-color:#dcc07933}
 .badge-local.badge-iconic .badge-svg{display:block;width:13px;height:13px}
-[data-theme="light"] .badge-local.badge-iconic{color:#57606a;background:#57606a14;border-color:#57606a40}
+[data-theme="light"] .badge-local.badge-iconic{color:#8a6d3b;background:#8a6d3b1a;border-color:#8a6d3b40}
 
 /* Plan 39 phase 4: per-debrid provider badges (RD / TB / AD). */
 .badge-provider{display:inline-block;padding:2px 8px;border-radius:10px;font-size:.72em;font-weight:600;vertical-align:middle;margin-left:4px}
 .badge-provider .badge-full{display:inline}
 .badge-provider .badge-mini{display:none}
-.badge-provider-rd{background:#3fb9500f;color:#3fb950;border:1px solid #3fb95033}
+.badge-provider-rd{background:#2dd4bf0f;color:#2dd4bf;border:1px solid #2dd4bf33}
 .badge-provider-tb{background:#58a6ff0f;color:var(--blue);border:1px solid #58a6ff33}
 .badge-provider-ad{background:#db6d280f;color:var(--orange);border:1px solid #db6d2833}
-[data-theme="light"] .badge-provider-rd{background:#1a7f371a;border-color:#1a7f3740}
+[data-theme="light"] .badge-provider-rd{background:#0f766e1a;border-color:#0f766e40;color:#0f766e}
 [data-theme="light"] .badge-provider-tb{background:#0969da1a;border-color:#0969da40;color:#0969da}
 [data-theme="light"] .badge-provider-ad{background:#bc4c001a;border-color:#bc4c0040;color:#bc4c00}
 @media(max-width:640px){
@@ -1200,11 +1202,12 @@ function switchTab(name) {
 // The visible label is dropped but the accessible name is preserved via
 // title/aria-label so hover tooltips and screen readers still say "Cloud".
 var CLOUD_BADGE = '<span class="badge-debrid badge-cloud" title="Cloud" aria-label="Cloud" role="img"><svg class="badge-svg" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M4.406 3.342A5.53 5.53 0 0 1 8 2c2.69 0 4.923 2 5.166 4.579C14.758 6.804 16 8.137 16 9.773 16 11.569 14.502 13 12.687 13H3.781C1.708 13 0 11.366 0 9.318c0-1.763 1.266-3.223 2.942-3.593.143-.863.698-1.723 1.464-2.383z"/></svg></span>';
-// Local (on-disk) location badge: a hard-drive glyph rather than the word
-// "Local". Kept neutral (not green) so it can't clash with RD's green provider
-// pill; shape carries the meaning, color is reserved for the provider badges.
-// Accessible name preserved via title/aria-label, matching CLOUD_BADGE.
-var LOCAL_BADGE = '<span class="badge-local badge-iconic" title="Local" aria-label="Local" role="img"><svg class="badge-svg" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M0 10a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8H0zm2.5 1a.5.5 0 1 1 0-1 .5.5 0 0 1 0 1m2 0a.5.5 0 1 1 0-1 .5.5 0 0 1 0 1M11.107 1a2 2 0 0 1 1.788 1.106l2.79 5.581A1.5 1.5 0 0 1 16 8.5V10H0V8.5a1.5 1.5 0 0 1 .316-.813l2.79-5.581A2 2 0 0 1 4.892 1zM4 2a1 1 0 0 0-.894.553L.677 7H15.32l-2.428-4.447A1 1 0 0 0 12 2z"/></svg></span>';
+// Local (on-disk) location badge: a folder glyph rather than the word
+// "Local", colored a warm manila/tan (the literal "manila folder" cue for a
+// file that lives on disk). Manila is distinct from every provider pill so it
+// never reads as a provider color. Accessible name preserved via
+// title/aria-label, matching CLOUD_BADGE.
+var LOCAL_BADGE = '<span class="badge-local badge-iconic" title="Local" aria-label="Local" role="img"><svg class="badge-svg" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M9.828 3h3.982a2 2 0 0 1 1.992 2.181l-.637 7A2 2 0 0 1 13.174 14H2.826a2 2 0 0 1-1.991-1.819l-.637-7a2 2 0 0 1 .342-1.31L.5 3a2 2 0 0 1 2-2h3.672a2 2 0 0 1 1.414.586l.828.828A2 2 0 0 0 9.828 3m-8.322.12q.322-.119.684-.12h5.396l-.707-.707A1 1 0 0 0 6.172 2H2.5a1 1 0 0 0-1 .981z"/></svg></span>';
 
 function buildBadges(source, item) {
   // Base location badge (Local / Cloud / Both / Wanted)
