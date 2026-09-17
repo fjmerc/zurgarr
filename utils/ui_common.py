@@ -43,7 +43,11 @@ a:hover{text-decoration:underline}
 [data-theme="light"] .sidebar-link.active{background:rgba(9,105,218,.08)}
 [data-theme="light"] .sidebar-link.active:hover{background:rgba(9,105,218,.12)}
 .sidebar-link svg{width:18px;height:18px;flex-shrink:0;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
-.sidebar-badge{display:inline-block;background:var(--red-solid);color:#fff;border-radius:8px;font-size:.72em;font-weight:700;padding:1px 6px;margin-left:auto;min-width:16px;text-align:center;line-height:1.4}
+/* Wanted count: a muted neutral counter, not an alert. Solid red read as
+   "something is critically wrong"; "Wanted" is just a tally of tracked items,
+   so it uses a subtle theme-aware pill with muted text (the GitHub counter
+   idiom) that reads as "N items", never as an error. */
+.sidebar-badge{display:inline-block;background:var(--border2);color:var(--text2);border-radius:8px;font-size:.72em;font-weight:600;padding:1px 6px;margin-left:auto;min-width:16px;text-align:center;line-height:1.4}
 .sidebar-divider{height:1px;background:var(--border);margin:4px 12px}
 .sidebar-footer{padding:12px 14px;border-top:1px solid var(--border)}
 .theme-switch{display:flex;background:var(--border2);border-radius:999px;padding:3px;gap:2px}
