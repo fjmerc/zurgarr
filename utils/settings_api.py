@@ -184,6 +184,10 @@ ENV_SCHEMA = [
              'Master kill switch for the periodic probe sweep. Default ON — turn OFF only if RD\'s API drifts and the prober starts misbehaving, or if you want to silence the background API calls entirely (default: ON).'),
             ('DEBRID_HEALTH_AUTO_REMEDIATE', 'Auto-Remediate Blocked Torrents', 'boolean', False,
              'When a probe confirms a torrent is filter-blocked: blocklist the hash, delete the torrent from your RD account, and trigger Sonarr/Radarr to re-search for a replacement. OFF by default because this mutates your debrid account state — review the detected blocks via /api/library or /config/debrid_health.json first, then flip ON. Hard-capped at 100 remediations per sweep so a first-run enable on a large library cannot mass-delete. The hash blocklist prevents re-grabs of the same release (default: OFF).'),
+            ('DEBRID_QUOTA_ENABLED', 'Enable Quota / Expiry Dashboard', 'boolean', False,
+             'Periodic per-provider poll of account expiry, storage usage, and per-torrent expiry dates (TorBox exposes these; Real-Debrid/AllDebrid have no per-torrent equivalent). Surfaces cards on the System page and zurgarr_debrid_* Prometheus gauges, and fires a debrid_expiry_warning notification when torrents enter the warning window or an account nears expiry. Read-only — never mutates debrid state (default: ON).'),
+            ('DEBRID_EXPIRY_WARN_DAYS', 'Expiry Warning Window (days)', 'number', False,
+             'Torrents expiring within this many days (and accounts this close to expiration) trigger the warning. Sweep cadence is DEBRID_QUOTA_INTERVAL, default 6h, env-only (default: 7).'),
         ],
     },
     {
@@ -348,6 +352,10 @@ _ENV_DEFAULTS = {
     # Debrid health detection is on by default; matches
     # utils/debrid_health.py::_enabled() and base/__init__.py Config.
     'DEBRID_HEALTH_ENABLED': 'true',
+    # Debrid quota/expiry dashboard defaults — match
+    # utils/debrid_quota.py::_enabled()/_warn_days() and base/__init__.py Config.
+    'DEBRID_QUOTA_ENABLED': 'true',
+    'DEBRID_EXPIRY_WARN_DAYS': '7',
     # Mount self-heal defaults ON — matches
     # utils/scheduled_tasks.py::_selfheal_enabled() and base/__init__.py Config.
     'MOUNT_SELFHEAL_ENABLED': 'true',

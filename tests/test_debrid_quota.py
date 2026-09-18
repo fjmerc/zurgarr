@@ -316,3 +316,53 @@ class TestRegistration:
         card health (routine, actionable, not a system failure)."""
         from utils.status_server import _ACTIVITY_WARN_TYPES
         assert 'debrid_expiry' in _ACTIVITY_WARN_TYPES
+
+
+# ---------------------------------------------------------------------------
+# Scheduler + env wiring
+# ---------------------------------------------------------------------------
+
+class TestSchedulerWiring:
+
+    def _registered_names(self, monkeypatch):
+        from utils import scheduled_tasks
+        registered = []
+        fake = MagicMock()
+        fake.register.side_effect = lambda name, *a, **k: registered.append(name)
+        fake.get_status.return_value = []
+        monkeypatch.setattr('utils.task_scheduler.scheduler', fake)
+        scheduled_tasks.register_all()
+        return registered
+
+    def test_registered_when_debrid_configured(self, clean_env, monkeypatch):
+        monkeypatch.setenv('TORBOX_API_KEY', 'tb-key')
+        assert 'debrid_quota_poll' in self._registered_names(monkeypatch)
+
+    def test_not_registered_without_debrid(self, clean_env, monkeypatch):
+        monkeypatch.delenv('TORBOX_API_KEY', raising=False)
+        with patch('os.path.isfile', return_value=False):
+            names = self._registered_names(monkeypatch)
+        assert 'debrid_quota_poll' not in names
+
+    def test_default_interval_six_hours(self):
+        from utils.scheduled_tasks import _DEFAULTS
+        assert _DEFAULTS['DEBRID_QUOTA_INTERVAL'] == 6 * 3600
+
+
+class TestEnvWiring:
+
+    def test_settings_schema_exposes_toggles(self):
+        from utils.settings_api import _ALL_KEYS
+        assert 'DEBRID_QUOTA_ENABLED' in _ALL_KEYS
+        assert 'DEBRID_EXPIRY_WARN_DAYS' in _ALL_KEYS
+
+    def test_env_defaults_match_config(self):
+        from utils.settings_api import _ENV_DEFAULTS
+        assert _ENV_DEFAULTS.get('DEBRID_QUOTA_ENABLED') == 'true'
+        assert _ENV_DEFAULTS.get('DEBRID_EXPIRY_WARN_DAYS') == '7'
+
+    def test_base_config_defaults(self, clean_env):
+        from base import Config
+        cfg = Config()
+        assert cfg.DEBRID_QUOTA_ENABLED == 'true'
+        assert cfg.DEBRID_EXPIRY_WARN_DAYS == '7'

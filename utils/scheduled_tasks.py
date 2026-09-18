@@ -41,6 +41,12 @@ _DEFAULTS = {
     # (≈85 min) — well clear of 12h, leaving headroom for other RD traffic.
     # Power-user override via env var; not surfaced in the Settings UI.
     'DEBRID_HEALTH_INTERVAL': 12 * 3600,       # 12 hours
+    # Debrid quota/expiry dashboard. Two API calls per provider per sweep
+    # (account + torrent list) — cheap enough for 6h, and TorBox expiry
+    # windows are multi-day so 6h leaves several warning sweeps before a
+    # deletion actually lands. Power-user override via env var; not
+    # surfaced in the Settings UI (DEBRID_HEALTH_INTERVAL precedent).
+    'DEBRID_QUOTA_INTERVAL': 6 * 3600,         # 6 hours
 }
 
 
@@ -1599,6 +1605,22 @@ def register_all():
             interval_seconds=_get_interval('DEBRID_HEALTH_INTERVAL'),
             description='Probe RD torrents for May 2026 keyword-filter blocks (infringing_file / error 35)',
             initial_delay=900,  # 15 min after startup
+        )
+
+    # Debrid Quota / Expiry Dashboard — register whenever any debrid
+    # provider is configured, so the task surfaces in the scheduler UI
+    # even when DEBRID_QUOTA_ENABLED is OFF (same rationale as the
+    # health reconciler: manual trigger works without a restart after
+    # toggling the env var ON). The sweep no-ops when disabled.
+    from utils.debrid_client import has_configured_debrid
+    if has_configured_debrid():
+        from utils.debrid_quota import run_sweep as _debrid_quota_run
+        scheduler.register(
+            'debrid_quota_poll',
+            _debrid_quota_run,
+            interval_seconds=_get_interval('DEBRID_QUOTA_INTERVAL'),
+            description='Poll debrid providers for account expiry, storage usage, and near-expiry torrents',
+            initial_delay=300,  # 5 min after startup
         )
 
     # Notification Digest — daily summary if enabled
