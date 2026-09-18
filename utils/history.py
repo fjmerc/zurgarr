@@ -124,6 +124,10 @@ CAUSE_MOUNT_SELFHEAL = 'mount_selfheal'
 # A mount skipped at startup (WebDAV unreachable within the timeout) was
 # successfully set up later by the mount_liveness deferred retry.
 CAUSE_MOUNT_DEFERRED_START = 'mount_deferred_start'
+# Debrid quota sweep: torrents entered the expiry warning window and/or a
+# provider account nears its expiration.  Change-gated — fires only when
+# the warning set differs from the previous sweep, never per-torrent.
+CAUSE_DEBRID_EXPIRY_WARNING = 'debrid_expiry_warning'
 
 
 def init(config_dir='/config'):

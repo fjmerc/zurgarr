@@ -373,3 +373,31 @@ def test_every_cause_constant_has_a_formatter():
                  if k.startswith('CAUSE_') and isinstance(v, str)]
     missing = [c for c in constants if c not in activity_format._CAUSE_FORMATTERS]
     assert not missing, f'CAUSE_* constants without formatters: {missing}'
+
+
+def test_debrid_expiry_warning_torrents_and_accounts():
+    ev = _ev('debrid_expiry_warning', torrents=3, accounts=1, warn_days=7)
+    s = format_event(ev)['short']
+    assert '3 torrents expiring within 7 days' in s
+    assert '1 account near expiry' in s
+
+
+def test_debrid_expiry_warning_torrents_only_singular():
+    ev = _ev('debrid_expiry_warning', torrents=1, accounts=0, warn_days=14)
+    s = format_event(ev)['short']
+    assert '1 torrent expiring within 14 days' in s
+    assert 'account' not in s
+
+
+def test_debrid_expiry_warning_accounts_only():
+    ev = _ev('debrid_expiry_warning', torrents=0, accounts=2, warn_days=7)
+    s = format_event(ev)['short']
+    assert '2 accounts near expiry' in s
+    assert 'torrent' not in s
+
+
+def test_debrid_expiry_warning_in_js_table():
+    """The JS mirror must carry the same slug or the browser feed degrades
+    to the raw detail string."""
+    from utils.activity_format import FORMATTER_JS
+    assert 'debrid_expiry_warning:' in FORMATTER_JS

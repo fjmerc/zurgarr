@@ -242,7 +242,7 @@ ENV_SCHEMA = [
              'library_refresh, symlink_created, symlink_failed, debrid_unavailable, pending_warning, '
              'local_fallback_triggered, blocklist_added, arr_deleted, health_error, symlink_repaired, '
              'daily_digest, debrid_add_success, debrid_add_failed, compromise_grabbed, debrid_filtered, debrid_rescued, '
-             'retry_giveup. Leave empty for all events'),
+             'retry_giveup, debrid_expiry_warning. Leave empty for all events'),
             ('NOTIFICATION_LEVEL', 'Minimum Level', 'select:info,warning,error', False, 'Minimum severity to send notifications'),
             ('NOTIFICATION_DIGEST_ENABLED', 'Daily Digest', 'boolean', False, 'Send a daily summary notification'),
             ('NOTIFICATION_DIGEST_TIME', 'Digest Time (HH:MM)', 'string', False, 'When to send the daily digest (24h format, default: 08:00)'),

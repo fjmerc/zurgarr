@@ -511,6 +511,21 @@ def _fmt_mount_deferred_start(ev, meta):
     return short, short
 
 
+def _fmt_debrid_expiry_warning(ev, meta):
+    torrents = meta.get('torrents', 0)
+    accounts = meta.get('accounts', 0)
+    warn_days = meta.get('warn_days', 7)
+    pieces = []
+    if torrents:
+        plural = 's' if torrents != 1 else ''
+        pieces.append(f'{torrents} torrent{plural} expiring within {warn_days} days')
+    if accounts:
+        plural = 's' if accounts != 1 else ''
+        pieces.append(f'{accounts} account{plural} near expiry')
+    short = 'Debrid expiry warning — ' + (', '.join(pieces) if pieces else 'cleared')
+    return short, short
+
+
 def _fmt_library_symlink_cleanup(ev, meta):
     s = meta.get('searched', 0)
     d = meta.get('deleted', 0)
@@ -574,6 +589,7 @@ _CAUSE_FORMATTERS = {
     'library_symlink_cleanup': _fmt_library_symlink_cleanup,
     'mount_selfheal': _fmt_mount_selfheal,
     'mount_deferred_start': _fmt_mount_deferred_start,
+    'debrid_expiry_warning': _fmt_debrid_expiry_warning,
 }
 
 
@@ -806,6 +822,13 @@ FORMATTER_JS = r"""
     },
     mount_deferred_start: function(ev,m){
       return 'Deferred rclone setup succeeded — ' + (m.mount || 'mount') + ' starting';
+    },
+    debrid_expiry_warning: function(ev,m){
+      var t = m.torrents || 0, a = m.accounts || 0, w = m.warn_days || 7;
+      var pieces = [];
+      if (t) pieces.push(t + ' torrent' + (t !== 1 ? 's' : '') + ' expiring within ' + w + ' days');
+      if (a) pieces.push(a + ' account' + (a !== 1 ? 's' : '') + ' near expiry');
+      return 'Debrid expiry warning — ' + (pieces.length ? pieces.join(', ') : 'cleared');
     }
   };
 

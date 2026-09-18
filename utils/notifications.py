@@ -50,6 +50,8 @@ ALL_EVENTS = {
     'debrid_rescued',             # Filter-blocked content auto-rehosted on the alt debrid (plan 39 phase 3)
     # Repair
     'symlink_repaired',           # Broken symlink repaired or re-search triggered
+    # Debrid quota / expiry dashboard
+    'debrid_expiry_warning',      # Torrents entered the expiry window or account near expiry
     # Debrid search
     'debrid_add_success',         # Torrent added to debrid from interactive search
     'debrid_add_failed',          # Failed to add torrent to debrid
