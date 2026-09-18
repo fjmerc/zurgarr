@@ -145,31 +145,52 @@ def _provider_snapshot(service, client, now, warn_days):
     return card
 
 
-def _warn_items(providers, warn_days):
+def _warn_items(providers, warn_days, prev_key=frozenset()):
     """(warn_key, human_lines) for the change gate + notification body.
 
     The account entry deliberately omits days_remaining from the key so
     the daily countdown doesn't re-fire a notification every sweep —
     only membership changes (a torrent entering/leaving the window, an
     account crossing the threshold) re-notify.
+
+    An errored probe is NOT a membership change: when a provider's list
+    or account call failed this sweep, its previous warn entries are
+    carried forward from ``prev_key`` so a transient API blip can't
+    shrink the set and re-fire a duplicate notification on recovery.
+    Carried entries contribute no body lines (their current state is
+    unknown).
+
+    Accounts already past expiration are lapsed, not "expiring in -N
+    days" — they never enter the warn set (the summary/UI still carry
+    the negative ``days_remaining``).
     """
     key = set()
     lines = []
     for card in providers:
-        near = card.get('near_expiry') or []
-        for t in near:
-            key.add(('torrent', card['service'], str(t['id'])))
-        if near:
-            soonest = near[0]
-            plural = 's' if len(near) != 1 else ''
-            lines.append(
-                f"{card['label']}: {len(near)} torrent{plural} expiring within "
-                f"{warn_days} days (soonest: {soonest['filename']} in "
-                f"{soonest['days_left']}d)")
-        days = card.get('account', {}).get('days_remaining')
-        if days is not None and days <= warn_days:
-            key.add(('account', card['service']))
-            lines.append(f"{card['label']} account expires in {days} days")
+        service = card['service']
+        if 'error' in (card.get('storage') or {}):
+            key |= {item for item in prev_key
+                    if item[0] == 'torrent' and item[1] == service}
+        else:
+            near = card.get('near_expiry') or []
+            for t in near:
+                key.add(('torrent', service, str(t['id'])))
+            if near:
+                soonest = near[0]
+                plural = 's' if len(near) != 1 else ''
+                lines.append(
+                    f"{card['label']}: {len(near)} torrent{plural} expiring within "
+                    f"{warn_days} days (soonest: {soonest['filename']} in "
+                    f"{soonest['days_left']}d)")
+        account = card.get('account') or {}
+        if 'error' in account:
+            if ('account', service) in prev_key:
+                key.add(('account', service))
+        else:
+            days = account.get('days_remaining')
+            if days is not None and 0 <= days <= warn_days:
+                key.add(('account', service))
+                lines.append(f"{card['label']} account expires in {days} days")
     return frozenset(key), lines
 
 
@@ -209,7 +230,9 @@ def _run_sweep(now=None):
         for service, client in debrid_client._all_configured_clients()
     ]
 
-    warn_key, lines = _warn_items(providers, warn_days)
+    with _lock:
+        prev_key = _last_warn_key
+    warn_key, lines = _warn_items(providers, warn_days, prev_key=prev_key)
 
     with _lock:
         _summary = {

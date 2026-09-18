@@ -1011,3 +1011,42 @@ class TestTorBoxExpiresAtPassthrough:
         result = tb.list_torrents()
         assert result[0]['expires_at'] == '2026-09-25T12:00:00Z'
         assert result[1]['expires_at'] is None
+
+
+class TestAccountInfoGuardOrdering:
+    """Non-dict payloads must raise the deliberate ValueError, not an
+    incidental AttributeError (bug-hunter finding #3)."""
+
+    @patch('utils.debrid_client.requests.get')
+    def test_ad_list_payload_raises_valueerror(self, mock_get, ad):
+        mock_get.return_value = _mock_response([])
+        with pytest.raises(ValueError):
+            ad.account_info()
+
+    @patch('utils.debrid_client.requests.get')
+    def test_ad_non_dict_data_raises_valueerror(self, mock_get, ad):
+        mock_get.return_value = _mock_response({'status': 'success', 'data': 'nope'})
+        with pytest.raises(ValueError):
+            ad.account_info()
+
+
+class TestTorBoxListGuard:
+    """TB HTTP-200 degraded payloads must not read as an empty account —
+    same posture as the RD non-list guard (bug-hunter finding #5)."""
+
+    @patch('utils.debrid_client.requests.get')
+    def test_null_data_raises(self, mock_get, tb):
+        mock_get.return_value = _mock_response({'success': False, 'data': None})
+        with pytest.raises(ValueError):
+            tb.list_torrents()
+
+    @patch('utils.debrid_client.requests.get')
+    def test_non_list_data_raises(self, mock_get, tb):
+        mock_get.return_value = _mock_response({'success': True, 'data': {'x': 1}})
+        with pytest.raises(ValueError):
+            tb.list_torrents()
+
+    @patch('utils.debrid_client.requests.get')
+    def test_empty_list_is_still_a_valid_empty_account(self, mock_get, tb):
+        mock_get.return_value = _mock_response({'success': True, 'data': []})
+        assert tb.list_torrents() == []

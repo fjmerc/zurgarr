@@ -366,3 +366,83 @@ class TestEnvWiring:
         cfg = Config()
         assert cfg.DEBRID_QUOTA_ENABLED == 'true'
         assert cfg.DEBRID_EXPIRY_WARN_DAYS == '7'
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: warn-set stability + lapsed accounts
+# ---------------------------------------------------------------------------
+
+class TestWarnSetStability:
+    """A transient provider error must not flap the warn set — an errored
+    probe is not a membership change (bug-hunter finding #1)."""
+
+    def _tb_ok(self):
+        return _tb_client(torrents=[
+            {'id': '9', 'filename': 'Soon.mkv', 'hash': 'AA', 'status': 'completed',
+             'bytes': 1, 'expires_at': _iso(NOW + timedelta(days=2))},
+        ])
+
+    def test_transient_list_error_does_not_renotify_on_recovery(self, quiet):
+        import requests
+        tb_err = _tb_client()
+        tb_err.list_torrents.side_effect = requests.ConnectionError('503')
+        for client, hours in ((self._tb_ok(), 0), (tb_err, 6), (self._tb_ok(), 12)):
+            with patch('utils.debrid_client._all_configured_clients',
+                       return_value=[('torbox', client)]):
+                debrid_quota._run_sweep(now=NOW + timedelta(hours=hours))
+        assert quiet.call_count == 1
+
+    def test_transient_account_error_does_not_renotify_on_recovery(self, quiet):
+        import requests
+        soon = {'premium': True, 'expiration': _iso(NOW + timedelta(days=3))}
+        rd_err = _rd_client(account=soon)
+        rd_err.account_info.side_effect = requests.ConnectionError('503')
+        for client, hours in ((_rd_client(account=soon), 0), (rd_err, 6),
+                              (_rd_client(account=soon), 12)):
+            with patch('utils.debrid_client._all_configured_clients',
+                       return_value=[('realdebrid', client)]):
+                debrid_quota._run_sweep(now=NOW + timedelta(hours=hours))
+        assert quiet.call_count == 1
+
+    def test_genuinely_cleared_warning_does_clear(self, quiet):
+        """A successful sweep with the torrent gone (not errored) clears the
+        set, so its later return legitimately re-notifies."""
+        for client, hours in ((self._tb_ok(), 0), (_tb_client(), 6),
+                              (self._tb_ok(), 12)):
+            with patch('utils.debrid_client._all_configured_clients',
+                       return_value=[('torbox', client)]):
+                debrid_quota._run_sweep(now=NOW + timedelta(hours=hours))
+        assert quiet.call_count == 2
+
+
+class TestLapsedAccount:
+    """An already-expired account is 'lapsed', not 'expiring in -N days'
+    (bug-hunter finding #2)."""
+
+    def test_negative_days_do_not_warn(self, quiet):
+        rd = _rd_client(account={
+            'premium': False, 'expiration': _iso(NOW - timedelta(days=123)),
+        })
+        with patch('utils.debrid_client._all_configured_clients',
+                   return_value=[('realdebrid', rd)]):
+            debrid_quota._run_sweep(now=NOW)
+        assert quiet.call_count == 0
+
+    def test_negative_days_still_visible_in_summary(self, quiet):
+        rd = _rd_client(account={
+            'premium': False, 'expiration': _iso(NOW - timedelta(days=123)),
+        })
+        with patch('utils.debrid_client._all_configured_clients',
+                   return_value=[('realdebrid', rd)]):
+            debrid_quota._run_sweep(now=NOW)
+        (card,) = debrid_quota.get_summary()['providers']
+        assert card['account']['days_remaining'] == -123
+
+    def test_zero_days_still_warns(self, quiet):
+        rd = _rd_client(account={
+            'premium': True, 'expiration': _iso(NOW + timedelta(hours=6)),
+        })
+        with patch('utils.debrid_client._all_configured_clients',
+                   return_value=[('realdebrid', rd)]):
+            debrid_quota._run_sweep(now=NOW)
+        assert quiet.call_count == 1

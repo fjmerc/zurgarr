@@ -572,9 +572,14 @@ class AllDebridClient(DebridClientBase):
         resp.raise_for_status()
         data = resp.json()
         # AD returns HTTP 200 + status=error on a bad key — don't misread
-        # that as a free account.
-        user = (data.get('data') or {}).get('user') if isinstance(data, dict) else None
-        if data.get('status') != 'success' or not isinstance(user, dict):
+        # that as a free account. Guard shape before touching any key so
+        # a non-dict payload raises this deliberate ValueError, not an
+        # incidental AttributeError.
+        if not isinstance(data, dict) or data.get('status') != 'success':
+            raise ValueError('AD /user returned non-success payload')
+        inner = data.get('data')
+        user = inner.get('user') if isinstance(inner, dict) else None
+        if not isinstance(user, dict):
             raise ValueError('AD /user returned non-success payload')
         until = user.get('premiumUntil') or 0
         expiration = None
@@ -631,9 +636,13 @@ class TorBoxClient(DebridClientBase):
         )
         resp.raise_for_status()
         data = resp.json()
-        torrents = data.get('data', [])
+        torrents = data.get('data', []) if isinstance(data, dict) else None
         if not isinstance(torrents, list):
-            return []
+            # TB can return HTTP 200 with a degraded payload
+            # ({"success": false, "data": null}) — same posture as the RD
+            # non-list guard: a silent [] here would read as "account is
+            # empty" to consumers like the quota sweep's warn set.
+            raise ValueError(f'TB /torrents/mylist returned non-list payload ({type(data).__name__})')
         return [
             {
                 'id': str(t.get('id', '')),

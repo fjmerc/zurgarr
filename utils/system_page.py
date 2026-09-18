@@ -463,8 +463,12 @@ function _dqRenderCardHtml(s,card){
   }else{
     pills.push('<span class="dh-pill '+(acct.premium?'dh-pill-on':'dh-pill-off')+'">'+(acct.premium?'Premium':'Free')+'</span>');
     if(acct.days_remaining!=null){
-      var warn=acct.days_remaining<=s.warn_days;
-      pills.push('<span class="dh-pill'+(warn?' dh-pill-warn':'')+'">Account: '+esc(String(acct.days_remaining))+'d left</span>');
+      if(acct.days_remaining<0){
+        pills.push('<span class="dh-pill dh-pill-warn">Account: expired</span>');
+      }else{
+        var warn=acct.days_remaining<=s.warn_days;
+        pills.push('<span class="dh-pill'+(warn?' dh-pill-warn':'')+'">Account: '+esc(String(acct.days_remaining))+'d left</span>');
+      }
     }
   }
   var rows=[];
@@ -607,6 +611,7 @@ window._hasAuthReady.then(function(){updateLogs();updateTasks();updateDebridHeal
 setInterval(updateLogs,10000);
 setInterval(updateTasks,15000);
 setInterval(updateDebridHealth,30000);
+setInterval(updateDebridQuota,30000);
 setInterval(updateRecovery,60000);
 __WANTED_BADGE_JS__
 </script>
