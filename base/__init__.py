@@ -83,6 +83,8 @@ __all__ = [
     # Debrid health reconciler (plan 38)
     'DEBRID_HEALTH_ENABLED', 'DEBRID_HEALTH_AUTO_REMEDIATE',
     'DEBRID_HEALTH_CROSS_RESCUE',
+    # Debrid quota / expiry dashboard
+    'DEBRID_QUOTA_ENABLED', 'DEBRID_EXPIRY_WARN_DAYS',
     # Routing audit
     'ROUTING_AUTO_TAG_UNTAGGED',
     # Gap-fill reconcile
@@ -312,6 +314,13 @@ class Config:
         # RD_API_KEY and TORBOX_API_KEY are set, off otherwise.  Explicit
         # ``true``/``false`` overrides the default.
         self.DEBRID_HEALTH_CROSS_RESCUE = os.getenv('DEBRID_HEALTH_CROSS_RESCUE')
+        # Debrid quota / expiry dashboard (surface + notify only) — polls
+        # each configured provider for account expiry + storage usage +
+        # per-torrent expiry (TorBox only; RD/AD expose no such field) and
+        # warns when content enters the expiry window. Never mutates
+        # debrid state.
+        self.DEBRID_QUOTA_ENABLED = os.getenv('DEBRID_QUOTA_ENABLED', 'true')
+        self.DEBRID_EXPIRY_WARN_DAYS = os.getenv('DEBRID_EXPIRY_WARN_DAYS', '7')
         # Routing audit (auto-tag untagged monitored series/movies with debrid tag)
         self.ROUTING_AUTO_TAG_UNTAGGED = os.getenv('ROUTING_AUTO_TAG_UNTAGGED', 'true')
         # Gap-fill reconcile — unconditional missing-episode search across
@@ -491,6 +500,8 @@ SYMLINK_REPAIR_AUTO_SEARCH = config.SYMLINK_REPAIR_AUTO_SEARCH
 DEBRID_HEALTH_ENABLED = config.DEBRID_HEALTH_ENABLED
 DEBRID_HEALTH_AUTO_REMEDIATE = config.DEBRID_HEALTH_AUTO_REMEDIATE
 DEBRID_HEALTH_CROSS_RESCUE = config.DEBRID_HEALTH_CROSS_RESCUE
+DEBRID_QUOTA_ENABLED = config.DEBRID_QUOTA_ENABLED
+DEBRID_EXPIRY_WARN_DAYS = config.DEBRID_EXPIRY_WARN_DAYS
 ROUTING_AUTO_TAG_UNTAGGED = config.ROUTING_AUTO_TAG_UNTAGGED
 GAP_FILL_ENABLED = config.GAP_FILL_ENABLED
 WANTED_TB_RECOVERY_ENABLED = config.WANTED_TB_RECOVERY_ENABLED

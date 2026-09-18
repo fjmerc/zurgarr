@@ -81,6 +81,12 @@ __NAV_HTML__
        Hidden entirely when no provider is configured. -->
   <div id="dh-heading" style="display:none;font-size:.85em;color:var(--text2);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">Debrid Health</div>
   <div id="dh-providers" class="dh-providers" style="display:none"></div>
+  <!-- Debrid Quota & Expiry dashboard (read-only): per-provider account
+       expiry, storage usage, and near-expiry torrents (TorBox exposes
+       per-torrent expires_at; RD/AD cards carry account + storage only).
+       Hidden until the first quota sweep populates the cache. -->
+  <div id="dq-heading" style="display:none;font-size:.85em;color:var(--text2);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">Debrid Quota &amp; Expiry</div>
+  <div id="dq-cards" class="dh-providers" style="display:none"></div>
   <div style="margin-bottom:8px">
     <button class="btn btn-ghost btn-sm" data-kb="refresh" onclick="updateTasks()">Refresh</button>
   </div>
@@ -441,6 +447,88 @@ function runDebridHealth(btn){
   }).catch(function(){btn.disabled=false;btn.textContent='Run sweep now';});
 }
 
+/* Debrid Quota & Expiry cards */
+function _dqBytes(n){
+  if(!n)return '0 GB';
+  var units=['B','KB','MB','GB','TB','PB'],i=0;
+  while(n>=1024&&i<units.length-1){n/=1024;i++;}
+  return (Math.round(n*10)/10)+' '+units[i];
+}
+function _dqRenderCardHtml(s,card){
+  var pills=[];
+  if(!s.enabled)pills.push('<span class="dh-pill dh-pill-off">Disabled</span>');
+  var acct=card.account||{};
+  if(acct.error){
+    pills.push('<span class="dh-pill dh-pill-off">Account: '+esc(acct.error)+'</span>');
+  }else{
+    pills.push('<span class="dh-pill '+(acct.premium?'dh-pill-on':'dh-pill-off')+'">'+(acct.premium?'Premium':'Free')+'</span>');
+    if(acct.days_remaining!=null){
+      if(acct.days_remaining<0){
+        pills.push('<span class="dh-pill dh-pill-warn">Account: expired</span>');
+      }else{
+        var warn=acct.days_remaining<=s.warn_days;
+        pills.push('<span class="dh-pill'+(warn?' dh-pill-warn':'')+'">Account: '+esc(String(acct.days_remaining))+'d left</span>');
+      }
+    }
+  }
+  var rows=[];
+  var st=card.storage||{};
+  if(st.error){
+    rows.push('<div class="dh-row"><span class="dh-label">Storage:</span><span class="dh-bad">'+esc(st.error)+'</span></div>');
+  }else{
+    rows.push('<div class="dh-row"><span class="dh-label">Storage:</span><span>'+esc(String(st.count||0))+' torrents · '+esc(_dqBytes(st.bytes||0))+'</span></div>');
+  }
+  var near=card.near_expiry||[];
+  if(!st.error){
+    var nearVal=near.length
+      ?'<span class="dh-bad">'+esc(String(near.length))+' within '+esc(String(s.warn_days))+'d</span>'
+      :'<span class="dh-good">none within '+esc(String(s.warn_days))+'d</span>';
+    rows.push('<div class="dh-row"><span class="dh-label">Expiring torrents:</span><span>'+nearVal+'</span></div>');
+  }
+  near.slice(0,5).forEach(function(t){
+    rows.push('<div class="dh-row"><span class="dh-label"></span><span class="dq-item" title="'+esc(t.expires_at||'')+'">'+esc(t.filename||t.id)+' — <b>'+esc(String(t.days_left))+'d</b></span></div>');
+  });
+  if(near.length>5){
+    rows.push('<div class="dh-row"><span class="dh-label"></span><span class="dq-item">&hellip;and '+esc(String(near.length-5))+' more</span></div>');
+  }
+  rows.push('<div class="dh-row"><span class="dh-label">Last sweep:</span><span>'+esc(fmtAge(s.generated_ts))+'</span></div>');
+  var note=card.service==='torbox'
+    ?'<div class="dh-note">TorBox deletes torrents at their <b>expires_at</b>. Anything listed above stops playing on that date unless re-downloaded or refreshed.</div>'
+    :'<div class="dh-note">'+esc(card.label)+' does not expose per-torrent expiry — this card tracks account expiry and storage only.</div>';
+  var actions=''
+    +'<button class="btn btn-ghost btn-sm" onclick="runDebridQuota(this)">Run sweep now</button>'
+    +'<a class="btn btn-ghost btn-sm" href="/activity?type=debrid_expiry">View activity &rarr;</a>';
+  return ''
+    +'<div class="dh-card">'
+    +'<div class="dh-card-head">'
+    +'<span class="dh-card-title">'+esc(card.label)+' Quota</span>'
+    +'<span class="dh-card-pills">'+pills.join('')+'</span>'
+    +'</div>'
+    +'<div class="dh-card-body">'+rows.join('')+note+'</div>'
+    +'<div class="dh-card-actions">'+actions+'</div>'
+    +'</div>';
+}
+function updateDebridQuota(){
+  fetch('/api/debrid_quota/summary').then(function(r){return r.json()}).then(function(s){
+    var container=document.getElementById('dq-cards');
+    var heading=document.getElementById('dq-heading');
+    if(!s||!s.generated_ts||!(s.providers||[]).length){
+      container.style.display='none';heading.style.display='none';return;
+    }
+    container.style.display='';
+    heading.style.display='';
+    container.className='dh-providers'+(s.providers.length>=2?' dh-providers-pair':'');
+    container.innerHTML=s.providers.map(function(p){return _dqRenderCardHtml(s,p);}).join('');
+  }).catch(function(){});
+}
+function runDebridQuota(btn){
+  btn.disabled=true;btn.textContent='...';
+  fetch('/api/tasks/debrid_quota_poll/run',{method:'POST'}).then(function(r){return r.json()}).then(function(d){
+    btn.textContent=d.status==='started'?'Started':'Already running';
+    setTimeout(function(){btn.disabled=false;btn.textContent='Run sweep now';updateDebridQuota();updateTasks();},3000);
+  }).catch(function(){btn.disabled=false;btn.textContent='Run sweep now';});
+}
+
 /* Media Recovery tile */
 function _recSparkline(snaps){
   /* Tiny inline trend of the headline metric (pct_on_disk = available to
@@ -519,10 +607,11 @@ window.onKbEscape=function(){
 };
 
 /* Initial load (wait for auth detection) + polling */
-window._hasAuthReady.then(function(){updateLogs();updateTasks();updateDebridHealth();updateRecovery();});
+window._hasAuthReady.then(function(){updateLogs();updateTasks();updateDebridHealth();updateDebridQuota();updateRecovery();});
 setInterval(updateLogs,10000);
 setInterval(updateTasks,15000);
 setInterval(updateDebridHealth,30000);
+setInterval(updateDebridQuota,30000);
 setInterval(updateRecovery,60000);
 __WANTED_BADGE_JS__
 </script>
@@ -553,6 +642,8 @@ th{color:var(--text2);font-weight:500;font-size:.75em;text-transform:uppercase;l
 .dh-pill-off{color:var(--text3)}
 .dh-pill-rd{color:var(--yellow);border-color:var(--yellow)}
 .dh-pill-tb{color:var(--blue);border-color:var(--blue)}
+.dh-pill-warn{color:var(--red);border-color:var(--red)}
+.dq-item{color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:420px}
 .dh-card-body{display:flex;flex-direction:column;gap:4px;margin-bottom:10px}
 .dh-row{display:flex;gap:8px;font-size:.8em;color:var(--text)}
 .dh-label{color:var(--text2);min-width:130px}

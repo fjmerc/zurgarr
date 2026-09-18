@@ -520,7 +520,7 @@ def check_services():
 _ACTIVITY_WARN_TYPES = frozenset({
     'failed', 'symlink_failed', 'blocklisted', 'blocklist_added',
     'switched_source', 'duplicate', 'debrid_unavailable', 'uncached_rejected',
-    'debrid_add_failed', 'release_incomplete', 'cleanup',
+    'debrid_add_failed', 'release_incomplete', 'cleanup', 'debrid_expiry',
 })
 # Routine periodic summaries — kept off the feed so they don't reintroduce
 # the heartbeat noise we just removed from the scheduler side.  They remain
@@ -1771,6 +1771,12 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
             try:
                 from utils.debrid_health import get_summary
                 self._send_json_response(200, json.dumps(get_summary()))
+            except Exception as e:
+                self._send_json_response(500, json.dumps({'error': str(e)}))
+        elif self.path == '/api/debrid_quota/summary':
+            try:
+                from utils.debrid_quota import get_summary as quota_summary
+                self._send_json_response(200, json.dumps(quota_summary()))
             except Exception as e:
                 self._send_json_response(500, json.dumps({'error': str(e)}))
         elif self.path.startswith('/api/recovery'):

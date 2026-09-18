@@ -8,6 +8,7 @@ chooses to prefer local copies.
 
 import os
 import re
+from datetime import datetime, timezone
 
 import requests
 
@@ -52,6 +53,17 @@ class DebridClientBase:
 
         Implementations may receive string-serialized IDs and are
         responsible for their own type coercion.
+        """
+        raise NotImplementedError
+
+    def account_info(self):
+        """Fetch account status from the provider.
+
+        Returns a normalized dict ``{'premium': bool, 'expiration': str|None}``
+        where ``expiration`` is an ISO-8601 timestamp (provider-native string,
+        or converted from epoch for AllDebrid).  Raises on transport errors
+        and on payloads that could misread an auth failure as a free/empty
+        account (mirrors the ``list_torrents`` non-list guard).
         """
         raise NotImplementedError
 
@@ -183,6 +195,22 @@ class RealDebridClient(DebridClientBase):
             }
             for t in data
         ]
+
+    def account_info(self):
+        resp = tracked_request(
+            self._name, requests.get,
+            f'{self._BASE}/user',
+            headers=self._headers(),
+            timeout=_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise ValueError(f'RD /user returned non-dict payload ({type(data).__name__})')
+        return {
+            'premium': data.get('type') == 'premium',
+            'expiration': data.get('expiration') or None,
+        }
 
     def delete_torrent(self, torrent_id):
         if not _SAFE_ID.match(str(torrent_id)):
@@ -534,6 +562,34 @@ class AllDebridClient(DebridClientBase):
             for m in magnets
         ]
 
+    def account_info(self):
+        resp = tracked_request(
+            self._name, requests.get,
+            f'{self._BASE}/user',
+            params=self._params(),
+            timeout=_TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        # AD returns HTTP 200 + status=error on a bad key — don't misread
+        # that as a free account. Guard shape before touching any key so
+        # a non-dict payload raises this deliberate ValueError, not an
+        # incidental AttributeError.
+        if not isinstance(data, dict) or data.get('status') != 'success':
+            raise ValueError('AD /user returned non-success payload')
+        inner = data.get('data')
+        user = inner.get('user') if isinstance(inner, dict) else None
+        if not isinstance(user, dict):
+            raise ValueError('AD /user returned non-success payload')
+        until = user.get('premiumUntil') or 0
+        expiration = None
+        if until:
+            expiration = datetime.fromtimestamp(int(until), tz=timezone.utc).isoformat()
+        return {
+            'premium': bool(user.get('isPremium')),
+            'expiration': expiration,
+        }
+
     def delete_torrent(self, torrent_id):
         if not _SAFE_ID.match(str(torrent_id)):
             logger.error(f"[debrid] AD invalid torrent ID: {torrent_id!r}")
@@ -580,9 +636,13 @@ class TorBoxClient(DebridClientBase):
         )
         resp.raise_for_status()
         data = resp.json()
-        torrents = data.get('data', [])
+        torrents = data.get('data', []) if isinstance(data, dict) else None
         if not isinstance(torrents, list):
-            return []
+            # TB can return HTTP 200 with a degraded payload
+            # ({"success": false, "data": null}) — same posture as the RD
+            # non-list guard: a silent [] here would read as "account is
+            # empty" to consumers like the quota sweep's warn set.
+            raise ValueError(f'TB /torrents/mylist returned non-list payload ({type(data).__name__})')
         return [
             {
                 'id': str(t.get('id', '')),
@@ -590,9 +650,29 @@ class TorBoxClient(DebridClientBase):
                 'hash': (t.get('hash') or '').upper(),
                 'status': t.get('download_state', ''),
                 'bytes': t.get('size', 0),
+                # TB torrents carry a hard server-side deletion date; RD/AD
+                # have no equivalent, so only TB rows ever have a value here.
+                'expires_at': t.get('expires_at') or None,
             }
             for t in torrents
         ]
+
+    def account_info(self):
+        resp = tracked_request(
+            self._name, requests.get,
+            f'{self._BASE}/user/me',
+            headers=self._headers(),
+            timeout=_TIMEOUT,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        data = payload.get('data') if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            raise ValueError('TB /user/me returned no data payload')
+        return {
+            'premium': (data.get('plan') or 0) > 0,
+            'expiration': data.get('expiration_date') or None,
+        }
 
     def delete_torrent(self, torrent_id):
         if not _SAFE_ID.match(str(torrent_id)):

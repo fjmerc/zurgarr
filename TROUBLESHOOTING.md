@@ -14,6 +14,7 @@ isn't here, open a [GitHub issue](https://github.com/fjmerc/zurgarr/issues).
 - [Mount missing after a host reboot ("Skipping rclone setup" in logs)](#mount-missing-after-a-host-reboot-skipping-rclone-setup-in-logs)
 - [Library shows only debrid content after a host reboot (local library appears empty)](#library-shows-only-debrid-content-after-a-host-reboot-local-library-appears-empty)
 - [TorBox mount fails to authenticate / 401 Invalid credentials](#torbox-mount-fails-to-authenticate--401-invalid-credentials)
+- [TorBox content that played fine last week is suddenly gone](#torbox-content-that-played-fine-last-week-is-suddenly-gone)
 - [Docker Desktop: mount propagation error](#docker-desktop-mount-propagation-error)
 - [Plex not seeing debrid content](#plex-not-seeing-debrid-content)
 - [New shows/movies only appear in Plex after a manual scan](#new-showsmovies-only-appear-in-plex-after-a-manual-scan)
@@ -245,6 +246,30 @@ user + password. Setup:
 Without `TORBOX_WEBDAV_USER` and `TORBOX_WEBDAV_PASS`, the WebDAV mount
 is skipped (logged as a startup warning) but the API-key-only features
 — cache probes, search-add, blackhole routing — continue to work.
+
+## TorBox content that played fine last week is suddenly gone
+
+A show or movie backed by TorBox stops playing, the file has vanished
+from `/data/torbox/`, and its library symlink is broken — nothing in
+the logs except the eventual symlink cleanup/repair.
+
+TorBox deletes stored torrents when they reach their server-side
+expiry date (visible per torrent as `expires_at` in their API — plans
+differ on the window, and inactivity shortens it). Zurgarr's reactive
+paths (`verify_symlinks`, the library scanner) only notice *after* the
+deletion, when the target is already gone.
+
+The **Debrid Quota & Expiry** cards on the System page show, per
+provider, exactly which torrents fall inside the warning window
+(default 7 days, `DEBRID_EXPIRY_WARN_DAYS`), and a
+`debrid_expiry_warning` notification fires when new content enters the
+window (subscribe via `NOTIFICATION_EVENTS`). When you get the warning:
+play or re-download the listed items on TorBox to refresh their
+activity, or accept that the arrs will re-acquire them after expiry.
+The sweep runs every 6 h (`DEBRID_QUOTA_INTERVAL`) and can be
+triggered manually from the System page ("Run sweep now" on the quota
+card). Real-Debrid does not publish per-torrent expiry, so only account
+expiry and storage totals can be shown for RD.
 
 ## Docker Desktop: mount propagation error
 

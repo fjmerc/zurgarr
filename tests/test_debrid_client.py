@@ -902,3 +902,151 @@ class TestSafeIdLengthCap:
 
     def test_rejects_empty_id(self):
         assert not _SAFE_ID.match('')
+
+
+# ---------------------------------------------------------------------------
+# Account info (quota/expiry dashboard)
+# ---------------------------------------------------------------------------
+
+class TestAccountInfo:
+    """account_info() — normalized {'premium': bool, 'expiration': str|None}."""
+
+    @patch('utils.debrid_client.requests.get')
+    def test_rd_premium_account(self, mock_get, rd):
+        mock_get.return_value = _mock_response({
+            'id': 123, 'username': 'fray', 'email': 'x@y.z', 'points': 700,
+            'locale': 'en', 'avatar': '', 'type': 'premium',
+            'premium': 12345678, 'expiration': '2027-01-01T00:00:00.000Z',
+        })
+        info = rd.account_info()
+        assert info == {'premium': True, 'expiration': '2027-01-01T00:00:00.000Z'}
+        # hits the authed /user endpoint
+        assert mock_get.call_args[0][0].endswith('/user')
+
+    @patch('utils.debrid_client.requests.get')
+    def test_rd_free_account(self, mock_get, rd):
+        mock_get.return_value = _mock_response({
+            'type': 'free', 'expiration': '2026-09-20T00:00:00.000Z',
+        })
+        info = rd.account_info()
+        assert info['premium'] is False
+
+    @patch('utils.debrid_client.requests.get')
+    def test_rd_non_dict_payload_raises(self, mock_get, rd):
+        """RD can 200 with a non-dict on auth degradation — must not read
+        as a free/empty account."""
+        mock_get.return_value = _mock_response([])
+        with pytest.raises(ValueError):
+            rd.account_info()
+
+    @patch('utils.debrid_client.requests.get')
+    def test_tb_plan_account(self, mock_get, tb):
+        mock_get.return_value = _mock_response({
+            'success': True,
+            'data': {'email': 'x@y.z', 'plan': 2,
+                     'expiration_date': '2026-10-01T00:00:00Z'},
+        })
+        info = tb.account_info()
+        assert info == {'premium': True, 'expiration': '2026-10-01T00:00:00Z'}
+        assert mock_get.call_args[0][0].endswith('/user/me')
+
+    @patch('utils.debrid_client.requests.get')
+    def test_tb_free_plan(self, mock_get, tb):
+        mock_get.return_value = _mock_response({
+            'success': True, 'data': {'plan': 0, 'expiration_date': None},
+        })
+        info = tb.account_info()
+        assert info == {'premium': False, 'expiration': None}
+
+    @patch('utils.debrid_client.requests.get')
+    def test_tb_missing_data_raises(self, mock_get, tb):
+        mock_get.return_value = _mock_response({'success': False, 'data': None})
+        with pytest.raises(ValueError):
+            tb.account_info()
+
+    @patch('utils.debrid_client.requests.get')
+    def test_ad_premium_epoch_converted_to_iso(self, mock_get, ad):
+        from datetime import datetime, timezone
+        dt = datetime(2027, 1, 1, tzinfo=timezone.utc)
+        mock_get.return_value = _mock_response({
+            'status': 'success',
+            'data': {'user': {'username': 'fray', 'isPremium': True,
+                              'premiumUntil': int(dt.timestamp())}},
+        })
+        info = ad.account_info()
+        assert info['premium'] is True
+        assert info['expiration'] == dt.isoformat()
+
+    @patch('utils.debrid_client.requests.get')
+    def test_ad_no_premium_until(self, mock_get, ad):
+        mock_get.return_value = _mock_response({
+            'status': 'success',
+            'data': {'user': {'isPremium': False, 'premiumUntil': 0}},
+        })
+        info = ad.account_info()
+        assert info == {'premium': False, 'expiration': None}
+
+    @patch('utils.debrid_client.requests.get')
+    def test_ad_error_status_raises(self, mock_get, ad):
+        """AD returns HTTP 200 + status=error on a bad key — must not read
+        as a free account."""
+        mock_get.return_value = _mock_response({'status': 'error'})
+        with pytest.raises(ValueError):
+            ad.account_info()
+
+
+class TestTorBoxExpiresAtPassthrough:
+
+    @patch('utils.debrid_client.requests.get')
+    def test_expires_at_included_in_list(self, mock_get, tb):
+        mock_get.return_value = _mock_response({
+            'success': True,
+            'data': [
+                {'id': 1, 'name': 'A.mkv', 'hash': 'aa', 'download_state': 'completed',
+                 'size': 10, 'expires_at': '2026-09-25T12:00:00Z'},
+                {'id': 2, 'name': 'B.mkv', 'hash': 'bb', 'download_state': 'completed',
+                 'size': 20},
+            ],
+        })
+        result = tb.list_torrents()
+        assert result[0]['expires_at'] == '2026-09-25T12:00:00Z'
+        assert result[1]['expires_at'] is None
+
+
+class TestAccountInfoGuardOrdering:
+    """Non-dict payloads must raise the deliberate ValueError, not an
+    incidental AttributeError (bug-hunter finding #3)."""
+
+    @patch('utils.debrid_client.requests.get')
+    def test_ad_list_payload_raises_valueerror(self, mock_get, ad):
+        mock_get.return_value = _mock_response([])
+        with pytest.raises(ValueError):
+            ad.account_info()
+
+    @patch('utils.debrid_client.requests.get')
+    def test_ad_non_dict_data_raises_valueerror(self, mock_get, ad):
+        mock_get.return_value = _mock_response({'status': 'success', 'data': 'nope'})
+        with pytest.raises(ValueError):
+            ad.account_info()
+
+
+class TestTorBoxListGuard:
+    """TB HTTP-200 degraded payloads must not read as an empty account —
+    same posture as the RD non-list guard (bug-hunter finding #5)."""
+
+    @patch('utils.debrid_client.requests.get')
+    def test_null_data_raises(self, mock_get, tb):
+        mock_get.return_value = _mock_response({'success': False, 'data': None})
+        with pytest.raises(ValueError):
+            tb.list_torrents()
+
+    @patch('utils.debrid_client.requests.get')
+    def test_non_list_data_raises(self, mock_get, tb):
+        mock_get.return_value = _mock_response({'success': True, 'data': {'x': 1}})
+        with pytest.raises(ValueError):
+            tb.list_torrents()
+
+    @patch('utils.debrid_client.requests.get')
+    def test_empty_list_is_still_a_valid_empty_account(self, mock_get, tb):
+        mock_get.return_value = _mock_response({'success': True, 'data': []})
+        assert tb.list_torrents() == []
