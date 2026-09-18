@@ -157,6 +157,8 @@ ENV_SCHEMA = [
             ('FORCE_GRAB_MAX_ATTEMPTS', 'Force-Grab Give-Up After (attempts)', 'number:1-100', False, 'How many times the library scanner will force-grab a debrid release for a stuck title before giving up and marking it debrid-unavailable. Each force-grab re-arms TorBox\'s abuse cooldown, so an uncached/never-completing title would otherwise be re-grabbed every scan forever, starving genuine recovery. The counter persists across restarts and resets when the title lands on debrid or after 30 idle days (default: 12).'),
             ('DEBRID_UNAVAILABLE_THRESHOLD_DAYS', 'Debrid Unavailable After (days)', 'number:1-30', False, 'Days of failed searches before marking content as debrid-unavailable (default: 3)'),
             ('GAP_FILL_ENABLED', 'Gap-Fill Missing Episodes', 'boolean', False, 'Reconcile every monitored show against TMDB and search Sonarr/Radarr for aired episodes missing from both debrid and local, regardless of source preference. Also auto-enables re-search for broken symlinks during verify_symlinks. Set OFF to opt out (default: true)'),
+            ('WANTED_DEPRIORITIZE_UNPLAYED', 'Deprioritize Never-Played Wanted Titles', 'boolean', False, 'When Tautulli is configured (Plex Library section), wanted-recovery targets whose title has no recorded plays sort to the back of the queue, so the per-scan TB/RD budgets flow to content people actually watch. Ordering only — nothing is skipped, no budgets change, and a Tautulli outage degrades to the normal order. Inert without Tautulli (default: ON).'),
+            ('TAUTULLI_HISTORY_DAYS', 'Watch-History Lookback (days)', 'number:1-3650', False, 'How far back Tautulli play history counts as "played" for the deprioritization above. Any play counts — partial watches included (default: 180).'),
             ('LIBRARY_RESCAN_NFS_DELAY', 'NFS Rescan Delay (seconds)', 'number:0-300', False,
              'Sleep this many seconds between creating new debrid symlinks and firing Sonarr/Radarr rescans. Default 0 (no delay) — bump to 30 if Sonarr/Radarr reads the symlink directory over NFS and you see "hasFile=false" right after a scan that later imports cleanly on its own. The arr-side kernel attribute cache (default 30-60s TTL on most NFS mounts) hides freshly-created symlinks from the rescan walk; this delay lets the cache expire first. Clamped to [0, 300] (default: 0).'),
         ],
@@ -234,6 +236,8 @@ ENV_SCHEMA = [
             ('DUPLICATE_CLEANUP', 'Duplicate Cleanup', 'boolean', False, 'Automatically remove duplicate media entries'),
             ('CLEANUP_INTERVAL', 'Cleanup Interval (hours)', 'number:1-168', False, 'How often to run duplicate cleanup'),
             ('DUPLICATE_CLEANUP_KEEP', 'Keep Copy From', 'select:local,zurg', False, 'Which copy to keep: "local" (default, logs Zurg dupes) or "zurg" (deletes local copies)'),
+            ('TAUTULLI_URL', 'Tautulli URL', 'url', False, 'Tautulli base URL (e.g. http://tautulli:8181). Enables watch-history correlation: the wanted-recovery pass reads play history to deprioritize never-played titles (see Recovery & Reconciliation). Read-only — zurgarr never writes to Tautulli.'),
+            ('TAUTULLI_API_KEY', 'Tautulli API Key', 'secret', False, 'Tautulli API key (Settings → Web Interface → API). Sent as a query parameter (Tautulli has no header auth); zurgarr strips query strings from logged URLs so the key never reaches logs.'),
         ],
     },
     {
@@ -356,6 +360,11 @@ _ENV_DEFAULTS = {
     # utils/debrid_quota.py::_enabled()/_warn_days() and base/__init__.py Config.
     'DEBRID_QUOTA_ENABLED': 'true',
     'DEBRID_EXPIRY_WARN_DAYS': '7',
+    # Tautulli watch-correlation defaults — match
+    # utils/library.py::wanted_deprioritize_unplayed_enabled(),
+    # utils/tautulli.py::history_days() and base/__init__.py Config.
+    'WANTED_DEPRIORITIZE_UNPLAYED': 'true',
+    'TAUTULLI_HISTORY_DAYS': '180',
     # Mount self-heal defaults ON — matches
     # utils/scheduled_tasks.py::_selfheal_enabled() and base/__init__.py Config.
     'MOUNT_SELFHEAL_ENABLED': 'true',
@@ -646,7 +655,8 @@ def validate_env_values(values):
     # space alone — write_env_values' _sanitize_value also strips, so the
     # stored value ends up clean regardless of what the user typed.
     url_fields = ['PLEX_ADDRESS', 'JF_ADDRESS', 'SEERR_ADDRESS', 'FLARESOLVERR_URL',
-                  'SONARR_URL', 'RADARR_URL', 'TORRENTIO_URL', 'PROWLARR_URL']
+                  'SONARR_URL', 'RADARR_URL', 'TORRENTIO_URL', 'PROWLARR_URL',
+                  'TAUTULLI_URL']
     for key in url_fields:
         val = values.get(key, '').strip()
         if val and not _is_valid_url(val):

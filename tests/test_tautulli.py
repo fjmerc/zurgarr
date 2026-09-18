@@ -148,3 +148,31 @@ class TestPlayedTitles:
         assert any('media_type=movie' in u for u in urls)
         assert any('media_type=episode' in u for u in urls)
         assert all('cmd=get_history' in u and 'grouping=1' in u for u in urls)
+
+
+class TestEnvWiring:
+
+    def test_settings_schema_exposes_vars(self):
+        from utils.settings_api import _ALL_KEYS
+        for key in ('TAUTULLI_URL', 'TAUTULLI_API_KEY',
+                    'WANTED_DEPRIORITIZE_UNPLAYED', 'TAUTULLI_HISTORY_DAYS'):
+            assert key in _ALL_KEYS, key
+
+    def test_env_defaults_match_config(self):
+        from utils.settings_api import _ENV_DEFAULTS
+        assert _ENV_DEFAULTS.get('WANTED_DEPRIORITIZE_UNPLAYED') == 'true'
+        assert _ENV_DEFAULTS.get('TAUTULLI_HISTORY_DAYS') == '180'
+
+    def test_base_config_defaults(self, clean_env, monkeypatch):
+        monkeypatch.delenv('TAUTULLI_URL', raising=False)
+        monkeypatch.delenv('TAUTULLI_API_KEY', raising=False)
+        from base import Config
+        cfg = Config()
+        assert cfg.WANTED_DEPRIORITIZE_UNPLAYED == 'true'
+        assert cfg.TAUTULLI_HISTORY_DAYS == '180'
+        assert cfg.TAUTULLI_URL is None
+
+    def test_tautulli_url_validated_as_url(self):
+        from utils.settings_api import validate_env_values
+        result = validate_env_values({'TAUTULLI_URL': 'not-a-url'})
+        assert any('TAUTULLI_URL' in e for e in result['errors'])

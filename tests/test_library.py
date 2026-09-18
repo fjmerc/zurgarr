@@ -9882,3 +9882,139 @@ class TestWantedRecoveryProwlarrFallback:
             '', None, 'movie', None, None,
             exclude_hashes=set(), season_cls={}, is_blocked=None) == []
         assert wire['prowlarr_calls'] == []
+
+
+class TestWantedTautulliDeprioritize:
+    """Tautulli watch-correlation: never-played wanted targets sort last
+    (stable), with graceful degradation to today's order."""
+
+    def _scanner(self):
+        sc = LibraryScanner.__new__(LibraryScanner)
+        sc._wanted_tb_cooldown = {}
+        sc._wanted_rd_miss = {}
+        sc._wanted_no_results = {}
+        return sc
+
+    def _movie(self, title, year):
+        return ('movie', {'title': title, 'year': year, 'imdb_id': 'tt1'},
+                None, None)
+
+    def _show(self, title):
+        return ('series', {'title': title, 'year': 2020, 'imdb_id': 'tt2'},
+                1, 1)
+
+    PLAYED = {
+        'movies': {'seen movie': {2016}, 'yearless movie': set()},
+        'shows': {'seen show'},
+    }
+
+    @pytest.fixture
+    def tautulli_on(self, monkeypatch):
+        monkeypatch.setenv('TAUTULLI_URL', 'http://tautulli:8181')
+        monkeypatch.setenv('TAUTULLI_API_KEY', 'k')
+        monkeypatch.delenv('WANTED_DEPRIORITIZE_UNPLAYED', raising=False)
+
+    def test_unplayed_sorted_last_stable(self, tautulli_on, monkeypatch):
+        sc = self._scanner()
+        targets = [
+            self._movie('Ghost A', 2020),          # unplayed
+            self._movie('Seen Movie', 2016),       # played
+            self._show('Ghost Show'),              # unplayed
+            self._show('Seen Show'),               # played
+        ]
+        with patch('utils.tautulli.played_titles', return_value=self.PLAYED):
+            out = sc._deprioritize_unplayed(list(targets))
+        names = [t[1]['title'] for t in out]
+        assert names == ['Seen Movie', 'Seen Show', 'Ghost A', 'Ghost Show']
+
+    def test_year_tolerance_one(self, tautulli_on):
+        sc = self._scanner()
+        near = self._movie('Seen Movie', 2017)   # history says 2016 → ±1 ok
+        far = self._movie('Seen Movie', 2020)    # remake — not the same film
+        anchor = self._movie('Seen Movie', 2016)
+        with patch('utils.tautulli.played_titles', return_value=self.PLAYED):
+            out = sc._deprioritize_unplayed([far, near, anchor])
+        assert [t[1]['year'] for t in out] == [2017, 2016, 2020]
+
+    def test_yearless_history_matches_on_title(self, tautulli_on):
+        sc = self._scanner()
+        with patch('utils.tautulli.played_titles', return_value=self.PLAYED):
+            out = sc._deprioritize_unplayed([
+                self._movie('Never Played', 2020),
+                self._movie('Yearless Movie', 2021),
+            ])
+        assert out[0][1]['title'] == 'Yearless Movie'
+
+    def test_unconfigured_no_fetch_no_reorder(self, monkeypatch):
+        monkeypatch.delenv('TAUTULLI_URL', raising=False)
+        monkeypatch.delenv('TAUTULLI_API_KEY', raising=False)
+        sc = self._scanner()
+        targets = [self._movie('B', 2020), self._movie('A', 2019)]
+        with patch('utils.tautulli.played_titles') as mock_pt:
+            out = sc._deprioritize_unplayed(list(targets))
+        assert mock_pt.call_count == 0
+        assert out == targets
+
+    def test_toggle_off_no_reorder(self, tautulli_on, monkeypatch):
+        monkeypatch.setenv('WANTED_DEPRIORITIZE_UNPLAYED', 'false')
+        sc = self._scanner()
+        targets = [self._movie('B', 2020), self._movie('Seen Movie', 2016)]
+        with patch('utils.tautulli.played_titles') as mock_pt:
+            out = sc._deprioritize_unplayed(list(targets))
+        assert mock_pt.call_count == 0
+        assert out == targets
+
+    def test_fetch_failure_keeps_original_order(self, tautulli_on):
+        sc = self._scanner()
+        targets = [self._movie('B', 2020), self._movie('Seen Movie', 2016)]
+        with patch('utils.tautulli.played_titles', return_value=None):
+            out = sc._deprioritize_unplayed(list(targets))
+        assert out == targets
+
+    def test_played_set_memoized_within_ttl(self, tautulli_on):
+        sc = self._scanner()
+        targets = [self._movie('B', 2020), self._movie('Seen Movie', 2016)]
+        with patch('utils.tautulli.played_titles',
+                   return_value=self.PLAYED) as mock_pt:
+            sc._deprioritize_unplayed(list(targets))
+            sc._deprioritize_unplayed(list(targets))
+        assert mock_pt.call_count == 1
+
+    def test_failed_fetch_not_memoized(self, tautulli_on):
+        sc = self._scanner()
+        targets = [self._movie('B', 2020), self._movie('Seen Movie', 2016)]
+        with patch('utils.tautulli.played_titles',
+                   side_effect=[None, self.PLAYED]) as mock_pt:
+            sc._deprioritize_unplayed(list(targets))
+            out = sc._deprioritize_unplayed(list(targets))
+        assert mock_pt.call_count == 2
+        assert out[0][1]['title'] == 'Seen Movie'
+
+    def test_recovery_pass_routes_targets_through_hook(self, monkeypatch):
+        """_recover_wanted_via_debrid must hand its built target list to
+        _deprioritize_unplayed before the per-target loop."""
+        import base
+        import utils.blackhole as bh
+        import utils.search as search
+
+        monkeypatch.setenv('TORRENTIO_URL', 'https://torrentio.example')
+        monkeypatch.setattr(base, 'load_secret_or_env',
+                            lambda name: 'tb_key' if name == 'torbox_api_key' else None)
+        monkeypatch.setattr(bh, '_check_torbox_cooldown', lambda *a, **kw: 0)
+        monkeypatch.setattr(search, 'search_torrentio', lambda *a, **kw: [])
+        monkeypatch.setattr(LibraryScanner, '_persist_wanted_memos',
+                            lambda self: None)
+
+        seen = {}
+        def spy(self, targets):
+            seen['targets'] = list(targets)
+            return targets
+        monkeypatch.setattr(LibraryScanner, '_deprioritize_unplayed', spy)
+
+        sc = self._scanner()
+        movies = [{'title': 'Ghost', 'year': 2024, 'type': 'movie',
+                   'source': 'wanted', 'is_available': True,
+                   'imdb_id': 'tt123'}]
+        sc._recover_wanted_via_debrid([], movies, {})
+        assert len(seen['targets']) == 1
+        assert seen['targets'][0][1]['title'] == 'Ghost'

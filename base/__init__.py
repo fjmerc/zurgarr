@@ -96,6 +96,9 @@ __all__ = [
     # Debrid search
     'TORRENTIO_URL', 'SEARCH_REQUIRE_CACHED', 'SEARCH_DEDUP_ENABLED',
     'PROWLARR_URL', 'PROWLARRAPIKEY',
+    # Tautulli watch correlation
+    'TAUTULLI_URL', 'TAUTULLI_API_KEY',
+    'WANTED_DEPRIORITIZE_UNPLAYED', 'TAUTULLI_HISTORY_DAYS',
     # Blackhole cache / debrid-account dedup gates
     'BLACKHOLE_REQUIRE_CACHED', 'BLACKHOLE_DEBRID_DEDUP_ENABLED',
     'BLACKHOLE_DELETE_UNCACHED_ON_TIMEOUT', 'BLACKHOLE_TB_ALT_RECOVERY_ENABLED',
@@ -343,6 +346,13 @@ class Config:
         # Torrentio.  Dormant unless both URL and key are set.
         self.PROWLARR_URL = os.getenv('PROWLARR_URL')
         self.PROWLARRAPIKEY = load_secret_or_env('prowlarr_api_key')
+        # Tautulli watch correlation — wanted-recovery targets nobody has
+        # ever played sort to the back of the acquisition queue. Ordering
+        # only; inert until TAUTULLI_URL + key are configured.
+        self.TAUTULLI_URL = os.getenv('TAUTULLI_URL')
+        self.TAUTULLI_API_KEY = load_secret_or_env('tautulli_api_key')
+        self.WANTED_DEPRIORITIZE_UNPLAYED = os.getenv('WANTED_DEPRIORITIZE_UNPLAYED', 'true')
+        self.TAUTULLI_HISTORY_DAYS = os.getenv('TAUTULLI_HISTORY_DAYS', '180')
         # Refuse the interactive "Add" button when the chosen hash is not
         # confirmed cached on the debrid provider (default OFF — RD has no
         # working cache probe, so ON effectively blocks all RD adds).
@@ -512,6 +522,10 @@ WANTED_SEASON_RECOVERY_ENABLED = config.WANTED_SEASON_RECOVERY_ENABLED
 TORRENTIO_URL = config.TORRENTIO_URL
 PROWLARR_URL = config.PROWLARR_URL
 PROWLARRAPIKEY = config.PROWLARRAPIKEY
+TAUTULLI_URL = config.TAUTULLI_URL
+TAUTULLI_API_KEY = config.TAUTULLI_API_KEY
+WANTED_DEPRIORITIZE_UNPLAYED = config.WANTED_DEPRIORITIZE_UNPLAYED
+TAUTULLI_HISTORY_DAYS = config.TAUTULLI_HISTORY_DAYS
 SEARCH_REQUIRE_CACHED = config.SEARCH_REQUIRE_CACHED
 SEARCH_DEDUP_ENABLED = config.SEARCH_DEDUP_ENABLED
 BLACKHOLE_REQUIRE_CACHED = config.BLACKHOLE_REQUIRE_CACHED
