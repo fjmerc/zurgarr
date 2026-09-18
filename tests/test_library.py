@@ -8251,7 +8251,7 @@ class TestRecoverWantedViaTorbox:
         monkeypatch.setattr(search, 'search_torrentio',
                             lambda *a, **kw: list(state['torrentio']))
 
-        def _cache(hashes, service=None, api_key=None):
+        def _cache(hashes, service=None, api_key=None, _stats=None):
             return {h: state['cache_cached'] for h in hashes}
         monkeypatch.setattr(search, 'check_debrid_cache', _cache)
 
@@ -8495,7 +8495,7 @@ class TestWantedSeasonPackRecovery:
             return list(state['torrentio'])
         monkeypatch.setattr(search, 'search_torrentio', _torrentio)
 
-        def _cache(hashes, service=None, api_key=None):
+        def _cache(hashes, service=None, api_key=None, _stats=None):
             return {h: state['cache_cached'] for h in hashes}
         monkeypatch.setattr(search, 'check_debrid_cache', _cache)
 
@@ -8738,7 +8738,7 @@ def _wire_wanted_recovery(monkeypatch):
     monkeypatch.setattr(search, 'search_torrentio',
                         lambda *a, **kw: list(state['torrentio']))
 
-    def _cache(hashes, service=None, api_key=None):
+    def _cache(hashes, service=None, api_key=None, _stats=None):
         return {h: state['cache_cached'] for h in hashes}
     monkeypatch.setattr(search, 'check_debrid_cache', _cache)
 
@@ -9247,6 +9247,25 @@ class TestWantedRdRecovery:
         assert ledger.get('wantedblock:tt1234567') == 1
 
 
+
+    def test_throttled_tb_probe_does_not_confirm_uncached(self, wire, ledger,
+                                                          monkeypatch):
+        """A probe suppressed by the TB throttle/breaker returns all-None
+        WITHOUT raising; that must not count as the "TB uncached" half of
+        the give-up signature."""
+        import utils.search as search
+        ledger.bump('rdblock:' + 'a' * 40)
+
+        def _cache(hashes, service=None, api_key=None, _stats=None):
+            if _stats is not None:
+                _stats['tb_not_probed'] = True
+            return {h: None for h in hashes}
+        monkeypatch.setattr(search, 'check_debrid_cache', _cache)
+        sc = self._scanner()
+        sc._recover_wanted_via_debrid([], self._movie(), {})
+        assert ledger.get('wantedblock:tt1234567') == 0
+
+
 class TestWantedFilterGiveup:
     """Terminal give-up when a Wanted ghost is RD-filter-blocked AND
     TorBox-uncached across WANTED_FILTER_GIVEUP_STRIKES recovery passes."""
@@ -9368,7 +9387,7 @@ class TestWantedFilterGiveup:
         wire['rd_core'] = {'rescued': False, 'reason': 'add_failed',
                            'http_status': 451, 'alt_torrent_id': None}
 
-        def _cache(hashes, service=None, api_key=None):
+        def _cache(hashes, service=None, api_key=None, _stats=None):
             # First title TB-cached (burns the budget), second uncached.
             return {h: h == 'a' * 40 for h in hashes}
         monkeypatch.setattr(search, 'check_debrid_cache', _cache)
@@ -9632,3 +9651,234 @@ class TestReleaseMatchesTitle:
     def test_no_years_anywhere_skips_year_check(self):
         assert _release_matches_title(
             'Sing.2.1080p.WEB.x264-GRP', 'Sing 2', media_year=2021)
+
+
+class TestWantedRecoveryProwlarrFallback:
+    """Prowlarr fallback inside _recover_wanted_via_debrid: fires only when
+    Torrentio produced nothing usable or the title carries prior give-up
+    strikes; every candidate is title-verified."""
+
+    def _scanner(self):
+        sc = LibraryScanner.__new__(LibraryScanner)
+        sc._wanted_tb_cooldown = {}
+        sc._wanted_rd_miss = {}
+        sc._wanted_no_results = {}
+        return sc
+
+    def _movie(self, title='The Substance', imdb='tt1234567', year=2024):
+        return [{'title': title, 'source': 'wanted', 'imdb_id': imdb,
+                 'year': year, 'is_available': True}]
+
+    @pytest.fixture
+    def ledger(self, tmp_path):
+        import importlib
+        from utils import attempt_ledger
+        importlib.reload(attempt_ledger)
+        attempt_ledger.init(config_dir=str(tmp_path))
+        yield attempt_ledger
+        attempt_ledger._file_path = None
+        attempt_ledger._state = {}
+
+    @pytest.fixture
+    def wire(self, monkeypatch):
+        import base
+        import utils.blackhole as bh
+        import utils.search as search
+        import utils.prowlarr as prowlarr
+
+        monkeypatch.setenv('TORRENTIO_URL', 'https://torrentio.example')
+        monkeypatch.setenv('WANTED_TB_RECOVERY_ENABLED', 'true')
+        monkeypatch.setenv('WANTED_RD_RECOVERY_ENABLED', 'false')
+        monkeypatch.delenv('WANTED_TB_RECOVERY_MAX_PER_SCAN', raising=False)
+
+        state = {
+            'adds': [],
+            'cooldown': 0,
+            'cache_cached': True,
+            'torrentio': [
+                {'info_hash': 'a' * 40,
+                 'title': 'The.Substance.2024.1080p.WEB-DL.RelA',
+                 'seeds': 10, 'quality': {'label': '1080p', 'score': 100}},
+            ],
+            'prowlarr': [
+                {'info_hash': 'e' * 40,
+                 'title': 'The.Substance.2024.2160p.WEB-DL.PRW',
+                 'seeds': 40, 'size_bytes': 1, 'source_name': 'TL',
+                 'origin': 'prowlarr',
+                 'quality': {'label': '2160p', 'score': 200}},
+            ],
+            'prowlarr_calls': [],
+            'prowlarr_configured': True,
+        }
+
+        monkeypatch.setattr(base, 'load_secret_or_env',
+                            lambda name: 'tb_key' if name == 'torbox_api_key'
+                            else None)
+        monkeypatch.setattr(bh, '_check_torbox_cooldown',
+                            lambda *a, **kw: state['cooldown'])
+        monkeypatch.setattr(search, 'search_torrentio',
+                            lambda *a, **kw: list(state['torrentio']))
+
+        def _cache(hashes, service=None, api_key=None, _stats=None):
+            return {h: state['cache_cached'] for h in hashes}
+        monkeypatch.setattr(search, 'check_debrid_cache', _cache)
+
+        def _add(info_hash, **kw):
+            state['adds'].append({'info_hash': info_hash, **kw})
+            return {'success': True, 'torrent_id': 't', 'service': 'torbox'}
+        monkeypatch.setattr(search, 'add_to_debrid', _add)
+
+        monkeypatch.setattr(prowlarr, 'is_prowlarr_configured',
+                            lambda: state['prowlarr_configured'])
+
+        def _prw(title, year=None, media_type='movie', season=None,
+                 episode=None):
+            state['prowlarr_calls'].append(
+                {'title': title, 'year': year, 'media_type': media_type})
+            return [dict(r) for r in state['prowlarr']]
+        monkeypatch.setattr(prowlarr, 'search_prowlarr', _prw)
+
+        return state
+
+    # ---- leg-level trigger conditions --------------------------------
+
+    def test_fallback_fires_when_torrentio_empty(self, wire):
+        wire['torrentio'] = []
+        sc = self._scanner()
+        sc._recover_wanted_via_debrid([], self._movie(), {})
+        assert wire['prowlarr_calls'] == [
+            {'title': 'The Substance', 'year': 2024, 'media_type': 'movie'}]
+        assert len(wire['adds']) == 1
+        assert wire['adds'][0]['info_hash'] == 'e' * 40
+
+    def test_not_consulted_when_torrentio_healthy(self, wire):
+        sc = self._scanner()
+        sc._recover_wanted_via_debrid([], self._movie(), {})
+        assert wire['prowlarr_calls'] == []
+        assert wire['adds'][0]['info_hash'] == 'a' * 40
+
+    def test_consulted_on_prior_giveup_strike(self, wire, ledger):
+        ledger.bump('wantedblock:tt1234567')
+        sc = self._scanner()
+        sc._recover_wanted_via_debrid([], self._movie(), {})
+        assert len(wire['prowlarr_calls']) == 1
+        # Prowlarr's 2160p candidate outranks Torrentio's 1080p
+        assert wire['adds'][0]['info_hash'] == 'e' * 40
+
+    def test_mismatched_prowlarr_title_filtered(self, wire):
+        wire['torrentio'] = []
+        wire['prowlarr'] = [
+            {'info_hash': 'f' * 40,
+             'title': 'Completely.Different.2024.1080p.WEB',
+             'seeds': 5, 'size_bytes': 1, 'source_name': 'TL',
+             'origin': 'prowlarr',
+             'quality': {'label': '1080p', 'score': 100}},
+        ]
+        sc = self._scanner()
+        sc._recover_wanted_via_debrid([], self._movie(), {})
+        assert wire['adds'] == []
+        assert 'tt1234567' in sc._wanted_no_results
+
+    def test_unconfigured_prowlarr_untouched(self, wire):
+        wire['torrentio'] = []
+        wire['prowlarr_configured'] = False
+        sc = self._scanner()
+        sc._recover_wanted_via_debrid([], self._movie(), {})
+        assert wire['prowlarr_calls'] == []
+        assert wire['adds'] == []
+        assert 'tt1234567' in sc._wanted_no_results
+
+    # ---- candidate-filter helper (TV targeting) ----------------------
+
+    _TV_PAYLOAD = [
+        {'info_hash': '1' * 40, 'title': 'Show.S01.1080p.WEB.Pack',
+         'seeds': 9, 'size_bytes': 1, 'source_name': 'TL',
+         'origin': 'prowlarr', 'quality': {'label': '1080p', 'score': 100}},
+        {'info_hash': '2' * 40, 'title': 'Show.S01E02.1080p.WEB.Exact',
+         'seeds': 9, 'size_bytes': 1, 'source_name': 'TL',
+         'origin': 'prowlarr', 'quality': {'label': '1080p', 'score': 100}},
+        {'info_hash': '3' * 40, 'title': 'Show.S03E05.1080p.WEB.Wrong',
+         'seeds': 9, 'size_bytes': 1, 'source_name': 'TL',
+         'origin': 'prowlarr', 'quality': {'label': '1080p', 'score': 100}},
+        {'info_hash': '4' * 40, 'title': 'Unrelated.Title.S01E02.1080p',
+         'seeds': 9, 'size_bytes': 1, 'source_name': 'TL',
+         'origin': 'prowlarr', 'quality': {'label': '1080p', 'score': 100}},
+    ]
+
+    def _helper(self, wire, media_type, season=1, episode=2,
+                season_cls=None, exclude=None, is_blocked=None):
+        wire['prowlarr'] = [dict(r) for r in self._TV_PAYLOAD]
+        sc = self._scanner()
+        return sc._prowlarr_fallback_candidates(
+            'Show', None, media_type, season, episode,
+            exclude_hashes=exclude or set(),
+            season_cls=season_cls if season_cls is not None else {},
+            is_blocked=is_blocked)
+
+    def test_episode_target_keeps_exact_episode_only(self, wire):
+        kept = self._helper(wire, 'series')
+        assert [r['info_hash'] for r in kept] == ['2' * 40]
+
+    def test_season_target_keeps_packs_and_exact_and_classifies(self, wire):
+        season_cls = {}
+        kept = self._helper(wire, 'season', season_cls=season_cls)
+        assert {r['info_hash'] for r in kept} == {'1' * 40, '2' * 40}
+        assert season_cls == {'1' * 40: 'pack', '2' * 40: 'episode'}
+
+    def test_helper_respects_exclude_and_blocklist(self, wire):
+        kept = self._helper(wire, 'series',
+                            exclude={'2' * 40})
+        assert kept == []
+        kept = self._helper(wire, 'series',
+                            is_blocked=lambda h: h == '2' * 40)
+        assert kept == []
+
+
+
+    # ---- reviewer-fix coverage (gates, rescue, throttle) -------------
+
+    def test_prowlarr_only_config_recovers(self, wire, monkeypatch):
+        """HIGH fix: without TORRENTIO_URL the leg must still run on
+        Prowlarr alone (and must not call the Torrentio search)."""
+        import utils.search as search
+        monkeypatch.delenv('TORRENTIO_URL', raising=False)
+
+        def _boom(*a, **kw):
+            raise AssertionError('search_torrentio must not be called '
+                                 'without TORRENTIO_URL')
+        monkeypatch.setattr(search, 'search_torrentio', _boom)
+        sc = self._scanner()
+        sc._recover_wanted_via_debrid([], self._movie(), {})
+        assert [a['info_hash'] for a in wire['adds']] == ['e' * 40]
+
+    def test_giveup_key_gets_one_prowlarr_rescue(self, wire, ledger):
+        """HIGH fix: a terminally given-up key (doomed Torrentio top
+        releases) gets exactly ONE Prowlarr-only rescue shot."""
+        for _ in range(3):
+            ledger.bump('wantedblock:tt1234567')
+        sc = self._scanner()
+        sc._recover_wanted_via_debrid([], self._movie(), {})
+        assert len(wire['prowlarr_calls']) == 1
+        # Prowlarr-only: the doomed Torrentio hash must NOT be re-added
+        assert [a['info_hash'] for a in wire['adds']] == ['e' * 40]
+        # one-shot: a later pass skips the key entirely again
+        sc2 = self._scanner()
+        sc2._recover_wanted_via_debrid([], self._movie(), {})
+        assert len(wire['prowlarr_calls']) == 1
+        assert len(wire['adds']) == 1
+
+    def test_giveup_key_without_prowlarr_stays_skipped(self, wire, ledger):
+        wire['prowlarr_configured'] = False
+        for _ in range(3):
+            ledger.bump('wantedblock:tt1234567')
+        sc = self._scanner()
+        sc._recover_wanted_via_debrid([], self._movie(), {})
+        assert wire['adds'] == []
+        assert wire['prowlarr_calls'] == []
+
+    def test_helper_requires_title(self, wire):
+        sc = self._scanner()
+        assert sc._prowlarr_fallback_candidates(
+            '', None, 'movie', None, None,
+            exclude_hashes=set(), season_cls={}, is_blocked=None) == []
+        assert wire['prowlarr_calls'] == []

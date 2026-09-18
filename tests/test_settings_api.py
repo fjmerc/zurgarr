@@ -1597,3 +1597,35 @@ class TestSyncEnvToPlexDebrid:
         written = json.loads(open(sf).read())
         assert written['Jellyfin API Key'] == ''
         assert written['Plex server address'] == 'http://plex:32400'
+
+
+class TestProwlarrSettings:
+    """Config plumbing for the Prowlarr search source."""
+
+    def _fields(self):
+        schema = get_env_schema()
+        return {f['key']: f for cat in schema['categories']
+                for f in cat['fields']}
+
+    def test_schema_has_prowlarr_url(self):
+        fields = self._fields()
+        assert 'PROWLARR_URL' in fields
+        assert fields['PROWLARR_URL']['type'] == 'url'
+
+    def test_schema_has_prowlarr_api_key_as_secret(self):
+        fields = self._fields()
+        assert 'PROWLARR_API_KEY' in fields
+        assert fields['PROWLARR_API_KEY']['type'] == 'secret'
+        assert fields['PROWLARR_API_KEY']['sensitive'] is True
+
+    def test_invalid_prowlarr_url_rejected(self):
+        from utils.settings_api import validate_env_values
+        result = validate_env_values({'PROWLARR_URL': 'not-a-url'})
+        assert any('PROWLARR_URL' in e for e in result['errors'])
+
+    def test_base_exports_prowlarr_globals(self):
+        import base
+        assert 'PROWLARR_URL' in base.__all__
+        assert 'PROWLARRAPIKEY' in base.__all__
+        assert hasattr(base.config, 'PROWLARR_URL')
+        assert hasattr(base.config, 'PROWLARRAPIKEY')

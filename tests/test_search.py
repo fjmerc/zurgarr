@@ -1516,3 +1516,186 @@ class TestAddToDebridInFlightRace:
         # the user can retry without a spurious "already in progress".
         with s._existing_hashes_lock:
             assert ('realdebrid', h) not in s._inflight_adds
+
+
+class TestSearchTorrentsProwlarrMerge:
+    """search_torrents merges Prowlarr results when title is provided."""
+
+    _TORRENTIO = [
+        {'info_hash': 'a' * 40, 'title': 'Movie.2024.1080p-TIO', 'seeds': 100,
+         'quality': {'label': '1080p', 'score': 3},
+         'size_bytes': 1000, 'source_name': 'RARBG'},
+    ]
+    _PROWLARR = [
+        # duplicate hash of a Torrentio entry — Torrentio's copy must win
+        {'info_hash': 'a' * 40, 'title': 'Movie.2024.1080p-PRW', 'seeds': 50,
+         'quality': {'label': '1080p', 'score': 3},
+         'size_bytes': 1000, 'source_name': 'TorrentLeech',
+         'origin': 'prowlarr'},
+        {'info_hash': 'e' * 40, 'title': 'Movie.2024.2160p-PRW', 'seeds': 40,
+         'quality': {'label': '2160p', 'score': 4},
+         'size_bytes': 9000, 'source_name': 'TorrentLeech',
+         'origin': 'prowlarr'},
+    ]
+
+    @patch('utils.prowlarr.is_prowlarr_configured', return_value=True)
+    @patch('utils.prowlarr.search_prowlarr')
+    @patch('utils.search.search_torrentio')
+    def test_merges_and_dedupes_by_hash(self, mock_tio, mock_prw, _cfg):
+        mock_tio.return_value = [dict(r) for r in self._TORRENTIO]
+        mock_prw.return_value = [dict(r) for r in self._PROWLARR]
+        results = search_torrents('tt1234567', title='Movie', year=2024)
+        by_hash = {r['info_hash']: r for r in results}
+        assert set(by_hash) == {'a' * 40, 'e' * 40}
+        # Torrentio's copy of the duplicate hash wins
+        assert by_hash['a' * 40]['title'] == 'Movie.2024.1080p-TIO'
+        assert by_hash['e' * 40]['origin'] == 'prowlarr'
+        mock_prw.assert_called_once_with('Movie', year=2024,
+                                         media_type='movie',
+                                         season=None, episode=None)
+
+    @patch('utils.prowlarr.is_prowlarr_configured', return_value=True)
+    @patch('utils.prowlarr.search_prowlarr')
+    @patch('utils.search.search_torrentio')
+    def test_no_title_skips_prowlarr(self, mock_tio, mock_prw, _cfg):
+        mock_tio.return_value = [dict(r) for r in self._TORRENTIO]
+        search_torrents('tt1234567')
+        mock_prw.assert_not_called()
+
+    @patch('utils.prowlarr.is_prowlarr_configured', return_value=False)
+    @patch('utils.prowlarr.search_prowlarr')
+    @patch('utils.search.search_torrentio')
+    def test_unconfigured_skips_prowlarr(self, mock_tio, mock_prw, _cfg):
+        mock_tio.return_value = [dict(r) for r in self._TORRENTIO]
+        results = search_torrents('tt1234567', title='Movie')
+        mock_prw.assert_not_called()
+        assert len(results) == 1
+
+    @patch('utils.prowlarr.is_prowlarr_configured', return_value=True)
+    @patch('utils.prowlarr.search_prowlarr')
+    @patch('utils.search.search_torrentio')
+    def test_prowlarr_only_when_torrentio_empty(self, mock_tio, mock_prw,
+                                                _cfg):
+        """Empty Torrentio must not short-circuit the Prowlarr leg — that
+        is the whole acquisition-gap point of the feature."""
+        mock_tio.return_value = []
+        mock_prw.return_value = [dict(self._PROWLARR[1])]
+        results = search_torrents('tt1234567', title='Movie', year=2024)
+        assert len(results) == 1
+        assert results[0]['info_hash'] == 'e' * 40
+
+    @patch('utils.prowlarr.is_prowlarr_configured', return_value=True)
+    @patch('utils.prowlarr.search_prowlarr')
+    @patch('utils.search.search_torrentio')
+    def test_blocklist_filters_prowlarr_results(self, mock_tio, mock_prw,
+                                                _cfg, monkeypatch):
+        mock_tio.return_value = []
+        mock_prw.return_value = [dict(r) for r in self._PROWLARR]
+        import utils.blocklist as bl
+        monkeypatch.setattr(bl, 'is_blocked',
+                            lambda h: h == 'e' * 40)
+        results = search_torrents('tt1234567', title='Movie')
+        assert {r['info_hash'] for r in results} == {'a' * 40}
+
+    @patch('utils.prowlarr.is_prowlarr_configured', return_value=True)
+    @patch('utils.prowlarr.search_prowlarr')
+    @patch('utils.search.search_torrentio')
+    def test_series_media_type_forwarded(self, mock_tio, mock_prw, _cfg):
+        mock_tio.return_value = []
+        mock_prw.return_value = []
+        search_torrents('tt1234567', media_type='series', season=1,
+                        episode=2, title='Show', year=2020)
+        mock_prw.assert_called_once_with('Show', year=2020,
+                                         media_type='series',
+                                         season=1, episode=2)
+
+
+class TestSearchTorrentsProbeFairness:
+    """Cache-probe selection must interleave sources: a flat quality-ranked
+    top-K would let a wall of high-score Prowlarr rows starve Torrentio's
+    (often actually-cached) candidates out of the TB probe window."""
+
+    @patch('utils.prowlarr.is_prowlarr_configured', return_value=True)
+    @patch('utils.prowlarr.search_prowlarr')
+    @patch('utils.search.check_debrid_cache')
+    @patch('utils.search._get_debrid_service')
+    @patch('utils.search.search_torrentio')
+    def test_probe_order_interleaves_sources(self, mock_tio, mock_service,
+                                             mock_check, mock_prw, _cfg):
+        mock_tio.return_value = [
+            {'info_hash': f'{i:040x}', 'title': f'T{i}.1080p', 'seeds': 10,
+             'quality': {'label': '1080p', 'score': 3}, 'size_bytes': 1,
+             'source_name': 'S'}
+            for i in range(5)]
+        mock_prw.return_value = [
+            {'info_hash': f'{i + 100:040x}', 'title': f'P{i}.2160p',
+             'seeds': 0, 'quality': {'label': '2160p', 'score': 4},
+             'size_bytes': 1, 'source_name': 'X', 'origin': 'prowlarr'}
+            for i in range(5)]
+        mock_service.return_value = ('torbox', 'k')
+        mock_check.return_value = {}
+        search_torrents('tt1234567', title='Movie', annotate_cache=True)
+        probed = mock_check.call_args[0][0]
+        assert probed[0] == f'{0:040x}'      # torrentio top first
+        assert probed[1] == f'{100:040x}'    # then prowlarr top
+        assert probed[2] == f'{1:040x}'
+
+
+class TestCheckCacheTbNotProbedSignal:
+    """_check_cache_tb must tell callers when it silently declined to
+    probe (throttle/breaker) so all-None is never misread as a clean
+    'confirmed uncached' verdict."""
+
+    def test_rate_cap_sets_flag(self, monkeypatch):
+        import utils.search as s
+        s._reset_tb_probe_state()
+        monkeypatch.setattr(s, '_TB_PROBE_MAX_PER_MIN', 0)
+        stats = {}
+        out = s._check_cache_tb(['a' * 40], 'key', _stats=stats)
+        assert out == {'a' * 40: None}
+        assert stats.get('tb_not_probed') is True
+        s._reset_tb_probe_state()
+
+    def test_auth_block_sets_flag(self, monkeypatch):
+        import time as _time
+        import utils.search as s
+        s._reset_tb_probe_state()
+        monkeypatch.setattr(s, '_tb_auth_block_until',
+                            _time.monotonic() + 1000)
+        stats = {}
+        out = s._check_cache_tb(['b' * 40], 'key', _stats=stats)
+        assert out == {'b' * 40: None}
+        assert stats.get('tb_not_probed') is True
+        s._reset_tb_probe_state()
+
+    def test_check_debrid_cache_forwards_stats(self, monkeypatch):
+        import utils.search as s
+        seen = {}
+
+        def _fake_tb(hashes, api_key, _stats=None):
+            seen['stats'] = _stats
+            return {h: None for h in hashes}
+        monkeypatch.setattr(s, '_check_cache_tb', _fake_tb)
+        stats = {}
+        s.check_debrid_cache(['c' * 40], service='torbox', api_key='k',
+                             _stats=stats)
+        assert seen['stats'] is stats
+
+
+class TestUrllibGetErrorLogging:
+
+    def test_http_error_status_code_logged(self, caplog, monkeypatch):
+        import io
+        import logging
+        import urllib.error
+        import utils.search as s
+
+        def _raise(req, timeout=None):
+            raise urllib.error.HTTPError(
+                'http://prowlarr:9696/api', 401, 'Unauthorized', {},
+                io.BytesIO(b''))
+        monkeypatch.setattr(s.urllib.request, 'urlopen', _raise)
+        with caplog.at_level(logging.WARNING):
+            out = s._urllib_get('http://prowlarr:9696/api?x=1')
+        assert out is None
+        assert any('401' in rec.message for rec in caplog.records)

@@ -93,6 +93,7 @@ __all__ = [
     'WANTED_SEASON_RECOVERY_ENABLED',
     # Debrid search
     'TORRENTIO_URL', 'SEARCH_REQUIRE_CACHED', 'SEARCH_DEDUP_ENABLED',
+    'PROWLARR_URL', 'PROWLARRAPIKEY',
     # Blackhole cache / debrid-account dedup gates
     'BLACKHOLE_REQUIRE_CACHED', 'BLACKHOLE_DEBRID_DEDUP_ENABLED',
     'BLACKHOLE_DELETE_UNCACHED_ON_TIMEOUT', 'BLACKHOLE_TB_ALT_RECOVERY_ENABLED',
@@ -329,6 +330,10 @@ class Config:
         self.WANTED_SEASON_RECOVERY_ENABLED = os.getenv('WANTED_SEASON_RECOVERY_ENABLED', 'true')
         # Debrid search
         self.TORRENTIO_URL = os.getenv('TORRENTIO_URL')
+        # Prowlarr search source: broadens the search-side add beyond
+        # Torrentio.  Dormant unless both URL and key are set.
+        self.PROWLARR_URL = os.getenv('PROWLARR_URL')
+        self.PROWLARRAPIKEY = load_secret_or_env('prowlarr_api_key')
         # Refuse the interactive "Add" button when the chosen hash is not
         # confirmed cached on the debrid provider (default OFF — RD has no
         # working cache probe, so ON effectively blocks all RD adds).
@@ -494,6 +499,8 @@ WANTED_RD_RECOVERY_ENABLED = config.WANTED_RD_RECOVERY_ENABLED
 WANTED_RD_RECOVERY_MAX_PER_SCAN = config.WANTED_RD_RECOVERY_MAX_PER_SCAN
 WANTED_SEASON_RECOVERY_ENABLED = config.WANTED_SEASON_RECOVERY_ENABLED
 TORRENTIO_URL = config.TORRENTIO_URL
+PROWLARR_URL = config.PROWLARR_URL
+PROWLARRAPIKEY = config.PROWLARRAPIKEY
 SEARCH_REQUIRE_CACHED = config.SEARCH_REQUIRE_CACHED
 SEARCH_DEDUP_ENABLED = config.SEARCH_DEDUP_ENABLED
 BLACKHOLE_REQUIRE_CACHED = config.BLACKHOLE_REQUIRE_CACHED

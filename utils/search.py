@@ -6,6 +6,7 @@ and one-click add them to their debrid provider.  Uses urllib only
 """
 
 import collections
+import itertools
 import json
 import os
 import re
@@ -119,7 +120,11 @@ def _urllib_get(url, headers=None, timeout=_SEARCH_TIMEOUT):
             return json.loads(resp.read(10 * 1024 * 1024).decode('utf-8'))
     except (urllib.error.URLError, urllib.error.HTTPError,
             json.JSONDecodeError, OSError, ValueError) as e:
-        logger.warning(f"[search] GET {_safe_log_url(url)}: {type(e).__name__}")
+        # HTTP status carries no credential and makes a rotated API key
+        # (401/403) distinguishable from a timeout in the logs.
+        code = getattr(e, 'code', None)
+        detail = f"{type(e).__name__}{f' {code}' if code else ''}"
+        logger.warning(f"[search] GET {_safe_log_url(url)}: {detail}")
         return None
 
 
@@ -317,7 +322,7 @@ _rd_cache_warning_emitted = False
 _ad_cache_warning_emitted = False
 
 
-def check_debrid_cache(info_hashes, service=None, api_key=None):
+def check_debrid_cache(info_hashes, service=None, api_key=None, _stats=None):
     """Check debrid-cache availability for a batch of info hashes.
 
     Args:
@@ -329,6 +334,13 @@ def check_debrid_cache(info_hashes, service=None, api_key=None):
             auto-detected service via ``_get_debrid_service()``.
         api_key: Optional API key override.  Defaults to the auto-detected
             key alongside the service.
+        _stats: Optional dict side-channel.  The TB probe sets
+            ``_stats['tb_not_probed'] = True`` when it returned unknowns
+            WITHOUT actually asking TorBox (throttle backstop, auth
+            circuit breaker, HTTP failure).  Callers that treat all-None
+            as "confirmed uncached" evidence (the wanted-recovery
+            give-up ledger) MUST check this flag — the throttles
+            themselves are load-bearing and never bypassed.
 
     Returns:
         Mapping of hash -> True / False / None.  ``True`` = provider
@@ -382,7 +394,7 @@ def check_debrid_cache(info_hashes, service=None, api_key=None):
         if service == 'alldebrid':
             return _check_cache_ad(hashes, api_key)
         if service == 'torbox':
-            return _check_cache_tb(hashes, api_key)
+            return _check_cache_tb(hashes, api_key, _stats=_stats)
     except (urllib.error.URLError, urllib.error.HTTPError,
             json.JSONDecodeError, OSError, ValueError) as e:
         logger.warning(f"[search] Cache probe failed for {service}: {type(e).__name__}")
@@ -471,7 +483,7 @@ def _reset_tb_probe_state():
         _tb_probe_call_times.clear()
 
 
-def _check_cache_tb(hashes, api_key):
+def _check_cache_tb(hashes, api_key, _stats=None):
     """TorBox batched cache probe via ``/api/torrents/checkcached``.
 
     All hashes go out as ONE comma-joined request (``format=object``) —
@@ -481,8 +493,19 @@ def _check_cache_tb(hashes, api_key):
     2026-08-16).  The batch is capped at ``_TORBOX_MAX_PROBES``; hashes
     beyond the cap stay as ``None`` (unknown) — callers rank candidates
     before probing so the top few always get probed.
+
+    ``_stats``: when the function returns unknowns WITHOUT the request
+    having produced verdicts (auth breaker, per-minute backstop, HTTP
+    failure, malformed response) it sets ``_stats['tb_not_probed']``
+    so callers can tell "confirmed nothing cached" apart from "never
+    asked" — see ``check_debrid_cache``.
     """
     global _tb_auth_block_until
+
+    def _flag_not_probed():
+        if _stats is not None:
+            _stats['tb_not_probed'] = True
+
     result = {h: None for h in hashes}
     now = time.monotonic()
     with _tb_probe_state_lock:
@@ -491,6 +514,10 @@ def _check_cache_tb(hashes, api_key):
             if entry is not None and now - entry[0] < _TB_VERDICT_TTL:
                 result[h] = entry[1]
         if now < _tb_auth_block_until:
+            # Only "not probed" if the breaker actually withheld
+            # verdicts — a fully TTL-served result is complete data.
+            if any(v is None for v in result.values()):
+                _flag_not_probed()
             return result
     batch = [h for h in hashes if result[h] is None][:_TORBOX_MAX_PROBES]
     if not batch:
@@ -503,6 +530,7 @@ def _check_cache_tb(hashes, api_key):
         while _tb_probe_call_times and now - _tb_probe_call_times[0] > 60:
             _tb_probe_call_times.popleft()
         if len(_tb_probe_call_times) >= _TB_PROBE_MAX_PER_MIN:
+            _flag_not_probed()
             return result
         _tb_probe_call_times.append(now)
     headers = {
@@ -531,11 +559,14 @@ def _check_cache_tb(hashes, api_key):
                 f"[search] TB batch cache probe ({len(batch)} hashes): "
                 f"{type(e).__name__}"
             )
+        _flag_not_probed()
         return result
     if not isinstance(data, dict) or not data.get('success'):
+        _flag_not_probed()
         return result
     payload = data.get('data')
     if not isinstance(payload, dict):
+        _flag_not_probed()
         return result
     with _tb_probe_state_lock:
         for h in batch:
@@ -795,12 +826,19 @@ def list_torbox_torrents(api_key, timeout=_MYLIST_TIMEOUT):
 
 def search_torrents(imdb_id, media_type='movie', season=None, episode=None,
                     annotate_cache=False, sort_mode='quality',
-                    cache_service=None):
-    """Search Torrentio for torrents, sorted by quality then seeds.
+                    cache_service=None, title=None, year=None):
+    """Search Torrentio (and Prowlarr, when configured) for torrents,
+    sorted by quality then seeds.
 
     Args:
         imdb_id / media_type / season / episode: forwarded to
             ``search_torrentio`` (see that function for details).
+        title / year: media title and year for the Prowlarr leg, whose
+            aggregated endpoint is text-keyed, not imdb-keyed.  When
+            ``title`` is provided AND Prowlarr is configured, its results
+            are merged in (deduped by hash, Torrentio's copy wins).
+            Callers that surface merged results to automation MUST
+            title-verify them — see the utils.prowlarr module docstring.
         annotate_cache: When True, every result carries ``cached``
             (``True``/``False``/``None``) and ``cached_service`` fields
             populated by ``check_debrid_cache``.  Default False — the
@@ -832,6 +870,30 @@ def search_torrents(imdb_id, media_type='movie', season=None, episode=None,
     (``/api/torrents/checkcached``) still returns meaningful True/False.
     """
     results = search_torrentio(imdb_id, media_type, season, episode)
+
+    # Prowlarr merge — lazy import because utils.prowlarr imports from
+    # this module at load time (one-way at import, both ways at call).
+    # An empty Torrentio list must NOT short-circuit this leg: titles
+    # Torrentio doesn't carry are the acquisition gap Prowlarr exists
+    # to close.  Never let a Prowlarr failure break Torrentio search.
+    if title:
+        try:
+            from utils.prowlarr import is_prowlarr_configured, search_prowlarr
+            if is_prowlarr_configured():
+                seen = {r['info_hash'] for r in results}
+                # season/episode scope the free-text query (SxxEyy tag)
+                # so an episode-targeted search isn't drowned by releases
+                # from every other season of the show.
+                for r in search_prowlarr(title, year=year,
+                                         media_type=media_type,
+                                         season=season, episode=episode):
+                    if r['info_hash'] not in seen:
+                        seen.add(r['info_hash'])
+                        results.append(r)
+        except Exception:
+            logger.warning("[search] Prowlarr merge failed — continuing "
+                           "with Torrentio-only results", exc_info=True)
+
     if not results:
         return []
 
@@ -862,8 +924,20 @@ def search_torrents(imdb_id, media_type='movie', season=None, episode=None,
             service, api_key = _cache_probe_service()
         else:
             service, api_key = _get_debrid_service()
+        # Fair probe selection: the TB probe caps its batch at
+        # _TORBOX_MAX_PROBES taken in list order, and a flat
+        # quality-ranked order would let a wall of high-score
+        # (often 0-seed) Prowlarr rows starve Torrentio's candidates —
+        # the ones most likely to actually be cached — out of the
+        # window.  Interleave the two sources, Torrentio first; the
+        # displayed result order stays quality-ranked.
+        tio = [r for r in results if r.get('origin') != 'prowlarr']
+        prw = [r for r in results if r.get('origin') == 'prowlarr']
+        probe_order = []
+        for pair in itertools.zip_longest(tio, prw):
+            probe_order.extend(p for p in pair if p is not None)
         cache_map = check_debrid_cache(
-            [r['info_hash'] for r in results],
+            [r['info_hash'] for r in probe_order],
             service=service, api_key=api_key,
         )
         for r in results:

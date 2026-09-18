@@ -2938,7 +2938,7 @@ function _renderMovieDetail(movie, meta) {
     movieActionBtns.push('<button class="btn btn-ghost btn-sm btn-danger" title="Delete from Radarr" onclick="event.stopPropagation();deleteItem(\'movie\')">&#128465; Delete</button>');
   }
   if (_searchEnabled && movie.imdb_id) {
-    movieActionBtns.push('<button class="btn btn-ghost btn-sm" data-imdb="' + escAttr(movie.imdb_id) + '" data-mtype="movie" data-label="' + escAttr(movie.title) + '" data-media-title="' + escAttr(movie.title) + '" onclick="openSearchFromBtn(this)">&#128269; Search Torrents</button>');
+    movieActionBtns.push('<button class="btn btn-ghost btn-sm" data-imdb="' + escAttr(movie.imdb_id) + '" data-mtype="movie" data-label="' + escAttr(movie.title) + '" data-media-title="' + escAttr(movie.title) + '" data-year="' + escAttr(String(movie.year || '')) + '" onclick="openSearchFromBtn(this)">&#128269; Search Torrents</button>');
   }
   if (movieActionBtns.length) {
     html += '<div class="detail-action-row">' + movieActionBtns.join('') + '</div>';
@@ -3178,7 +3178,7 @@ function _renderSeasonEpisodes(season, si) {
       html += '<button class="btn btn-ghost btn-icon" title="' + escAttr(blTitle) + '" aria-label="Block ' + epLabel + '" data-folder="' + escAttr(epFolder) + '" onclick="event.stopPropagation();_blockFromBtn(this)">&#128683;</button>';
     }
     if (_searchEnabled && _detailItem && _detailItem.imdb_id) {
-      html += ' <button class="btn btn-ghost btn-sm" title="Search torrents for ' + escAttr(epLabel) + '" data-imdb="' + escAttr(_detailItem.imdb_id) + '" data-mtype="series" data-season="' + season.number + '" data-episode="' + ep.number + '" data-label="' + escAttr(_detailItem.title + ' ' + epLabel) + '" data-media-title="' + escAttr(_detailItem.title) + '" onclick="event.stopPropagation();openSearchFromBtn(this)">&#128269;</button>';
+      html += ' <button class="btn btn-ghost btn-sm" title="Search torrents for ' + escAttr(epLabel) + '" data-imdb="' + escAttr(_detailItem.imdb_id) + '" data-mtype="series" data-season="' + season.number + '" data-episode="' + ep.number + '" data-label="' + escAttr(_detailItem.title + ' ' + epLabel) + '" data-media-title="' + escAttr(_detailItem.title) + '" data-year="' + escAttr(String(_detailItem.year || '')) + '" onclick="event.stopPropagation();openSearchFromBtn(this)">&#128269;</button>';
     }
     html += '</td>';
     html += '</tr>';
@@ -3306,7 +3306,7 @@ function _renderShowDetail(show, meta) {
     showActionBtns.push('<button class="btn btn-ghost btn-sm btn-danger" title="Delete from Sonarr" onclick="event.stopPropagation();deleteItem(\'show\')">&#128465; Delete</button>');
   }
   if (_searchEnabled && show.imdb_id) {
-    showActionBtns.push('<button class="btn btn-ghost btn-sm" data-imdb="' + escAttr(show.imdb_id) + '" data-mtype="series" data-label="' + escAttr(show.title) + '" data-media-title="' + escAttr(show.title) + '" onclick="openSearchFromBtn(this)">&#128269; Search Torrents</button>');
+    showActionBtns.push('<button class="btn btn-ghost btn-sm" data-imdb="' + escAttr(show.imdb_id) + '" data-mtype="series" data-label="' + escAttr(show.title) + '" data-media-title="' + escAttr(show.title) + '" data-year="' + escAttr(String(show.year || '')) + '" onclick="openSearchFromBtn(this)">&#128269; Search Torrents</button>');
   }
   if (showActionBtns.length) {
     html += '<div class="detail-action-row">' + showActionBtns.join('') + '</div>';
@@ -4723,10 +4723,12 @@ function openSearchFromBtn(btn) {
   var episode = btn.getAttribute('data-episode');
   var label = btn.getAttribute('data-label') || '';
   var mediaTitle = btn.getAttribute('data-media-title') || '';
-  openSearchModal(imdbId, mediaType, season ? parseInt(season, 10) : null, episode ? parseInt(episode, 10) : null, label, mediaTitle);
+  var yearAttr = btn.getAttribute('data-year');
+  var mediaYear = yearAttr ? parseInt(yearAttr, 10) : null;
+  openSearchModal(imdbId, mediaType, season ? parseInt(season, 10) : null, episode ? parseInt(episode, 10) : null, label, mediaTitle, mediaYear);
 }
 
-function openSearchModal(imdbId, mediaType, season, episode, displayTitle, mediaTitle) {
+function openSearchModal(imdbId, mediaType, season, episode, displayTitle, mediaTitle, mediaYear) {
   var overlay = document.createElement('div');
   overlay.className = 'search-overlay';
   overlay.id = 'search-overlay';
@@ -4740,7 +4742,7 @@ function openSearchModal(imdbId, mediaType, season, episode, displayTitle, media
   html += '<div class="search-dialog-hdr"><h3 id="search-dialog-title">Search: ' + esc(headerTitle) + '</h3>';
   html += '<button class="search-dialog-close" onclick="closeSearchModal()" title="Close">&times;</button></div>';
   html += '<div class="search-dialog-body" id="search-body">';
-  html += '<div style="text-align:center;padding:24px 0;color:var(--text3)"><span class="spinner" style="display:inline-block;width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--blue);border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:8px"></span>Searching Torrentio\u2026</div>';
+  html += '<div style="text-align:center;padding:24px 0;color:var(--text3)"><span class="spinner" style="display:inline-block;width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--blue);border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle;margin-right:8px"></span>Searching indexers\u2026</div>';
   html += '</div></div>';
   overlay.innerHTML = html;
   document.body.appendChild(overlay);
@@ -4771,6 +4773,10 @@ function openSearchModal(imdbId, mediaType, season, episode, displayTitle, media
   var payload = {imdb_id: imdbId, type: mediaType};
   if (seasonStr) payload.season = parseInt(seasonStr, 10);
   if (episodeStr) payload.episode = parseInt(episodeStr, 10);
+  // title/year feed the server's Prowlarr merge leg (text-keyed search);
+  // omitted, the search stays Torrentio-only exactly as before.
+  if (mediaTitle) payload.title = mediaTitle;
+  if (mediaYear && !isNaN(mediaYear)) payload.year = mediaYear;
 
   fetch('/api/search', {
     method: 'POST',

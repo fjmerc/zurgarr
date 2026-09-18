@@ -187,3 +187,84 @@ class TestApiSearchAdd:
             assert status == 400
             assert 'info_hash' in data['error']
         mock_add.assert_not_called()
+
+
+class TestApiSearchProwlarrParams:
+    """POST /api/search forwards optional title/year to search_torrents
+    (they feed the text-keyed Prowlarr merge leg)."""
+
+    @patch('utils.search.list_configured_services')
+    @patch('utils.search.search_torrents')
+    def test_title_year_forwarded(self, mock_search, mock_list,
+                                  status_server):
+        mock_search.return_value = []
+        mock_list.return_value = []
+        status, _ = _post_json(
+            status_server + '/api/search',
+            {'imdb_id': 'tt1234567', 'type': 'movie',
+             'title': 'F1', 'year': 2025},
+        )
+        assert status == 200
+        _, kwargs = mock_search.call_args
+        assert kwargs['title'] == 'F1'
+        assert kwargs['year'] == 2025
+
+    @patch('utils.search.list_configured_services')
+    @patch('utils.search.search_torrents')
+    def test_omitted_title_defaults_none(self, mock_search, mock_list,
+                                         status_server):
+        mock_search.return_value = []
+        mock_list.return_value = []
+        status, _ = _post_json(
+            status_server + '/api/search',
+            {'imdb_id': 'tt1234567', 'type': 'movie'},
+        )
+        assert status == 200
+        _, kwargs = mock_search.call_args
+        assert kwargs['title'] is None
+        assert kwargs['year'] is None
+
+    @patch('utils.search.search_torrents')
+    def test_non_string_title_rejected(self, mock_search, status_server):
+        status, data = _post_json(
+            status_server + '/api/search',
+            {'imdb_id': 'tt1234567', 'type': 'movie', 'title': ['x']},
+        )
+        assert status == 400
+        mock_search.assert_not_called()
+
+    @patch('utils.search.search_torrents')
+    def test_oversized_title_rejected(self, mock_search, status_server):
+        status, _ = _post_json(
+            status_server + '/api/search',
+            {'imdb_id': 'tt1234567', 'type': 'movie', 'title': 'x' * 500},
+        )
+        assert status == 400
+        mock_search.assert_not_called()
+
+    @patch('utils.search.search_torrents')
+    def test_out_of_range_year_rejected(self, mock_search, status_server):
+        status, _ = _post_json(
+            status_server + '/api/search',
+            {'imdb_id': 'tt1234567', 'type': 'movie',
+             'title': 'F1', 'year': 99999},
+        )
+        assert status == 400
+        mock_search.assert_not_called()
+
+
+class TestLibraryPageSearchPayloadContract:
+    """Sync guard: the Library page's search modal must send the fields
+    /api/search accepts for the Prowlarr merge (title, year)."""
+
+    def test_search_payload_wires_title_and_year(self):
+        from utils.library_page import get_library_html
+        html = get_library_html()
+        assert 'payload.title' in html
+        assert 'payload.year' in html
+        # buttons must carry the year for the modal to forward, and the
+        # attribute must go through escAttr like every sibling attribute
+        # 3 search buttons + the pre-existing card attribute — every
+        # data-year concat must go through escAttr
+        assert html.count('data-year="\' + escAttr(String(') >= 3
+        assert 'data-year="\' + (' not in html

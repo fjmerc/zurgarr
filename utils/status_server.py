@@ -310,6 +310,22 @@ _service_cache_time = 0
 _SERVICE_CACHE_TTL = 60  # seconds
 
 
+def _search_enabled():
+    """True when ANY interactive-search source is configured.
+
+    Gates the Library UI's Search buttons.  Torrentio and Prowlarr are
+    independent sources — a Prowlarr-only setup must get the search UI,
+    not just a green Status tile.
+    """
+    if (os.environ.get('TORRENTIO_URL') or '').strip():
+        return True
+    try:
+        from utils.prowlarr import is_prowlarr_configured
+        return is_prowlarr_configured()
+    except Exception:
+        return False
+
+
 def _check_service(name, svc_type, url, headers=None, ok_codes=(200,)):
     """Check a single service. Returns a status dict."""
     import requests as req
@@ -437,6 +453,18 @@ def check_services():
             f'{seerr_addr}/api/v1/status',
             headers={'X-Api-Key': seerr_key})
         svc['url'] = seerr_addr
+        services.append(svc)
+
+    # Prowlarr (search source).  /api/v1/health requires a valid key, so
+    # a dead key shows red here — unlike Seerr's public /status ping.
+    prowlarr_url = (os.environ.get('PROWLARR_URL') or '').rstrip('/')
+    prowlarr_key = _get_secret_or_env('prowlarr_api_key', 'PROWLARR_API_KEY')
+    if prowlarr_url and prowlarr_key:
+        svc, resp = _check_service(
+            'Prowlarr', 'automation',
+            f'{prowlarr_url}/api/v1/health',
+            headers={'X-Api-Key': prowlarr_key})
+        svc['url'] = prowlarr_url
         services.append(svc)
 
     # Zurg WebDAV
@@ -1906,7 +1934,7 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
                 result['download_services'] = get_configured_services()
                 result['pending'] = get_all_pending()
                 result['preferences'] = get_all_preferences()
-                result['search_enabled'] = bool((os.environ.get('TORRENTIO_URL') or '').strip())
+                result['search_enabled'] = _search_enabled()
                 data = json.dumps(result)
                 self._send_json_response(200, data)
         elif self.path.startswith('/api/library/metadata'):
@@ -3432,10 +3460,30 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
                     except (ValueError, TypeError):
                         self._send_json_response(400, json.dumps({'error': 'episode must be integer'}))
                         return
+                # Optional title/year feed the text-keyed Prowlarr merge
+                # leg inside search_torrents; absent, search stays
+                # Torrentio-only (imdb-keyed) exactly as before.
+                title = values.get('title')
+                if title is not None:
+                    if not isinstance(title, str) or len(title) > 300:
+                        self._send_json_response(400, json.dumps({'error': 'title must be a string of at most 300 chars'}))
+                        return
+                    title = title.strip() or None
+                year = values.get('year')
+                if year is not None:
+                    try:
+                        year = int(year)
+                        if year < 1850 or year > 2100:
+                            self._send_json_response(400, json.dumps({'error': 'year out of range'}))
+                            return
+                    except (ValueError, TypeError):
+                        self._send_json_response(400, json.dumps({'error': 'year must be integer'}))
+                        return
                 from utils.search import search_torrents, list_configured_services
                 results = search_torrents(imdb_id, media_type, season, episode,
                                           annotate_cache=True,
-                                          cache_service='auto_probe')
+                                          cache_service='auto_probe',
+                                          title=title, year=year)
                 self._send_json_response(200, json.dumps({
                     'results': results,
                     'providers': list_configured_services(),

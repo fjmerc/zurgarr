@@ -4959,8 +4959,14 @@ class LibraryScanner:
         scan (6h for the TB leg, 7 days for RD misses — see
         ``_wanted_rd_miss``).
         """
-        if not os.environ.get('TORRENTIO_URL'):
-            return  # no Torrentio feed to search against
+        torrentio_ok = bool(os.environ.get('TORRENTIO_URL'))
+        try:
+            from utils.prowlarr import is_prowlarr_configured
+            prowlarr_ok = is_prowlarr_configured()
+        except Exception:
+            prowlarr_ok = False
+        if not torrentio_ok and not prowlarr_ok:
+            return  # no search source configured
 
         from base import load_secret_or_env
         from utils import search as _search
@@ -5156,8 +5162,23 @@ class LibraryScanner:
             # independently — one bump per pass, not one per episode.  An
             # operator Retry (clear_retry_state) or the ledger prune sweep
             # clears the strike and gives the title a fresh chance.
-            if imdb and _ledger.get(f'wantedblock:{key}') >= WANTED_FILTER_GIVEUP_STRIKES:
-                continue
+            wb_strikes = _ledger.get(f'wantedblock:{key}') if imdb else 0
+            prowlarr_rescue = False
+            if wb_strikes >= WANTED_FILTER_GIVEUP_STRIKES:
+                # One-shot Prowlarr rescue: the give-up verdict only
+                # condemns Torrentio's top releases (RD filter-blocked +
+                # TB uncached) — Prowlarr's indexer pool is a different
+                # population, so a terminally given-up key gets exactly
+                # one Prowlarr-only pass (fresh hashes, no doomed
+                # Torrentio candidates).  The ledger key is pruned on the
+                # same 30-day idle sweep as the strikes, so a long-stuck
+                # title re-earns a shot roughly monthly.
+                if (prowlarr_ok and imdb
+                        and _ledger.get(f'prowlarrtried:{key}') == 0):
+                    prowlarr_rescue = True
+                    _ledger.bump(f'prowlarrtried:{key}')
+                else:
+                    continue
             if key in self._wanted_no_results:
                 continue
             # Per-leg gates — a TB cooldown must never suppress the RD leg
@@ -5171,11 +5192,17 @@ class LibraryScanner:
 
             media_title = item.get('title')
             try:
-                results = _search.search_torrentio(
-                    imdb,
-                    media_type='series' if media_type == 'season'
-                    else media_type,
-                    season=season, episode=episode)
+                # Rescue mode deliberately skips Torrentio: its top
+                # releases for this key are already condemned, and
+                # re-probing them would waste the TB probe budget.
+                if torrentio_ok and not prowlarr_rescue:
+                    results = _search.search_torrentio(
+                        imdb,
+                        media_type='series' if media_type == 'season'
+                        else media_type,
+                        season=season, episode=episode)
+                else:
+                    results = []
             except Exception:
                 results = []
             # Blocklisted hashes were rejected for a reason (bad release,
@@ -5235,6 +5262,28 @@ class LibraryScanner:
                         f"non-covering result(s) for '{media_title}' "
                         f"S{season:02d}")
                 results = kept
+
+            # ---- Prowlarr fallback (acquisition breadth) -------------
+            # Fires only when Torrentio produced nothing usable, or when
+            # prior passes recorded give-up strikes for this key (its
+            # Torrentio top releases are known-doomed on both providers).
+            # Healthy Torrentio candidates keep indexer fan-out at zero.
+            # Candidates come back title-verified and (for TV) episode/
+            # season-targeted, so the downstream ranking → cache gate →
+            # add → memo machinery runs on them unchanged.
+            if not results or wb_strikes > 0:
+                try:
+                    results.extend(self._prowlarr_fallback_candidates(
+                        media_title, item.get('year'), media_type,
+                        season, episode,
+                        exclude_hashes={r['info_hash'] for r in results},
+                        season_cls=season_cls,
+                        is_blocked=_is_blocked))
+                except Exception:
+                    logger.warning(
+                        "[library] Prowlarr fallback failed — continuing "
+                        "with Torrentio results", exc_info=True)
+
             if not results:
                 self._memo_wanted(self._wanted_no_results, key)
                 continue
@@ -5267,11 +5316,19 @@ class LibraryScanner:
                 probe = results[:self._WANTED_TB_MAX_PROBES]
                 hashes = [r['info_hash'] for r in probe]
                 tb_probe_ok = True
+                probe_stats = {}
                 try:
                     cmap = _search.check_debrid_cache(
-                        hashes, service='torbox', api_key=tb_key)
+                        hashes, service='torbox', api_key=tb_key,
+                        _stats=probe_stats)
                 except Exception:
                     cmap = {}
+                    tb_probe_ok = False
+                if probe_stats.get('tb_not_probed'):
+                    # The TB throttle/breaker declined to ask — all-None
+                    # here is "never probed", NOT "confirmed uncached".
+                    # Without this, a throttled pass mints false give-up
+                    # strikes on evidence that was never collected.
                     tb_probe_ok = False
                 cached = next(
                     (r for r in probe if cmap.get(r['info_hash'])), None)
@@ -5431,6 +5488,80 @@ class LibraryScanner:
         # Persist the memo state so a restart resumes the drain where it
         # left off instead of re-probing the whole backlog.
         self._persist_wanted_memos()
+
+    def _prowlarr_fallback_candidates(self, media_title, media_year,
+                                      media_type, season, episode,
+                                      exclude_hashes=None, season_cls=None,
+                                      is_blocked=None):
+        """Fetch and gate Prowlarr candidates for one wanted-recovery target.
+
+        Prowlarr's aggregated search is text-keyed (not imdb-keyed), so
+        every result MUST pass ``_release_matches_title`` before it may
+        enter the recovery pipeline — mislabeled uploads are even likelier
+        here than in Torrentio's lists.  TV targets are additionally gated
+        by ``_release_covers_season``: season targets keep packs and the
+        exact first-missing episode (classifying each hash into
+        *season_cls* so pack-vs-episode add metadata stays correct), while
+        single-episode targets keep exact-episode releases only — a pack
+        add there would carry SxxEyy metadata for a whole-season torrent.
+
+        Returns a (possibly empty) list shaped like ``search_torrentio``
+        output, deduped against *exclude_hashes*.  Never raises.
+        """
+        if not media_title:
+            return []
+        from utils.prowlarr import is_prowlarr_configured, search_prowlarr
+        if not is_prowlarr_configured():
+            return []
+        try:
+            # Single-episode targets scope the query with the SxxEyy tag;
+            # season targets keep the plain title (packs don't carry
+            # episode tags) and rely on the coverage filter below.
+            found = search_prowlarr(
+                media_title, year=media_year,
+                media_type='movie' if media_type == 'movie' else 'series',
+                season=season if media_type == 'series' else None,
+                episode=episode if media_type == 'series' else None)
+        except Exception:
+            logger.warning("[library] Prowlarr fallback search failed for "
+                           f"{media_title!r}", exc_info=True)
+            return []
+
+        exclude = set(exclude_hashes or ())
+        kept = []
+        for r in found:
+            ih = r.get('info_hash') or ''
+            if not ih or ih in exclude:
+                continue
+            if is_blocked is not None:
+                try:
+                    if is_blocked(ih):
+                        continue
+                except Exception:
+                    pass
+            release = r.get('title') or ''
+            try:
+                if not _release_matches_title(release, media_title,
+                                              media_year=media_year):
+                    continue
+            except Exception:
+                continue
+            if media_type in ('series', 'season'):
+                cls = _release_covers_season(release, season, episode)
+                if media_type == 'season':
+                    if not cls:
+                        continue
+                    if season_cls is not None:
+                        season_cls[ih] = cls
+                elif cls != 'episode':
+                    continue
+            exclude.add(ih)
+            kept.append(r)
+        if kept:
+            logger.info(f"[library] Prowlarr fallback contributed "
+                        f"{len(kept)}/{len(found)} candidate(s) for "
+                        f"{media_title!r}")
+        return kept
 
     def _record_wanted_filter_giveup(self, key, imdb, media_title, ep_str):
         """Bump the persistent both-providers give-up strike for a Wanted
