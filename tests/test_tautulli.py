@@ -176,3 +176,68 @@ class TestEnvWiring:
         from utils.settings_api import validate_env_values
         result = validate_env_values({'TAUTULLI_URL': 'not-a-url'})
         assert any('TAUTULLI_URL' in e for e in result['errors'])
+
+
+class TestNormalizeDisambiguation:
+    """Sonarr disambiguates titles ("Doctor Who (2005)", "The Office (US)");
+    Plex's grandparent_title usually doesn't. Both sides go through
+    normalize(), so the suffix must strip or watched shows silently sort
+    as never-played (bug-hunter finding #1)."""
+
+    def test_trailing_year_stripped(self):
+        assert normalize('Doctor Who (2005)') == 'doctor who'
+        assert normalize('Ghosts (2021)') == 'ghosts'
+
+    def test_trailing_country_code_stripped(self):
+        assert normalize('The Office (US)') == 'the office'
+        assert normalize('Shameless (UK)') == 'shameless'
+
+    def test_leading_parenthetical_kept(self):
+        assert normalize('(500) Days of Summer') == '(500) days of summer'
+
+    def test_inner_parenthetical_kept(self):
+        assert normalize('What We Do (in Shadow)land') == 'what we do (in shadow)land'
+
+
+class TestHistoryPaging:
+    """get_history is paged (bug-hunter finding #2): a single 5000-row
+    response can exceed the transport's 10MB read cap on busy servers."""
+
+    def _page(self, n, *, start=0, day_offset=1.0):
+        return _resp([
+            {'title': f'M{start + i}', 'year': 2020,
+             'date': int(NOW - day_offset * 86400)}
+            for i in range(n)
+        ])
+
+    @patch('utils.tautulli._urllib_get')
+    def test_full_page_fetches_next_page(self, mock_get):
+        mock_get.side_effect = [
+            self._page(1000), self._page(3, start=1000),   # movie pages
+            _resp([]),                                      # episode page
+        ]
+        played = played_titles(days=180)
+        assert len(played['movies']) == 1003
+        movie_urls = [c[0][0] for c in mock_get.call_args_list[:2]]
+        assert 'start=0' in movie_urls[0]
+        assert 'start=1000' in movie_urls[1]
+
+    @patch('utils.tautulli._urllib_get')
+    def test_short_page_stops_paging(self, mock_get):
+        mock_get.side_effect = [self._page(3), _resp([])]
+        played_titles(days=180)
+        assert mock_get.call_count == 2  # one movie page, one episode page
+
+    @patch('utils.tautulli._urllib_get')
+    def test_paging_stops_once_rows_leave_the_window(self, mock_get):
+        """Rows are newest-first; a full page whose oldest row is already
+        outside the lookback means no later page can matter."""
+        mock_get.side_effect = [self._page(1000, day_offset=400), _resp([])]
+        played = played_titles(days=180)
+        assert mock_get.call_count == 2  # no second movie page requested
+        assert played['movies'] == {}
+
+    @patch('utils.tautulli._urllib_get')
+    def test_mid_paging_failure_returns_none(self, mock_get):
+        mock_get.side_effect = [self._page(1000), None]
+        assert played_titles(days=180) is None
