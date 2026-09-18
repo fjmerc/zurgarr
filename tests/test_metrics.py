@@ -218,3 +218,65 @@ class TestEmitHelper:
         _emit(lines, 'sample', 'help', 'gauge', [('', 1), ('label="x"', 2)])
         for line in lines:
             assert 'pd_zurg_' not in line
+
+
+class TestDebridQuotaGauges:
+    """zurgarr_debrid_* gauges from the quota sweep's cached summary."""
+
+    @pytest.fixture(autouse=True)
+    def _reset(self):
+        from utils import debrid_quota
+        debrid_quota._reset_for_tests()
+        yield
+        debrid_quota._reset_for_tests()
+
+    def _seed(self, monkeypatch):
+        from datetime import datetime, timedelta, timezone
+        from unittest.mock import MagicMock, patch
+        from utils import debrid_quota
+        now = datetime(2026, 9, 18, 12, 0, 0, tzinfo=timezone.utc)
+        tb = MagicMock()
+        tb.account_info.return_value = {
+            'premium': True,
+            'expiration': (now + timedelta(days=12)).isoformat(),
+        }
+        tb.list_torrents.return_value = [
+            {'id': '1', 'filename': 'A.mkv', 'bytes': 10,
+             'expires_at': (now + timedelta(days=2)).isoformat()},
+            {'id': '2', 'filename': 'B.mkv', 'bytes': 20, 'expires_at': None},
+        ]
+        monkeypatch.setattr(debrid_quota, 'notify', MagicMock())
+        monkeypatch.setattr(debrid_quota, '_log_warning_event', MagicMock())
+        with patch('utils.debrid_client._all_configured_clients',
+                   return_value=[('torbox', tb)]):
+            debrid_quota._run_sweep(now=now)
+
+    def test_gauges_emitted_after_sweep(self, monkeypatch):
+        self._seed(monkeypatch)
+        out = MetricsRegistry().format_metrics()
+        assert 'zurgarr_debrid_account_days_remaining{provider="torbox"} 12' in out
+        assert 'zurgarr_debrid_storage_bytes{provider="torbox"} 30' in out
+        assert 'zurgarr_debrid_torrents{provider="torbox"} 2' in out
+        assert 'zurgarr_debrid_torrents_near_expiry{provider="torbox"} 1' in out
+
+    def test_absent_before_first_sweep(self):
+        out = MetricsRegistry().format_metrics()
+        assert 'zurgarr_debrid_' not in out
+
+    def test_errored_probe_omits_samples(self, monkeypatch):
+        """A failed account probe must not emit a lying 0 — the sample is
+        simply absent for that provider."""
+        from datetime import datetime, timezone
+        from unittest.mock import MagicMock, patch
+        from utils import debrid_quota
+        import requests
+        now = datetime(2026, 9, 18, 12, 0, 0, tzinfo=timezone.utc)
+        rd = MagicMock()
+        rd.account_info.side_effect = requests.ConnectionError('down')
+        rd.list_torrents.side_effect = requests.ConnectionError('down')
+        monkeypatch.setattr(debrid_quota, 'notify', MagicMock())
+        with patch('utils.debrid_client._all_configured_clients',
+                   return_value=[('realdebrid', rd)]):
+            debrid_quota._run_sweep(now=now)
+        out = MetricsRegistry().format_metrics()
+        assert 'provider="realdebrid"' not in out

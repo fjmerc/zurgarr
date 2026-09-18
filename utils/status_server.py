@@ -1773,6 +1773,12 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json_response(200, json.dumps(get_summary()))
             except Exception as e:
                 self._send_json_response(500, json.dumps({'error': str(e)}))
+        elif self.path == '/api/debrid_quota/summary':
+            try:
+                from utils.debrid_quota import get_summary as quota_summary
+                self._send_json_response(200, json.dumps(quota_summary()))
+            except Exception as e:
+                self._send_json_response(500, json.dumps({'error': str(e)}))
         elif self.path.startswith('/api/recovery'):
             try:
                 from utils import recovery

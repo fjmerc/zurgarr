@@ -143,6 +143,37 @@ class MetricsRegistry:
                   'Total network bytes transmitted', 'counter',
                   [('', system['net_tx_bytes'])])
 
+        # Debrid quota/expiry dashboard gauges. Absent until the first
+        # sweep populates the cache; an errored probe omits its samples
+        # rather than emitting a lying 0.
+        try:
+            from utils.debrid_quota import get_summary as _quota_summary
+            quota_providers = _quota_summary().get('providers') or []
+        except Exception:
+            quota_providers = []
+        if quota_providers:
+            days_samples, bytes_samples, count_samples, near_samples = [], [], [], []
+            for card in quota_providers:
+                label = f'provider="{_sanitize_label(card.get("service", "unknown"))}"'
+                account = card.get('account') or {}
+                if 'error' not in account and account.get('days_remaining') is not None:
+                    days_samples.append((label, account['days_remaining']))
+                storage = card.get('storage') or {}
+                if 'error' not in storage and 'count' in storage:
+                    count_samples.append((label, storage['count']))
+                    bytes_samples.append((label, storage.get('bytes', 0)))
+                    near_samples.append((label, len(card.get('near_expiry') or [])))
+            if days_samples:
+                _emit(lines, 'debrid_account_days_remaining',
+                      'Days until the debrid account expires', 'gauge', days_samples)
+            if count_samples:
+                _emit(lines, 'debrid_torrents',
+                      'Torrents stored at the debrid provider', 'gauge', count_samples)
+                _emit(lines, 'debrid_storage_bytes',
+                      'Total bytes stored at the debrid provider', 'gauge', bytes_samples)
+                _emit(lines, 'debrid_torrents_near_expiry',
+                      'Torrents expiring within the warning window', 'gauge', near_samples)
+
         services = data.get('services', [])
         if services:
             samples = [
