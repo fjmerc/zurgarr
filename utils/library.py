@@ -127,6 +127,45 @@ def wanted_season_recovery_enabled():
     return os.environ.get('WANTED_SEASON_RECOVERY_ENABLED', 'true').strip().lower() == 'true'
 
 
+def wanted_deprioritize_unplayed_enabled():
+    """Return ``True`` when Tautulli watch-correlation ordering is enabled.
+
+    Default ``true`` — inert until Tautulli is configured. When active,
+    wanted-recovery targets whose title has never been played (per
+    Tautulli history) sort to the back of the queue, so the per-scan
+    TB/RD budgets flow to content people actually watch. Ordering only:
+    nothing is skipped and no budget rules change.
+    """
+    return os.environ.get('WANTED_DEPRIORITIZE_UNPLAYED', 'true').strip().lower() == 'true'
+
+
+def _wanted_target_played(target, played):
+    """Whether a wanted-recovery target's title has recorded plays.
+
+    Movies match on normalized title with ±1-year tolerance against the
+    play-history years (a yearless history entry matches on title alone —
+    so does a yearless wanted item). Shows and season targets match on
+    the show title. ``played`` is the dict from
+    ``utils.tautulli.played_titles``.
+    """
+    from utils.tautulli import normalize
+    media_type, item, _season, _episode = target
+    title = normalize(item.get('title'))
+    if not title:
+        return False
+    if media_type == 'movie':
+        years = played.get('movies', {}).get(title)
+        if years is None:
+            return False
+        if not years:
+            return True
+        item_year = item.get('year')
+        if not isinstance(item_year, int):
+            return True
+        return any(abs(item_year - y) <= 1 for y in years)
+    return title in played.get('shows', set())
+
+
 # Plan 41 phase B.2 — NFS attribute-cache delay between symlink creation
 # and arr rescan trigger.  See ``_create_debrid_symlinks`` for the
 # narrative.  Lifted to a module-level helper so it can be unit-tested
@@ -4459,6 +4498,61 @@ class LibraryScanner:
     # legitimately burn _WANTED_RD_READY_TIMEOUT seconds of polling — a
     # 30s ceiling would cap the pass at ~1 RD attempt per scan.
     _WANTED_RECOVERY_BUDGET_SECONDS = 120
+    # Tautulli played-set memo TTL.  Covers repeated calls within one
+    # scan cycle (and manual rescans landing close together); the hourly
+    # library-scan cadence means at most ~2 Tautulli fetches per hour.
+    _TAUTULLI_MEMO_TTL = 1800
+
+    def _tautulli_played(self):
+        """Memoized Tautulli played-titles fetch. None = no signal.
+
+        Only successful fetches are memoized — a transient failure is
+        retried on the next call rather than pinning "no signal" for the
+        TTL.
+        """
+        from utils import tautulli
+        now = time.monotonic()
+        memo = getattr(self, '_tautulli_played_memo', None)
+        if memo is not None and now - memo[0] < self._TAUTULLI_MEMO_TTL:
+            return memo[1]
+        try:
+            played = tautulli.played_titles(tautulli.history_days())
+        except Exception as e:
+            logger.warning(f"[library] Tautulli history fetch failed: {type(e).__name__}")
+            played = None
+        if played is not None:
+            self._tautulli_played_memo = (now, played)
+        return played
+
+    def _deprioritize_unplayed(self, targets):
+        """Stable-sort wanted-recovery targets: played titles first.
+
+        Ordering only — no target is dropped, so the give-up ledger,
+        memos, and budget mechanics are untouched. Degrades to the
+        original order (byte-identical behavior) when the toggle is off,
+        Tautulli is unconfigured, or the history fetch failed.
+        """
+        if len(targets) < 2:
+            return targets
+        if not wanted_deprioritize_unplayed_enabled():
+            return targets
+        from utils import tautulli
+        if not tautulli.is_tautulli_configured():
+            return targets
+        played = self._tautulli_played()
+        if played is None:
+            logger.debug("[library] Tautulli signal unavailable — wanted order unchanged")
+            return targets
+        flagged = [(target, _wanted_target_played(target, played))
+                   for target in targets]
+        unplayed = sum(1 for _, was_played in flagged if not was_played)
+        if unplayed:
+            logger.info(
+                f"[library] Wanted recovery: {unplayed} of {len(targets)} "
+                f"targets never played — queued last (Tautulli)")
+        # sorted() is stable: existing order (movies → ghosts → seasons
+        # by missing-count desc) is preserved within each band.
+        return [t for t, _ in sorted(flagged, key=lambda f: 0 if f[1] else 1)]
 
     def _check_pending_freshness(self, norm, pending, direction):
         """Resolve a title's pending entry and decide retry-vs-wait.
@@ -5126,6 +5220,10 @@ class LibraryScanner:
                         (len(eps), ('season', s, sn, min(eps))))
             season_targets.sort(key=lambda t: t[0], reverse=True)
             targets.extend(t for _, t in season_targets)
+
+        # Tautulli watch-correlation: never-played titles go to the back
+        # of the queue so the per-scan budgets favor watched content.
+        targets = self._deprioritize_unplayed(targets)
 
         try:
             from utils.blocklist import is_blocked as _is_blocked
