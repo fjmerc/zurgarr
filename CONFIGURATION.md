@@ -264,6 +264,11 @@ Sweep cadences (`DEBRID_HEALTH_INTERVAL`, default 12h; `DEBRID_QUOTA_INTERVAL`, 
 
 ## Status UI & monitoring
 
+A ready-made Grafana dashboard for the `/metrics` exporter lives in
+[`grafana/`](grafana/) (import `zurgarr-dashboard.json`, scrape-config
+snippet in its README). A CI sync-guard keeps its panels aligned with
+the metrics the exporter actually emits.
+
 | Variable | Description | Default |
 |---|---|---|
 | `STATUS_UI_ENABLED` | Enable the status web dashboard | `false` |

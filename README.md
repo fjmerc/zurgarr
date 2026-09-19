@@ -91,7 +91,7 @@ observe. Capabilities grouped by intent:
   debrid add, filterable by type and time
 - **Apprise notifications** across 90+ services (Discord, Telegram,
   Slack, email, etc.) with optional daily digest mode
-- **Prometheus metrics endpoint** for Grafana / Alertmanager
+- **Prometheus metrics endpoint** for Grafana / Alertmanager (canned dashboard in [`grafana/`](grafana/))
 - **OAuth device-code flows** for Trakt, Debrid Link, Put.io, Orionoid;
   **MDBList** subscriptions that auto-feed plex_debrid
 
