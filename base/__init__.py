@@ -99,6 +99,8 @@ __all__ = [
     # Tautulli watch correlation
     'TAUTULLI_URL', 'TAUTULLI_API_KEY',
     'WANTED_DEPRIORITIZE_UNPLAYED', 'TAUTULLI_HISTORY_DAYS',
+    # Seerr request-status writeback
+    'SEERR_WRITEBACK_ENABLED',
     # Blackhole cache / debrid-account dedup gates
     'BLACKHOLE_REQUIRE_CACHED', 'BLACKHOLE_DEBRID_DEDUP_ENABLED',
     'BLACKHOLE_DELETE_UNCACHED_ON_TIMEOUT', 'BLACKHOLE_TB_ALT_RECOVERY_ENABLED',
@@ -353,6 +355,10 @@ class Config:
         self.TAUTULLI_API_KEY = load_secret_or_env('tautulli_api_key')
         self.WANTED_DEPRIORITIZE_UNPLAYED = os.getenv('WANTED_DEPRIORITIZE_UNPLAYED', 'true')
         self.TAUTULLI_HISTORY_DAYS = os.getenv('TAUTULLI_HISTORY_DAYS', '180')
+        # Seerr request-status writeback — opt-in (default OFF): it
+        # mutates user-visible request state in Overseerr (mark
+        # available on delivery, decline on terminal movie give-up).
+        self.SEERR_WRITEBACK_ENABLED = os.getenv('SEERR_WRITEBACK_ENABLED', 'false')
         # Refuse the interactive "Add" button when the chosen hash is not
         # confirmed cached on the debrid provider (default OFF — RD has no
         # working cache probe, so ON effectively blocks all RD adds).
@@ -526,6 +532,7 @@ TAUTULLI_URL = config.TAUTULLI_URL
 TAUTULLI_API_KEY = config.TAUTULLI_API_KEY
 WANTED_DEPRIORITIZE_UNPLAYED = config.WANTED_DEPRIORITIZE_UNPLAYED
 TAUTULLI_HISTORY_DAYS = config.TAUTULLI_HISTORY_DAYS
+SEERR_WRITEBACK_ENABLED = config.SEERR_WRITEBACK_ENABLED
 SEARCH_REQUIRE_CACHED = config.SEARCH_REQUIRE_CACHED
 SEARCH_DEDUP_ENABLED = config.SEARCH_DEDUP_ENABLED
 BLACKHOLE_REQUIRE_CACHED = config.BLACKHOLE_REQUIRE_CACHED

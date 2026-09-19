@@ -96,6 +96,7 @@ mount you need the two `TORBOX_WEBDAV_*` vars as well.
 | `JF_API_KEY` | Jellyfin/Emby API key | |
 | `SEERR_API_KEY` | Overseerr/Jellyseerr API key | |
 | `SEERR_ADDRESS` | Overseerr/Jellyseerr URL | |
+| `SEERR_WRITEBACK_ENABLED` | Close the request loop: when the library scanner delivers requested content, the matching Seerr request's media is marked **available** (movies always; shows only once the scanner knows the show is complete — partial seasons are left to Seerr's own Plex sync); when Wanted recovery terminally gives up on a movie (filter-blocked on RD *and* uncached on TB across the strike threshold), its request is **declined** so the requester sees "not coming" instead of eternal processing. TV give-ups are per-episode and never decline a whole request. Correlation is by TMDB id against the approved-requests list at fire time; best-effort — a Seerr outage never blocks a scan. OFF by default because it changes user-visible request state | `false` |
 | `SHOW_MENU` | Show plex_debrid interactive menu on startup | `true` |
 | `PD_UPDATE` | Auto-update plex_debrid. Requires `PD_REPO` | `false` |
 | `PD_REPO` | Update repo in `user,repo,branch` form | |

@@ -223,6 +223,70 @@ def _maybe_refresh_plex(symlinked_shows, symlinked_movies):
         except Exception as e:
             logger.warning(f"[library] Plex movie-section refresh failed: {e}")
 
+
+def _build_delivered_for_seerr(symlinked_shows, symlinked_movies, shows,
+                               movies, sonarr_map, radarr_map, new_files,
+                               upgrades, state_init):
+    """Genuine new deliveries for the Seerr writeback, with tmdb identity.
+
+    Excludes state-init bootstrap replays (not real deliveries) and
+    quality upgrades (the request was already fulfilled). Movies always
+    qualify; shows qualify only once the scanner knows the show is now
+    complete — pre-scan ``missing_episodes`` minus the media files this
+    scan symlinked (season-pack extras could theoretically inflate the
+    count, so this can mark a hair early, never chronically late).
+    Titles with no resolvable tmdb id are skipped: the writeback matches
+    Seerr requests by ``media.tmdbId`` and has nothing else to go on.
+    """
+    if state_init:
+        return []
+
+    def _tmdb_for(title, arr_map, items, item_keys):
+        info = arr_map.get(title.lower())
+        if info and info.get('tmdb_id'):
+            return info['tmdb_id']
+        for item in items:
+            if item.get('title') == title:
+                for key in item_keys:
+                    if item.get(key):
+                        return item[key]
+        return None
+
+    delivered = []
+    for title in sorted(symlinked_movies):
+        if upgrades.get(title):
+            continue
+        tmdb = _tmdb_for(title, radarr_map, movies,
+                         ('tmdb_id', '_radarr_tmdb_id'))
+        if tmdb:
+            delivered.append({'title': title, 'tmdb_id': tmdb,
+                              'media_type': 'movie'})
+    for title in sorted(symlinked_shows):
+        if upgrades.get(title):
+            continue
+        item = next((s for s in shows if s.get('title') == title), None)
+        missing = (item.get('missing_episodes') or 0) if item else 0
+        if missing - len(new_files.get(title, [])) > 0:
+            continue
+        tmdb = _tmdb_for(title, sonarr_map, shows,
+                         ('tmdb_id', '_sonarr_tmdb_id'))
+        if tmdb:
+            delivered.append({'title': title, 'tmdb_id': tmdb,
+                              'media_type': 'tv'})
+    return delivered
+
+
+def _maybe_writeback_seerr(delivered):
+    """Best-effort Seerr writeback for this scan's deliveries. Gating
+    (toggle + credentials) lives in the writeback module; this wrapper
+    only guarantees a failure can never raise into the scan loop."""
+    try:
+        from utils import seerr_writeback
+        seerr_writeback.writeback_scan_delivery(delivered)
+    except Exception as e:
+        logger.warning(f"[library] Seerr writeback failed: {type(e).__name__}")
+
+
 # Consecutive empty local-library scans before warning that local content
 # has never been seen this container lifetime.  Covers the stale-bind-at-boot
 # case (docker binds the local library path before the host's network share
@@ -5568,7 +5632,11 @@ class LibraryScanner:
                 # climb to WANTED_FILTER_GIVEUP_STRIKES (a few passes),
                 # after which the top-of-loop guard skips it for good.
                 self._record_wanted_filter_giveup(
-                    key, imdb, media_title, ep_str)
+                    key, imdb, media_title, ep_str,
+                    tmdb_id=(item.get('tmdb_id')
+                             or item.get('_radarr_tmdb_id')
+                             or item.get('_sonarr_tmdb_id')),
+                    media_type=media_type)
             elif rd_outcome == 'filter_blocked' and imdb:
                 # TB probe errored — can't confirm uncached, so no strike;
                 # cool down + memo RD-miss to avoid re-probing the blocked
@@ -5661,7 +5729,8 @@ class LibraryScanner:
                         f"{media_title!r}")
         return kept
 
-    def _record_wanted_filter_giveup(self, key, imdb, media_title, ep_str):
+    def _record_wanted_filter_giveup(self, key, imdb, media_title, ep_str,
+                                     tmdb_id=None, media_type=None):
         """Bump the persistent both-providers give-up strike for a Wanted
         ghost, logging the terminal event exactly once when the count first
         reaches ``WANTED_FILTER_GIVEUP_STRIKES`` (after which the loop's top
@@ -5669,7 +5738,11 @@ class LibraryScanner:
 
         ``key`` is the per-probe key (imdb for movies, ``imdb:season:episode``
         for shows) so a series accrues strikes per-episode and one blocked
-        episode never terminates the whole show."""
+        episode never terminates the whole show.
+
+        ``tmdb_id``/``media_type`` feed the opt-in Seerr writeback: a
+        terminal MOVIE give-up declines the matching request. TV give-ups
+        are per-episode and never decline a whole request."""
         from utils import attempt_ledger as _ledger
         try:
             strikes = _ledger.bump(f'wantedblock:{key}')
@@ -5712,6 +5785,18 @@ class LibraryScanner:
                    level='warning')
         except Exception:
             pass
+        # Opt-in Seerr writeback: decline the matching movie request so the
+        # requester sees "not coming" instead of eternal processing.
+        # Idempotent against ledger-prune re-fires (a declined request is
+        # no longer in the approved list, so the lookup just misses).
+        if media_type == 'movie' and tmdb_id:
+            try:
+                from utils import seerr_writeback
+                if (seerr_writeback.writeback_enabled()
+                        and seerr_writeback.is_seerr_configured()):
+                    seerr_writeback.decline_movie_giveup(tmdb_id, media_title or imdb)
+            except Exception as e:
+                logger.warning(f"[library] Seerr give-up decline failed: {type(e).__name__}")
 
     def _wanted_rd_probe_add(self, rd_client, rd_key, release,
                              media_title, ep_str, key):
@@ -7459,6 +7544,17 @@ class LibraryScanner:
             # never fires for scanner-delivered content; this is the trigger
             # that makes it visible in Plex without a manual scan.
             _maybe_refresh_plex(symlinked_shows, symlinked_movies)
+
+            # Opt-in Seerr writeback: mark the matching requests available
+            # for this scan's genuine new deliveries (same "the arr's own
+            # webhook never fires here" gap as the Plex refresh above).
+            # state_init read from the attribute (not the local above, which
+            # only exists when the history import succeeded).
+            _maybe_writeback_seerr(_build_delivered_for_seerr(
+                symlinked_shows, symlinked_movies, shows, movies,
+                sonarr_map, radarr_map, _symlink_new_files,
+                _symlink_is_upgrade,
+                getattr(self, '_state_was_bootstrapped', False)))
 
     # Category names that indicate TV/show content
     _SHOW_CATEGORIES = {'shows', 'tv', 'anime', 'series', 'television'}

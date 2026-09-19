@@ -10018,3 +10018,117 @@ class TestWantedTautulliDeprioritize:
         sc._recover_wanted_via_debrid([], movies, {})
         assert len(seen['targets']) == 1
         assert seen['targets'][0][1]['title'] == 'Ghost'
+
+
+class TestSeerrDeliveredAdapter:
+    """_build_delivered_for_seerr: turns scan symlink results into the
+    writeback list — genuine new deliveries only, with tmdb identity."""
+
+    def _movies(self):
+        return [{'title': 'Movie A', 'year': 2024, '_radarr_tmdb_id': 100}]
+
+    def _shows(self):
+        return [{'title': 'Show B', 'year': 2020, 'tmdb_id': 200,
+                 'missing_episodes': 2}]
+
+    def test_movie_delivery_uses_radarr_map_tmdb(self):
+        out = library._build_delivered_for_seerr(
+            symlinked_shows=set(), symlinked_movies={'Movie A'},
+            shows=[], movies=[{'title': 'Movie A'}],
+            sonarr_map={}, radarr_map={'movie a': {'tmdb_id': 111}},
+            new_files={'Movie A': [{'file': 'a.mkv'}]},
+            upgrades={}, state_init=False)
+        assert out == [{'title': 'Movie A', 'tmdb_id': 111,
+                        'media_type': 'movie'}]
+
+    def test_movie_falls_back_to_item_tmdb(self):
+        out = library._build_delivered_for_seerr(
+            set(), {'Movie A'}, [], self._movies(),
+            {}, {}, {'Movie A': [{'file': 'a.mkv'}]}, {}, False)
+        assert out[0]['tmdb_id'] == 100
+
+    def test_movie_without_tmdb_skipped(self):
+        out = library._build_delivered_for_seerr(
+            set(), {'Movie A'}, [], [{'title': 'Movie A'}],
+            {}, {}, {}, {}, False)
+        assert out == []
+
+    def test_state_init_produces_nothing(self):
+        out = library._build_delivered_for_seerr(
+            set(), {'Movie A'}, [], self._movies(),
+            {}, {}, {}, {}, True)
+        assert out == []
+
+    def test_upgrade_excluded(self):
+        out = library._build_delivered_for_seerr(
+            set(), {'Movie A'}, [], self._movies(),
+            {}, {}, {}, {'Movie A': True}, False)
+        assert out == []
+
+    def test_show_complete_after_delivery_included(self):
+        out = library._build_delivered_for_seerr(
+            {'Show B'}, set(), self._shows(), [],
+            {}, {}, {'Show B': [{'file': 'e1.mkv'}, {'file': 'e2.mkv'}]},
+            {}, False)
+        assert out == [{'title': 'Show B', 'tmdb_id': 200,
+                        'media_type': 'tv'}]
+
+    def test_show_still_missing_episodes_skipped(self):
+        out = library._build_delivered_for_seerr(
+            {'Show B'}, set(), self._shows(), [],
+            {}, {}, {'Show B': [{'file': 'e1.mkv'}]}, {}, False)
+        assert out == []
+
+
+class TestSeerrGiveupDecline:
+    """Terminal wanted give-up declines the matching MOVIE request."""
+
+    def _scanner(self):
+        return LibraryScanner.__new__(LibraryScanner)
+
+    @pytest.fixture
+    def seerr_on(self, monkeypatch):
+        monkeypatch.setenv('SEERR_WRITEBACK_ENABLED', 'true')
+        monkeypatch.setenv('SEERR_ADDRESS', 'http://overseerr:5055')
+        monkeypatch.setenv('SEERR_API_KEY', 'k')
+
+    def _fire(self, monkeypatch, strikes, tmdb_id=27205, media_type='movie'):
+        import utils.attempt_ledger as ledger
+        monkeypatch.setattr(ledger, 'bump', lambda key: strikes)
+        with patch('utils.seerr_writeback.decline_movie_giveup') as mock_decline, \
+             patch('utils.history.log_event'), \
+             patch('utils.notifications.notify'):
+            sc = self._scanner()
+            sc._record_wanted_filter_giveup(
+                'tt1', 'tt1', 'Inception', '',
+                tmdb_id=tmdb_id, media_type=media_type)
+        return mock_decline
+
+    def test_movie_giveup_declines(self, seerr_on, monkeypatch):
+        from utils.library import WANTED_FILTER_GIVEUP_STRIKES
+        mock = self._fire(monkeypatch, WANTED_FILTER_GIVEUP_STRIKES)
+        mock.assert_called_once_with(27205, 'Inception')
+
+    def test_below_threshold_no_decline(self, seerr_on, monkeypatch):
+        mock = self._fire(monkeypatch, 1)
+        assert mock.call_count == 0
+
+    def test_tv_giveup_never_declines(self, seerr_on, monkeypatch):
+        from utils.library import WANTED_FILTER_GIVEUP_STRIKES
+        mock = self._fire(monkeypatch, WANTED_FILTER_GIVEUP_STRIKES,
+                          media_type='series')
+        assert mock.call_count == 0
+
+    def test_disabled_no_decline(self, monkeypatch):
+        from utils.library import WANTED_FILTER_GIVEUP_STRIKES
+        monkeypatch.setenv('SEERR_WRITEBACK_ENABLED', 'false')
+        monkeypatch.setenv('SEERR_ADDRESS', 'http://overseerr:5055')
+        monkeypatch.setenv('SEERR_API_KEY', 'k')
+        mock = self._fire(monkeypatch, WANTED_FILTER_GIVEUP_STRIKES)
+        assert mock.call_count == 0
+
+    def test_missing_tmdb_no_decline(self, seerr_on, monkeypatch):
+        from utils.library import WANTED_FILTER_GIVEUP_STRIKES
+        mock = self._fire(monkeypatch, WANTED_FILTER_GIVEUP_STRIKES,
+                          tmdb_id=None)
+        assert mock.call_count == 0

@@ -526,6 +526,16 @@ def _fmt_debrid_expiry_warning(ev, meta):
     return short, short
 
 
+def _fmt_seerr_marked_available(ev, meta):
+    short = 'Seerr request marked available'
+    return short, short
+
+
+def _fmt_seerr_request_declined(ev, meta):
+    short = 'Seerr request declined — recovery gave up'
+    return short, short
+
+
 def _fmt_library_symlink_cleanup(ev, meta):
     s = meta.get('searched', 0)
     d = meta.get('deleted', 0)
@@ -590,6 +600,8 @@ _CAUSE_FORMATTERS = {
     'mount_selfheal': _fmt_mount_selfheal,
     'mount_deferred_start': _fmt_mount_deferred_start,
     'debrid_expiry_warning': _fmt_debrid_expiry_warning,
+    'seerr_marked_available': _fmt_seerr_marked_available,
+    'seerr_request_declined': _fmt_seerr_request_declined,
 }
 
 
@@ -822,6 +834,12 @@ FORMATTER_JS = r"""
     },
     mount_deferred_start: function(ev,m){
       return 'Deferred rclone setup succeeded — ' + (m.mount || 'mount') + ' starting';
+    },
+    seerr_marked_available: function(ev,m){
+      return 'Seerr request marked available';
+    },
+    seerr_request_declined: function(ev,m){
+      return 'Seerr request declined — recovery gave up';
     },
     debrid_expiry_warning: function(ev,m){
       var t = m.torrents || 0, a = m.accounts || 0, w = m.warn_days || 7;
