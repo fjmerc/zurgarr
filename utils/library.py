@@ -226,7 +226,7 @@ def _maybe_refresh_plex(symlinked_shows, symlinked_movies):
 
 def _build_delivered_for_seerr(symlinked_shows, symlinked_movies, shows,
                                movies, sonarr_map, radarr_map, new_files,
-                               upgrades, state_init):
+                               upgrades, state_init, years=None):
     """Genuine new deliveries for the Seerr writeback, with tmdb identity.
 
     Excludes state-init bootstrap replays (not real deliveries) and
@@ -235,28 +235,51 @@ def _build_delivered_for_seerr(symlinked_shows, symlinked_movies, shows,
     complete — pre-scan ``missing_episodes`` minus the media files this
     scan symlinked (season-pack extras could theoretically inflate the
     count, so this can mark a hair early, never chronically late).
-    Titles with no resolvable tmdb id are skipped: the writeback matches
-    Seerr requests by ``media.tmdbId`` and has nothing else to go on.
+    Unknown completeness (``missing_episodes`` is None — TMDB miss) is
+    NEVER treated as complete.
+
+    This feeds external writes, so ambiguity means skip, not guess:
+    same-title collisions (remakes/reboots) are resolved by the
+    symlink-time year (``years``, the scanner's ``_symlink_years`` map)
+    or dropped, and titles with no resolvable tmdb id are dropped — the
+    writeback matches Seerr requests by ``media.tmdbId`` and has nothing
+    else to go on.
     """
     if state_init:
         return []
+    years = years or {}
 
-    def _tmdb_for(title, arr_map, items, item_keys):
-        info = arr_map.get(title.lower())
-        if info and info.get('tmdb_id'):
-            return info['tmdb_id']
-        for item in items:
-            if item.get('title') == title:
-                for key in item_keys:
-                    if item.get(key):
-                        return item[key]
+    def _resolve_item(title, items):
+        """(item, ambiguous): the unique library item for a title. On a
+        same-title collision, only an exact symlink-year match wins."""
+        matches = [i for i in items if i.get('title') == title]
+        if len(matches) <= 1:
+            return (matches[0] if matches else None), False
+        year = years.get(title)
+        filtered = [i for i in matches if year and i.get('year') == year]
+        return (filtered[0] if len(filtered) == 1 else None), True
+
+    def _tmdb_for(title, arr_map, item, ambiguous, item_keys):
+        # On a collision the arr map's lowercase-title key can't
+        # disambiguate either — trust only the year-resolved item.
+        if not ambiguous:
+            info = arr_map.get(title.lower())
+            if info and info.get('tmdb_id'):
+                return info['tmdb_id']
+        if item:
+            for key in item_keys:
+                if item.get(key):
+                    return item[key]
         return None
 
     delivered = []
     for title in sorted(symlinked_movies):
         if upgrades.get(title):
             continue
-        tmdb = _tmdb_for(title, radarr_map, movies,
+        item, ambiguous = _resolve_item(title, movies)
+        if ambiguous and item is None:
+            continue
+        tmdb = _tmdb_for(title, radarr_map, item, ambiguous,
                          ('tmdb_id', '_radarr_tmdb_id'))
         if tmdb:
             delivered.append({'title': title, 'tmdb_id': tmdb,
@@ -264,11 +287,15 @@ def _build_delivered_for_seerr(symlinked_shows, symlinked_movies, shows,
     for title in sorted(symlinked_shows):
         if upgrades.get(title):
             continue
-        item = next((s for s in shows if s.get('title') == title), None)
-        missing = (item.get('missing_episodes') or 0) if item else 0
+        item, ambiguous = _resolve_item(title, shows)
+        if item is None:
+            continue  # unknown show (or unresolved collision) — never assert
+        missing = item.get('missing_episodes')
+        if missing is None:
+            continue  # completeness unknown — never assert availability
         if missing - len(new_files.get(title, [])) > 0:
             continue
-        tmdb = _tmdb_for(title, sonarr_map, shows,
+        tmdb = _tmdb_for(title, sonarr_map, item, ambiguous,
                          ('tmdb_id', '_sonarr_tmdb_id'))
         if tmdb:
             delivered.append({'title': title, 'tmdb_id': tmdb,
@@ -7548,13 +7575,19 @@ class LibraryScanner:
             # Opt-in Seerr writeback: mark the matching requests available
             # for this scan's genuine new deliveries (same "the arr's own
             # webhook never fires here" gap as the Plex refresh above).
-            # state_init read from the attribute (not the local above, which
-            # only exists when the history import succeeded).
-            _maybe_writeback_seerr(_build_delivered_for_seerr(
-                symlinked_shows, symlinked_movies, shows, movies,
-                sonarr_map, radarr_map, _symlink_new_files,
-                _symlink_is_upgrade,
-                getattr(self, '_state_was_bootstrapped', False)))
+            # MUST use the state_init LOCAL captured before the event loop —
+            # self._state_was_bootstrapped is reset to False when scan state
+            # persists, so re-reading the attribute here would treat every
+            # bootstrap replay as a genuine delivery. The outer try keeps
+            # argument evaluation from ever raising into the scan loop.
+            try:
+                _maybe_writeback_seerr(_build_delivered_for_seerr(
+                    symlinked_shows, symlinked_movies, shows, movies,
+                    sonarr_map, radarr_map, _symlink_new_files,
+                    _symlink_is_upgrade, state_init,
+                    years=_symlink_years))
+            except Exception as e:
+                logger.warning(f"[library] Seerr writeback skipped: {type(e).__name__}")
 
     # Category names that indicate TV/show content
     _SHOW_CATEGORIES = {'shows', 'tv', 'anime', 'series', 'television'}

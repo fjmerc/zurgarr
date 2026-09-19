@@ -10132,3 +10132,63 @@ class TestSeerrGiveupDecline:
         mock = self._fire(monkeypatch, WANTED_FILTER_GIVEUP_STRIKES,
                           tmdb_id=None)
         assert mock.call_count == 0
+
+
+class TestSeerrAdapterReviewFixes:
+    """Bug-hunter findings: unknown completeness must not read as
+    complete, and same-title collisions must not misattribute tmdb."""
+
+    def test_show_with_unknown_missing_episodes_skipped(self):
+        """missing_episodes=None means 'don't know', not 'complete' —
+        never assert availability on unknown state."""
+        shows = [{'title': 'Show B', 'year': 2020, 'tmdb_id': 200,
+                  'missing_episodes': None}]
+        out = library._build_delivered_for_seerr(
+            {'Show B'}, set(), shows, [],
+            {}, {}, {'Show B': [{'file': 'e1.mkv'}]}, {}, False)
+        assert out == []
+
+    def test_show_absent_from_list_skipped(self):
+        out = library._build_delivered_for_seerr(
+            {'Show B'}, set(), [], [],
+            {'show b': {'tmdb_id': 200}}, {},
+            {'Show B': [{'file': 'e1.mkv'}]}, {}, False)
+        assert out == []
+
+    def test_title_collision_disambiguated_by_year(self):
+        """Two 'Point Break' movies: the symlink-year map decides which
+        tmdb the writeback gets."""
+        movies = [
+            {'title': 'Point Break', 'year': 1991, '_radarr_tmdb_id': 1089},
+            {'title': 'Point Break', 'year': 2015, '_radarr_tmdb_id': 2963},
+        ]
+        out = library._build_delivered_for_seerr(
+            set(), {'Point Break'}, [], movies,
+            {}, {'point break': {'tmdb_id': 1089}},
+            {'Point Break': [{'file': 'pb.mkv'}]}, {}, False,
+            years={'Point Break': 2015})
+        assert out == [{'title': 'Point Break', 'tmdb_id': 2963,
+                        'media_type': 'movie'}]
+
+    def test_title_collision_without_year_skipped(self):
+        """Ambiguous and no year to disambiguate → skip rather than
+        guess on an external write."""
+        movies = [
+            {'title': 'Point Break', 'year': 1991, '_radarr_tmdb_id': 1089},
+            {'title': 'Point Break', 'year': 2015, '_radarr_tmdb_id': 2963},
+        ]
+        out = library._build_delivered_for_seerr(
+            set(), {'Point Break'}, [], movies,
+            {}, {'point break': {'tmdb_id': 1089}},
+            {'Point Break': [{'file': 'pb.mkv'}]}, {}, False,
+            years={})
+        assert out == []
+
+    def test_unambiguous_title_keeps_arr_map_shortcut(self):
+        out = library._build_delivered_for_seerr(
+            set(), {'Movie A'}, [], [{'title': 'Movie A', 'year': 2024}],
+            {}, {'movie a': {'tmdb_id': 111}},
+            {'Movie A': [{'file': 'a.mkv'}]}, {}, False,
+            years={'Movie A': 2024})
+        assert out == [{'title': 'Movie A', 'tmdb_id': 111,
+                        'media_type': 'movie'}]
