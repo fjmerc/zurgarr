@@ -18,7 +18,12 @@ DASHBOARD_PATH = os.path.join(REPO_ROOT, 'grafana', 'zurgarr-dashboard.json')
 METRICS_SOURCE = os.path.join(REPO_ROOT, 'utils', 'metrics.py')
 
 # Metrics deliberately absent from the dashboard go here, with a reason.
-ALLOWED_UNUSED = set()
+ALLOWED_UNUSED = {
+    # Constant 1 while the exporter answers; when zurgarr is down the
+    # series just goes stale, so it can never show red. The dashboard's
+    # up-stat queries Prometheus's own up{job="zurgarr"} instead.
+    'zurgarr_up',
+}
 
 _METRIC_RE = re.compile(r'zurgarr_[a-z0-9_]+')
 _EMIT_RE = re.compile(r"_emit\(lines,\s*'([a-z0-9_]+)'")
@@ -99,3 +104,42 @@ class TestPromqlSanity:
             # No unresolved template leftovers beyond Grafana's own vars
             leftovers = re.findall(r'\$\{?(\w+)', expr)
             assert all(v.startswith('__') for v in leftovers), expr
+
+
+class TestRegistryDrift:
+    """Every counter the app increments must be exported (or explicitly
+    waived) — four blackhole counters were being collected and silently
+    dropped (bug-hunter finding #7)."""
+
+    ALLOWED_UNEXPORTED = set()
+
+    def test_every_incremented_counter_is_exported(self):
+        inc_re = re.compile(r"metrics\.inc\(\s*'([a-z0-9_]+)'")
+        utils_dir = os.path.join(REPO_ROOT, 'utils')
+        keys = set()
+        for name in os.listdir(utils_dir):
+            if not name.endswith('.py') or name == 'metrics.py':
+                continue
+            with open(os.path.join(utils_dir, name)) as f:
+                keys |= set(inc_re.findall(f.read()))
+        assert keys, 'failed to find any metrics.inc sites'
+        emitted = _emitted_metrics()
+        dropped = {
+            k for k in keys - self.ALLOWED_UNEXPORTED
+            if f'zurgarr_{k}' not in emitted and f'zurgarr_{k}_total' not in emitted
+        }
+        assert not dropped, (
+            f'counters incremented but never exported by metrics.py: {sorted(dropped)}')
+
+
+class TestGaugePanels:
+
+    def test_percent_gauges_have_fixed_scale(self):
+        """Without min/max Grafana auto-scales the arc to the data range,
+        so a flat 3% CPU renders as a full arc (bug-hunter finding #3)."""
+        for panel in _load_dashboard()['panels']:
+            if panel.get('type') != 'gauge':
+                continue
+            defaults = panel['fieldConfig']['defaults']
+            assert defaults.get('min') == 0, panel['title']
+            assert defaults.get('max') == 100, panel['title']

@@ -2,10 +2,9 @@
 
 A canned dashboard for zurgarr's built-in Prometheus exporter
 (`/metrics` on the Status UI port). Five rows: Overview (service/process
-health), Debrid Quota & Expiry, Pipeline throughput, System resources,
+health), Debrid Quota & Expiry, Pipeline (blackhole outcomes by status,
+symlink/timeout/rejection counters, events, network), System resources,
 and Mount state timelines.
-
-![Rows: Overview · Debrid Quota & Expiry · Pipeline · System · Mounts]
 
 ## 1. Scrape zurgarr from Prometheus
 
@@ -21,6 +20,11 @@ scrape_configs:
     static_configs:
       - targets: ['zurgarr:8080']   # container name : STATUS_UI_PORT
 ```
+
+Keep `job_name: zurgarr` — the dashboard's "Zurgarr" up-stat queries
+`up{job="zurgarr"}` (Prometheus's own scrape-health series, which goes
+red when zurgarr is down; the exporter's `zurgarr_up` would merely go
+stale). If you use a different job name, edit that one panel.
 
 Most gauges update per scrape; the debrid quota gauges update when the
 `debrid_quota_poll` task sweeps (every 6 h by default) and are absent
