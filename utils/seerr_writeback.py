@@ -24,7 +24,10 @@ state in an external system, same posture as DEBRID_HEALTH_AUTO_REMEDIATE).
 
 import os
 
-from base import load_secret_or_env
+# Call-time resolution, not from-import: this module loads lazily, so an
+# import-time binding would freeze whatever base.load_secret_or_env was
+# at first import (see the identical note in utils/tautulli.py).
+import base as _base
 from utils.logger import get_logger
 
 logger = get_logger()
@@ -44,8 +47,8 @@ def writeback_enabled():
 
 
 def is_seerr_configured():
-    return bool(load_secret_or_env('seerr_address')
-                and load_secret_or_env('seerr_api_key'))
+    return bool(_base.load_secret_or_env('seerr_address')
+                and _base.load_secret_or_env('seerr_api_key'))
 
 
 def _client():

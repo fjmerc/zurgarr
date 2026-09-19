@@ -187,3 +187,16 @@ class TestRegistration:
         monkeypatch.delenv('SEERR_WRITEBACK_ENABLED', raising=False)
         from base import Config
         assert Config().SEERR_WRITEBACK_ENABLED == 'false'
+
+
+class TestLateBoundSecrets:
+
+    def test_secret_lookup_is_late_bound(self, monkeypatch):
+        """Same late-binding rule as utils/tautulli.py: lazily-imported
+        modules must resolve base.load_secret_or_env at call time."""
+        import base
+        monkeypatch.setattr(base, 'load_secret_or_env',
+                            lambda name: 'late-bound')
+        assert sw.is_seerr_configured() is True
+        monkeypatch.setattr(base, 'load_secret_or_env', lambda name: None)
+        assert sw.is_seerr_configured() is False

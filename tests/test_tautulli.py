@@ -241,3 +241,16 @@ class TestHistoryPaging:
     def test_mid_paging_failure_returns_none(self, mock_get):
         mock_get.side_effect = [self._page(1000), None]
         assert played_titles(days=180) is None
+
+
+class TestLateBoundSecrets:
+
+    def test_secret_lookup_is_late_bound(self, monkeypatch):
+        """This module is imported lazily mid-scan; if the base secret
+        helper is bound at import time, a test (or SIGHUP-style reload)
+        that had patched base.load_secret_or_env at first-import freezes
+        that function in forever — the test-order pollution class found
+        in the wanted-recovery suite."""
+        import base
+        monkeypatch.setattr(base, 'load_secret_or_env', lambda name: 'late-bound')
+        assert tautulli._get_tautulli_key() == 'late-bound'

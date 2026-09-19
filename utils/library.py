@@ -226,7 +226,8 @@ def _maybe_refresh_plex(symlinked_shows, symlinked_movies):
 
 def _build_delivered_for_seerr(symlinked_shows, symlinked_movies, shows,
                                movies, sonarr_map, radarr_map, new_files,
-                               upgrades, state_init, years=None):
+                               upgrades, state_init, years=None,
+                               sonarr_map_norm=None, radarr_map_norm=None):
     """Genuine new deliveries for the Seerr writeback, with tmdb identity.
 
     Excludes state-init bootstrap replays (not real deliveries) and
@@ -248,6 +249,14 @@ def _build_delivered_for_seerr(symlinked_shows, symlinked_movies, shows,
     if state_init:
         return []
     years = years or {}
+    sonarr_map_norm = sonarr_map_norm or {}
+    radarr_map_norm = radarr_map_norm or {}
+
+    # A movie and a show sharing a display title in one scan cross-
+    # contaminate the shared per-title bookkeeping (upgrade flags,
+    # new-file counts are single dicts keyed by bare title) — neither
+    # side's gates can be trusted, so such titles are skipped outright.
+    cross_type = symlinked_shows & symlinked_movies
 
     def _resolve_item(title, items):
         """(item, ambiguous): the unique library item for a title. On a
@@ -259,11 +268,12 @@ def _build_delivered_for_seerr(symlinked_shows, symlinked_movies, shows,
         filtered = [i for i in matches if year and i.get('year') == year]
         return (filtered[0] if len(filtered) == 1 else None), True
 
-    def _tmdb_for(title, arr_map, item, ambiguous, item_keys):
-        # On a collision the arr map's lowercase-title key can't
-        # disambiguate either — trust only the year-resolved item.
+    def _tmdb_for(title, arr_map, arr_map_norm, item, ambiguous, item_keys):
+        # On a collision the arr maps' title keys can't disambiguate
+        # either — trust only the year-resolved item.
         if not ambiguous:
-            info = arr_map.get(title.lower())
+            info = (arr_map.get(title.lower())
+                    or arr_map_norm.get(_norm_for_matching(title)))
             if info and info.get('tmdb_id'):
                 return info['tmdb_id']
         if item:
@@ -274,18 +284,18 @@ def _build_delivered_for_seerr(symlinked_shows, symlinked_movies, shows,
 
     delivered = []
     for title in sorted(symlinked_movies):
-        if upgrades.get(title):
+        if title in cross_type or upgrades.get(title):
             continue
         item, ambiguous = _resolve_item(title, movies)
         if ambiguous and item is None:
             continue
-        tmdb = _tmdb_for(title, radarr_map, item, ambiguous,
+        tmdb = _tmdb_for(title, radarr_map, radarr_map_norm, item, ambiguous,
                          ('tmdb_id', '_radarr_tmdb_id'))
         if tmdb:
             delivered.append({'title': title, 'tmdb_id': tmdb,
                               'media_type': 'movie'})
     for title in sorted(symlinked_shows):
-        if upgrades.get(title):
+        if title in cross_type or upgrades.get(title):
             continue
         item, ambiguous = _resolve_item(title, shows)
         if item is None:
@@ -295,7 +305,7 @@ def _build_delivered_for_seerr(symlinked_shows, symlinked_movies, shows,
             continue  # completeness unknown — never assert availability
         if missing - len(new_files.get(title, [])) > 0:
             continue
-        tmdb = _tmdb_for(title, sonarr_map, item, ambiguous,
+        tmdb = _tmdb_for(title, sonarr_map, sonarr_map_norm, item, ambiguous,
                          ('tmdb_id', '_sonarr_tmdb_id'))
         if tmdb:
             delivered.append({'title': title, 'tmdb_id': tmdb,
@@ -7585,7 +7595,9 @@ class LibraryScanner:
                     symlinked_shows, symlinked_movies, shows, movies,
                     sonarr_map, radarr_map, _symlink_new_files,
                     _symlink_is_upgrade, state_init,
-                    years=_symlink_years))
+                    years=_symlink_years,
+                    sonarr_map_norm=sonarr_map_norm,
+                    radarr_map_norm=radarr_map_norm))
             except Exception as e:
                 logger.warning(f"[library] Seerr writeback skipped: {type(e).__name__}")
 

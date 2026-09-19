@@ -10192,3 +10192,35 @@ class TestSeerrAdapterReviewFixes:
             years={'Movie A': 2024})
         assert out == [{'title': 'Movie A', 'tmdb_id': 111,
                         'media_type': 'movie'}]
+
+
+class TestSeerrCrossTypeCollision:
+    """A movie and a show sharing a display title in one scan cross-
+    contaminate the shared per-title bookkeeping dicts (upgrade flags,
+    new-file counts) — such titles are skipped outright."""
+
+    def test_title_in_both_symlink_sets_skipped(self):
+        movies = [{'title': 'Fargo', 'year': 1996, '_radarr_tmdb_id': 275}]
+        shows = [{'title': 'Fargo', 'year': 2014, 'tmdb_id': 60622,
+                  'missing_episodes': 0}]
+        out = library._build_delivered_for_seerr(
+            {'Fargo'}, {'Fargo'}, shows, movies,
+            {}, {}, {'Fargo': [{'file': 'x.mkv'}]}, {}, False,
+            years={'Fargo': 2014})
+        assert out == []
+
+
+class TestSeerrNormalizedTitleFallback:
+    """Exact-lowercase arr-map lookup misses punctuation/rename variants
+    ('F1 The Movie' vs Radarr's 'F1'); the normalized-title map is the
+    established fallback for exactly this."""
+
+    def test_norm_map_resolves_when_exact_misses(self):
+        from utils.library import _norm_for_matching
+        norm_key = _norm_for_matching('F1: The Movie')
+        out = library._build_delivered_for_seerr(
+            set(), {'F1: The Movie'}, [], [{'title': 'F1: The Movie'}],
+            {}, {}, {'F1: The Movie': [{'file': 'f1.mkv'}]}, {}, False,
+            years={}, radarr_map_norm={norm_key: {'tmdb_id': 911430}})
+        assert out == [{'title': 'F1: The Movie', 'tmdb_id': 911430,
+                        'media_type': 'movie'}]
