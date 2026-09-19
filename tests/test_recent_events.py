@@ -255,6 +255,9 @@ class TestSeveritySyncGuard:
         'rescan_triggered', 'repair', 'local_fallback_triggered',
         'arr_deleted', 'debrid', 'debrid_add', 'routing_repaired',
         'tb_cached_alt_grabbed', 'compromise_grabbed',
+        # Seerr writeback outcomes are routine info — the interesting
+        # event (delivery / give-up) already has its own feed entry.
+        'seerr_writeback',
     })
 
     def _emitted_types(self):

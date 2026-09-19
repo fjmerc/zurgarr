@@ -128,6 +128,11 @@ CAUSE_MOUNT_DEFERRED_START = 'mount_deferred_start'
 # provider account nears its expiration.  Change-gated — fires only when
 # the warning set differs from the previous sweep, never per-torrent.
 CAUSE_DEBRID_EXPIRY_WARNING = 'debrid_expiry_warning'
+# Seerr request-status writeback (opt-in): the matching Overseerr request
+# was marked available after a scanner delivery, or declined after a
+# terminal wanted give-up.
+CAUSE_SEERR_MARKED_AVAILABLE = 'seerr_marked_available'
+CAUSE_SEERR_REQUEST_DECLINED = 'seerr_request_declined'
 
 
 def init(config_dir='/config'):

@@ -2396,6 +2396,32 @@ class OverseerrClient(_ArrClientBase):
         results = result.get('results', [])
         return results[0] if results else None
 
+    def list_requests(self, take=100, skip=0, filter='approved'):
+        """One page of Overseerr requests. Returns the raw page dict
+        ({'pageInfo', 'results'}) or None on error."""
+        return self._get('/api/v1/request', {
+            'take': str(take),
+            'skip': str(skip),
+            'filter': filter,
+        })
+
+    def mark_media_available(self, media_id):
+        """Mark an Overseerr media item available (the writeback the
+        requester sees). Returns True on success."""
+        if not isinstance(media_id, int):
+            return False
+        result = self._post(f'/api/v1/media/{media_id}/available',
+                            {'is4k': False})
+        return result is not None
+
+    def decline_request(self, request_id):
+        """Decline an Overseerr request (the closest thing its API has to
+        'failed'). Returns True on success."""
+        if not isinstance(request_id, int):
+            return False
+        result = self._post(f'/api/v1/request/{request_id}/decline')
+        return result is not None
+
     def request_tv(self, tmdb_id, seasons):
         """Request a TV show (specific seasons) in Overseerr.
 

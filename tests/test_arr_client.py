@@ -2486,3 +2486,50 @@ class TestMarkDownloadFailed:
     def test_radarr_inherits_same_method(self):
         # Sonarr/Radarr parity by inheritance — one implementation on the base.
         assert RadarrClient.mark_download_failed is SonarrClient.mark_download_failed
+
+
+class TestOverseerrWriteback:
+    """Status-writeback additions: list requests, mark media available,
+    decline a request."""
+
+    @patch('urllib.request.urlopen')
+    def test_list_requests_params_and_results(self, mock_urlopen, overseerr):
+        mock_urlopen.return_value = _mock_urlopen({
+            'pageInfo': {'pages': 1, 'results': 1},
+            'results': [{'id': 9, 'type': 'movie',
+                         'media': {'id': 5, 'tmdbId': 27205, 'status': 3}}],
+        })
+        out = overseerr.list_requests(take=100, skip=0, filter='approved')
+        assert out['results'][0]['media']['tmdbId'] == 27205
+        url = mock_urlopen.call_args[0][0].full_url
+        assert '/api/v1/request?' in url
+        assert 'take=100' in url and 'skip=0' in url and 'filter=approved' in url
+
+    @patch('urllib.request.urlopen')
+    def test_mark_media_available_posts_expected_body(self, mock_urlopen, overseerr):
+        mock_urlopen.return_value = _mock_urlopen({'id': 5, 'status': 5})
+        assert overseerr.mark_media_available(5) is True
+        req = mock_urlopen.call_args[0][0]
+        assert req.full_url.endswith('/api/v1/media/5/available')
+        import json as _json
+        assert _json.loads(req.data.decode()) == {'is4k': False}
+
+    @patch('urllib.request.urlopen')
+    def test_mark_media_available_failure_returns_false(self, mock_urlopen, overseerr):
+        import urllib.error
+        mock_urlopen.side_effect = urllib.error.URLError('down')
+        assert overseerr.mark_media_available(5) is False
+
+    @patch('urllib.request.urlopen')
+    def test_decline_request_posts_status_path(self, mock_urlopen, overseerr):
+        mock_urlopen.return_value = _mock_urlopen({'id': 9, 'status': 3})
+        assert overseerr.decline_request(9) is True
+        req = mock_urlopen.call_args[0][0]
+        assert req.full_url.endswith('/api/v1/request/9/decline')
+
+    @patch('urllib.request.urlopen')
+    def test_decline_request_rejects_junk_id(self, mock_urlopen, overseerr):
+        """IDs are interpolated into the URL path — only ints allowed."""
+        assert overseerr.decline_request('9; rm -rf') is False
+        assert overseerr.mark_media_available(None) is False
+        assert mock_urlopen.call_count == 0

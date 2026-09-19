@@ -401,3 +401,23 @@ def test_debrid_expiry_warning_in_js_table():
     to the raw detail string."""
     from utils.activity_format import FORMATTER_JS
     assert 'debrid_expiry_warning:' in FORMATTER_JS
+
+
+def test_seerr_marked_available():
+    ev = _ev('seerr_marked_available', tmdb_id=27205, request_id=9)
+    s = format_event(ev)['short']
+    assert 'marked available' in s.lower()
+    assert 'seerr' in s.lower()
+
+
+def test_seerr_request_declined():
+    ev = _ev('seerr_request_declined', tmdb_id=27205, request_id=9)
+    s = format_event(ev)['short']
+    assert 'declined' in s.lower()
+    assert 'gave up' in s.lower()
+
+
+def test_seerr_causes_in_js_table():
+    from utils.activity_format import FORMATTER_JS
+    assert 'seerr_marked_available:' in FORMATTER_JS
+    assert 'seerr_request_declined:' in FORMATTER_JS

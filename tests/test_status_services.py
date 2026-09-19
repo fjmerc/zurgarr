@@ -80,3 +80,18 @@ class TestSearchEnabledFlag:
 
     def test_disabled_with_neither(self):
         assert ss._search_enabled() is False
+
+
+class TestSeerrTileAuthedProbe:
+    """The Seerr tile must probe an endpoint that fails on a dead key —
+    the original /status ping was public and showed false green (the
+    documented 'Seerr tile mistake')."""
+
+    def test_probe_hits_authed_request_endpoint(self, monkeypatch, fake_check):
+        monkeypatch.setenv('SEERR_ADDRESS', 'http://overseerr:5055')
+        monkeypatch.setenv('SEERR_API_KEY', 'seerr-key')
+        ss.check_services()
+        call = next(c for c in fake_check if c['name'] == 'Overseerr')
+        assert call['url'] == 'http://overseerr:5055/api/v1/request?take=1'
+        assert 'seerr-key' not in call['url']
+        assert call['headers'].get('X-Api-Key') == 'seerr-key'

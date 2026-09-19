@@ -23,7 +23,12 @@ import re
 import time
 import urllib.parse
 
-from base import load_secret_or_env
+# base is imported as a module and its secret helper resolved at CALL
+# time, not from-imported: this module loads lazily mid-scan, and an
+# import-time binding freezes whatever base.load_secret_or_env happens
+# to be at first import (bit the test suite: a wanted-recovery test's
+# patched helper got frozen in and disabled Tautulli for the session).
+import base as _base
 # Module-level import is safe one-way: utils.search never imports this
 # module (same posture as prowlarr.py).
 from utils.search import _urllib_get
@@ -57,7 +62,7 @@ def _get_tautulli_url():
 
 
 def _get_tautulli_key():
-    return load_secret_or_env('tautulli_api_key')
+    return _base.load_secret_or_env('tautulli_api_key')
 
 
 def is_tautulli_configured():

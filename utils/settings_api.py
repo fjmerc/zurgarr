@@ -210,6 +210,8 @@ ENV_SCHEMA = [
             ('PLEX_ADDRESS', 'Plex Address', 'url', False, 'Plex server URL (e.g., http://192.168.1.100:32400)'),
             ('SEERR_ADDRESS', 'Overseerr/Jellyseerr Address', 'url', False, 'Request management server URL'),
             ('SEERR_API_KEY', 'Overseerr/Jellyseerr API Key', 'secret', False, 'API key for Overseerr/Jellyseerr'),
+            ('SEERR_WRITEBACK_ENABLED', 'Seerr Request Writeback', 'boolean', False,
+             'Close the request loop: when the library scanner delivers requested content, mark the matching Overseerr/Jellyseerr request available (movies always; shows once complete); when Wanted recovery terminally gives up on a movie, decline its request so the requester sees "not coming" instead of eternal processing. OFF by default because it changes user-visible request state in Seerr. Requires the address + API key above (default: OFF).'),
             ('PD_LOG_LEVEL', 'Log Level', 'select:DEBUG,INFO,WARNING,ERROR,CRITICAL', False, 'plex_debrid log level'),
             ('PD_UPDATE', 'Auto-Update plex_debrid', 'boolean', False, 'Check for updates on startup'),
             ('PD_REPO', 'plex_debrid Repository', 'string', False, 'GitHub repo (owner/repo format)'),
@@ -365,6 +367,9 @@ _ENV_DEFAULTS = {
     # utils/tautulli.py::history_days() and base/__init__.py Config.
     'WANTED_DEPRIORITIZE_UNPLAYED': 'true',
     'TAUTULLI_HISTORY_DAYS': '180',
+    # Seerr writeback is opt-in — matches
+    # utils/seerr_writeback.py::writeback_enabled() and base Config.
+    'SEERR_WRITEBACK_ENABLED': 'false',
     # Mount self-heal defaults ON — matches
     # utils/scheduled_tasks.py::_selfheal_enabled() and base/__init__.py Config.
     'MOUNT_SELFHEAL_ENABLED': 'true',

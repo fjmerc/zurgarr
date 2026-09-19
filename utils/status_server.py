@@ -448,15 +448,18 @@ def check_services():
     seerr_addr = os.environ.get('SEERR_ADDRESS') or _get_secret_or_env('seerr_address', 'SEERR_ADDRESS')
     seerr_key = os.environ.get('SEERR_API_KEY') or _get_secret_or_env('seerr_api_key', 'SEERR_API_KEY')
     if seerr_addr and seerr_key:
+        # /api/v1/request requires a valid key (401 on a dead one) —
+        # the original public /status ping showed false green forever.
         svc, resp = _check_service(
             'Overseerr', 'automation',
-            f'{seerr_addr}/api/v1/status',
+            f'{seerr_addr}/api/v1/request?take=1',
             headers={'X-Api-Key': seerr_key})
         svc['url'] = seerr_addr
         services.append(svc)
 
     # Prowlarr (search source).  /api/v1/health requires a valid key, so
-    # a dead key shows red here — unlike Seerr's public /status ping.
+    # a dead key shows red here — same authed-probe rule as the Seerr
+    # tile above (which historically pinged the public /status).
     prowlarr_url = (os.environ.get('PROWLARR_URL') or '').rstrip('/')
     prowlarr_key = _get_secret_or_env('prowlarr_api_key', 'PROWLARR_API_KEY')
     if prowlarr_url and prowlarr_key:
