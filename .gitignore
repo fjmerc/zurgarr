@@ -381,3 +381,4 @@ htmlcov/
 .claude
 CLAUDE.md
 .playwright-mcp/
+.impeccable/
