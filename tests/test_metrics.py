@@ -280,3 +280,33 @@ class TestDebridQuotaGauges:
             debrid_quota._run_sweep(now=now)
         out = MetricsRegistry().format_metrics()
         assert 'provider="realdebrid"' not in out
+
+
+class TestAlwaysEmittedBlackholeCounters:
+    """Conditionally-emitted counters are born at >=1, so rate() credits
+    nothing at series birth and the first event is invisible. Unlabeled
+    blackhole counters must always emit, 0 included."""
+
+    def test_zero_valued_counters_present(self):
+        out = MetricsRegistry().format_metrics()
+        for line in (
+            'zurgarr_blackhole_retry_total 0',
+            'zurgarr_blackhole_torrent_timeout_total 0',
+            'zurgarr_blackhole_disc_rip_rejected_total 0',
+            'zurgarr_blackhole_symlink_created_total 0',
+            'zurgarr_blackhole_symlink_failed_total 0',
+        ):
+            assert line in out, line
+
+    def test_restart_metric_declared_gauge(self):
+        """process_restart_total is a windowed, resettable value (zeroed
+        1h after a burst, on manual restart, on supervision re-arm) — a
+        counter declaration is a lie Prometheus acts on. The emission is
+        conditional on registered processes, so assert on the source."""
+        import os
+        import utils.metrics as metrics_mod
+        with open(os.path.abspath(metrics_mod.__file__)) as f:
+            source = f.read()
+        assert re.search(
+            r"_emit\(lines,\s*'process_restart_total',[^)]*'gauge'",
+            source, re.S)

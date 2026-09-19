@@ -57,8 +57,14 @@ class MetricsRegistry:
                  p.get('restart_count', 0))
                 for p in procs
             ]
+            # Gauge, not counter: the underlying value is the crash count
+            # inside the supervisor's current backoff window — zeroed 1h
+            # after a burst, on manual restart, and on supervision re-arm —
+            # so it is routinely non-monotone. The name keeps its historical
+            # _total suffix for scrape compatibility.
             _emit(lines, 'process_restart_total',
-                  'Total restart count per process', 'counter', samples)
+                  'Crash-restart count within the current backoff window per process',
+                  'gauge', samples)
 
         mounts = data.get('mounts', [])
         if mounts:
@@ -88,11 +94,24 @@ class MetricsRegistry:
             _emit(lines, 'blackhole_processed_total',
                   'Torrent files processed by blackhole', 'counter', samples)
 
-        retry_val = self.get_counter('blackhole_retry')
-        if retry_val:
-            _emit(lines, 'blackhole_retry_total',
-                  'Total retry attempts for failed files', 'counter',
-                  [('', retry_val)])
+        # Unlabeled blackhole counters are always emitted, 0 included — a
+        # conditionally-emitted counter is born at >=1 and rate() credits
+        # nothing at series birth, hiding the first event of each kind.
+        _emit(lines, 'blackhole_retry_total',
+              'Total retry attempts for failed files', 'counter',
+              [('', self.get_counter('blackhole_retry'))])
+        _emit(lines, 'blackhole_torrent_timeout_total',
+              'Torrents abandoned after the download timeout', 'counter',
+              [('', self.get_counter('blackhole_torrent_timeout'))])
+        _emit(lines, 'blackhole_disc_rip_rejected_total',
+              'Disc-rip releases rejected by the blackhole', 'counter',
+              [('', self.get_counter('blackhole_disc_rip_rejected'))])
+        _emit(lines, 'blackhole_symlink_created_total',
+              'Symlinks created by the blackhole', 'counter',
+              [('', self.get_counter('blackhole_symlink_created'))])
+        _emit(lines, 'blackhole_symlink_failed_total',
+              'Symlink creations that failed in the blackhole', 'counter',
+              [('', self.get_counter('blackhole_symlink_failed'))])
 
         event_samples = [
             (f'level="{level}"', self.get_counter('events', {'level': level}))
