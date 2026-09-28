@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Status page: long service errors no longer spill across neighbouring cards**: the "Last error" line on a provider card inherited the metric chips' no-wrap styling, so long upstream errors (e.g. `HTTPSConnectionPool(...)` traces) ran straight across the rest of the Services row. The error now wraps (breaking long tokens), is clamped to three lines, and shows the full text on hover.
+
 - **Status page: the Overseerr tile can now actually turn red**: the tile probed the public `/api/v1/status` endpoint, which answers 200 with a dead or wrong API key — the long-documented "Seerr tile mistake". It now probes the authenticated `/api/v1/request?take=1`, so a bad key finally shows as an error instead of false green.
 
 - **Canned Grafana dashboard for the /metrics exporter** (`grafana/zurgarr-dashboard.json` + import/scrape instructions in `grafana/README.md`): five rows — Overview (up/uptime, per-service and per-process health, restart trend), Debrid Quota & Expiry (per-provider account days-remaining with the same amber ≤7 / red ≤3 thresholds as the app's banners, near-expiry count, storage/torrent trends), Pipeline (blackhole throughput + retries, events by level, network), System (CPU/memory/disk/fd gauges), and Mount state timelines. Imports against any Prometheus datasource (prompted at import; dashboard uid `zurgarr` so re-imports update in place). A new CI sync-guard (`tests/test_grafana_dashboard.py`) cross-checks the dashboard's queries against the metrics `utils/metrics.py` actually emits — in both directions — so a renamed or newly added metric fails the build until the dashboard catches up.

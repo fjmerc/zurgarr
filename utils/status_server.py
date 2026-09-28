@@ -1035,7 +1035,8 @@ function renderServices(svcs){
       h+='<details class="svc-more"'+(_svcOpen[s.name]?' open':'')+'><summary>Metrics</summary><div class="svc-health">'+mh+'</div></details>';
     }
     if(ph&&ph.last_error){
-      h+='<div class="svc-health svc-err"><span>Last error: '+esc(ph.last_error)+(ph.last_error_time?' ('+esc(ph.last_error_time)+')':'')+'</span></div>';
+      const errTxt='Last error: '+esc(ph.last_error)+(ph.last_error_time?' ('+esc(ph.last_error_time)+')':'');
+      h+='<div class="svc-health svc-err"><span title="'+errTxt.replace(/"/g,'&quot;')+'">'+errTxt+'</span></div>';
     }
     h+='</div>';
     if(s.days_remaining!==undefined&&s.days_remaining!==null){
@@ -1548,6 +1549,9 @@ th{color:var(--text2);font-weight:500;font-size:.75em;text-transform:uppercase;l
 .svc-more>summary:focus-visible{outline:2px solid var(--blue);outline-offset:2px;border-radius:2px}
 .svc-more .svc-health{margin-top:5px}
 .svc-health.svc-err{color:var(--red);margin-top:4px}
+/* Upstream errors (e.g. HTTPSConnectionPool traces) are long unbroken strings; the
+   metric chips' nowrap must not apply or they spill across neighbouring cards. */
+.svc-health.svc-err span{white-space:normal;overflow-wrap:anywhere;min-width:0;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
 @media(pointer:coarse){.svc-more>summary{min-height:32px}}
 .svc-item .svc-info{flex:1;min-width:0;margin-left:8px}
 .svc-item .svc-name{font-size:.85em;font-weight:500;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
