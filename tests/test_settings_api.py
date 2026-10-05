@@ -1779,3 +1779,54 @@ class TestSourcesAndExplicitSave:
         result = write_env_values(values)
         assert result['status'] == 'error'
         assert any('RD_API_KEY' in e and 'Docker secret' in e for e in result['errors'])
+
+
+class TestSchemaTiers:
+
+    def test_every_field_has_a_tier(self):
+        schema = get_env_schema()
+        for cat in schema['categories']:
+            for field in cat['fields']:
+                assert field['tier'] in ('essential', 'feature', 'advanced')
+
+    def test_categories_carry_gate(self):
+        cats = {c['name']: c for c in get_env_schema()['categories']}
+        assert cats['Blackhole']['gate']['key'] == 'BLACKHOLE_ENABLED'
+        assert cats['rclone']['gate'] is None
+
+
+class TestAutoSourcesForDerivedKeys:
+
+    @pytest.fixture(autouse=True)
+    def _fresh(self, monkeypatch):
+        from utils import config_resolve
+        monkeypatch.setattr(config_resolve, '_WRITTEN', {})
+        monkeypatch.setattr(config_resolve, '_CURRENT', {})
+        for key in ('BLACKHOLE_DEBRID_ROUTING', 'BLACKHOLE_DEBRID_PRIMARY',
+                    'BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX', 'DEBRID_HEALTH_CROSS_RESCUE',
+                    'RD_API_KEY', 'AD_API_KEY', 'TORBOX_API_KEY', 'BLACKHOLE_DEBRID'):
+            monkeypatch.delenv(key, raising=False)
+
+    def test_auto_sources_for_already_derived_keys(self, monkeypatch):
+        from utils import config_resolve
+        from utils.settings_api import get_env_sources
+        monkeypatch.setenv('RD_API_KEY', 'k1')
+        monkeypatch.setenv('TORBOX_API_KEY', 'k2')
+        monkeypatch.setenv('BLACKHOLE_SYMLINK_TARGET_BASE', '/mnt/debrid')
+        config_resolve.apply(config_resolve.resolve(os.environ, {}))
+        src = get_env_sources()
+        assert src['BLACKHOLE_DEBRID_ROUTING']['source'] == 'auto'
+        assert 'cache_aware' in src['BLACKHOLE_DEBRID_ROUTING']['reason']
+        assert src['BLACKHOLE_DEBRID_PRIMARY']['source'] == 'auto'
+        assert 'realdebrid' in src['BLACKHOLE_DEBRID_PRIMARY']['reason']
+        assert src['DEBRID_HEALTH_CROSS_RESCUE']['source'] == 'auto'
+        assert 'on' in src['DEBRID_HEALTH_CROSS_RESCUE']['reason']
+        assert src['BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX']['source'] == 'auto'
+        assert '/mnt/debrid_torbox' in src['BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX']['reason']
+
+    def test_explicit_value_is_not_reported_auto(self, monkeypatch):
+        from utils import config_resolve
+        from utils.settings_api import get_env_sources
+        config_resolve.apply(config_resolve.resolve(
+            os.environ, {'BLACKHOLE_DEBRID_ROUTING': 'primary_only'}))
+        assert get_env_sources()['BLACKHOLE_DEBRID_ROUTING']['source'] == 'set'

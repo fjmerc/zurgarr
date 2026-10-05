@@ -350,6 +350,7 @@ def _is_sensitive(key):
 
 def get_env_schema():
     """Return the env var schema as a JSON-serializable structure."""
+    from utils.settings_tiers import GATES, tier_for
     categories = []
     for cat in ENV_SCHEMA:
         fields = []
@@ -361,12 +362,14 @@ def get_env_schema():
                 'required': required,
                 'help': help_text,
                 'sensitive': _is_sensitive(key),
+                'tier': tier_for(key),
             }
             fields.append(field)
         categories.append({
             'name': cat['name'],
             'description': cat['description'],
             'fields': fields,
+            'gate': GATES.get(cat['name']),
         })
     return {'categories': categories}
 
@@ -411,6 +414,33 @@ def read_env_values():
     return result
 
 
+def _derived_reasons():
+    """Human reasons for keys resolved at runtime by their own modules."""
+    reasons = {}
+    try:
+        from utils import debrid_routing as dr
+        configured = dr.configured_debrids()
+        mode = dr.resolve_routing_mode()
+        reasons['BLACKHOLE_DEBRID_ROUTING'] = (
+            f'{mode} — {len(configured)} debrid provider(s) configured')
+        primary = dr.resolve_primary()
+        if primary:
+            reasons['BLACKHOLE_DEBRID_PRIMARY'] = f'{primary} — first configured provider'
+        tb_base = dr.symlink_target_base_for_debrid(dr.TORBOX)
+        if tb_base:
+            reasons['BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX'] = f'{tb_base} — the Real-Debrid base + _torbox'
+    except Exception:
+        pass
+    try:
+        from utils.debrid_health import _cross_rescue_enabled
+        reasons['DEBRID_HEALTH_CROSS_RESCUE'] = (
+            'on — Real-Debrid and TorBox are both configured' if _cross_rescue_enabled()
+            else 'off — needs both Real-Debrid and TorBox')
+    except Exception:
+        pass
+    return reasons
+
+
 def get_env_sources():
     """Provenance for every schema key: {'source', 'reason'} (see config_resolve)."""
     from utils import config_resolve
@@ -427,6 +457,11 @@ def get_env_sources():
                 out[key] = {'source': 'unset', 'reason': None}
         else:
             out[key] = {'source': r.source, 'reason': r.reason}
+    # Keys whose value is already worked out at runtime by the module that
+    # uses them (unset means "automatic"): explain what that resolves to.
+    for key, reason in _derived_reasons().items():
+        if out.get(key, {}).get('source') == 'unset' and reason:
+            out[key] = {'source': 'auto', 'reason': reason}
     return out
 
 
