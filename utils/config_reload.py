@@ -124,8 +124,9 @@ def _zurg_auto():
     return r is not None and r.source == 'auto'
 
 
-_FUSE_ONLY_KEYS = frozenset({'RCLONE_POLL_INTERVAL', 'TORBOX_RCLONE_TPSLIMIT',
-                             'TORBOX_RCLONE_TPSLIMIT_BURST'})
+# (not RCLONE_POLL_INTERVAL: rclone reads RCLONE_* from its environment too,
+# `serve nfs` included)
+_FUSE_ONLY_KEYS = frozenset({'TORBOX_RCLONE_TPSLIMIT', 'TORBOX_RCLONE_TPSLIMIT_BURST'})
 # Every setting restart_pending can name (the save banner checks these).
 REPORTED_KEYS = _boot.SNAPSHOT_KEYS | {'TORBOX_API_KEY'}
 
@@ -156,28 +157,37 @@ def restart_pending(get=None, auto=None):
         if not (boot.torbox or live.torbox):
             keys -= _TORBOX_MOUNT_KEYS      # no TorBox mount then or now
         if (boot.zurg and live.zurg and boot.torbox != live.torbox
+                and bool(now('TORBOX_API_KEY')) != bool(start.get('TORBOX_API_KEY'))
                 and not keys & {'TORBOX_WEBDAV_USER', 'TORBOX_WEBDAV_PASS'}):
             keys.add('TORBOX_API_KEY')      # the key alone switched the TorBox mount
         if 'ZURG_ENABLED' in keys and len(keys) > 1 and (_zurg_auto() if auto is None else auto):
             keys.discard('ZURG_ENABLED')    # name what the user changed
     if boot.zurg:
-        # Zurg's Plex-refresh hook is written into its config at start
-        if changed('PLEX_REFRESH'):
-            keys.add('PLEX_REFRESH')
-        if start.get('PLEX_REFRESH') and changed('PLEX_MOUNT_DIR'):
-            keys.add('PLEX_MOUNT_DIR')
-        # duplicate cleanup / Zurg updates: switching off applies at once,
-        # switching on (or re-scheduling) needs the start-up registration
-        if not start.get('DUPLICATE_CLEANUP') and now('DUPLICATE_CLEANUP'):
+        # Zurg's Plex-refresh hook is written into its config at start (with
+        # the Plex address/token/mount it had then)
+        plex = ('PLEX_REFRESH', 'PLEX_ADDRESS', 'PLEX_TOKEN', 'PLEX_MOUNT_DIR')
+        hook_now = bool(now('PLEX_REFRESH') and all(now(k) for k in plex[1:]))
+        hook_then = _boot.started('plex_hook')
+        if hook_now != hook_then or (hook_now and any(changed(k) for k in plex[1:])):
+            keys |= {k for k in plex if changed(k)}
+        # duplicate cleanup: switching off applies at once; on (or a new
+        # interval) needs the start-up registration — when it would register
+        if _boot.started('duplicate_cleanup'):
+            if changed('CLEANUP_INTERVAL'):
+                keys.add('CLEANUP_INTERVAL')
+        elif now('DUPLICATE_CLEANUP') and now('PLEX_ADDRESS') and now('PLEX_TOKEN'):
             keys.add('DUPLICATE_CLEANUP')
-        if start.get('DUPLICATE_CLEANUP') and changed('CLEANUP_INTERVAL'):
-            keys.add('CLEANUP_INTERVAL')
-        if not start.get('ZURG_UPDATE') and now('ZURG_UPDATE'):
+        # Zurg updates: same — and a pinned (non-nightly) version never updates
+        version = now('ZURG_VERSION').lower()
+        if (not _boot.started('Zurg_update') and now('ZURG_UPDATE')
+                and (not version or 'nightly' in version)):
             keys.add('ZURG_UPDATE')
-    pd_at_start = bool(start.get('PD_ENABLED'))
-    if pd_at_start and not start.get('PD_UPDATE') and now('PD_UPDATE'):
-        keys.add('PD_UPDATE')
-    if (((boot.zurg and start.get('ZURG_UPDATE')) or (pd_at_start and start.get('PD_UPDATE')))
+    if _boot.started('plex_debrid'):
+        if not _boot.started('plex_debrid_update') and now('PD_UPDATE') and now('PD_REPO'):
+            keys.add('PD_UPDATE')
+    elif now('PD_ENABLED'):
+        keys.add('PD_ENABLED')        # plex_debrid is set up only at start
+    if ((_boot.started('Zurg_update') or _boot.started('plex_debrid_update'))
             and changed('AUTO_UPDATE_INTERVAL')):
         keys.add('AUTO_UPDATE_INTERVAL')
     return sorted(keys)
@@ -199,6 +209,8 @@ def _drop_not_running(services):
     from utils.processes import _process_registry, _registry_lock
     with _registry_lock:
         running = {e['process_name'].lower() for e in _process_registry}
+    if not _boot.STARTUP_COMPLETE.is_set() and _boot.started('plex_debrid'):
+        running.add('plex_debrid')   # being set up: the deferred pass restarts it
     return {s for s in services if s != 'plex_debrid' or s in running}
 
 
@@ -286,6 +298,9 @@ def _restart_plex_debrid(changed):
             except Exception as e:
                 logger.error(f"[reload] Failed to rewrite Trakt .env: {e}")
 
+        if (os.environ.get('PD_ENABLED') or '').strip().lower() != 'true':
+            logger.info("[reload] plex_debrid switched off — stopped, not restarted")
+            return
         for e in entries:
             if _proc_mod._shutting_down:
                 logger.info("[reload] Aborting restart — shutdown in progress")
@@ -306,20 +321,45 @@ _deferred_lock = threading.Lock()
 
 
 def _apply_service_restarts(services, changed):
+    """Restart *services* (plex_debrid / blackhole); returns those restarted.
+    One failing never skips the other; nothing restarts during shutdown."""
+    import utils.processes as _proc_mod
+    if _proc_mod._shutting_down:
+        return set()
     services = _drop_not_running(services)
     if services:
         logger.info(f"[reload] Restarting: {', '.join(service_labels(services))}")
+    done = set()
     if 'plex_debrid' in services:
-        _restart_plex_debrid(changed)
-    if 'blackhole' in services:
+        try:
+            _restart_plex_debrid(changed)
+            done.add('plex_debrid')
+        except Exception as e:
+            logger.error(f"[reload] Failed to restart plex_debrid: {e}")
+    if 'blackhole' in services and not _proc_mod._shutting_down:
         try:
             from utils import blackhole
             blackhole.stop()
             blackhole.setup()
+            done.add('blackhole')
             logger.info("[reload] Blackhole watcher restarted")
         except Exception as e:
             logger.error(f"[reload] Failed to restart blackhole: {e}")
-    return services
+    return done
+
+
+def _report_restarts(services):
+    """Recent Events + notification for restarts done after the reload
+    itself returned (deferred to the end of startup)."""
+    if not services:
+        return
+    try:
+        from utils.status_server import status_data
+        status_data.add_event('config_reload',
+                              f'Startup finished — restarted: {", ".join(service_labels(services))}')
+    except Exception:
+        pass
+    _notify_reload(set(), services)
 
 
 def _run_deferred():
@@ -332,7 +372,10 @@ def _run_deferred():
         _deferred.update(services=set(), changed=set(), thread=None)
     if services:
         logger.info("[reload] Startup finished — applying deferred service restarts")
-        _apply_service_restarts(services, changed)
+        try:
+            _report_restarts(_apply_service_restarts(services, changed))
+        except Exception as e:
+            logger.error(f"[reload] Deferred service restarts failed: {e}")
 
 
 def _restart_services(services, changed):
@@ -344,6 +387,9 @@ def _restart_services(services, changed):
         return set()
     if _boot.STARTUP_COMPLETE.is_set():
         return _apply_service_restarts(todo, changed)
+    todo = _drop_not_running(todo)   # e.g. plex_debrid not used on this install
+    if not todo:
+        return set()
     with _deferred_lock:
         _deferred['services'] |= todo
         _deferred['changed'] |= set(changed)

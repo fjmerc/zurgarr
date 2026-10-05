@@ -53,7 +53,7 @@ def test_record_and_load_round_trip(tmp_path, monkeypatch):
     assert boot_layout.load(str(path)) == {
         'zurg': True, 'instances': ['RD'],
         'rclone_mount_name': 'zurgarr', 'torbox_mount_name': 'tb',
-        'nfs': False, 'torbox': False}
+        'nfs': False, 'torbox': False, 'pd': False}
 
 
 def test_clear_removes_a_previous_runs_record(tmp_path):
@@ -94,6 +94,16 @@ class TestHealthcheckFollowsBoot:
         assert f == {'zurg': True, 'rd': True, 'ad': False, 'rclone_rd': 'zurgarr',
                      'rclone_ad': 'zurgarr', 'torbox': 'tb', 'nfs': False,
                      'torbox_mount': False}
+
+    def test_plex_debrid_expected_as_started(self, tmp_path, monkeypatch):
+        import healthcheck
+        path = tmp_path / 'boot_layout.json'
+        path.write_text(json.dumps({'zurg': False, 'instances': [], 'pd': False}))
+        monkeypatch.setattr(boot_layout, 'PATH', str(path))
+        assert healthcheck._plex_debrid_expected(pd='true', connected=True) is False
+        path.write_text(json.dumps({'zurg': False, 'instances': [], 'pd': True}))
+        assert healthcheck._plex_debrid_expected(pd='false', connected=True) is True
+        assert healthcheck._plex_debrid_expected(pd='true', connected=False) is False
 
     def test_torbox_mount_and_nfs_mode_follow_the_record(self, tmp_path, monkeypatch):
         # Zurg off at boot → no TorBox mount was started, even with creds set
@@ -319,9 +329,15 @@ class TestLibraryFollowsRunningZurg:
         monkeypatch.setattr(boot_layout, 'BOOT_LAYOUT',
                             Layout(True, frozenset({'RD'}), 'z', False, '', 'torbox', True))
         monkeypatch.delenv('TORBOX_API_KEY', raising=False)     # removed after start
-        assert boot_layout.torbox_mount_started() is True
-        import inspect
-        assert 'torbox_mount_started()' in inspect.getsource(library.LibraryScanner._discover_torbox_mount)
+        mount = tmp_path / 'torbox'
+        mount.mkdir()
+        from utils import debrid_routing
+        monkeypatch.setattr(debrid_routing, 'mount_for_debrid',
+                            lambda d, **kw: str(mount) if d == 'torbox' else None)
+        assert library.LibraryScanner._discover_torbox_mount() == str(mount)   # still scanned
+        monkeypatch.setattr(boot_layout, 'BOOT_LAYOUT',
+                            Layout(True, frozenset({'RD'}), 'z', False, '', '', False))
+        assert library.LibraryScanner._discover_torbox_mount() is None          # never started
 
 
 def test_no_mount_for_an_instance_that_did_not_start(monkeypatch):
@@ -368,7 +384,7 @@ def _settings_read_by(paths):
     root = pathlib.Path(__file__).resolve().parents[1]
     base_src = (root / 'base' / '__init__.py').read_text()
     attr_env = {a: e.upper() for a, e in re.findall(
-        r"self\.(\w+) = (?:os\.getenv|load_secret_or_env|_env|os\.environ\.get)\(['\"](\w+)['\"]", base_src)}
+        r"self\.(\w+) = \(?\s*(?:os\.getenv|load_secret_or_env|_env|os\.environ\.get)\(['\"](\w+)['\"]", base_src)}
     keys = set()
     for p in paths:
         src = (root / p).read_text()
@@ -382,16 +398,47 @@ def test_every_setting_zurg_and_rclone_setup_read_is_startup_only():
     # needing a restart — or be listed here with the reason it isn't
     not_startup = {
         'ZURG_CURRENT_VERSION': 'internal state, not a setting',
-        'LOG_LEVEL': 'derived per process (zurg_log_level)',
-        'TORBOX_API_KEY': 'reported when it alone switches the TorBox mount',
-        'PLEX_ADDRESS': "plex_refresh.py reads it live from Zurg's env at each run",
-        'PLEX_TOKEN': "plex_refresh.py reads it live from Zurg's env at each run",
-        'ZURGARR_LOG_LEVEL': 'zurgarr setting; rclone/Zurg use its startup value',
-        'PLEXDEBRID': None, 'PD_ENABLED': 'plex_debrid, applied by reload',
-        'DUPLICATE_CLEANUP': 'conditional (restart_pending rules)',
-        'SKIP_VALIDATION': 'not used by setup',
+        'ZURGARR_LOG_LEVEL': "zurgarr's own setting; rclone/Zurg use its startup value",
     }
-    read = _settings_read_by(['rclone/rclone.py', 'zurg/setup.py', 'zurg/update.py'])
+    read = _settings_read_by(['rclone/rclone.py', 'zurg/setup.py', 'zurg/update.py', 'zurg/download.py'])
     read = {k for k in read if not k.startswith('ZURG_PORT_')}       # internal
     missing = sorted(read - boot_layout.SNAPSHOT_KEYS - set(not_startup))
     assert missing == []
+    assert set(not_startup) <= read                       # no stale exemptions
+
+
+class TestWhatStartedIsRecorded:
+
+    @pytest.fixture(autouse=True)
+    def _fresh(self, monkeypatch):
+        monkeypatch.setattr(boot_layout, 'STARTED', {})
+
+    def test_auto_update_thread(self, monkeypatch):
+        from utils.auto_update import Update
+        u = Update.__new__(Update)
+        u.logger = __import__('unittest.mock', fromlist=['MagicMock']).MagicMock()
+        monkeypatch.setattr(u, 'update_check', lambda name: True, raising=False)
+        monkeypatch.setattr(u, 'update_schedule', lambda name: None, raising=False)
+        monkeypatch.setattr(u, 'start_process', lambda name: None, raising=False)
+        u.auto_update('Zurg', True)
+        assert boot_layout.started('Zurg_update')
+        u.auto_update('plex_debrid', False)
+        assert not boot_layout.started('plex_debrid_update')
+
+    def test_plex_hook(self, tmp_path, monkeypatch):
+        from zurg import setup as zs
+        monkeypatch.setattr(zs.shutil, 'copy', lambda *a: None)
+        cfg = tmp_path / 'config.yml'
+        cfg.write_text('zurg: v1\n')
+        zs.apply_plex_refresh_hook(str(cfg), str(tmp_path / 'p.py'), 'true', 'http://p', 't', '')
+        assert not boot_layout.started('plex_hook')             # skipped: no mount dir
+        zs.apply_plex_refresh_hook(str(cfg), str(tmp_path / 'p.py'), 'true', 'http://p', 't', '/m')
+        assert boot_layout.started('plex_hook')
+
+    def test_duplicate_cleanup_and_plex_debrid(self):
+        import inspect
+        import pathlib
+        import utils.duplicate_cleanup as dc
+        assert "mark_started('duplicate_cleanup')" in inspect.getsource(dc.setup)
+        main = pathlib.Path(__file__).resolve().parents[1].joinpath('main.py').read_text()
+        assert "mark_started('plex_debrid')" in main

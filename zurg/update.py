@@ -44,6 +44,12 @@ class ZurgUpdate(Update, ProcessHandler):
                     # zurgarr's logger rewrites), kept for every restart
                     level = zurg_log_level()
                     handler.env_overrides = {'LOG_LEVEL': level or None}
+                    # Its Plex-refresh hook keeps the Plex settings Zurg was
+                    # set up with (they apply at the next container start).
+                    from utils import boot_layout
+                    if boot_layout.BOOTED:
+                        for k in ('PLEX_ADDRESS', 'PLEX_TOKEN', 'PLEX_MOUNT_DIR'):
+                            handler.env_overrides[k] = boot_layout.BOOT_VALUES.get(k) or None
                 elif handler.process and handler.process.poll() is None:
                     # Still running (stop_process reaps what it kills, so this
                     # is a live process): a second Popen would clash with it.

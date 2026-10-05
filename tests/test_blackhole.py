@@ -5940,6 +5940,7 @@ class TestSetupIdempotent:
         from unittest.mock import MagicMock
         import utils.blackhole as bh
         old, thread = MagicMock(), MagicMock()
+        thread.is_alive.return_value = False
         monkeypatch.setattr(bh, '_watcher', old)
         monkeypatch.setattr(bh, '_watcher_thread', thread, raising=False)
         monkeypatch.setenv('BLACKHOLE_ENABLED', 'false')
@@ -5947,3 +5948,61 @@ class TestSetupIdempotent:
         old.stop.assert_called_once()
         thread.join.assert_called_once()
         assert bh._watcher is None
+
+
+class TestStopIsPrompt:
+
+    def test_a_stopping_watcher_processes_no_more_files(self, tmp_path):
+        # a long pass must end at the next file once stopped — a replacement
+        # watcher would otherwise handle the same files (double adds)
+        import os
+        import time
+        from unittest.mock import MagicMock
+        import utils.blackhole as bh
+        w = bh.BlackholeWatcher.__new__(bh.BlackholeWatcher)
+        w._stop_event = __import__('threading').Event()
+        w.SUPPORTED_EXTENSIONS = bh.BlackholeWatcher.SUPPORTED_EXTENSIONS
+        w._process_file = MagicMock()
+        f = tmp_path / 'x.torrent'
+        f.write_bytes(b'd')
+        os.utime(f, (time.time() - 60, time.time() - 60))
+        w._stop_event.set()
+        w._maybe_process_watch_file(str(f), 'x.torrent', time.time(), label=None)
+        w._process_file.assert_not_called()
+
+    def test_setup_waits_for_the_old_watcher_to_finish(self, monkeypatch):
+        from unittest.mock import MagicMock
+        import utils.blackhole as bh
+        old, thread = MagicMock(), MagicMock()
+        thread.is_alive.side_effect = [True, True, False]       # finishing its file
+        monkeypatch.setattr(bh, '_watcher', old)
+        monkeypatch.setattr(bh, '_watcher_thread', thread)
+        monkeypatch.setenv('BLACKHOLE_ENABLED', 'false')
+        bh.setup()
+        assert thread.join.call_count == 3
+
+
+class TestRoutesOnlyToStartedInstances:
+
+    def test_debrid_added_after_start_is_not_routed_until_restart(self, monkeypatch, tmp_path):
+        # booted with RD only, AD key added later: AD grabs would be looked
+        # for on the RD mount (there's no AD Zurg mount until a restart)
+        from unittest.mock import MagicMock
+        import utils.blackhole as bh
+        from base import config
+        from utils import boot_layout
+        monkeypatch.setattr(boot_layout, 'BOOTED', True)
+        monkeypatch.setattr(boot_layout, 'BOOT_LAYOUT',
+                            boot_layout.Layout(True, frozenset({'RD'}), 'z', False, '', '', False))
+        monkeypatch.setattr(config, 'RDAPIKEY', 'rd', raising=False)
+        monkeypatch.setattr(config, 'ADAPIKEY', 'ad', raising=False)
+        monkeypatch.setenv('BLACKHOLE_ENABLED', 'true')
+        monkeypatch.setenv('BLACKHOLE_DIR', str(tmp_path))
+        captured = {}
+        monkeypatch.setattr(bh, 'BlackholeWatcher',
+                            lambda *a, **k: captured.update(keys=k.get('debrid_api_keys')) or MagicMock())
+        monkeypatch.setattr(bh.threading, 'Thread', lambda *a, **k: MagicMock())
+        monkeypatch.setattr(bh, '_watcher', None)
+        monkeypatch.setattr(bh, '_watcher_thread', None)
+        bh.setup()
+        assert set(captured['keys']) == {'realdebrid'}

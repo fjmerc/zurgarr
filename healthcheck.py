@@ -139,6 +139,16 @@ def _layout_facts(zurg, rd, ad, rclone_mn, torbox_mn, nfs, torbox_configured):
             'nfs': nfs_on, 'torbox_mount': torbox_mount}
 
 
+def _plex_debrid_expected(pd, connected):
+    """Whether plex_debrid should be running: it was enabled at container
+    start (the boot record; it's set up only then — the live setting before
+    one exists) and Plex/Jellyfin is connected."""
+    from utils import boot_layout
+    rec = boot_layout.load()
+    enabled = bool(rec.get('pd')) if rec is not None and 'pd' in rec else str(pd).lower() == 'true'
+    return enabled and bool(connected)
+
+
 def _mounts_to_probe(facts, exists):
     """Local FUSE mount paths to liveness-probe: the started mounts with a
     /healthcheck marker.  None in NFS mode — `rclone serve nfs` serves the
@@ -173,10 +183,10 @@ def main():
 
         mount_type = "serve nfs" if facts['nfs'] else "mount"
 
-        plex_debrid_should_run = str(PLEXDEBRID).lower() == 'true' and (
+        plex_debrid_should_run = _plex_debrid_expected(PLEXDEBRID, (
             os.getenv('PLEX_CONNECTED', 'False') == 'True'
             or bool(os.getenv('JF_API_KEY', '').strip())
-        )
+        ))
 
         torbox_mount_configured = facts['torbox_mount']
 

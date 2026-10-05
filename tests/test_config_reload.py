@@ -356,7 +356,7 @@ class TestZurgRcloneApplyAtStartup:
         monkeypatch.setenv('TORBOX_RCLONE_DIR_CACHE_TIME', '5h')
         assert cr.restart_pending() == []
         cr = boot(NFS_ENABLED='true', **self.RD_BOOT)          # NFS: no FUSE-only flags
-        monkeypatch.setenv('RCLONE_POLL_INTERVAL', '1m')
+        monkeypatch.setenv('TORBOX_RCLONE_TPSLIMIT', '7')
         assert cr.restart_pending() == []
 
     def test_removing_the_only_debrid_key_does_not_name_torbox(self, boot, monkeypatch):
@@ -365,17 +365,65 @@ class TestZurgRcloneApplyAtStartup:
         monkeypatch.setenv('ZURG_ENABLED', 'false')
         assert cr.restart_pending(auto=True) == ['RD_API_KEY']
 
-    def test_partly_live_settings(self, boot, monkeypatch):
-        cr = boot(DUPLICATE_CLEANUP='true', ZURG_UPDATE='false', PLEX_REFRESH='true',
-                  PLEX_MOUNT_DIR='/media', **self.RD_BOOT)
+    @pytest.fixture
+    def started(self, monkeypatch):
+        from utils import boot_layout
+        monkeypatch.setattr(boot_layout, 'STARTED', {})
+        return lambda *names: [boot_layout.mark_started(n) for n in names]
+
+    def test_partly_live_settings_follow_what_started(self, boot, started, monkeypatch):
+        cr = boot(DUPLICATE_CLEANUP='true', PLEX_ADDRESS='http://plex', PLEX_TOKEN='t',
+                  PLEX_REFRESH='true', PLEX_MOUNT_DIR='/media', **self.RD_BOOT)
+        started('duplicate_cleanup', 'plex_hook')
         monkeypatch.setenv('DUPLICATE_CLEANUP', 'false')       # off applies at once
         assert cr.restart_pending() == []
-        monkeypatch.setenv('ZURG_UPDATE', 'true')              # on needs the update thread
+        monkeypatch.setenv('ZURG_UPDATE', 'true')              # the update thread starts at boot
         monkeypatch.setenv('CLEANUP_INTERVAL', '6')            # re-scheduling needs a restart
-        monkeypatch.setenv('PLEX_MOUNT_DIR', '/plex')          # Zurg's refresh hook
-        assert cr.restart_pending() == ['CLEANUP_INTERVAL', 'PLEX_MOUNT_DIR', 'ZURG_UPDATE']
-        monkeypatch.setenv('PLEX_REFRESH', 'false')            # Zurg's hook keeps firing
-        assert 'PLEX_REFRESH' in cr.restart_pending()
+        monkeypatch.setenv('PLEX_MOUNT_DIR', '/plex')          # Zurg's hook got the old one
+        monkeypatch.setenv('PLEX_TOKEN', 't2')
+        assert cr.restart_pending() == ['CLEANUP_INTERVAL', 'PLEX_MOUNT_DIR', 'PLEX_TOKEN', 'ZURG_UPDATE']
+
+    def test_hook_skipped_at_boot_is_listed_when_now_complete(self, boot, started, monkeypatch):
+        cr = boot(PLEX_REFRESH='true', PLEX_MOUNT_DIR='/media', PLEX_TOKEN='t', **self.RD_BOOT)
+        started()                                              # hook skipped: no PLEX_ADDRESS
+        monkeypatch.setenv('PLEX_REFRESH', 'false')            # nothing to remove
+        assert cr.restart_pending() == []
+        monkeypatch.setenv('PLEX_REFRESH', 'true')
+        monkeypatch.setenv('PLEX_ADDRESS', 'http://plex')      # a restart would add the hook
+        assert cr.restart_pending() == ['PLEX_ADDRESS']
+
+    def test_switches_that_would_change_nothing_are_not_listed(self, boot, started, monkeypatch):
+        cr = boot(ZURG_VERSION='v0.9.3', PD_ENABLED='true', **self.RD_BOOT)
+        started('plex_debrid')
+        monkeypatch.setenv('ZURG_UPDATE', 'true')              # pinned version: never updates
+        monkeypatch.setenv('PD_UPDATE', 'true')                # no PD_REPO: no update thread
+        monkeypatch.setenv('DUPLICATE_CLEANUP', 'true')        # no Plex login: never registers
+        monkeypatch.setenv('CLEANUP_INTERVAL', '6')            # cleanup isn't running
+        monkeypatch.setenv('AUTO_UPDATE_INTERVAL', '6')        # no update thread running
+        assert cr.restart_pending() == []
+
+    def test_plex_debrid_switched_on_needs_a_restart(self, boot, started, monkeypatch):
+        cr = boot(**self.RD_BOOT)
+        started()
+        monkeypatch.setenv('PD_ENABLED', 'true')
+        assert cr.restart_pending() == ['PD_ENABLED']
+
+    def test_auto_update_interval_listed_when_an_update_thread_runs(self, boot, started, monkeypatch):
+        cr = boot(**self.RD_BOOT)
+        started('Zurg_update')
+        monkeypatch.setenv('AUTO_UPDATE_INTERVAL', '6')
+        assert cr.restart_pending() == ['AUTO_UPDATE_INTERVAL']
+
+    def test_torbox_key_not_named_when_a_name_change_switched_the_mount(self, boot, monkeypatch):
+        cr = boot(TORBOX_API_KEY='t', TORBOX_WEBDAV_USER='u', TORBOX_WEBDAV_PASS='p', **self.RD_BOOT)
+        monkeypatch.setenv('TORBOX_MOUNT_NAME', 'zurgarr')     # clashes: mount would be skipped
+        assert cr.restart_pending() == ['TORBOX_MOUNT_NAME']
+
+    def test_poll_interval_matters_in_nfs_mode(self, boot, monkeypatch):
+        # rclone also reads RCLONE_* from its environment (serve nfs too)
+        cr = boot(NFS_ENABLED='true', **self.RD_BOOT)
+        monkeypatch.setenv('RCLONE_POLL_INTERVAL', '1m')
+        assert cr.restart_pending() == ['RCLONE_POLL_INTERVAL']
 
     def _reload(self, cr, monkeypatch, changed):
         monkeypatch.setattr(cr, '_reload_env', lambda: set(changed))
@@ -386,6 +434,7 @@ class TestZurgRcloneApplyAtStartup:
     def test_reload_never_touches_zurg_or_rclone(self, boot, monkeypatch):
         from utils import processes
         cr = boot(**self.RD_BOOT)
+        monkeypatch.setenv('PD_ENABLED', 'true')
         monkeypatch.setenv('ZURG_PASS', 'new')
         handlers = {}
         reg = []
@@ -419,9 +468,22 @@ class TestZurgRcloneApplyAtStartup:
         self._reload(cr, monkeypatch, {'PLEX_USER'})
         assert seen == [(True, False)]
 
+    def test_plex_debrid_switched_off_is_stopped_not_restarted(self, boot, monkeypatch):
+        from utils import processes
+        cr = boot(**self.RD_BOOT)
+        h = MagicMock()
+        h.process.poll.side_effect = [None, 0]
+        monkeypatch.setattr(processes, '_process_registry',
+                            [{'process_name': 'plex_debrid', 'key_type': None, 'handler': h}])
+        monkeypatch.setenv('PD_ENABLED', 'false')
+        self._reload(cr, monkeypatch, {'PD_ENABLED'})
+        h.stop_process.assert_called_once()
+        h.restart_process.assert_not_called()
+
     def test_plex_debrid_still_alive_after_stop_is_not_started_twice(self, boot, monkeypatch):
         from utils import processes
         cr = boot(**self.RD_BOOT)
+        monkeypatch.setenv('PD_ENABLED', 'true')
         h = MagicMock()
         h.process.poll.return_value = None                       # survived the kill
         monkeypatch.setattr(processes, '_process_registry',
@@ -471,6 +533,43 @@ class TestZurgRcloneApplyAtStartup:
         finally:
             boot_layout.STARTUP_COMPLETE.set()
 
+    def test_deferred_pass_survives_a_failure_and_reports(self, boot, monkeypatch):
+        import utils.blackhole as bh
+        cr = boot(**self.RD_BOOT)
+        calls, events = [], []
+        monkeypatch.setattr(cr, '_drop_not_running', lambda s: set(s))
+        monkeypatch.setattr(cr, '_restart_plex_debrid', lambda changed: (_ for _ in ()).throw(OSError('popen')))
+        monkeypatch.setattr(bh, 'stop', lambda: calls.append('bh-stop'))
+        monkeypatch.setattr(bh, 'setup', lambda: calls.append('bh-setup'))
+        monkeypatch.setattr(cr, '_report_restarts', lambda services: events.append(sorted(services)))
+        cr._deferred.update(services={'plex_debrid', 'blackhole'}, changed={'PLEX_USER'}, thread=None)
+        cr._run_deferred()
+        assert calls == ['bh-stop', 'bh-setup']                 # not skipped by the failure
+        assert events == [['blackhole']]
+
+    def test_no_restarts_during_shutdown(self, boot, monkeypatch):
+        import utils.blackhole as bh
+        import utils.processes as procs
+        cr = boot(**self.RD_BOOT)
+        calls = []
+        monkeypatch.setattr(procs, '_shutting_down', True)
+        monkeypatch.setattr(cr, '_drop_not_running', lambda s: set(s))
+        monkeypatch.setattr(bh, 'setup', lambda: calls.append('bh-setup'))
+        assert cr._apply_service_restarts({'blackhole'}, set()) == set()
+        assert calls == []
+
+    def test_preview_during_startup_counts_plex_debrid_that_will_start(self, boot, monkeypatch):
+        from utils import boot_layout, processes
+        cr = boot(**self.RD_BOOT)
+        monkeypatch.setattr(processes, '_process_registry', [])     # not registered yet
+        monkeypatch.setattr(boot_layout, 'STARTED', {'plex_debrid': True})
+        boot_layout.STARTUP_COMPLETE.clear()
+        try:
+            assert cr._drop_not_running({'plex_debrid'}) == {'plex_debrid'}
+        finally:
+            boot_layout.STARTUP_COMPLETE.set()
+        assert cr._drop_not_running({'plex_debrid'}) == set()
+
     def test_reload_refreshes_the_setup_check(self, boot, monkeypatch):
         cr = boot(**self.RD_BOOT)
         import utils.setup_check as sc
@@ -513,3 +612,13 @@ class TestOnlyRunningProcessesListed:
                             [{'process_name': 'rclone', 'key_type': 'torbox', 'handler': None}])
         assert cr._drop_not_running({'plex_debrid', 'rclone', 'notifications'}) == {'rclone', 'notifications'}
 
+
+
+def test_refresh_globals_never_replaces_functions_with_config_methods():
+    # base exports json's `load`; Config has a `load()` method — refreshing
+    # replaced the module's json.load with it (pd_setup then read None)
+    import json
+    from base import refresh_globals
+    g = {'load': json.load, 'dump': json.dump}
+    refresh_globals(g)
+    assert g['load'] is json.load and g['dump'] is json.dump

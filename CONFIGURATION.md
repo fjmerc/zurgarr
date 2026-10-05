@@ -17,8 +17,10 @@ Three options, any of them work:
    `STATUS_UI_AUTH`. Saves to `.env` and applies most changes without a
    restart (SIGHUP reload). Zurg and rclone settings (debrid keys, Zurg
    login/port/version/log level, every `RCLONE_*`, NFS, mount names, the
-   TorBox mount) take effect when the container starts — the Settings page
-   and the Status page's Setup check tell you when a restart is needed.
+   TorBox mount) take effect when the container starts, and so does turning
+   on plex_debrid, duplicate cleanup or the auto-updates (turning those off
+   applies at once) — the Settings page and the Status page's Setup check
+   tell you when a restart is needed.
 
 ### Which value wins
 
@@ -67,8 +69,8 @@ Everything else has a sensible default or is opt-in.
 | `RCLONE_BUFFER_SIZE` | Buffer size for transfers | |
 | `RCLONE_TRANSFERS` | Parallel transfers | |
 | `ZURG_VERSION` | Pin Zurg version or `nightly` (requires `GITHUB_TOKEN`) | `latest` |
-| `ZURG_UPDATE` | Auto-update Zurg on startup | `false` |
-| `ZURG_LOG_LEVEL` | Zurg log level. `OFF` to suppress | `INFO` |
+| `ZURG_UPDATE` | Auto-update Zurg on startup and every `AUTO_UPDATE_INTERVAL`. Off applies at once; on at container start | `false` |
+| `ZURG_LOG_LEVEL` | Zurg log level (blank: follows `ZURGARR_LOG_LEVEL`). `OFF` to suppress. Takes effect at container start | `INFO` |
 | `ZURG_USER` | WebDAV basic auth username | |
 | `ZURG_PASS` | WebDAV basic auth password | |
 | `ZURG_PORT` | WebDAV port. Set a fixed value if exposing to other machines. With both Real-Debrid and AllDebrid, AllDebrid uses this port + 1 | random |
@@ -108,7 +110,7 @@ changes to its settings take effect at the next container start.
 
 | Variable | Description | Default |
 |---|---|---|
-| `PD_ENABLED` | Enable plex_debrid | `false` |
+| `PD_ENABLED` | Enable plex_debrid. Off applies at once; on at container start | `false` |
 | `PLEX_USER` | Plex username | |
 | `PLEX_TOKEN` | Plex token | |
 | `PLEX_ADDRESS` | Plex server URL. Must include scheme, no trailing `/` | |
@@ -118,7 +120,7 @@ changes to its settings take effect at the next container start.
 | `SEERR_ADDRESS` | Overseerr/Jellyseerr URL | |
 | `SEERR_WRITEBACK_ENABLED` | Close the request loop: when the library scanner delivers requested content, the matching Seerr request's media is marked **available** (movies always; shows only once the scanner knows the show is complete — partial seasons are left to Seerr's own Plex sync); when Wanted recovery terminally gives up on a movie (filter-blocked on RD *and* uncached on TB across the strike threshold), its request is **declined** so the requester sees "not coming" instead of eternal processing. TV give-ups are per-episode and never decline a whole request. Correlation is by TMDB id against the approved-requests list at fire time; best-effort — a Seerr outage never blocks a scan. OFF by default because it changes user-visible request state | `false` |
 | `SHOW_MENU` | Show plex_debrid interactive menu on startup | `true` |
-| `PD_UPDATE` | Auto-update plex_debrid. Requires `PD_REPO` | `false` |
+| `PD_UPDATE` | Auto-update plex_debrid. Requires `PD_REPO`. Off applies at once; on at container start | `false` |
 | `PD_REPO` | Update repo in `user,repo,branch` form | |
 | `PD_LOG_LEVEL` | Log level (`DEBUG`/`INFO`/`OFF`) | `INFO` |
 | `PD_LOGFILE` | Path for plex_debrid log output | |
@@ -134,11 +136,11 @@ changes to its settings take effect at the next container start.
 | Variable | Description | Default |
 |---|---|---|
 | `PLEX_REFRESH` | Auto-refresh Plex libraries. Enables both Zurg's `on_library_update` hook (RealDebrid content) and the library scanner's Plex section refresh after it symlinks new debrid content (covers TorBox/scanner-delivered titles). Requires `PLEX_ADDRESS` and `PLEX_TOKEN`. | `false` |
-| `PLEX_MOUNT_DIR` | Mount path as Plex sees it (for library refresh) | |
-| `DUPLICATE_CLEANUP` | Automated Plex duplicate detection + cleanup | `false` |
-| `CLEANUP_INTERVAL` | Hours between duplicate cleanup runs | `24` |
+| `PLEX_MOUNT_DIR` | Mount path as Plex sees it (for Zurg's own library-refresh hook; takes effect at container start) | |
+| `DUPLICATE_CLEANUP` | Automated Plex duplicate detection + cleanup. Off applies at once; on at container start | `false` |
+| `CLEANUP_INTERVAL` | Hours between duplicate cleanup runs. Takes effect at container start | `24` |
 | `DUPLICATE_CLEANUP_KEEP` | `local` (logs Zurg dupes) or `zurg` (deletes local copy) | `local` |
-| `AUTO_UPDATE_INTERVAL` | Hours between auto-update checks | `24` |
+| `AUTO_UPDATE_INTERVAL` | Hours between auto-update checks. Takes effect at container start | `24` |
 
 ---
 

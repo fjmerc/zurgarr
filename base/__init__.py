@@ -188,7 +188,10 @@ def refresh_globals(target_globals):
     """
     for name in __all__:
         if hasattr(config, name):
-            target_globals[name] = getattr(config, name)
+            value = getattr(config, name)
+            if callable(value):   # e.g. Config.load vs json's exported `load`
+                continue
+            target_globals[name] = value
 
 
 class Config:

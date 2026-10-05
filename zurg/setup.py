@@ -3,19 +3,6 @@ from utils.logger import *
 from utils.file_utils import atomic_write
 
 
-def apply_zurg_log_level():
-    """Pass ZURG_LOG_LEVEL to zurg as LOG_LEVEL.  Blank counts as unset
-    (stock compose passes it as ''), so LOG_LEVEL inherited from
-    ZURGARR_LOG_LEVEL (utils/logger.py) isn't clobbered with ''."""
-    level = (ZURGLOGLEVEL or '').strip()
-    if level:
-        os.environ['LOG_LEVEL'] = level
-    elif not os.environ.get('ZURGARR_LOG_LEVEL', '').strip():
-        # Cleared on SIGHUP with nothing to inherit: drop the stale level
-        # so the restarted zurg falls back to its own default.
-        os.environ.pop('LOG_LEVEL', None)
-
-
 _PLEX_HOOK = (
     "tmpfile=$(mktemp)\n"
     "for arg in \"$@\"\n"
@@ -34,11 +21,15 @@ _PLEX_HOOK = (
 )
 
 
+_STOCK_HOOK = 'sh plex_update.sh "$@"'   # zurg-public's config.yml default
+_HOOK_WARNED = False
+
+
 def apply_plex_refresh_hook(config_file_path, refresh_file_path, plex_refresh, addr, token, mount):
     """Zurg's own Plex refresh (on_library_update → plex_refresh.py) for the
     content Zurg serves.  Added when PLEX_REFRESH is on and Plex is fully
-    configured; otherwise our hook is removed (turning PLEX_REFRESH off must
-    stop it) — a hook that isn't ours is left alone.  A missing Plex setting
+    configured; otherwise our hook is replaced by Zurg's stock one (turning
+    PLEX_REFRESH off must stop it) — a hook that isn't ours is left alone.  A missing Plex setting
     skips the hook with a warning instead of failing Zurg's setup: the
     library scanner's refresh doesn't need PLEX_MOUNT_DIR."""
     from ruamel.yaml import YAML
@@ -53,19 +44,25 @@ def apply_plex_refresh_hook(config_file_path, refresh_file_path, plex_refresh, a
         missing = [n for n, v in (('PLEX_ADDRESS', addr), ('PLEX_TOKEN', token),
                                   ('PLEX_MOUNT_DIR', mount)) if not v]
         if missing:
-            logger.warning(f"Plex Refresh: {', '.join(missing)} not set — Zurg's own refresh hook "
-                           "is skipped (the library scanner's refresh still runs)")
+            global _HOOK_WARNED
+            if not _HOOK_WARNED:   # once, not per Zurg instance
+                _HOOK_WARNED = True
+                logger.warning(f"Plex Refresh: {', '.join(missing)} not set — Zurg's own refresh hook "
+                               "is skipped (the library scanner's refresh still runs)")
             want = False
-    ours = 'plex_refresh.py' in str(config.get('on_library_update') or '')
+    ours = str(config.get('on_library_update') or '') == _PLEX_HOOK
     if want:
+        from utils import boot_layout
+        boot_layout.mark_started('plex_hook')
         logger.info(f"Updating Plex Refresh in config file: {config_file_path}")
         config['on_library_update'] = _PLEX_HOOK
         if not os.path.exists(refresh_file_path):
             logger.debug(f"Copying Plex Refresh script from base: /zurg/plex_refresh.py to {refresh_file_path}")
             shutil.copy('/zurg/plex_refresh.py', refresh_file_path)
     elif ours:
+        # back to Zurg's stock hook (replacing the value keeps the comments)
         logger.info(f"Removing Zurg's Plex Refresh hook from {config_file_path}")
-        del config['on_library_update']
+        config['on_library_update'] = _STOCK_HOOK
     else:
         return
     with atomic_write(config_file_path) as f:
@@ -94,21 +91,7 @@ def zurg_setup():
     zurg_config_base = '/zurg/config.yml'
     zurg_plex_update_base = '/zurg/plex_update.sh'
   
-    try:
-        apply_zurg_log_level()
-    except Exception as e:
-        logger.error(f"Error setting Zurg log level from 'ZURG_LOG_LEVEL': {e}")
-
-    def update_plex(file_path):
-        logger.debug(f"Disabling plex_update.sh in config file: {file_path}")
-        with open(file_path, 'r') as file:
-            lines = file.readlines()
-        with atomic_write(file_path) as file:
-            for line in lines:
-                if line.strip().startswith("on_library_update:"):
-                    file.write("# on_library_update:\n")
-                else:
-                    file.write(line)
+    # (Zurg's LOG_LEVEL is set per process: zurg/update.zurg_log_level)
 
     def update_token(file_path, token):
         logger.debug(f"Updating token in config file: {file_path}")

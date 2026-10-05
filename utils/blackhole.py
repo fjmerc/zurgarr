@@ -5111,6 +5111,8 @@ class BlackholeWatcher:
             return
 
         for label, file_path, filename in candidates:
+            if self._stop_event.is_set():
+                break   # stopping: a replacement watcher takes over
             ext = os.path.splitext(filename)[1].lower()
             if ext not in self.SUPPORTED_EXTENSIONS:
                 continue
@@ -5221,6 +5223,8 @@ class BlackholeWatcher:
 
     def _maybe_process_watch_file(self, file_path, filename, now, label):
         """Shared pre-processing: skip in-flight writes, dispatch on extension."""
+        if self._stop_event.is_set():
+            return   # stopping: a replacement watcher takes over (never both)
         try:
             if now - os.path.getmtime(file_path) < 2.0:
                 return
@@ -5339,11 +5343,11 @@ class BlackholeWatcher:
     def _beat(self):
         """Heartbeat gated on THIS watcher's stop event.
 
-        The SIGHUP reload path (config_reload) calls ``stop()`` then
-        ``setup()`` without joining the old thread — an old watcher still
-        mid-scan would otherwise keep beating the name the NEW watcher
-        just registered, masking a wedge in the new thread for as long
-        as the old one keeps working.
+        ``setup()`` waits for an old watcher to finish the file it's on
+        before starting a new one, but the old thread's last beats can still
+        land after ``stop()`` — gating on the stop event keeps a stopped
+        watcher from beating the name the NEW watcher registers (masking a
+        wedge in the new thread).
         """
         if not self._stop_event.is_set():
             heartbeat.beat(_HEARTBEAT_NAME)
@@ -5396,6 +5400,17 @@ def _setup_locked():
         debrid_api_keys['alldebrid'] = ADAPIKEY
     if tb_key:
         debrid_api_keys['torbox'] = tb_key
+
+    # Zurg's instances are set up at container start: a Real-Debrid /
+    # AllDebrid key added since has no Zurg mount yet, so its grabs would be
+    # looked for on the other instance's mount — use it after a restart.
+    from utils import boot_layout
+    if boot_layout.BOOTED and boot_layout.BOOT_LAYOUT.zurg:
+        for name, inst in (('realdebrid', 'RD'), ('alldebrid', 'AD')):
+            if name in debrid_api_keys and inst not in boot_layout.BOOT_LAYOUT.instances:
+                logger.warning(f"[blackhole] {name} has no Zurg mount until the container "
+                               f"restarts — not routing grabs to it yet")
+                del debrid_api_keys[name]
 
     if not debrid_api_keys:
         logger.error("[blackhole] No debrid API key found. Blackhole disabled.")
@@ -5529,9 +5544,12 @@ def _stop_locked():
     if _watcher:
         _watcher.stop()
         if _watcher_thread is not None:
-            _watcher_thread.join(timeout=30)   # let its current pass finish
-            if _watcher_thread.is_alive():
-                logger.warning("[blackhole] Watcher still finishing a pass after 30s")
+            # Let it finish the file it's on (it stops before the next one);
+            # starting the replacement meanwhile would double-add torrents.
+            _watcher_thread.join(timeout=30)
+            while _watcher_thread.is_alive():
+                logger.warning("[blackhole] Waiting for the previous watcher to finish its current file")
+                _watcher_thread.join(timeout=30)
     _watcher = _watcher_thread = None
 
 

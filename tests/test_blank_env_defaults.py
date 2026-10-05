@@ -80,21 +80,24 @@ class TestDuplicateCleanupIntervalBlank:
     def test_blank_or_unset_is_24h(self, monkeypatch, value):
         from base import config
         from utils import duplicate_cleanup
-        monkeypatch.setattr(config, 'CLEANUPINT', value)
+        if value is None:
+            monkeypatch.delenv('CLEANUP_INTERVAL', raising=False)
+        else:
+            monkeypatch.setenv('CLEANUP_INTERVAL', value)
         assert duplicate_cleanup.cleanup_interval() == 24
         assert duplicate_cleanup.get_interval_seconds() == 24 * 3600
 
     def test_explicit_value_wins(self, monkeypatch):
         from base import config
         from utils import duplicate_cleanup
-        monkeypatch.setattr(config, 'CLEANUPINT', '6')
+        monkeypatch.setenv('CLEANUP_INTERVAL', '6')
         assert duplicate_cleanup.cleanup_interval() == 6.0
         assert duplicate_cleanup.get_interval_seconds() == 6 * 3600
 
     def test_garbage_falls_back_instead_of_raising(self, monkeypatch):
         from base import config
         from utils import duplicate_cleanup
-        monkeypatch.setattr(config, 'CLEANUPINT', 'daily')
+        monkeypatch.setenv('CLEANUP_INTERVAL', 'daily')
         assert duplicate_cleanup.get_interval_seconds() == 24 * 3600
 
 
@@ -224,34 +227,36 @@ class TestChildEnvScrubsBlankRclone:
 
 
 class TestZurgLogLevelBlank:
+    """Zurg's LOG_LEVEL (zurg/update.zurg_log_level, set per Zurg process)."""
 
-    def test_blank_zurg_log_level_keeps_inherited_log_level(self, monkeypatch):
-        # utils/logger.py seeds LOG_LEVEL from ZURGARR_LOG_LEVEL; a blank
-        # ZURG_LOG_LEVEL must not overwrite it with ''.
-        from zurg import setup as zurg_setup
-        monkeypatch.setattr(zurg_setup, 'ZURGLOGLEVEL', '', raising=False)
-        monkeypatch.setenv('ZURGARR_LOG_LEVEL', 'DEBUG')
-        monkeypatch.setenv('LOG_LEVEL', 'DEBUG')   # seeded by utils/logger.py
-        zurg_setup.apply_zurg_log_level()
-        assert os.environ['LOG_LEVEL'] == 'DEBUG'
+    @pytest.fixture(autouse=True)
+    def _before_boot(self, monkeypatch):
+        from utils import boot_layout
+        monkeypatch.setattr(boot_layout, 'BOOTED', False)
+
+    def test_blank_zurg_log_level_follows_zurgarr(self, monkeypatch):
+        from zurg.update import zurg_log_level
+        monkeypatch.setenv('ZURG_LOG_LEVEL', '')
+        monkeypatch.setenv('ZURGARR_LOG_LEVEL', 'debug')
+        assert zurg_log_level() == 'DEBUG'
 
     def test_explicit_zurg_log_level_wins(self, monkeypatch):
-        from zurg import setup as zurg_setup
-        monkeypatch.setattr(zurg_setup, 'ZURGLOGLEVEL', 'WARNING', raising=False)
-        monkeypatch.setenv('LOG_LEVEL', 'DEBUG')
-        zurg_setup.apply_zurg_log_level()
-        assert os.environ['LOG_LEVEL'] == 'WARNING'
+        from zurg.update import zurg_log_level
+        monkeypatch.setenv('ZURG_LOG_LEVEL', 'WARNING')
+        monkeypatch.setenv('ZURGARR_LOG_LEVEL', 'DEBUG')
+        assert zurg_log_level() == 'WARNING'
 
 
 class TestZurgLogLevelCleared:
 
-    def test_cleared_level_with_nothing_to_inherit_is_dropped(self, monkeypatch):
-        from zurg import setup as zurg_setup
-        monkeypatch.setattr(zurg_setup, 'ZURGLOGLEVEL', '', raising=False)
+    def test_nothing_set_means_zurgs_own_default(self, monkeypatch):
+        # the process override then removes LOG_LEVEL (None = drop)
+        from utils import boot_layout
+        from zurg.update import zurg_log_level
+        monkeypatch.setattr(boot_layout, 'BOOTED', False)
+        monkeypatch.setenv('ZURG_LOG_LEVEL', '')
         monkeypatch.setenv('ZURGARR_LOG_LEVEL', '')
-        monkeypatch.setenv('LOG_LEVEL', 'DEBUG')   # stale from before reload
-        zurg_setup.apply_zurg_log_level()
-        assert 'LOG_LEVEL' not in os.environ
+        assert zurg_log_level() == ''
 
 
 class TestSettingsFileBeatsBlankContainerEnv:

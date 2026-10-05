@@ -135,21 +135,20 @@ def main():
                 logger.error(f"Error in rclone/cleanup setup: {e}", exc_info=True)
 
     if str(PLEXDEBRID).lower() == 'true':
-        # (a settings reload restarting plex_debrid waits until it's set up)
-        from utils.processes import lifecycle_lock
-        with lifecycle_lock:
-            try:
-                p.setup.pd_setup()
-                pd_updater = p.update.PlexDebridUpdate()
-                if str(PDUPDATE).lower() == 'true' and PDREPO:
-                    pd_updater.auto_update('plex_debrid', True)
-                elif PDREPO:
-                    p.download.get_latest_release()
-                    pd_updater.auto_update('plex_debrid', False)
-                else:
-                    pd_updater.auto_update('plex_debrid', False)
-            except Exception as e:
-                logger.error(f"Error in plex_debrid setup: {e}", exc_info=True)
+        from utils import boot_layout
+        boot_layout.mark_started('plex_debrid')
+        try:
+            p.setup.pd_setup()
+            pd_updater = p.update.PlexDebridUpdate()
+            if str(PDUPDATE).lower() == 'true' and PDREPO:
+                pd_updater.auto_update('plex_debrid', True)
+            elif PDREPO:
+                p.download.get_latest_release()
+                pd_updater.auto_update('plex_debrid', False)
+            else:
+                pd_updater.auto_update('plex_debrid', False)
+        except Exception as e:
+            logger.error(f"Error in plex_debrid setup: {e}", exc_info=True)
 
     blackhole.setup()
 

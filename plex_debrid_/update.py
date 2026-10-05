@@ -31,7 +31,8 @@ class PlexDebridUpdate(Update, ProcessHandler):
         raise ValueError("Version not found in the specified file")
 
     def update_check(self, process_name):
-        if (os.environ.get('PD_UPDATE') or '').strip().lower() != 'true':
+        if ((os.environ.get('PD_UPDATE') or '').strip().lower() != 'true'
+                or (os.environ.get('PD_ENABLED') or '').strip().lower() != 'true'):
             # switched off after start: the update thread runs until a
             # restart, but must not update (stop/start) plex_debrid any more
             self.logger.info(f"Automatic {process_name} updates are off — skipping")

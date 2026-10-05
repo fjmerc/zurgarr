@@ -93,8 +93,10 @@ STARTUP_KEYS = frozenset({
 # auto-update threads are set up at start; switching cleanup/updates off
 # applies at once.
 CONDITIONAL_KEYS = frozenset({
-    'PLEX_REFRESH', 'PLEX_MOUNT_DIR', 'DUPLICATE_CLEANUP', 'CLEANUP_INTERVAL',
-    'ZURG_UPDATE', 'AUTO_UPDATE_INTERVAL', 'PD_ENABLED', 'PD_UPDATE',
+    'PLEX_REFRESH', 'PLEX_ADDRESS', 'PLEX_TOKEN', 'PLEX_MOUNT_DIR',
+    'DUPLICATE_CLEANUP', 'CLEANUP_INTERVAL',
+    'ZURG_UPDATE', 'AUTO_UPDATE_INTERVAL', 'PD_ENABLED', 'PD_UPDATE', 'PD_REPO',
+    'TORBOX_API_KEY',
 })
 SNAPSHOT_KEYS = STARTUP_KEYS | CONDITIONAL_KEYS
 _BOOL_KEYS = frozenset({'ZURG_ENABLED', 'NFS_ENABLED', 'PLEX_REFRESH', 'DUPLICATE_CLEANUP',
@@ -171,6 +173,21 @@ def torbox_mount_started():
     return all((get(k) or '').strip() for k in TORBOX_KEYS)
 
 
+# What actually started at boot (the code that starts it marks it):
+# 'plex_debrid', 'Zurg_update' / 'plex_debrid_update' (auto-update threads),
+# 'duplicate_cleanup' (task registered), 'plex_hook' (Zurg's Plex-refresh
+# hook written).  Restart notices follow these, not raw setting values.
+STARTED = {}
+
+
+def mark_started(name, value=True):
+    STARTED[name] = bool(value)
+
+
+def started(name):
+    return STARTED.get(name, False)
+
+
 def record(path=None):
     """Write the boot snapshot for healthcheck.py (called once by main.py)."""
     from utils.file_utils import atomic_write
@@ -178,7 +195,8 @@ def record(path=None):
     data = {'zurg': BOOT_LAYOUT.zurg, 'instances': sorted(BOOT_LAYOUT.instances),
             'rclone_mount_name': BOOT_RCLONE_MOUNT_NAME,
             'torbox_mount_name': BOOT_TORBOX_MOUNT_NAME,
-            'nfs': BOOT_LAYOUT.nfs, 'torbox': BOOT_LAYOUT.torbox}
+            'nfs': BOOT_LAYOUT.nfs, 'torbox': BOOT_LAYOUT.torbox,
+            'pd': bool(BOOT_VALUES.get('PD_ENABLED'))}
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with atomic_write(path) as f:
         json.dump(data, f)

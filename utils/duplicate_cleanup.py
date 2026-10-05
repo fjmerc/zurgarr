@@ -172,6 +172,8 @@ def setup():
             from utils.task_scheduler import scheduler
             interval = get_interval_seconds()
             logger.info(f"Duplicate cleanup interval: {format_time(cleanup_interval())}")
+            from utils import boot_layout
+            boot_layout.mark_started('duplicate_cleanup')
             scheduler.register(
                 'duplicate_cleanup',
                 start_cleanup,
@@ -185,8 +187,8 @@ def setup():
 def cleanup_interval():
     """Cleanup interval in hours. Blank counts as unset (stock compose passes
     CLEANUP_INTERVAL as ''); an unparseable value warns and uses 24."""
-    from base import config
-    raw = str(config.CLEANUPINT or '').strip()
+    from utils import boot_layout   # applies at container start (task registered then)
+    raw = boot_layout.setting_at_start('CLEANUP_INTERVAL')
     if not raw:
         return 24
     try:

@@ -205,7 +205,7 @@ ENV_SCHEMA = [
         'name': 'plex_debrid',
         'description': 'Plex/Debrid integration service',
         'fields': [
-            ('PD_ENABLED', 'Enable plex_debrid', 'boolean', False, 'Run the plex_debrid service'),
+            ('PD_ENABLED', 'Enable plex_debrid', 'boolean', False, 'Run the plex_debrid service. Switching it off applies right away; switching it on takes effect when the container starts.'),
             ('SHOW_MENU', 'Show Menu', 'boolean', False, 'Show plex_debrid interactive menu on startup. Mirrors the "Show Menu on Startup" toggle on the plex_debrid tab — changes to either propagate through the sync layer.'),
             ('PLEX_USER', 'Plex Username', 'string', False, 'Plex account username'),
             ('PLEX_TOKEN', 'Plex Token', 'secret', False, 'Plex authentication token'),
@@ -369,10 +369,9 @@ def _dry_resolve(explicit):
 
 
 def _fixed_port_problems(values):
-    """(errors, warnings) for fixed ports that can't all bind: Zurg's
+    """[(keys, message)] for fixed ports that can't all bind: Zurg's
     (AllDebrid takes ZURG_PORT + 1 next to Real-Debrid), NFS (one port per
-    mount from NFS_PORT) and the dashboard's — out of range or shared.
-    Warnings when every port involved is set in compose / a Docker secret."""
+    mount from NFS_PORT) and the dashboard's — out of range or shared."""
     def on(key):
         return str(values.get(key, '')).strip().lower() == 'true'
 
@@ -382,11 +381,6 @@ def _fixed_port_problems(values):
         except ValueError:
             return None
     rd, ad = bool(values.get('RD_API_KEY')), bool(values.get('AD_API_KEY'))
-    try:   # ports the Settings page can't change (compose / Docker secret)
-        from utils import config_resolve
-        fixed = {k for k, r in config_resolve.current().items() if r.source in ('locked', 'secret')}
-    except Exception:
-        fixed = set()
     used = []   # (port, label)
     zp = num('ZURG_PORT')
     if on('ZURG_ENABLED') and zp is not None:
@@ -402,21 +396,55 @@ def _fixed_port_problems(values):
     sp = num('STATUS_UI_PORT')
     if sp is not None:
         used.append((sp, 'STATUS_UI_PORT'))
-    errors, warnings, seen = [], [], {}
-
-    def report(keys, msg):
-        # all from compose/secrets: the page can't fix it — don't block saves
-        (warnings if set(keys) <= fixed else errors).append(msg)
+    problems, seen = [], {}
     for port, label in used:
         key = label.split(' ')[0]
         if not 1 <= port <= 65535:
-            report({key}, f"{key}: {label} would be port {port}, outside 1-65535.")
+            problems.append(({key}, f"{key}: {label} would be port {port}, outside 1-65535."))
         elif port in seen:
-            report({key, seen[port].split(' ')[0]},
-                   f"{key}: {label} and {seen[port]} would both use port {port}.")
+            problems.append(({key, seen[port].split(' ')[0]},
+                             f"{key}: {label} and {seen[port]} would both use port {port}."))
         else:
             seen[port] = label
-    return errors, warnings
+    return problems
+
+
+def _torbox_name_problems(values):
+    """[(keys, message)] when the TorBox mount would share a name with one of
+    Zurg's mounts (rclone skips it then — same naming rule as rclone)."""
+    from utils.boot_layout import TORBOX_KEYS, zurg_mount_names
+    if str(values.get('ZURG_ENABLED', '')).strip().lower() != 'true':
+        return []   # no rclone mounts at all
+    if not all(values.get(k) for k in TORBOX_KEYS):
+        return []   # no TorBox mount
+    tb_name = str(values.get('TORBOX_MOUNT_NAME') or '').strip() or 'torbox'
+    if tb_name not in zurg_mount_names(str(values.get('RCLONE_MOUNT_NAME') or '').strip(),
+                                       bool(values.get('RD_API_KEY')), bool(values.get('AD_API_KEY'))):
+        return []
+    return [({'TORBOX_MOUNT_NAME', 'RCLONE_MOUNT_NAME'},
+             f"TORBOX_MOUNT_NAME '{tb_name}' is the name of a Zurg mount — pick another (default 'torbox').")]
+
+
+def _current_effective_values():
+    """The settings in effect now (for "was this already so before the save")."""
+    from utils import config_resolve
+    vals = {k: r.value for k, r in config_resolve.current().items()
+            if r.source != 'unset' and r.value is not None}
+    return _with_secret_placeholders(vals)
+
+
+def _classify_problems(problems_fn, values, errors, warnings):
+    """Errors, except a problem that already exists in the settings in effect
+    and involves only settings the page can't change (compose / Docker
+    secret): an error would block every save — a warning then."""
+    try:
+        from utils import config_resolve
+        fixed = {k for k, r in config_resolve.current().items() if r.source in ('locked', 'secret')}
+        before = {msg for _keys, msg in problems_fn(_current_effective_values())}
+    except Exception:
+        fixed, before = set(), set()
+    for keys, msg in problems_fn(values):
+        (warnings if (msg in before and keys <= fixed) else errors).append(msg)
 
 
 def get_env_schema():
@@ -954,18 +982,8 @@ def validate_env_values(values):
             except ValueError:
                 errors.append(f"{var}='{val}' is not a valid integer")
 
-    port_errors, port_warnings = _fixed_port_problems(values)
-    errors.extend(port_errors)
-    warnings.extend(port_warnings)
-
-    # The TorBox mount can't share a name with one of Zurg's mounts (rclone
-    # would skip it — same naming rule as rclone/rclone.py).
-    from utils.boot_layout import zurg_mount_names
-    tb_name = str(values.get('TORBOX_MOUNT_NAME') or '').strip() or 'torbox'
-    if values.get('TORBOX_API_KEY') and tb_name in zurg_mount_names(
-            str(values.get('RCLONE_MOUNT_NAME') or '').strip(),
-            bool(values.get('RD_API_KEY')), bool(values.get('AD_API_KEY'))):
-        errors.append(f"TORBOX_MOUNT_NAME '{tb_name}' is the name of a Zurg mount — pick another (default 'torbox').")
+    _classify_problems(_fixed_port_problems, values, errors, warnings)
+    _classify_problems(_torbox_name_problems, values, errors, warnings)
 
     # Quality compromise ratio — float in [0, 1].  Declared as 'string'
     # in the schema because the number:MIN-MAX renderer coerces to int,

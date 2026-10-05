@@ -446,12 +446,46 @@ class TestValidateEnvValues:
         # the page can't change compose values: an error would block every save
         from utils import config_resolve
         cur = {'ZURG_PORT': config_resolve.Resolved('8081', 'locked', 'x'),
-               'STATUS_UI_PORT': config_resolve.Resolved('8081', 'locked', 'x')}
+               'STATUS_UI_PORT': config_resolve.Resolved('8081', 'locked', 'x'),
+               'ZURG_ENABLED': config_resolve.Resolved('true', 'set', 'x'),
+               'RD_API_KEY': config_resolve.Resolved('k', 'set', 'x')}   # clash already in effect
         monkeypatch.setattr(config_resolve, 'current', lambda: cur)
         r = validate_env_values({'ZURG_ENABLED': 'true', 'RD_API_KEY': 'k', 'RCLONE_MOUNT_NAME': 'm',
                                  'ZURG_PORT': '8081', 'STATUS_UI_PORT': '8081'})
         assert not [e for e in r['errors'] if 'port' in e.lower()], r
         assert any('8081' in w for w in r['warnings']), r
+
+    def test_port_clash_caused_by_this_save_is_an_error_even_with_locked_ports(self, monkeypatch):
+        # both ports in compose, but adding AllDebrid on the page creates the
+        # clash (ZURG_PORT + 1): that must not be waved through
+        from utils import config_resolve
+        cur = {'ZURG_PORT': config_resolve.Resolved('8079', 'locked', 'x'),
+               'STATUS_UI_PORT': config_resolve.Resolved('8080', 'locked', 'x'),
+               'ZURG_ENABLED': config_resolve.Resolved('true', 'set', 'x'),
+               'RD_API_KEY': config_resolve.Resolved('k', 'set', 'x')}
+        monkeypatch.setattr(config_resolve, 'current', lambda: cur)
+        r = validate_env_values({'ZURG_ENABLED': 'true', 'RD_API_KEY': 'k', 'AD_API_KEY': 'a',
+                                 'RCLONE_MOUNT_NAME': 'm', 'ZURG_PORT': '8079', 'STATUS_UI_PORT': '8080'})
+        assert any('8080' in e for e in r['errors']), r
+
+    def test_torbox_name_clash_only_when_a_torbox_mount_would_start(self):
+        base = {'ZURG_ENABLED': 'true', 'RD_API_KEY': 'k', 'RCLONE_MOUNT_NAME': 'torbox',
+                'TORBOX_API_KEY': 't'}
+        assert not [e for e in validate_env_values(base)['errors'] if e.startswith('TORBOX_MOUNT_NAME')]
+        off = dict(base, ZURG_ENABLED='false', TORBOX_WEBDAV_USER='u', TORBOX_WEBDAV_PASS='p')
+        assert not [e for e in validate_env_values(off)['errors'] if e.startswith('TORBOX_MOUNT_NAME')]
+
+    def test_torbox_name_clash_set_in_compose_is_a_warning(self, monkeypatch):
+        from utils import config_resolve
+        vals = {'ZURG_ENABLED': 'true', 'RD_API_KEY': 'k', 'RCLONE_MOUNT_NAME': 'zurgarr',
+                'TORBOX_MOUNT_NAME': 'zurgarr', 'TORBOX_API_KEY': 't',
+                'TORBOX_WEBDAV_USER': 'u', 'TORBOX_WEBDAV_PASS': 'p'}
+        cur = {k: config_resolve.Resolved(v, 'locked' if 'MOUNT_NAME' in k else 'set', 'x')
+               for k, v in vals.items()}
+        monkeypatch.setattr(config_resolve, 'current', lambda: cur)
+        r = validate_env_values(vals)
+        assert not [e for e in r['errors'] if e.startswith('TORBOX_MOUNT_NAME')]
+        assert any(w.startswith('TORBOX_MOUNT_NAME') for w in r['warnings'])
 
     def test_torbox_mount_name_must_not_clash_with_a_zurg_mount(self):
         base = {'ZURG_ENABLED': 'true', 'RD_API_KEY': 'k', 'RCLONE_MOUNT_NAME': 'zurgarr',

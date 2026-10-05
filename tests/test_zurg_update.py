@@ -198,10 +198,11 @@ class TestPlexRefreshHook:
         cfg = self._cfg(tmp_path)
         zs.apply_plex_refresh_hook(str(cfg), str(tmp_path / 'p.py'), 'true', 'http://plex', 'tok', '/m')
         zs.apply_plex_refresh_hook(str(cfg), str(tmp_path / 'p.py'), 'false', '', '', '')
-        assert 'on_library_update' not in cfg.read_text()
-        other = self._cfg(tmp_path, "zurg: v1\non_library_update: sh plex_update.sh \"$@\"\n")
-        zs.apply_plex_refresh_hook(str(other), str(tmp_path / 'p.py'), 'false', '', '', '')
-        assert 'plex_update.sh' in other.read_text()                # not ours: left alone
+        text = cfg.read_text()
+        assert 'plex_refresh.py' not in text and 'plex_update.sh' in text   # Zurg's stock hook back
+        mine = self._cfg(tmp_path, "zurg: v1\non_library_update: python my/plex_refresh.py\n")
+        zs.apply_plex_refresh_hook(str(mine), str(tmp_path / 'p.py'), 'false', '', '', '')
+        assert 'my/plex_refresh.py' in mine.read_text()             # not ours: left alone
 
 
 class TestZurgLogLevel:
@@ -218,7 +219,7 @@ class TestZurgLogLevel:
         monkeypatch.setattr(zu.ProcessHandler, 'start_process', lambda self, *a, **k: None)
         z.start_process('Zurg', '/zurg/RD')
         h = z._instance_handlers['RealDebrid']
-        assert h.env_overrides == {'LOG_LEVEL': 'DEBUG'}
+        assert h.env_overrides['LOG_LEVEL'] == 'DEBUG'
         monkeypatch.setattr(boot_layout, 'BOOT_VALUES', dict(boot_layout.BOOT_VALUES, ZURG_LOG_LEVEL=''))
         assert zu.zurg_log_level() == 'INFO'                  # falls back to zurgarr's
 
@@ -231,3 +232,18 @@ class TestZurgLogLevel:
         monkeypatch.setenv('DROP_ME', 'x')
         env = h._child_env()
         assert env['LOG_LEVEL'] == 'DEBUG' and 'DROP_ME' not in env
+
+
+def test_zurg_hook_keeps_the_plex_settings_it_started_with(z, monkeypatch):
+    # Zurg's refresh hook runs in Zurg's environment: a crash-restart must not
+    # half-apply Plex settings the Setup check still lists as pending
+    from utils import boot_layout
+    monkeypatch.setattr(boot_layout, 'BOOTED', True)
+    monkeypatch.setattr(boot_layout, 'BOOT_LAYOUT',
+                        boot_layout.Layout(True, frozenset({'RD'}), 'z', False, '', '', False))
+    monkeypatch.setattr(boot_layout, 'BOOT_VALUES', dict(
+        boot_layout.BOOT_VALUES, PLEX_ADDRESS='http://plex', PLEX_TOKEN='t', PLEX_MOUNT_DIR='/media'))
+    monkeypatch.setattr(zu.ProcessHandler, 'start_process', lambda self, *a, **k: None)
+    z.start_process('Zurg', '/zurg/RD')
+    o = z._instance_handlers['RealDebrid'].env_overrides
+    assert (o['PLEX_ADDRESS'], o['PLEX_TOKEN'], o['PLEX_MOUNT_DIR']) == ('http://plex', 't', '/media')

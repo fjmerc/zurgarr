@@ -415,10 +415,14 @@ _services_to_restart(changed)
      page Setup check say a container restart is needed.
          │
          ▼
-Restart affected services (under processes.lifecycle_lock, shared with
-auto-updates and restart_service):
-  ├─ plex_debrid: stop (outside the registry lock), Trakt .env, start
-  ├─ Non-process services: notifications.init(), blackhole.stop()/setup()
+Apply at once: notifications.init(), Status UI auth/origins.
+Restart services (deferred to the end of startup while main.py is still
+setting them up — config_reload._restart_services, one pass for all saves):
+  ├─ plex_debrid (under processes.lifecycle_lock, shared with auto-updates
+  │  and restart_service): stop (outside the registry lock), Trakt .env,
+  │  start — not started again when PD_ENABLED was switched off
+  ├─ blackhole: stop()/setup() under blackhole's own lock — setup waits for
+  │  the old watcher to finish its current file (never two watchers)
   └─ Notify: 'Config Reloaded' notification
 
 Mount paths used at runtime (blackhole, library, liveness, routing) come
