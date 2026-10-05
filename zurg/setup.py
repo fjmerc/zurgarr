@@ -16,6 +16,16 @@ def apply_zurg_log_level():
         os.environ.pop('LOG_LEVEL', None)
 
 
+def instance_port(key_type, zurg_port, both):
+    """Fixed port for a Zurg instance, or None (auto-assign).  With both a
+    Real-Debrid and an AllDebrid instance, AllDebrid takes ZURG_PORT + 1 —
+    two instances can't share one port."""
+    if not str(zurg_port or '').strip():
+        return None
+    port = int(zurg_port)
+    return port + 1 if both and key_type == 'AllDebrid' else port
+
+
 def zurg_setup():
     refresh_globals(globals())
     logger = get_logger()
@@ -197,8 +207,8 @@ def zurg_setup():
             if not os.path.exists(plex_update_file_path):
                 shutil.copy(zurg_plex_update_base,plex_update_file_path)                
 
-            if ZURGPORT:
-                port = ZURGPORT
+            port = instance_port(key_type, ZURGPORT, bool(RDAPIKEY and ADAPIKEY))
+            if port is not None:
                 logger.debug(f"Setting port {port} for Zurg w/ {key_type} instance")
                 update_port(config_file_path, port)
             else:

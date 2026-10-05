@@ -76,6 +76,7 @@ def test_one_instance_failing_still_updates_and_restarts_the_others(z, monkeypat
 
 def test_start_skips_an_instance_that_is_running(z, monkeypatch):
     h = _handler(alive=True)
+    h.restart_policy = object()                          # supervised, i.e. not stopped
     z._instance_handlers = {'RealDebrid': h}
     z.start_process('Zurg', '/zurg/RD')
     h.start_process.assert_not_called()                  # no second process on it
@@ -98,3 +99,32 @@ def test_update_holds_the_lifecycle_lock(z, monkeypatch):
 
 def test_no_dead_shared_handler_helper():
     assert not hasattr(zu.ZurgUpdate, 'terminate_zurg_instance')
+
+
+def test_start_does_not_skip_an_instance_we_just_stopped(z):
+    # stopped on purpose (policy None) but not reaped yet: still start it
+    h = _handler(alive=True)
+    h.restart_policy = None
+    z._instance_handlers = {'RealDebrid': h}
+    z.start_process('Zurg', '/zurg/RD')
+    h.start_process.assert_called_once()
+
+
+def test_version_not_advanced_when_an_instance_kept_the_old_binary(z, monkeypatch):
+    # a later check must retry the instance whose copy failed
+    _no_copy(monkeypatch, fail_for=('/zurg/AD',))
+    monkeypatch.setattr(zu, 'download_and_unzip_release',
+                        lambda *a: zu.os.environ.__setitem__('ZURG_CURRENT_VERSION', 'v2') or True)
+    z._instance_handlers = {'RealDebrid': _handler(), 'AllDebrid': _handler()}
+    monkeypatch.setattr(z, 'start_process', lambda *a, **k: None)
+    z.update_check('Zurg')
+    assert zu.os.environ['ZURG_CURRENT_VERSION'] == 'v1'
+
+
+def test_fixed_zurg_port_gives_each_instance_its_own_port():
+    # both instances on one ZURG_PORT: the second can't bind and crash-loops
+    from zurg.setup import instance_port
+    assert instance_port('RealDebrid', '9090', both=True) == 9090
+    assert instance_port('AllDebrid', '9090', both=True) == 9091
+    assert instance_port('AllDebrid', '9090', both=False) == 9090
+    assert instance_port('RealDebrid', '', both=True) is None      # auto-assigned

@@ -107,7 +107,7 @@ def _status_server_alive(port, timeout):
     return True
 
 
-def _layout_facts(zurg, rd, ad, rclone_mn, torbox_mn):
+def _layout_facts(zurg, rd, ad, rclone_mn, torbox_mn, nfs, torbox_configured):
     """Zurg on/off, its instances and the mount names to check.  Follows what
     main.py started at boot (utils/boot_layout) — Zurg and its mounts only
     start with the container, so a runtime settings change mustn't make the
@@ -121,38 +121,45 @@ def _layout_facts(zurg, rd, ad, rclone_mn, torbox_mn):
         has_rd, has_ad = 'RD' in instances, 'AD' in instances
         rclone_mn = rec.get('rclone_mount_name') or ''
         torbox_mn = rec.get('torbox_mount_name') or torbox_mn
+        nfs_on = bool(rec.get('nfs'))
+        torbox_mount = bool(rec.get('torbox'))
     else:
         zurg_on = str(zurg).lower() == 'true'
         has_rd, has_ad = bool(rd), bool(ad)
+        nfs_on = str(nfs).lower() == 'true'
+        # main.py only starts rclone (the TorBox mount too) with Zurg on
+        torbox_mount = zurg_on and bool(torbox_configured)
     # Dual-provider mount name derivation (must match rclone/rclone.py)
     if has_rd and has_ad and rclone_mn:
         rclone_rd, rclone_ad = f"{rclone_mn}_RD", f"{rclone_mn}_AD"
     else:
         rclone_rd = rclone_ad = rclone_mn
     return {'zurg': zurg_on, 'rd': has_rd, 'ad': has_ad,
-            'rclone_rd': rclone_rd, 'rclone_ad': rclone_ad, 'torbox': torbox_mn}
+            'rclone_rd': rclone_rd, 'rclone_ad': rclone_ad, 'torbox': torbox_mn,
+            'nfs': nfs_on, 'torbox_mount': torbox_mount}
 
 
 def main():
     try:
         error_messages = []
 
-        facts = _layout_facts(ZURG, RDAPIKEY, ADAPIKEY, RCLONEMN, TORBOX_MOUNT_NAME)
+        # TorBox mount is set up by rclone/rclone.py iff API key + WebDAV
+        # creds are all present — must match _torbox_mount_configured() there.
+        facts = _layout_facts(ZURG, RDAPIKEY, ADAPIKEY, RCLONEMN, TORBOX_MOUNT_NAME, NFSMOUNT,
+                              bool(TORBOXAPIKEY and TORBOXWEBDAVUSER and TORBOXWEBDAVPASS))
         RCLONEMN_RD, RCLONEMN_AD = facts['rclone_rd'], facts['rclone_ad']
         TB_MOUNT = facts['torbox']
         zurg_rd = facts['zurg'] and facts['rd']
         zurg_ad = facts['zurg'] and facts['ad']
 
-        mount_type = "serve nfs" if NFSMOUNT is not None and str(NFSMOUNT).lower() == 'true' else "mount"
+        mount_type = "serve nfs" if facts['nfs'] else "mount"
 
         plex_debrid_should_run = str(PLEXDEBRID).lower() == 'true' and (
             os.getenv('PLEX_CONNECTED', 'False') == 'True'
             or bool(os.getenv('JF_API_KEY', '').strip())
         )
 
-        # TorBox mount is set up by rclone/rclone.py iff API key + WebDAV
-        # creds are all present — must match _torbox_mount_configured() there.
-        torbox_mount_configured = bool(TORBOXAPIKEY and TORBOXWEBDAVUSER and TORBOXWEBDAVPASS)
+        torbox_mount_configured = facts['torbox_mount']
 
         process_info = {
             "zurg_rd": {
@@ -217,9 +224,9 @@ def main():
                 alive, why = _mount_alive(mp, _probe_budget())
                 if not alive:
                     error_messages.append(f"Rclone mount {mp} is not active ({why}).")
-        # TB mount is NOT under the ZURG guard: TorBox uses its own WebDAV
-        # endpoint (webdav.torbox.app) and does not require Zurg to be
-        # enabled.  A TB-only setup with ZURG=false is supported.
+        # The TorBox mount talks to TorBox's own WebDAV (webdav.torbox.app),
+        # not Zurg, but main.py only starts rclone — this mount included —
+        # when Zurg is on; facts['torbox_mount'] reflects what was started.
         if torbox_mount_configured and os.path.exists(f'/healthcheck/{TB_MOUNT}'):
             mp = f'/data/{TB_MOUNT}'
             alive, why = _mount_alive(mp, _probe_budget())

@@ -29,8 +29,9 @@ class ZurgUpdate(Update, ProcessHandler):
                 handler = self._instance_handlers.get(key_type)
                 if handler is None:
                     handler = self._instance_handlers[key_type] = ProcessHandler(self.logger)
-                elif handler.process and handler.process.poll() is None:
-                    continue   # already running: a second Popen would orphan it
+                elif (handler.restart_policy is not None and handler.process
+                      and handler.process.poll() is None):
+                    continue   # running and supervised: a second Popen would orphan it
                 handler.start_process(process_name, dir_to_check, command, key_type, suppress_logging=suppress_logging)
 
     _DIRS = {'RealDebrid': '/zurg/RD', 'AllDebrid': '/zurg/AD'}
@@ -101,6 +102,7 @@ class ZurgUpdate(Update, ProcessHandler):
                     raise Exception(f"Failed to download and extract the release for {process_name}.")
 
                 updated = False
+                failed = False
                 # Never interleave with a config reload restarting Zurg.
                 with lifecycle_lock:
                     for dir_to_check, key_type in self._instances():
@@ -120,9 +122,17 @@ class ZurgUpdate(Update, ProcessHandler):
                                 shutil.copyfileobj(src, dst)
                             updated = True   # every instance, not just the first
                         except Exception as e:
+                            failed = True
                             self.logger.error(f"Could not update {process_name} w/ {key_type}: {e} — restarting the current version")
                         # Always bring the instance back (new or old binary).
                         self.start_process('Zurg', dir_to_check)
+                if failed:
+                    # Keep the old version so the next check retries the
+                    # instance(s) still on the old binary.
+                    if current_version:
+                        os.environ['ZURG_CURRENT_VERSION'] = current_version
+                    else:
+                        os.environ.pop('ZURG_CURRENT_VERSION', None)
                 if updated:
                     return True
 

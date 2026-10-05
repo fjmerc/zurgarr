@@ -5,6 +5,8 @@ import os
 import re
 import tempfile
 import pytest
+
+from utils.boot_layout import Layout
 from unittest.mock import patch, MagicMock
 
 from utils.settings_api import (
@@ -1791,7 +1793,12 @@ class TestSourcesAndExplicitSave:
         monkeypatch.delenv('ZURG_ENABLED', raising=False)
         monkeypatch.setenv('RD_API_KEY', 'k' * 20)          # Zurg is automatically on
         import utils.config_reload as cr
-        monkeypatch.setattr(cr, '_BOOT_LAYOUT', (True, frozenset({'RD'})))
+        monkeypatch.setattr(cr, '_BOOT_LAYOUT', Layout(True, frozenset({'RD'}), 'zurgarr', False, '', '', False))
+        monkeypatch.setattr(cr, '_FROZEN_PENDING', frozenset())
+        monkeypatch.setenv('RCLONE_MOUNT_NAME', 'zurgarr')
+        monkeypatch.setenv('NFS_ENABLED', 'false')
+        for _k in ('TORBOX_API_KEY', 'TORBOX_WEBDAV_USER', 'TORBOX_WEBDAV_PASS', 'NFS_PORT'):
+            monkeypatch.delenv(_k, raising=False)
         config_resolve.apply(config_resolve.resolve(os.environ, {}))
         values = self._as_page_posts(read_env_values())
         values.pop('RD_API_KEY', None)
@@ -1809,7 +1816,12 @@ class TestSourcesAndExplicitSave:
         monkeypatch.setenv('RD_API_KEY', 'k' * 20)
         env_file.write_text('ZURG_ENABLED=false\n')            # off now, but booted on
         config_resolve.apply(config_resolve.resolve(os.environ, {'ZURG_ENABLED': 'false'}))
-        monkeypatch.setattr(cr, '_BOOT_LAYOUT', (True, frozenset({'RD'})))
+        monkeypatch.setattr(cr, '_BOOT_LAYOUT', Layout(True, frozenset({'RD'}), 'zurgarr', False, '', '', False))
+        monkeypatch.setattr(cr, '_FROZEN_PENDING', frozenset())
+        monkeypatch.setenv('RCLONE_MOUNT_NAME', 'zurgarr')
+        monkeypatch.setenv('NFS_ENABLED', 'false')
+        for _k in ('TORBOX_API_KEY', 'TORBOX_WEBDAV_USER', 'TORBOX_WEBDAV_PASS', 'NFS_PORT'):
+            monkeypatch.delenv(_k, raising=False)
         values = self._as_page_posts(read_env_values())
         values.pop('RD_API_KEY', None)
         values['ZURG_ENABLED'] = 'true'
@@ -1842,6 +1854,34 @@ class TestSourcesAndExplicitSave:
         assert os.environ['NOTIFICATION_LEVEL'] == 'error'
         env_file.write_text('')                       # the save cleared it; no reload yet
         assert read_env_values()['NOTIFICATION_LEVEL'] == config_resolve.DEFAULTS.get('NOTIFICATION_LEVEL', '')
+
+    def test_clearing_last_debrid_key_with_automatic_zurg_saves(self, env_file, monkeypatch):
+        # page shows (and posts back) the automatic ZURG_ENABLED=true; with the
+        # key cleared the automatic value becomes false — validate that, not
+        # the stale displayed 'true'
+        from utils import config_resolve
+        from utils.settings_api import read_env_values
+        monkeypatch.delenv('ZURG_ENABLED', raising=False)
+        env_file.write_text('RD_API_KEY=' + 'k' * 20 + '\n')
+        config_resolve.apply(config_resolve.resolve(os.environ, {'RD_API_KEY': 'k' * 20},
+                                                    frozenset(), config_resolve.written()))
+        values = self._as_page_posts(read_env_values())
+        assert values['ZURG_ENABLED'] == 'true'
+        values['RD_API_KEY'] = ''
+        result = write_env_values(values)
+        assert result['status'] == 'saved', result
+
+    def test_read_after_clear_of_a_key_without_default(self, env_file, monkeypatch):
+        from utils import config_resolve
+        from utils.settings_api import read_env_values
+        monkeypatch.delenv('SONARR_URL', raising=False)
+        config_resolve.apply(config_resolve.resolve(os.environ, {}, frozenset(), config_resolve.written()))
+        env_file.write_text('SONARR_URL=http://sonarr:8989\n')
+        config_resolve.apply(config_resolve.resolve(os.environ, {'SONARR_URL': 'http://sonarr:8989'},
+                                                    frozenset(), config_resolve.written()))
+        env_file.write_text('')                       # cleared; reload not run yet
+        assert os.environ['SONARR_URL'] == 'http://sonarr:8989'
+        assert read_env_values()['SONARR_URL'] == ''
 
     def test_save_to_secret_key_rejected(self, env_file, monkeypatch):
         from dotenv import dotenv_values

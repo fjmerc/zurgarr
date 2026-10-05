@@ -1202,12 +1202,13 @@ def _selfheal_enabled():
 def _zurg_mount_registered():
     """Whether a Zurg-backed rclone mount is running in this container
     (it only starts at boot, so a runtime ZURG_ENABLED flip doesn't change it).
-    The TorBox mount is told apart by its name at boot — a runtime rename
-    doesn't rename the running process."""
-    from utils.boot_layout import BOOT_TORBOX_MOUNT_NAME as tb
+    The TorBox mount is told apart by the flag rclone.setup sets on its
+    handler (a name check would misfire on a renamed mount, or a Zurg mount
+    that happens to be called "torbox")."""
     from utils.processes import _process_registry, _registry_lock
     with _registry_lock:
-        return any(e['process_name'].lower() == 'rclone' and e.get('key_type') != tb
+        return any(e['process_name'].lower() == 'rclone'
+                   and getattr(e.get('handler'), 'no_dependencies', False) is not True
                    for e in _process_registry)
 
 
@@ -1513,8 +1514,7 @@ def _rclone_mount_expected():
     mounts (see utils/boot_layout)."""
     from utils import boot_layout
     from utils.config_reload import _BOOT_LAYOUT
-    on, instances = _BOOT_LAYOUT
-    return bool(on and instances and boot_layout.BOOT_RCLONE_MOUNT_NAME)
+    return bool(_BOOT_LAYOUT.zurg and _BOOT_LAYOUT.instances and boot_layout.BOOT_RCLONE_MOUNT_NAME)
 
 
 def register_all():

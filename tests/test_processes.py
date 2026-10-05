@@ -152,14 +152,17 @@ class TestDependencyCheckMultiEntry:
         assert proc._check_dependencies_alive('plex_debrid') == (False, 'rclone')
 
     def test_torbox_mount_does_not_wait_for_zurg(self, monkeypatch):
-        # TorBox-only install: no Zurg registered; the TorBox mount uses
-        # TorBox's own WebDAV, so its restart must not be deferred forever
+        # the TorBox mount uses TorBox's own WebDAV, so its restart must not
+        # wait for Zurg (e.g. while Zurg is down) — known by the flag rclone
+        # sets when it writes the TorBox remote, not by name: a Zurg mount
+        # named "torbox" still depends on Zurg
         import utils.processes as proc
-        from utils import boot_layout
-        monkeypatch.setattr(boot_layout, 'BOOT_TORBOX_MOUNT_NAME', 'torbox')
         monkeypatch.setattr(proc, '_process_registry', [])
-        assert proc._check_dependencies_alive('rclone', 'torbox') == (True, None)
-        assert proc._check_dependencies_alive('rclone', 'zurgarr') == (False, 'Zurg')
+        tb, zm = MagicMock(), MagicMock()
+        tb.no_dependencies = True
+        zm.no_dependencies = False
+        assert proc._check_dependencies_alive('rclone', 'torbox', tb) == (True, None)
+        assert proc._check_dependencies_alive('rclone', 'torbox', zm) == (False, 'Zurg')
 
     def test_unregistered_dependency_fails(self, monkeypatch):
         import utils.processes as proc
@@ -211,3 +214,28 @@ class TestDependencyCheckMultiEntry:
             proc._handle_restart(dep_entry, MagicMock())
         exhausted.assert_not_called()
         assert dep_entry['handler'].restart_policy is not None
+
+
+class TestStopWaitsForExit:
+
+    def test_stop_reaps_the_killed_process(self):
+        # without the wait, poll() can still report "running" right after the
+        # kill and a restart decision is made on a corpse
+        from unittest.mock import MagicMock
+        from utils.processes import ProcessHandler
+        h = ProcessHandler(MagicMock())
+        h.process = MagicMock()
+        h.subprocess_logger = None
+        h.stop_process('Zurg', 'RealDebrid')
+        h.process.kill.assert_called_once()
+        h.process.wait.assert_called_once()
+
+    def test_stop_survives_a_process_that_will_not_exit(self):
+        import subprocess
+        from unittest.mock import MagicMock
+        from utils.processes import ProcessHandler
+        h = ProcessHandler(MagicMock())
+        h.process = MagicMock()
+        h.process.wait.side_effect = subprocess.TimeoutExpired('zurg', 5)
+        h.subprocess_logger = None
+        h.stop_process('Zurg')                             # logs, doesn't raise

@@ -639,6 +639,9 @@ def setup():
                 # coverage, restart_service(key_type=...), and the mount
                 # self-heal's service_registered gate.
                 process_handler = ProcessHandler(logger)
+                # The TorBox mount uses TorBox's own WebDAV, not Zurg: its
+                # restarts don't wait for Zurg, and it isn't a Zurg mount.
+                process_handler.no_dependencies = bool(mn == TORBOX_MOUNT_NAME and torbox_remote_written)
                 # Every auto-restart / restart_service relaunch runs the same
                 # `rclone mount` command, so a corpse left by the crashed
                 # instance must be cleared first or the whole restart budget

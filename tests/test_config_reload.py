@@ -2,6 +2,7 @@
 
 import os
 import pytest
+from unittest.mock import MagicMock
 from utils.config_reload import (
     _determine_restarts, _reload_env, SOFT_RELOAD, SERVICE_DEPENDENCIES,
     ENV_FILE,
@@ -18,7 +19,7 @@ class TestDetermineRestarts:
 
     def test_rclone_change_cascades_to_plex_debrid(self):
         """Changing an rclone var should also restart plex_debrid."""
-        services = _determine_restarts({'RCLONE_MOUNT_NAME'})
+        services = _determine_restarts({'RCLONE_VFS_CACHE_MODE'})
         assert 'rclone' in services
         assert 'plex_debrid' in services
 
@@ -104,7 +105,7 @@ class TestServiceDependencies:
 
     def test_expected_services_defined(self):
         """Expected services should all be defined."""
-        expected = {'zurg', 'rclone', 'plex_debrid', 'blackhole', 'notifications', 'status_ui'}
+        expected = {'zurg', 'rclone', 'plex_debrid', 'blackhole', 'notifications', 'status_ui', 'rclone_torbox'}
         assert expected == set(SERVICE_DEPENDENCIES.keys())
 
     def test_plex_debrid_deps_include_debrid_keys(self):
@@ -290,68 +291,169 @@ def test_notification_url_is_masked_in_reload_log(tmp_path, monkeypatch):
     assert not any('tok123' in m for m in logged)
 
 
+def _L(zurg=True, instances=('RD',), rclone_mount='zurgarr', nfs=False, nfs_port='',
+       torbox_mount='', torbox=False):
+    from utils.boot_layout import Layout
+    return Layout(zurg, frozenset(instances), rclone_mount, nfs, nfs_port, torbox_mount, torbox)
+
+
 class TestZurgRestartRequired:
-    """Zurg's instances (on/off, which debrid keys) are fixed when the
-    container starts.  A reload that changes them restarts nothing Zurg-side
-    and flags a restart; a key rotation for a running instance still
-    restarts Zurg with the new key."""
+    """Zurg's and rclone's topology (Zurg on/off, RD/AD instances, mount
+    names, NFS mode, the TorBox mount) is fixed when the container starts.
+    While the live settings differ from it, nothing Zurg/rclone-side restarts
+    (zurg_setup would delete a running instance's dir, regenerate_config
+    would rename the remotes the running mounts use) and a restart is
+    flagged; with the topology unchanged, rotations still apply."""
 
     @pytest.fixture
     def boot(self, monkeypatch):
         import utils.config_reload as cr
-        for k in ('RD_API_KEY', 'AD_API_KEY', 'ZURG_ENABLED'):
+        monkeypatch.setattr(cr, '_FROZEN_PENDING', frozenset())
+        for k in ('RD_API_KEY', 'AD_API_KEY', 'ZURG_ENABLED', 'TORBOX_API_KEY',
+                  'TORBOX_WEBDAV_USER', 'TORBOX_WEBDAV_PASS', 'NFS_PORT', 'TORBOX_MOUNT_NAME'):
             monkeypatch.delenv(k, raising=False)
+        monkeypatch.setenv('RCLONE_MOUNT_NAME', 'zurgarr')
+        monkeypatch.setenv('NFS_ENABLED', 'false')
         monkeypatch.setattr('utils.env.SECRETS_DIR', '/nonexistent-secrets')
 
-        def _boot(on, instances, **env):
-            monkeypatch.setattr(cr, '_BOOT_LAYOUT', (on, frozenset(instances)))
+        def _boot(layout, **env):
+            monkeypatch.setattr(cr, '_BOOT_LAYOUT', layout)
             for k, v in env.items():
                 monkeypatch.setenv(k, v)
             return cr
         return _boot
 
     def test_change_away_from_boot_value_flags_restart(self, boot):
-        cr = boot(True, {'RD'}, ZURG_ENABLED='false', RD_API_KEY='k')
+        cr = boot(_L(), ZURG_ENABLED='false', RD_API_KEY='k')
         note = cr._zurg_restart_note({'ZURG_ENABLED'})
         assert note and 'restart the container' in note.lower() and 'ZURG_ENABLED' in note
 
-    def test_change_back_to_boot_value_clears_flag(self, boot, monkeypatch):
-        cr = boot(True, {'RD'}, ZURG_ENABLED='true', RD_API_KEY='k')
+    def test_change_back_to_boot_value_clears_flag(self, boot):
+        cr = boot(_L(), ZURG_ENABLED='true', RD_API_KEY='k')
         assert cr._zurg_restart_note({'ZURG_ENABLED'}) is None
 
     def test_unrelated_change_is_untouched(self, boot):
-        cr = boot(True, {'RD'}, ZURG_ENABLED='true', RD_API_KEY='k')
+        cr = boot(_L(), ZURG_ENABLED='true', RD_API_KEY='k')
         assert cr._zurg_restart_note({'PLEX_USER'}) is None
 
     def test_removing_a_debrid_key_flags_restart_and_leaves_zurg_alone(self, boot):
-        # boot with RD+AD, remove RD: zurg_setup would delete /zurg/RD under the
-        # running instance — so nothing Zurg-side restarts, a restart is flagged
-        cr = boot(True, {'RD', 'AD'}, ZURG_ENABLED='true', AD_API_KEY='a')
+        cr = boot(_L(instances=('RD', 'AD')), ZURG_ENABLED='true', AD_API_KEY='a')
         assert not {'zurg', 'rclone'} & cr._services_to_restart({'RD_API_KEY'})
         assert 'plex_debrid' in cr._services_to_restart({'RD_API_KEY'})   # its own config
         assert 'RD_API_KEY' in cr._zurg_restart_note({'RD_API_KEY'})
 
+    def test_drifted_layout_freezes_every_zurg_and_rclone_setting(self, boot):
+        # boot RD+AD, AD removed (drift), then another Zurg/rclone setting
+        # changes: restarting would rmtree /zurg/AD and rename the remotes
+        cr = boot(_L(instances=('RD', 'AD')), ZURG_ENABLED='true', RD_API_KEY='k')
+        for key in ('ZURG_LOG_LEVEL', 'ZURG_USER', 'ZURG_PORT', 'RCLONE_VFS_CACHE_MODE',
+                    'TORBOX_WEBDAV_PASS'):
+            assert not {'zurg', 'rclone', 'rclone_torbox'} & cr._services_to_restart({key}), key
+
+    def test_settings_frozen_during_drift_stay_restart_required(self, boot, monkeypatch):
+        cr = boot(_L(instances=('RD', 'AD')), ZURG_ENABLED='true', RD_API_KEY='k')
+        cr._record_frozen({'ZURG_LOG_LEVEL', 'PLEX_USER'})
+        assert cr.restart_pending() == ['AD_API_KEY', 'ZURG_LOG_LEVEL']
+        monkeypatch.setenv('AD_API_KEY', 'a')            # drift undone …
+        assert cr.restart_pending() == ['ZURG_LOG_LEVEL']   # … the frozen change still needs one
+
+    def test_mount_name_nfs_and_torbox_mount_are_boot_fixed(self, boot, monkeypatch):
+        cr = boot(_L(), ZURG_ENABLED='true', RD_API_KEY='k')
+        for key, val in (('RCLONE_MOUNT_NAME', 'media'), ('NFS_ENABLED', 'true')):
+            monkeypatch.setenv(key, val)
+            assert cr._services_to_restart({key}) == set(), key
+            assert key in cr.restart_pending(), key
+            monkeypatch.setenv(key, {'RCLONE_MOUNT_NAME': 'zurgarr', 'NFS_ENABLED': 'false'}[key])
+        for k, v in (('TORBOX_API_KEY', 't'), ('TORBOX_WEBDAV_USER', 'u'), ('TORBOX_WEBDAV_PASS', 'p')):
+            monkeypatch.setenv(k, v)                      # TorBox mount configured after boot
+        assert set(cr.restart_pending()) & {'TORBOX_API_KEY', 'TORBOX_WEBDAV_USER', 'TORBOX_WEBDAV_PASS'}
+
     def test_rotating_a_running_instances_key_restarts_zurg(self, boot):
-        cr = boot(True, {'RD'}, ZURG_ENABLED='true', RD_API_KEY='new')
+        cr = boot(_L(), ZURG_ENABLED='true', RD_API_KEY='new')
         assert {'zurg', 'rclone'} <= cr._services_to_restart({'RD_API_KEY'})
         assert cr._zurg_restart_note({'RD_API_KEY'}) is None
 
-    def test_zurg_off_at_boot_never_runs_zurg_setup(self, boot):
-        # no Zurg running: a TorBox key change restarts the TorBox mount, not Zurg
-        cr = boot(False, set(), ZURG_ENABLED='false', TORBOX_API_KEY='t')
-        services = cr._services_to_restart({'TORBOX_API_KEY'})
-        assert 'zurg' not in services and 'rclone' in services
+    def test_torbox_key_does_not_restart_zurg(self, boot):
+        # Zurg (RD/AD) doesn't use the TorBox API key
+        cr = boot(_L(), ZURG_ENABLED='true', RD_API_KEY='k')
+        assert not {'zurg', 'rclone'} & cr._services_to_restart({'TORBOX_API_KEY'})
+
+    def test_torbox_webdav_rotation_restarts_only_the_torbox_mount(self, boot):
+        cr = boot(_L(torbox_mount='torbox', torbox=True), ZURG_ENABLED='true', RD_API_KEY='k',
+                  TORBOX_API_KEY='t', TORBOX_WEBDAV_USER='u', TORBOX_WEBDAV_PASS='p2')
+        services = cr._services_to_restart({'TORBOX_WEBDAV_PASS'})
+        assert 'rclone_torbox' in services and not {'zurg', 'rclone', 'plex_debrid'} & services
+
+    def test_auto_zurg_names_the_key_that_drove_it(self, boot, monkeypatch):
+        # boot RD only on automatic; removing the key flips Zurg off: the
+        # note/link point at RD_API_KEY, the field the user changed
+        from utils import config_resolve
+        cr = boot(_L(), ZURG_ENABLED='false')
+        monkeypatch.setattr(config_resolve, 'current',
+                            lambda: {'ZURG_ENABLED': config_resolve.Resolved('false', 'auto', 'x')})
+        assert cr.restart_pending() == ['RD_API_KEY']
+
+    def test_zurg_off_at_boot_restarts_no_zurg_or_mount(self, boot):
+        cr = boot(_L(zurg=False, instances=(), rclone_mount=''), ZURG_ENABLED='false',
+                  TORBOX_API_KEY='t')
+        assert not {'zurg', 'rclone', 'rclone_torbox'} & cr._services_to_restart({'TORBOX_API_KEY', 'ZURG_LOG_LEVEL'})
 
     def test_zurg_toggle_alone_restarts_nothing_either_way(self, boot):
-        cr = boot(True, {'RD'}, ZURG_ENABLED='false', RD_API_KEY='k')
+        cr = boot(_L(), ZURG_ENABLED='false', RD_API_KEY='k')
         assert cr._services_to_restart({'ZURG_ENABLED'}) == set()
 
     def test_zurg_toggle_with_other_changes_keeps_their_restarts(self, boot):
-        cr = boot(True, {'RD'}, ZURG_ENABLED='false', RD_API_KEY='k')
+        cr = boot(_L(), ZURG_ENABLED='false', RD_API_KEY='k')
         assert 'plex_debrid' in cr._services_to_restart({'ZURG_ENABLED', 'PLEX_USER'})
 
+    def test_reload_records_frozen_changes(self, boot, monkeypatch):
+        cr = boot(_L(instances=('RD', 'AD')), ZURG_ENABLED='true', RD_API_KEY='k')
+        monkeypatch.setattr(cr, '_reload_env', lambda: {'ZURG_LOG_LEVEL'})
+        monkeypatch.setattr('base.config.load', lambda **kw: None)
+        monkeypatch.setattr(cr, '_notify_reload', lambda *a, **k: None)
+        cr._reload_once()
+        assert 'ZURG_LOG_LEVEL' in cr.restart_pending()
+
+    def test_reload_restarts_only_the_torbox_mount_for_webdav_rotation(self, boot, monkeypatch):
+        from utils import processes, boot_layout
+        cr = boot(_L(torbox_mount='torbox', torbox=True), ZURG_ENABLED='true', RD_API_KEY='k',
+                  TORBOX_API_KEY='t', TORBOX_WEBDAV_USER='u', TORBOX_WEBDAV_PASS='p2')
+        monkeypatch.setattr(boot_layout, 'BOOT_TORBOX_MOUNT_NAME', 'torbox')
+        zm, tb = MagicMock(no_dependencies=False), MagicMock(no_dependencies=True)
+        for h in (zm, tb):
+            h.process.poll.return_value = None
+        monkeypatch.setattr(processes, '_process_registry', [
+            {'process_name': 'rclone', 'key_type': 'zurgarr', 'handler': zm},
+            {'process_name': 'rclone', 'key_type': 'torbox', 'handler': tb}])
+        regen = []
+        monkeypatch.setattr('rclone.rclone.regenerate_config', lambda: regen.append(1))
+        monkeypatch.setattr(cr, '_reload_env', lambda: {'TORBOX_WEBDAV_PASS'})
+        monkeypatch.setattr('base.config.load', lambda **kw: None)
+        monkeypatch.setattr(cr, '_notify_reload', lambda *a, **k: None)
+        cr._reload_once()
+        assert regen == [1]
+        tb.stop_process.assert_called_once()
+        tb.restart_process.assert_called_once()
+        zm.stop_process.assert_not_called()
+        zm.restart_process.assert_not_called()
+
+    def test_reload_holds_lifecycle_lock_while_restarting(self, boot, monkeypatch):
+        from utils import processes
+        cr = boot(_L(), ZURG_ENABLED='true', RD_API_KEY='k')
+        seen = []
+        h = MagicMock()
+        h.process.poll.return_value = None
+        h.stop_process.side_effect = lambda *a: seen.append(processes.lifecycle_lock._is_owned())
+        monkeypatch.setattr(processes, '_process_registry',
+                            [{'process_name': 'plex_debrid', 'key_type': None, 'handler': h}])
+        monkeypatch.setattr(cr, '_reload_env', lambda: {'PLEX_USER'})
+        monkeypatch.setattr('base.config.load', lambda **kw: None)
+        monkeypatch.setattr(cr, '_notify_reload', lambda *a, **k: None)
+        cr._reload_once()
+        assert seen == [True]
+
     def test_reload_refreshes_the_setup_check(self, boot, monkeypatch):
-        cr = boot(True, {'RD'}, ZURG_ENABLED='false', RD_API_KEY='k')
+        cr = boot(_L(), ZURG_ENABLED='false', RD_API_KEY='k')
         import utils.setup_check as sc
         calls = []
         monkeypatch.setattr(cr, '_reload_env', lambda: {'ZURG_ENABLED'})
@@ -362,7 +464,7 @@ class TestZurgRestartRequired:
         assert calls
 
     def test_soft_only_reload_refreshes_the_setup_check(self, boot, monkeypatch):
-        cr = boot(True, {'RD'}, ZURG_ENABLED='true', RD_API_KEY='k')
+        cr = boot(_L(), ZURG_ENABLED='true', RD_API_KEY='k')
         import utils.setup_check as sc
         calls = []
         monkeypatch.setattr(cr, '_reload_env', lambda: {'BLACKHOLE_REQUIRE_CACHED'})
@@ -397,3 +499,8 @@ class TestOnlyRunningProcessesListed:
         monkeypatch.setattr(processes, '_process_registry',
                             [{'process_name': 'rclone', 'key_type': 'torbox', 'handler': None}])
         assert cr._drop_not_running({'plex_debrid', 'rclone', 'notifications'}) == {'rclone', 'notifications'}
+
+
+def test_service_labels_are_readable():
+    import utils.config_reload as cr
+    assert cr.service_labels({'rclone_torbox', 'plex_debrid'}) == ['TorBox mount', 'plex_debrid']

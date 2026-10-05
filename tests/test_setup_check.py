@@ -5,6 +5,8 @@ from unittest.mock import patch
 
 import pytest
 
+from utils.boot_layout import Layout
+
 from utils import setup_check as sc
 
 
@@ -661,18 +663,45 @@ class TestRound7:
         # setting changed (reload, plex_debrid sync, failed reload)
         import utils.config_reload as cr
         clean.setattr(sc, '_restart_pending', _REAL_RESTART_PENDING)
-        monkeypatch.setattr(cr, '_BOOT_LAYOUT', (True, frozenset({'RD'})))
+        monkeypatch.setattr(cr, '_BOOT_LAYOUT', Layout(True, frozenset({'RD'}), 'zurgarr', False, '', '', False))
         monkeypatch.setattr('utils.env.SECRETS_DIR', '/nonexistent-secrets')
+        monkeypatch.setattr(cr, '_FROZEN_PENDING', frozenset())
+        clean.setenv('RCLONE_MOUNT_NAME', 'zurgarr')
+        clean.setenv('NFS_ENABLED', 'false')
+        for k in ('TORBOX_WEBDAV_USER', 'TORBOX_WEBDAV_PASS', 'NFS_PORT', 'ZURG_ENABLED'):
+            clean.delenv(k, raising=False)
         clean.setenv('RD_API_KEY', 'k')
         clean.setenv('ZURG_ENABLED', 'false')
         f = next(f for f in sc.collect_findings() if f['id'] == 'restart-required')
         assert f['level'] == 'warn' and f['key'] == 'ZURG_ENABLED'
+        assert 'it only takes effect' in f['message']
         clean.setenv('ZURG_ENABLED', 'true')
+        monkeypatch.setattr(cr, '_FROZEN_PENDING', frozenset({'ZURG_LOG_LEVEL', 'ZURG_USER'}))
+        f = next(f for f in sc.collect_findings() if f['id'] == 'restart-required')
+        assert 'they only take effect' in f['message']
+        monkeypatch.setattr(cr, '_FROZEN_PENDING', frozenset())
         clean.setenv('AD_API_KEY', 'a')                   # a second instance added
         f = next(f for f in sc.collect_findings() if f['id'] == 'restart-required')
         assert f['key'] == 'AD_API_KEY'
         clean.delenv('AD_API_KEY')
         assert not any(f['id'] == 'restart-required' for f in sc.collect_findings())
+
+    def test_concurrent_compute_never_replaces_a_newer_cached_result(self, clean, tmp_path):
+        # two requests computing at once: the one that started earlier must
+        # not overwrite the newer result (the page would treat every later
+        # cached answer as stale), and gets the newer one back
+        clean.setattr(sc, 'CONFIG_DIR', str(tmp_path))
+        sc._invalidate()
+        newer = {'findings': [], 'dismissed': 0, 'auth_configured': False, 'checked_at': 2000.0}
+
+        def collect():
+            with sc._lock:                                  # the other request finished first
+                sc._cache['value'], sc._cache['at'] = newer, 2000.0
+            return []
+        clean.setattr(sc, 'collect_findings', collect)
+        clean.setattr(sc.time, 'time', lambda: 1999.0)
+        assert sc.get_setup_check()['checked_at'] == 2000.0
+        assert sc._cache['value'] is newer
 
     def test_result_is_not_cached_when_every_attempt_was_invalidated(self, clean, tmp_path):
         clean.setattr(sc, 'CONFIG_DIR', str(tmp_path))

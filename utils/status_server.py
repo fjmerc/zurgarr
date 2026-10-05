@@ -341,6 +341,24 @@ def _check_service(name, svc_type, url, headers=None, ok_codes=(200,)):
         return svc, None
 
 
+def _zurg_running_config(path):
+    """(port, username, password) from a Zurg instance's config.yml — what
+    the running Zurg uses; Nones where unset or unreadable."""
+    try:
+        from ruamel.yaml import YAML
+        with open(path) as f:
+            data = YAML(typ='safe').load(f) or {}
+    except Exception:
+        return None, None, None
+    if not isinstance(data, dict):
+        return None, None, None
+
+    def val(key):
+        v = data.get(key)
+        return None if v is None or v == '' else str(v)
+    return val('port'), val('username'), val('password')
+
+
 def check_services():
     """Check connectivity to all configured external services. Cached."""
     global _service_cache, _service_cache_time
@@ -471,15 +489,15 @@ def check_services():
     # Zurg WebDAV
     # (the instances started at boot — a runtime change doesn't start/stop them)
     from utils.config_reload import _BOOT_LAYOUT
-    zurg_on, zurg_instances = _BOOT_LAYOUT
+    zurg_on, zurg_instances = _BOOT_LAYOUT.zurg, _BOOT_LAYOUT.instances
     if zurg_on:
-        zurg_user = secret_or_env('ZURG_USER')
-        zurg_pass = secret_or_env('ZURG_PASS')
         for key_type, env_suffix in [('RD', 'RealDebrid'), ('AD', 'AllDebrid')]:
-            port = os.environ.get(f'ZURG_PORT_{env_suffix}')
+            # Port and login Zurg is running with (its config.yml) — a change
+            # in Settings may not have been applied to it yet.
+            port, zurg_user, zurg_pass = _zurg_running_config(f'/zurg/{key_type}/config.yml')
+            port = port or os.environ.get(f'ZURG_PORT_{env_suffix}')
             if port and key_type in zurg_instances:
                 headers = {}
-                auth = None
                 if zurg_user and zurg_pass:
                     import base64 as b64
                     creds = b64.b64encode(f'{zurg_user}:{zurg_pass}'.encode()).decode()

@@ -209,7 +209,7 @@ def _check_findings():
     pending = _restart_pending()
     if pending:
         out.append(_finding('restart-required', 'warn', pending[0],
-                            f"{_names(pending)} changed, but it only takes effect when the container starts.",
+                            f"{_names(pending)} changed, but {'it only takes' if len(pending) == 1 else 'they only take'} effect when the container starts.",
                             'Restart the container to apply it.', sig_inputs=pending))
     locked = _locked_schema_keys()
     if locked:
@@ -246,10 +246,10 @@ def _recommendations():
 
 def _restart_pending():
     """Settings changed since the container started that only apply at
-    start (Zurg on/off, which debrid instances run): compared live, so it's
-    right however the change got in."""
+    start (Zurg/rclone topology — compared live, so it's right however the
+    change got in — and Zurg/rclone settings a reload couldn't apply)."""
     from utils import config_reload
-    return sorted(config_reload._layout_keys_changed(config_reload._zurg_layout()))
+    return config_reload.restart_pending()
 
 
 def collect_findings():
@@ -357,6 +357,10 @@ def get_setup_check(fresh=False):
     }
     with _lock:
         if current and _cache['gen'] == gen:   # only a result nothing invalidated
+            if _cache['value'] is not None and _cache['at'] > now:
+                # a concurrent request computed a newer one: keep and serve it
+                # (an older cached result would read as stale to the page)
+                return _cache['value']
             _cache['at'], _cache['value'] = now, value
     return value
 

@@ -125,7 +125,7 @@ def _on_restart_exhausted(desc, restart_count, max_restarts):
         pass
 
 
-def _check_dependencies_alive(process_name, key_type=None):
+def _check_dependencies_alive(process_name, key_type=None, handler=None):
     """Check if all dependencies for a process are alive.
 
     A name can be registered more than once (each rclone mount is its own
@@ -133,15 +133,13 @@ def _check_dependencies_alive(process_name, key_type=None):
     alive, so a single dead mount doesn't wedge dependents that can run
     degraded on the surviving one.
 
-    The TorBox mount (rclone with the TorBox mount name) talks to TorBox's
-    own WebDAV, not Zurg, so it has no dependency.
+    A handler flagged ``no_dependencies`` (the TorBox mount: rclone.setup
+    sets it when the mount uses TorBox's own WebDAV, not Zurg) has none.
 
     Returns (ok, dead_dep_name). Caller must acquire _registry_lock.
     """
-    if process_name == 'rclone' and key_type is not None:
-        from utils.boot_layout import BOOT_TORBOX_MOUNT_NAME
-        if key_type == BOOT_TORBOX_MOUNT_NAME:
-            return True, None
+    if getattr(handler, 'no_dependencies', False) is True:
+        return True, None
     deps = _PROCESS_DEPENDENCIES.get(process_name, [])
     for dep_name in deps:
         any_alive = False
@@ -173,7 +171,7 @@ def _handle_restart(entry, logger):
 
     # Check dependencies before consuming a restart attempt
     with _registry_lock:
-        deps_ok, dead_dep = _check_dependencies_alive(process_name, key_type)
+        deps_ok, dead_dep = _check_dependencies_alive(process_name, key_type, handler)
         if not deps_ok:
             # If the dependency has permanently died (every registered
             # instance exhausted its own restarts), mark this process as
@@ -442,6 +440,7 @@ class ProcessHandler:
         self.stderr = ""
         self.returncode = None
         # Restart support
+        self.no_dependencies = False   # see _check_dependencies_alive
         self.restart_policy = None
         self._restart_count = 0
         self._first_restart_time = None
@@ -603,6 +602,12 @@ class ProcessHandler:
                 process_description = f"{process_name}"
             if self.process:
                 self.process.kill()
+                # Reap it: right after kill() poll() can still say "running",
+                # and the caller (reload, auto-update) decides on that next.
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.logger.warning(f"{process_description} did not exit within 5s of SIGKILL")
                 if self.subprocess_logger:
                     self.subprocess_logger.stop_logging_stdout()
                     self.subprocess_logger.stop_monitoring_stderr()

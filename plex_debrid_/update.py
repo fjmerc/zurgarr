@@ -1,6 +1,6 @@
 from base import *
 from utils.logger import *
-from utils.processes import ProcessHandler
+from utils.processes import ProcessHandler, lifecycle_lock
 from utils.auto_update import Update
 from plex_debrid_.download import get_latest_release, parse_repo_info
 
@@ -67,8 +67,10 @@ class PlexDebridUpdate(Update, ProcessHandler):
                         raise Exception(f"Failed to download and extract the release for {process_name}.")                    
                     else:    
                         self.logger.info(f"Automatic update installed for {process_name} [v{latest_version}]")                        
-                        self.stop_process(process_name)
-                        self.start_process(process_name)
+                        # Never interleave with a config reload restarting it.
+                        with lifecycle_lock:
+                            self.stop_process(process_name)
+                            self.start_process(process_name)
                         return True
                 else:
                     self.logger.info(f"Automatic update not required for {process_name}")

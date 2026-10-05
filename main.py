@@ -83,6 +83,17 @@ def main():
     # leave the previous run's entries aging toward a restart storm.
     from utils import heartbeat
     heartbeat.reset()
+    # Same reason: the previous run's boot record and mount markers survive
+    # `docker restart`.  Record what starts now (fixed until the next
+    # container start) for healthcheck.py — see utils/boot_layout.
+    from utils import boot_layout
+    boot_layout.clear()
+    boot_layout.reset_markers()
+    try:
+        boot_layout.record()
+    except Exception as e:
+        boot_layout.clear()   # healthcheck falls back to the live settings
+        logger.warning(f"Could not record the boot layout for the healthcheck: {e}")
 
     if ENV_FILE_FILLED_KEYS:
         logger.info(
@@ -102,14 +113,6 @@ def main():
     blocklist.init()
     notifications.init()
     notifications.notify('startup', 'Zurgarr Started', f'Version {version}')
-
-    # What starts now is fixed until the next container start: record it for
-    # healthcheck.py (a separate process) — see utils/boot_layout.
-    try:
-        from utils import boot_layout
-        boot_layout.record()
-    except Exception as e:
-        logger.warning(f"Could not record the boot layout for the healthcheck: {e}")
 
     if str(ZURG).lower() == 'true':
         if not (RDAPIKEY or ADAPIKEY):

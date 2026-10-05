@@ -27,19 +27,21 @@ ENV_FILE = '/config/.env'
 # Types: boolean, string, secret, url, number:MIN-MAX, select:OPT1,OPT2,...
 # ---------------------------------------------------------------------------
 
+_RESTART_HELP = ' Takes effect when the container starts — restart it after changing this.'
+
 ENV_SCHEMA = [
     {
         'name': 'Zurg',
         'description': 'Core debrid service and WebDAV server',
         'fields': [
             ('ZURG_ENABLED', 'Enable Zurg', 'boolean', True, 'Enable the Zurg WebDAV server. Takes effect when the container starts — restart it after changing this, or after adding/removing a Real-Debrid or AllDebrid key'),
-            ('RD_API_KEY', 'Real-Debrid API Key', 'secret', False, 'API key from real-debrid.com/apitoken'),
-            ('AD_API_KEY', 'AllDebrid API Key', 'secret', False, 'API key from alldebrid.com'),
+            ('RD_API_KEY', 'Real-Debrid API Key', 'secret', False, 'API key from real-debrid.com/apitoken. Adding or removing it (starting/stopping a Zurg instance) takes effect when the container starts; replacing it applies right away.'),
+            ('AD_API_KEY', 'AllDebrid API Key', 'secret', False, 'API key from alldebrid.com. Adding or removing it (starting/stopping a Zurg instance) takes effect when the container starts; replacing it applies right away.'),
             ('TORBOX_API_KEY', 'TorBox API Key', 'secret', False, 'API key from torbox.app. Powers cache probes, search-add, and the dual-debrid blackhole routing. For the WebDAV mount, also set TORBOX_WEBDAV_USER + TORBOX_WEBDAV_PASS (see the TorBox section).'),
             ('ZURG_VERSION', 'Zurg Version', 'string', False, 'Pin to specific version (e.g., v0.9.2-hotfix.4)'),
             ('ZURG_UPDATE', 'Auto-Update Zurg', 'boolean', False, 'Check for Zurg updates on startup'),
             ('ZURG_LOG_LEVEL', 'Zurg Log Level', 'select:DEBUG,INFO,WARNING,ERROR', False, 'Log level for Zurg process'),
-            ('ZURG_PORT', 'Zurg Port', 'number:1-65535', False, 'WebDAV server port (auto-assigned if empty)'),
+            ('ZURG_PORT', 'Zurg Port', 'number:1-65535', False, 'WebDAV server port (auto-assigned if empty). With both Real-Debrid and AllDebrid, AllDebrid uses this port + 1.'),
             ('ZURG_USER', 'Zurg Username', 'string', False, 'Basic auth username for WebDAV'),
             ('ZURG_PASS', 'Zurg Password', 'secret', False, 'Basic auth password for WebDAV'),
         ],
@@ -48,10 +50,10 @@ ENV_SCHEMA = [
         'name': 'rclone',
         'description': 'Mount configuration and VFS tuning',
         'fields': [
-            ('RCLONE_MOUNT_NAME', 'Mount Name', 'string', True, 'Name for the rclone mount point under /data'),
+            ('RCLONE_MOUNT_NAME', 'Mount Name', 'string', True, 'Name for the rclone mount point under /data.'+_RESTART_HELP),
             ('RCLONE_LOG_LEVEL', 'Log Level', 'select:DEBUG,INFO,NOTICE,ERROR', False, 'rclone log verbosity'),
-            ('NFS_ENABLED', 'Enable NFS', 'boolean', False, 'Use NFS server instead of FUSE mount'),
-            ('NFS_PORT', 'NFS Port', 'number:1-65535', False, 'NFS server port'),
+            ('NFS_ENABLED', 'Enable NFS', 'boolean', False, 'Use NFS server instead of FUSE mount.'+_RESTART_HELP),
+            ('NFS_PORT', 'NFS Port', 'number:1-65535', False, 'NFS server port.'+_RESTART_HELP),
             ('RCLONE_CACHE_DIR', 'Cache Directory', 'string', False, 'Directory for VFS cache files'),
             ('RCLONE_DIR_CACHE_TIME', 'Dir Cache Time', 'string', False, 'How long to cache directory listings (e.g., 10s, 5m)'),
             ('RCLONE_VFS_READ_CHUNK_SIZE', 'VFS Read Chunk Size', 'string', False, 'Initial chunk size for streaming reads (e.g., 8M)'),
@@ -67,9 +69,9 @@ ENV_SCHEMA = [
         'name': 'TorBox',
         'description': 'TorBox co-debrid mount (plan 39). TORBOX_API_KEY alone enables cache probes and search-add against TorBox; the WebDAV mount additionally requires TORBOX_WEBDAV_USER + TORBOX_WEBDAV_PASS (configured in the TorBox dashboard under Settings → Integrations → WebDAV — the API key itself does NOT authenticate WebDAV).',
         'fields': [
-            ('TORBOX_WEBDAV_USER', 'TorBox WebDAV User', 'string', False, 'TorBox account email used for WebDAV Basic auth. NOT the API key.'),
+            ('TORBOX_WEBDAV_USER', 'TorBox WebDAV User', 'string', False, 'TorBox account email used for WebDAV Basic auth. NOT the API key. The TorBox mount starts with the container (with Zurg on) once the API key and both WebDAV fields are set.'),
             ('TORBOX_WEBDAV_PASS', 'TorBox WebDAV Password', 'secret', False, 'WebDAV-only password set in the TorBox dashboard (Settings → Integrations → WebDAV). Distinct from the account login password and from the API key.'),
-            ('TORBOX_MOUNT_NAME', 'TorBox Mount Name', 'string', False, 'Mount path under /data. Default "torbox" — must not collide with RCLONE_MOUNT_NAME.'),
+            ('TORBOX_MOUNT_NAME', 'TorBox Mount Name', 'string', False, 'Mount path under /data. Default "torbox" — must not collide with RCLONE_MOUNT_NAME.'+_RESTART_HELP),
             ('TORBOX_RCLONE_TPSLIMIT', 'TorBox rclone tps limit', 'string', False, 'Max requests-per-second issued by the TB rclone mount. Default 5. TB rate-limits reads aggressively under concurrent Plex/Bazarr scans; capping tps avoids the "too many errors 11/10" 429 cascade. Set to 0 to omit the flag.'),
             ('TORBOX_RCLONE_TPSLIMIT_BURST', 'TorBox rclone tps burst', 'string', False, 'Short-burst allowance on top of TORBOX_RCLONE_TPSLIMIT. Default 3 (lowered from 10 to avoid tripping TorBox WebDAV listing rate-limits). Lets quick peeks (ffprobe header reads) succeed without blocking. Set to 0 to omit the flag.'),
             ('TORBOX_RCLONE_DIR_CACHE_TIME', 'TorBox dir-cache time', 'string', False, 'How long the TB rclone mount caches directory listings (rclone --dir-cache-time syntax, e.g. 2h). Default 2h. Must exceed the library scan interval; with a shorter value every cold scan re-lists all TB folders at the throttled tps limit and times out, dropping TB titles. The blackhole grab hook calls vfs/refresh so new content still appears between expiries.'),
@@ -355,6 +357,19 @@ _CONNECTION_KEYS = frozenset({'TRAKT_CLIENT_ID', 'STATUS_UI_TRUSTED_ORIGINS',
                               'STATUS_UI_PORT', 'NOTIFICATION_URL'})
 
 
+def _dry_resolve(explicit):
+    """What the settings resolve to once *explicit* is saved, or None."""
+    try:
+        from base import SECRETS_DIR
+        from utils import config_resolve
+        return config_resolve.resolve(
+            os.environ, explicit, config_resolve.present_secrets(SECRETS_DIR),
+            config_resolve.written())
+    except Exception as e:
+        logger.warning(f'[settings] Could not resolve the new settings: {e}')
+        return None
+
+
 def get_env_schema():
     """Return the env var schema as a JSON-serializable structure."""
     from utils.settings_tiers import ESSENTIAL_GROUPS, GATES, UNGATED_KEYS, tier_for
@@ -430,6 +445,9 @@ def read_env_values():
             return ''   # the secret is in effect; never echo a stale file copy
         if r is not None and r.source in ('set', 'auto', 'default') and r.value is not None:
             return r.value
+        if r is not None and r.source == 'unset':
+            # never os.environ: it may still hold a value just cleared
+            return _ENV_DEFAULTS.get(key, '')
         # Blank file lines (`KEY=`, left by older versions) count as not
         # set, matching the resolver — show the value actually in effect.
         if (file_values.get(key) or '').strip():
@@ -648,6 +666,17 @@ def write_env_values(values):
                 'STATUS_UI_AUTH: removing the dashboard login would lock you out of Settings. '
                 'Enter a new username:password instead, or remove it from config/.env by hand.']}
 
+        # Validate the values that will be in effect: an automatic setting
+        # (ZURG_ENABLED) is posted back as shown, but follows the new inputs
+        # (clearing the last debrid key turns it off).
+        dry = _dry_resolve(explicit)
+        if dry is not None:
+            from utils.config_resolve import RULES
+            for k in RULES:
+                r = dry.get(k)
+                if k not in explicit and r is not None and r.source == 'auto':
+                    merged[k] = r.value
+
         # Validate before writing
         validation = validate_env_values(merged)
         if validation['errors']:
@@ -688,16 +717,14 @@ def write_env_values(values):
         changed = set()
         try:
             from utils.config_reload import (
-                SOFT_RELOAD, _ZURG_LAYOUT_KEYS, _drop_not_running, _layout_keys_changed,
-                _services_to_restart, _zurg_layout, restart_note)
+                SOFT_RELOAD, _LAYOUT_KEYS, _drop_not_running, _frozen_by_drift, service_labels,
+                _layout_keys_changed, _services_to_restart, _zurg_layout, restart_note)
             from utils.env import secret_or_env
             # Preview with a dry run of the same resolver the SIGHUP reload
             # uses, so the banner names only services that will really restart.
-            from base import SECRETS_DIR
             from utils import config_resolve
-            dry = config_resolve.resolve(
-                os.environ, explicit, config_resolve.present_secrets(SECRETS_DIR),
-                config_resolve.written())
+            if dry is None:
+                raise RuntimeError('settings could not be resolved')
             current = config_resolve.current()
 
             def _eff(res, key):
@@ -708,13 +735,17 @@ def write_env_values(values):
 
             def _new(key):
                 r = dry.get(key)
-                return secret_or_env(key) if r is not None and r.source == 'secret' else _eff(dry, key)
+                if r is None:
+                    return os.environ.get(key)
+                return secret_or_env(key) if r.source == 'secret' else _eff(dry, key)
             layout = _zurg_layout(_new)
             if changed and not changed <= SOFT_RELOAD:   # mirrors the reload
-                restarted = sorted(_drop_not_running(_services_to_restart(changed, layout)))
-            keys = _layout_keys_changed(layout)
-            if keys and changed & _ZURG_LAYOUT_KEYS:
-                validation['warnings'].append(restart_note(keys))
+                restarted = service_labels(_drop_not_running(_services_to_restart(changed, layout)))
+            zr = dry.get('ZURG_ENABLED')
+            keys = _layout_keys_changed(_new, zr is not None and zr.source == 'auto')
+            frozen = _frozen_by_drift(changed, layout)
+            if (keys and changed & _LAYOUT_KEYS) or frozen:
+                validation['warnings'].append(restart_note(keys | frozen))
 
         except Exception as e:
             # Advisory only — a failed preview must never block the apply.

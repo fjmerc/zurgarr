@@ -11,6 +11,7 @@ Usage:
 import os
 import threading
 from dotenv import dotenv_values
+from utils import boot_layout as _boot
 from utils.boot_layout import zurg_layout as _zurg_layout, BOOT_LAYOUT as _BOOT_LAYOUT
 from utils.logger import get_logger
 
@@ -20,21 +21,23 @@ ENV_FILE = '/config/.env'
 
 # Which env vars affect which services
 SERVICE_DEPENDENCIES = {
-    # (ZURG_ENABLED, and RD/AD keys that add or remove an instance, are
-    # fixed at container start — see _services_to_restart.)
+    # (Topology — Zurg on/off, which RD/AD instances, mount names, NFS mode,
+    # the TorBox mount — is fixed at container start: _LAYOUT_KEYS.)
     'zurg': {
-        'RD_API_KEY', 'AD_API_KEY', 'TORBOX_API_KEY',
+        'RD_API_KEY', 'AD_API_KEY',
         'ZURG_VERSION', 'ZURG_LOG_LEVEL', 'ZURG_USER', 'ZURG_PASS',
         'ZURG_PORT',
     },
     'rclone': {
-        'RCLONE_MOUNT_NAME', 'RCLONE_LOG_LEVEL', 'RCLONE_CACHE_DIR',
+        'RCLONE_LOG_LEVEL', 'RCLONE_CACHE_DIR',
         'RCLONE_DIR_CACHE_TIME', 'RCLONE_VFS_CACHE_MODE',
         'RCLONE_VFS_CACHE_MAX_SIZE', 'RCLONE_VFS_CACHE_MAX_AGE',
         'RCLONE_VFS_READ_CHUNK_SIZE',
         'RCLONE_VFS_READ_CHUNK_SIZE_LIMIT', 'RCLONE_BUFFER_SIZE',
-        'RCLONE_TRANSFERS', 'NFS_ENABLED', 'NFS_PORT',
+        'RCLONE_TRANSFERS',
     },
+    # The TorBox mount alone (its WebDAV login); Zurg's mounts don't use it.
+    'rclone_torbox': {'TORBOX_WEBDAV_USER', 'TORBOX_WEBDAV_PASS'},
     'plex_debrid': {
         'PD_ENABLED', 'PLEX_USER', 'PLEX_TOKEN', 'PLEX_ADDRESS',
         'SHOW_MENU', 'SEERR_API_KEY', 'SEERR_ADDRESS',
@@ -115,40 +118,96 @@ def _reload_env():
     return set(changes)
 
 
-# Zurg and its rclone mounts only start at container start (main.py): which
-# instances run — Zurg on/off, and a Real-Debrid and/or AllDebrid instance —
-# is fixed then.  A reload can't change that (zurg_setup would delete a
-# running instance's directory), so it leaves those processes alone and says
-# a restart is needed (the Status page Setup check compares the live settings
-# with _BOOT_LAYOUT and lists them too).
-_ZURG_LAYOUT_KEYS = frozenset({'ZURG_ENABLED', 'RD_API_KEY', 'AD_API_KEY'})
+# Zurg and its rclone mounts only start at container start (main.py), and
+# their topology (utils/boot_layout.Layout) is fixed then.  While the live
+# settings describe a different topology, a reload must not restart Zurg or
+# rclone at all: zurg_setup would delete a running instance's directory and
+# regenerate_config would rename the remotes the running mounts use.  Those
+# processes are left alone and a container restart is flagged instead —
+# for the topology settings, and for Zurg/rclone settings changed meanwhile.
+_LAYOUT_KEYS = frozenset({
+    'ZURG_ENABLED', 'RD_API_KEY', 'AD_API_KEY', 'RCLONE_MOUNT_NAME',
+    'NFS_ENABLED', 'NFS_PORT', 'TORBOX_MOUNT_NAME', *_boot.TORBOX_KEYS})
+# Never restart anything themselves (only via topology / container start).
+_TOPOLOGY_ONLY = frozenset({'ZURG_ENABLED', 'RCLONE_MOUNT_NAME', 'NFS_ENABLED',
+                            'NFS_PORT', 'TORBOX_MOUNT_NAME'})
+_MOUNT_DEPS = frozenset(SERVICE_DEPENDENCIES['zurg'] | SERVICE_DEPENDENCIES['rclone']
+                        | SERVICE_DEPENDENCIES['rclone_torbox'])
+# Zurg/rclone settings a reload couldn't apply (topology had drifted);
+# replaced, never mutated (read from the HTTP threads).  Until restart.
+_FROZEN_PENDING = frozenset()
 
 
+def _zurg_auto():
+    from utils import config_resolve
+    r = config_resolve.current().get('ZURG_ENABLED')
+    return r is not None and r.source == 'auto'
 
 
-def _layout_keys_changed(layout):
-    """Settings that moved Zurg's layout away from the boot one."""
-    if layout[0] != _BOOT_LAYOUT[0]:
+def _layout_keys_changed(get=None, auto=None):
+    """Settings whose values moved the topology away from the boot one.
+    *get*: settings lookup (default live); *auto*: ZURG_ENABLED is automatic
+    (then the debrid keys that flipped it are named, not ZURG_ENABLED)."""
+    get = get or _boot.live_getter()
+    layout, boot = _zurg_layout(get), _BOOT_LAYOUT
+    if layout == boot:
+        return set()
+
+    def present(key):
+        return bool((get(key) or '').strip())
+    if layout.zurg != boot.zurg:
+        if _zurg_auto() if auto is None else auto:
+            keys = {f'{k}_API_KEY' for k in ('RD', 'AD')
+                    if present(f'{k}_API_KEY') != (k in boot.instances)}
+            if keys:
+                return keys
         return {'ZURG_ENABLED'}
-    return {f'{k}_API_KEY' for k in layout[1] ^ _BOOT_LAYOUT[1]}
+    keys = {f'{k}_API_KEY' for k in layout.instances ^ boot.instances}
+    for field, key in (('rclone_mount', 'RCLONE_MOUNT_NAME'), ('nfs', 'NFS_ENABLED'),
+                       ('nfs_port', 'NFS_PORT')):
+        if getattr(layout, field) != getattr(boot, field):
+            keys.add(key)
+    if layout.torbox != boot.torbox:
+        missing = {k for k in _boot.TORBOX_KEYS if not present(k)}
+        keys |= missing or set(_boot.TORBOX_KEYS)
+    elif layout.torbox_mount != boot.torbox_mount:
+        keys.add('TORBOX_MOUNT_NAME')
+    return keys
+
+
+def _record_frozen(keys):
+    """Remember Zurg/rclone settings a reload left unapplied."""
+    global _FROZEN_PENDING
+    keys = frozenset(keys) & _MOUNT_DEPS
+    if keys:
+        _FROZEN_PENDING = _FROZEN_PENDING | keys
+
+
+def restart_pending(get=None, auto=None):
+    """Settings changed since the container started that only a restart
+    applies — sorted names."""
+    return sorted(_layout_keys_changed(get, auto) | _FROZEN_PENDING)
+
+
+def _frozen_by_drift(changed, layout=None):
+    """Zurg/rclone settings in *changed* that can't be applied because the
+    topology differs from the boot one (or Zurg didn't start)."""
+    layout = _zurg_layout() if layout is None else layout
+    if layout != _BOOT_LAYOUT or not _BOOT_LAYOUT.zurg:
+        return set(changed) & _MOUNT_DEPS
+    return set()
 
 
 def _services_to_restart(changed, layout=None):
-    """Services a change restarts.  Nothing that changes Zurg's layout
-    restarts Zurg or its mount (see above); a key rotation for a running
-    instance does.  *layout*: the new layout (default: the live one)."""
+    """Services a change restarts.  Topology settings restart nothing; while
+    the topology differs from the boot one (or Zurg didn't start) no Zurg/
+    rclone setting does either (see above).  With it unchanged, rotations
+    apply.  *layout*: the new topology (default: the live one)."""
     changed = set(changed)
-    layout = _zurg_layout() if layout is None else layout
-    frozen = {'ZURG_ENABLED'}
-    if layout != _BOOT_LAYOUT:
-        frozen |= {'RD_API_KEY', 'AD_API_KEY'}
-    if not _BOOT_LAYOUT[0]:
-        # No Zurg running: its settings restart nothing (the TorBox key
-        # still restarts the mounts, as before).
-        frozen |= SERVICE_DEPENDENCIES['zurg'] - {'TORBOX_API_KEY'}
+    frozen = set(_TOPOLOGY_ONLY) | _frozen_by_drift(changed, layout)
+    if not _BOOT_LAYOUT.torbox:
+        frozen |= SERVICE_DEPENDENCIES['rclone_torbox']   # no TorBox mount running
     services = _determine_restarts(changed - frozen)
-    if not _BOOT_LAYOUT[0]:
-        services.discard('zurg')
     if changed & SERVICE_DEPENDENCIES['plex_debrid']:
         services.add('plex_debrid')   # the keys also feed plex_debrid's own config
     return services
@@ -160,22 +219,49 @@ def _drop_not_running(services):
     from utils.processes import _process_registry, _registry_lock
     with _registry_lock:
         running = {e['process_name'].lower() for e in _process_registry}
-    return {s for s in services if s not in ('zurg', 'rclone', 'plex_debrid') or s in running}
+    proc = {'zurg': 'zurg', 'rclone': 'rclone', 'plex_debrid': 'plex_debrid',
+            'rclone_torbox': 'rclone'}
+    return {s for s in services if s not in proc or proc[s] in running}
+
+
+def _restart_torbox_mount():
+    """Apply a new TorBox WebDAV login: rewrite rclone.config and restart
+    only the TorBox mount (Zurg's mounts don't use it).  Caller holds
+    lifecycle_lock."""
+    from utils.processes import _process_registry, _registry_lock
+    try:
+        from rclone.rclone import regenerate_config
+        regenerate_config()
+    except Exception as e:
+        logger.error(f"[reload] Failed to regenerate rclone config: {e}")
+        return
+    with _registry_lock:
+        entries = [e for e in _process_registry
+                   if e['process_name'].lower() == 'rclone'
+                   and getattr(e['handler'], 'no_dependencies', False) is True]
+        for e in entries:
+            if e['handler'].process and e['handler'].process.poll() is None:
+                logger.info(f"[reload] Stopping rclone w/ {e['key_type']}")
+                e['handler'].stop_process('rclone', e['key_type'])
+    for e in entries:
+        logger.info(f"[reload] Starting rclone w/ {e['key_type']}")
+        e['handler'].restart_process()
 
 
 def restart_note(keys):
     """User-facing text for settings that need a container restart."""
     return (f"{', '.join(sorted(keys))} changed — restart the container to apply it "
-            "(Zurg and its mounts only start when the container starts).")
+            "(Zurg and its mounts are set up only when the container starts).")
 
 
 def _zurg_restart_note(changed):
-    """The note to log when this reload moved Zurg away from its boot
-    layout, or None (unrelated change, or moved back to it)."""
-    if not set(changed) & _ZURG_LAYOUT_KEYS:
+    """The note to log for this reload — it touched the topology or left
+    Zurg/rclone settings unapplied — or None (unrelated, or moved back)."""
+    changed = set(changed)
+    if not (changed & _LAYOUT_KEYS or changed & _FROZEN_PENDING):
         return None
-    keys = _layout_keys_changed(_zurg_layout())
-    return restart_note(keys) if keys else None
+    pending = restart_pending()
+    return restart_note(pending) if pending else None
 
 
 def _determine_restarts(changed_vars):
@@ -262,8 +348,9 @@ def _reload_once():
             _notify_reload(changed, set())
             return
 
+        _record_frozen(_frozen_by_drift(changed))
         services = _drop_not_running(_services_to_restart(changed))
-        logger.info(f"[reload] Services to restart: {', '.join(sorted(services)) or 'none'}")
+        logger.info(f"[reload] Services to restart: {', '.join(service_labels(services)) or 'none'}")
 
         # Handle process-based services
         zurg_note = _zurg_restart_note(changed)
@@ -353,6 +440,10 @@ def _reload_once():
                             logger.info(f"[reload] Starting {desc}")
                             handler.restart_process()
 
+            # A full rclone restart above already applied it.
+            if 'rclone_torbox' in services and 'rclone' not in process_services:
+                _restart_torbox_mount()
+
         # Handle non-process services
         if 'notifications' in services:
             try:
@@ -400,13 +491,21 @@ def _reload_once():
         logger.error(f"[reload] Reload failed: {e}")
 
 
+_SERVICE_LABELS = {'rclone_torbox': 'TorBox mount'}
+
+
+def service_labels(services):
+    """Sorted, readable names for *services* (for messages)."""
+    return sorted(_SERVICE_LABELS.get(s, s) for s in services)
+
+
 def _notify_reload(changed, services):
     """Send notification about config reload."""
     try:
         from utils.notifications import notify
         body = f'Reloaded {len(changed)} variable(s)'
         if services:
-            body += f', restarted: {", ".join(sorted(services))}'
+            body += f', restarted: {", ".join(service_labels(services))}'
 
         notify('startup', 'Config Reloaded', body)
     except Exception:

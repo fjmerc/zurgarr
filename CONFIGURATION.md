@@ -52,7 +52,7 @@ Everything else has a sensible default or is opt-in.
 | `RD_API_KEY` | [Real-Debrid API key](https://real-debrid.com/apitoken) | |
 | `AD_API_KEY` | [AllDebrid API key](https://alldebrid.com/apikeys/). Public Zurg is Real-Debrid only — AllDebrid needs the sponsors-only nightly (`ZURG_VERSION=nightly` + `GITHUB_TOKEN`) | |
 | `TORBOX_API_KEY` | [TorBox API key](https://torbox.app/settings). Powers cache probes, search-add, and dual-debrid blackhole routing. For the WebDAV mount, see [TorBox co-debrid](#torbox-co-debrid-mount-plan-39). | |
-| `RCLONE_MOUNT_NAME` | Name for the rclone mount (under `/data`) | `zurgarr` |
+| `RCLONE_MOUNT_NAME` | Name for the rclone mount (under `/data`). Takes effect at container start. | `zurgarr` |
 | `RCLONE_LOG_LEVEL` | [rclone log level](https://rclone.org/docs/#log-level-level). `OFF` to suppress. When unset, follows `ZURGARR_LOG_LEVEL` (WARNING → NOTICE, CRITICAL → ERROR) | `NOTICE` |
 | `RCLONE_DIR_CACHE_TIME` | [Directory cache duration](https://rclone.org/commands/rclone_mount/#vfs-directory-cache) | `10s` |
 | `RCLONE_CACHE_DIR` | [Cache directory](https://rclone.org/docs/#cache-dir-dir) | |
@@ -68,9 +68,9 @@ Everything else has a sensible default or is opt-in.
 | `ZURG_LOG_LEVEL` | Zurg log level. `OFF` to suppress | `INFO` |
 | `ZURG_USER` | WebDAV basic auth username | |
 | `ZURG_PASS` | WebDAV basic auth password | |
-| `ZURG_PORT` | WebDAV port. Set a fixed value if exposing to other machines | random |
-| `NFS_ENABLED` | Enable rclone NFS server (does NOT create a local mount — use FUSE if Plex is on the same host) | `false` |
-| `NFS_PORT` | NFS server port | random |
+| `ZURG_PORT` | WebDAV port. Set a fixed value if exposing to other machines. With both Real-Debrid and AllDebrid, AllDebrid uses this port + 1 | random |
+| `NFS_ENABLED` | Enable rclone NFS server (does NOT create a local mount — use FUSE if Plex is on the same host). Takes effect at container start. | `false` |
+| `NFS_PORT` | NFS server port. Takes effect at container start. | random |
 
 ---
 
@@ -80,14 +80,17 @@ TorBox runs as an *additive* co-debrid alongside Real-Debrid (or AllDebrid).
 Zurg can't proxy TorBox, so the mount goes through rclone's native webdav
 remote against `https://webdav.torbox.app/`. Setting `TORBOX_API_KEY` alone
 enables cache probes / search-add / blackhole routing. To get the WebDAV
-mount you need the two `TORBOX_WEBDAV_*` vars as well.
+mount you need the two `TORBOX_WEBDAV_*` vars as well. The TorBox mount is
+started with the container, together with Zurg's mount (so Zurg must be on);
+adding or removing it later needs a container restart, while a changed WebDAV
+login applies right away (only the TorBox mount restarts).
 
 | Variable | Description | Default |
 |---|---|---|
 | `TORBOX_API_KEY` | TorBox API key (cache probes, search, blackhole) | |
 | `TORBOX_WEBDAV_USER` | TorBox account email used for WebDAV Basic auth | |
 | `TORBOX_WEBDAV_PASS` | WebDAV-only password from the TorBox dashboard → Settings → Integrations → WebDAV. **Not** the account password, **not** the API key. | |
-| `TORBOX_MOUNT_NAME` | Mount path under `/data` (must not collide with `RCLONE_MOUNT_NAME`) | `torbox` |
+| `TORBOX_MOUNT_NAME` | Mount path under `/data` (must not collide with `RCLONE_MOUNT_NAME`). Takes effect at container start. | `torbox` |
 | `TORBOX_RCLONE_TPSLIMIT` | Max requests-per-second issued by the TB rclone mount. TB rate-limits reads aggressively under concurrent Plex/Bazarr scans; capping tps avoids the `too many errors 11/10` 429 cascade. Set to `0` to omit the flag entirely. | `5` |
 | `TORBOX_RCLONE_TPSLIMIT_BURST` | Short-burst allowance on top of `TORBOX_RCLONE_TPSLIMIT`. Lets quick peeks (ffprobe header reads) succeed without blocking. Set to `0` to omit the flag entirely. Lowered from `10` to `3` to avoid an N-way burst tripping TorBox's WebDAV listing rate-limit. | `3` |
 | `TORBOX_RCLONE_DIR_CACHE_TIME` | How long the TB rclone mount caches directory listings (rclone `--dir-cache-time` syntax, e.g. `2h`). Must exceed `LIBRARY_SCAN_INTERVAL`; with a shorter value every cold scan re-lists all TB folders at the throttled tps limit and times out, dropping TB titles (they show as "Wanted"). The blackhole grab hook calls `vfs/refresh`, so newly-grabbed content still appears between expiries. | `2h` |
