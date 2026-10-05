@@ -10,12 +10,18 @@ GATES collapse a whole category while its switch is off.  Only gate a
 category where *every* field is meaningless with the switch off.
 """
 
-ESSENTIAL_KEYS = (
-    'RD_API_KEY', 'TORBOX_API_KEY', 'STATUS_UI_AUTH',
-    'PLEX_ADDRESS', 'PLEX_TOKEN',
-    'SONARR_URL', 'SONARR_API_KEY', 'RADARR_URL', 'RADARR_API_KEY',
-    'TMDB_API_KEY',
+# Essentials in pipeline order: debrid → Sonarr/Radarr → media server →
+# metadata → dashboard login.  Groups render as labels inside the card.
+ESSENTIAL_GROUPS = (
+    {'label': 'Debrid — at least one (AllDebrid: see the Zurg section)',
+     'keys': ('RD_API_KEY', 'TORBOX_API_KEY')},
+    {'label': 'Sonarr / Radarr', 'keys': ('SONARR_URL', 'SONARR_API_KEY',
+                                          'RADARR_URL', 'RADARR_API_KEY')},
+    {'label': 'Media server', 'keys': ('PLEX_ADDRESS', 'PLEX_TOKEN')},
+    {'label': 'Metadata', 'keys': ('TMDB_API_KEY',)},
+    {'label': 'Dashboard login', 'keys': ('STATUS_UI_AUTH',)},
 )
+ESSENTIAL_KEYS = tuple(k for g in ESSENTIAL_GROUPS for k in g['keys'])
 
 FEATURE_KEYS = frozenset({
     # Zurg / mounts
@@ -50,12 +56,21 @@ FEATURE_KEYS = frozenset({
 
 GATES = {
     'Blackhole': {'key': 'BLACKHOLE_ENABLED',
-                  'note': 'Turn on the blackhole to set up Sonarr/Radarr grabs through debrid.'},
+                  'note': "Off: Sonarr/Radarr aren't sending grabs through debrid. "
+                          'Turn it on to set the watch folder, symlinks and duplicate checks.'},
     'Quality Compromise': {'key': 'BLACKHOLE_ENABLED',
-                           'note': 'Part of the blackhole — turn the blackhole on (above) to use these.'},
+                           'note': 'Needs the blackhole — turn it on in the Blackhole section.'},
     'Notifications': {'key': 'NOTIFICATION_URL',
-                      'note': 'Add an Apprise notification URL to choose what gets sent.'},
+                      'note': 'Add an Apprise URL (e.g. discord://…) to choose which events are sent.'},
 }
+
+# Fields in a gated category that are used even with its switch off —
+# rendered outside the collapsible part.  Local library paths feed the
+# library scanner and the stale-bind alert; the blocklist feeds search.
+UNGATED_KEYS = frozenset({
+    'BLACKHOLE_LOCAL_LIBRARY_TV', 'BLACKHOLE_LOCAL_LIBRARY_MOVIES',
+    'BLOCKLIST_AUTO_ADD', 'BLOCKLIST_EXPIRY_DAYS',
+})
 
 
 def tier_for(key):

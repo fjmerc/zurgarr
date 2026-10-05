@@ -207,13 +207,17 @@ textarea{min-height:120px;resize:vertical;font-family:monospace;font-size:.8em;l
 .gated-fields.open{display:block}
 .gate-note{font-size:.82em;color:var(--text2);padding:8px 0 2px}
 .category.essentials{border-color:var(--blue)}
-.src-badge{display:inline-flex;align-items:center;font-size:.66em;font-weight:600;border-radius:3px;padding:1px 5px;margin-left:6px;white-space:nowrap;vertical-align:middle;line-height:1.4;color:var(--text2);border:1px solid var(--border2)}
-.src-badge.src-set{color:var(--blue);border-color:var(--blue)}
-.src-badge.src-auto{color:var(--teal,#27aabc);border-color:rgba(39,170,188,.45)}
-.src-badge.src-locked,.src-badge.src-secret{color:#c08a1e;border-color:rgba(192,138,30,.5)}
-[data-theme="light"] .src-badge.src-locked,[data-theme="light"] .src-badge.src-secret{color:#8a5a00;border-color:rgba(138,90,0,.45)}
-.field-src-note{font-size:.72em;color:var(--text3);margin-top:3px}
-.field.is-locked input,.field.is-locked select{opacity:.65;cursor:not-allowed}
+.ess-group{font-size:.72em;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--text2);padding:12px 0 2px}
+.ess-group:first-child{padding-top:2px}
+.src-badge{display:inline-flex;align-items:center;font-size:.72em;font-weight:600;border-radius:3px;padding:1px 5px;margin-left:6px;white-space:nowrap;vertical-align:middle;line-height:1.4;border:1px solid currentColor}
+.src-badge.src-auto{color:var(--teal)}
+.src-badge.src-locked,.src-badge.src-secret{color:var(--amber)}
+.field-src-note{font-size:.75em;color:var(--text2);margin-top:3px}
+.field.is-locked input[readonly]{background:var(--bg);border-style:dashed;cursor:default}
+.field.is-locked select:disabled{background:var(--bg);border-style:dashed;cursor:not-allowed}
+.field.is-locked .toggle .slider{opacity:.5;cursor:not-allowed}
+button.advanced-toggle{display:block;width:100%;text-align:left;background:none;border:0;border-top:1px solid var(--border2);min-height:32px;font:inherit;font-size:.82em}
+button.advanced-toggle:focus-visible{outline:2px solid var(--input-focus);outline-offset:2px}
 [data-theme="light"] .field-modified-chip{color:#0e7a88;background:rgba(14,122,136,.1);border-color:rgba(14,122,136,.3)}
 
 /* "Show only modified" toggle button in the env toolbar */
@@ -358,8 +362,9 @@ async function refreshEnvSources() {
   }
 }
 
-const _SRC_LABEL = {set: 'set by you', default: 'default', auto: 'auto',
-                    locked: 'locked', secret: 'Docker secret'};
+// Badge only the exceptions: plain defaults and your own edits stay quiet
+// (the "modified" chip already marks changes).
+const _SRC_LABEL = {auto: 'auto', locked: 'docker-compose', secret: 'Docker secret'};
 let pdValues = {};
 let isDirty = false;  // combined flag for beforeunload
 let envDirty = false;
@@ -376,10 +381,11 @@ window.onKbEscape = function() {
 // -----------------------------------------------------------------------
 // Shared helpers
 // -----------------------------------------------------------------------
+// Escapes for HTML text *and* attribute values (quotes included — the old
+// text-node trick left " unescaped, truncating values like pa"ss in value="").
 function esc(s) {
-  const d = document.createElement('div');
-  d.appendChild(document.createTextNode(String(s ?? '')));
-  return d.innerHTML;
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 function escJs(s) { return String(s ?? '').replace(/\\/g,'\\\\').replace(/'/g,"\\'"); }
 
@@ -591,7 +597,9 @@ async function copySecret(btn) {
 function toggleAdvanced(el) {
   const fields = el.nextElementSibling;
   fields.classList.toggle('open');
-  el.textContent = fields.classList.contains('open') ? 'Hide advanced settings' : 'Show advanced settings';
+  const open = fields.classList.contains('open');
+  el.textContent = open ? 'Hide advanced settings' : 'Show advanced settings';
+  el.setAttribute('aria-expanded', open);
 }
 
 function setButtonLoading(id, loading, text) {
@@ -618,6 +626,13 @@ function isNonDefault(key, value, fieldType) {
   // spuriously flag every server-pre-filled true-default (the booleans/
   // numerics read_env_values resolves from _ENV_DEFAULTS) as modified.
   if (Object.keys(envDefaults).length === 0) return false;
+  // An automatic value is the app's own choice, not a change from default —
+  // unless the user has edited the field away from it.
+  const autoSrc = envSources[key];
+  if (autoSrc && autoSrc.source === 'auto') {
+    const norm = v => fieldType === 'boolean' ? (String(v).toLowerCase() === 'true' ? 'true' : 'false') : String(v ?? '');
+    if (norm(value) === norm(envValues[key] ?? '')) return false;
+  }
   const dflt = String(envDefaults[key] !== undefined ? envDefaults[key] : '');
   const cur = String(value !== undefined ? value : '');
   if (fieldType === 'secret') {
@@ -676,6 +691,12 @@ function toggleModifiedFilter() {
 // -----------------------------------------------------------------------
 function renderEnvField(field, value) {
   const id = 'env-' + field.key;
+  const src = envSources[field.key] || {};
+  const isLocked = src.source === 'locked' || src.source === 'secret';
+  // A locked value comes from the container, never from whatever this
+  // render was handed (Reset All to Defaults / Import .env) — it can't be
+  // edited, so a different value here would make every save fail.
+  if (isLocked) value = envValues[field.key] ?? '';
   let inputHtml = '';
 
   if (field.type === 'boolean') {
@@ -705,13 +726,25 @@ function renderEnvField(field, value) {
     inputHtml = `<input type="text" id="${id}" data-key="${esc(field.key)}" data-type="string" value="${esc(value || '')}">`;
   }
 
-  const src = envSources[field.key] || {};
-  const isLocked = src.source === 'locked' || src.source === 'secret';
-  if (isLocked) inputHtml = inputHtml.replace(/<(input|select)\b/g, '<$1 disabled');
+  const noteId = 'src-' + field.key;
+  if (isLocked) {
+    // Text-like inputs stay readable/copyable (readonly); toggles and
+    // selects have no readonly, so they're disabled.  A secret-sourced
+    // field has no value here, so its Show/Copy buttons would be dead.
+    const described = ` aria-describedby="${esc(noteId)}"`;
+    inputHtml = inputHtml
+      .replace(/<select\b/g, '<select disabled' + described)
+      .replace(/<input(?=[^>]*type="checkbox")/g, '<input disabled' + described)
+      .replace(/<input(?![^>]*type="checkbox")/g, '<input readonly' + described);
+    if (src.source === 'secret') {
+      inputHtml = inputHtml.replace(/<button\b[^>]*>[^<]*<\/button>/g, '')
+        .replace('type="password"', `type="password" placeholder="Loaded from /run/secrets"`);
+    }
+  }
   const srcBadge = _SRC_LABEL[src.source]
-    ? `<span class="src-badge src-${esc(src.source)}" title="${esc(src.reason || '')}">${esc(_SRC_LABEL[src.source])}</span>` : '';
+    ? `<span class="src-badge src-${esc(src.source)}" title="${esc(src.reason || '')}"><span class="sr-only">Source: </span>${esc(_SRC_LABEL[src.source])}</span>` : '';
   const srcNote = (src.reason && (src.source === 'auto' || isLocked))
-    ? `<div class="field-src-note">${esc(src.source === 'auto' ? 'Automatic: ' : '')}${esc(src.reason)}${isLocked && src.source === 'locked' ? ' — edit it there' : ''}</div>` : '';
+    ? `<div class="field-src-note" id="${esc(noteId)}">${esc(src.source === 'auto' ? 'Automatic: ' : '')}${esc(src.reason)}${src.source === 'locked' ? ' — edit it there, then recreate the container' : ''}</div>` : '';
   const helpHtml = field.help ? `<div class="field-help">${esc(field.help)}</div>` : '';
   const reqMark = field.required ? '<span class="required">*</span>' : '';
   const resetBtn = isLocked ? '' : `<button type="button" class="field-reset" onclick="resetField('env','${escJs(field.key)}')" title="Undo change">↺</button>`;
@@ -748,33 +781,48 @@ function renderEnvCategories(values) {
   const container = document.getElementById('env-categories');
   let html = '';
 
-  // Essentials card: the few values most setups need, always first + open.
+  // Essentials card: the few values most setups need, in pipeline order
+  // with group labels, always first + open.
   let essHtml = '';
-  ENV_SCHEMA.categories.forEach(cat => cat.fields.forEach(f => {
-    if (f.tier === 'essential') essHtml += renderEnvField(f, values[f.key] || '');
-  }));
+  (ENV_SCHEMA.essentials || []).forEach(group => {
+    let groupHtml = '';
+    group.keys.forEach(k => {
+      const f = _ENV_FIELD_BY_KEY[k];
+      if (f) groupHtml += renderEnvField(f, values[k] || '');
+    });
+    if (groupHtml) essHtml += `<div class="ess-group">${esc(group.label)}</div>${groupHtml}`;
+  });
   if (essHtml) {
     html += `<div class="category essentials" data-tab="env">${_catHeader('Essentials', 'the settings most setups need', true)}<div class="cat-body open">${essHtml}</div></div>`;
   }
 
+  const advSection = adv => adv
+    ? `<button type="button" class="advanced-toggle" aria-expanded="false" onclick="toggleAdvanced(this)">Show advanced settings</button><div class="advanced-fields">${adv}</div>` : '';
+
   ENV_SCHEMA.categories.forEach((cat, i) => {
     const gate = cat.gate;
-    let gateField = '', main = '', adv = '';
+    let gateField = '', main = '', adv = '', freeMain = '', freeAdv = '';
     cat.fields.forEach(f => {
       if (f.tier === 'essential') return;
       const rendered = renderEnvField(f, values[f.key] || '');
       if (gate && f.key === gate.key) gateField = rendered;   // the switch stays visible
+      else if (gate && f.ungated) { if (f.tier === 'feature') freeMain += rendered; else freeAdv += rendered; }
       else if (f.tier === 'feature') main += rendered;
       else adv += rendered;
     });
-    if (!gateField && !main && !adv) return;   // everything moved to Essentials
+    if (!gateField && !main && !adv && !freeMain && !freeAdv) return;   // all moved to Essentials
 
-    const advHtml = adv
-      ? `<div class="advanced-toggle" onclick="toggleAdvanced(this)">Show advanced settings</div><div class="advanced-fields">${adv}</div>` : '';
-    let bodyHtml = gateField + main + advHtml;
-    if (gate) {
+    let bodyHtml;
+    if (!gate && !main) {
+      // Nothing but tuning here: opening the section already says "show me".
+      bodyHtml = adv;
+    } else if (!gate) {
+      bodyHtml = main + advSection(adv);
+    } else {
       const open = _gateOn(gate.key, values);
-      bodyHtml = `${gateField}<div class="gate-note" data-gate-note="${esc(gate.key)}"${open ? ' hidden' : ''}>${esc(gate.note)}</div><div class="gated-fields${open ? ' open' : ''}" data-gate="${esc(gate.key)}">${main}${advHtml}</div>`;
+      const gateSrc = envSources[gate.key] || {};
+      const note = gate.note + (gateSrc.source === 'locked' ? ' (The switch is set in docker-compose — change it there.)' : '');
+      bodyHtml = `${gateField}${freeMain}<div class="gate-note" data-gate-note="${esc(gate.key)}"${open ? ' hidden' : ''}>${esc(note)}</div><div class="gated-fields${open ? ' open' : ''}" data-gate="${esc(gate.key)}">${main}${advSection(adv)}</div>${advSection(freeAdv)}`;
     }
     html += `<div class="category" data-cat-idx="${i}" data-tab="env">${_catHeader(cat.name, cat.description, false)}<div class="cat-body">${bodyHtml}</div></div>`;
   });
@@ -901,6 +949,7 @@ async function envSave() {
         const fresh = await fetch('/api/settings/env');
         if (fresh.ok) {
           const body = await fresh.json();
+          await refreshEnvSources();   // before the focus check below
           const isPlainObject = body && typeof body === 'object' && !Array.isArray(body);
           const activeEl = document.activeElement;
           const userEditing = activeEl && activeEl !== document.body
@@ -908,7 +957,6 @@ async function envSave() {
             && !activeEl.matches('button');
           if (isPlainObject) {
             envValues = body;
-            await refreshEnvSources();
             if (!userEditing) renderEnvCategories(envValues);
           } else {
             envValues = collectEnvData();
@@ -1055,7 +1103,7 @@ function renderPdCategories(values) {
 
     let advHtml = '';
     if (hasAdvanced) {
-      advHtml = `<div class="advanced-toggle" onclick="toggleAdvanced(this)">Show advanced settings</div><div class="advanced-fields">${advFields}</div>`;
+      advHtml = `<button type="button" class="advanced-toggle" aria-expanded="false" onclick="toggleAdvanced(this)">Show advanced settings</button><div class="advanced-fields">${advFields}</div>`;
     }
 
     html += `<div class="category" data-cat-idx="${i}" data-tab="pd"><div class="cat-header" role="button" tabindex="0" aria-expanded="false" onclick="toggleCategory(this)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleCategory(this)}"><h2><span class="cat-name">${esc(cat.name)}</span> <span class="desc">\u2014 ${esc(cat.description)}</span></h2><span class="cat-dirty"><span class="cat-dirty-dot"></span><span class="cat-dirty-count"></span></span><span class="arrow" aria-hidden="true">&#9660;</span></div><div class="cat-body">${mainFields}${advHtml}</div></div>`;
@@ -2159,7 +2207,11 @@ function filterSettings(tab, query) {
       body.querySelectorAll('.gated-fields').forEach(g => {
         let gVisible = 0;
         g.querySelectorAll('.field').forEach(f => { if (f.style.display !== 'none') gVisible++; });
-        if (gVisible > 0) g.classList.add('open');
+        if (gVisible > 0) {
+          g.classList.add('open');
+          const note = body.querySelector(`.gate-note[data-gate-note="${g.dataset.gate}"]`);
+          if (note) note.hidden = true;
+        }
       });
     }
 
@@ -2167,6 +2219,8 @@ function filterSettings(tab, query) {
   });
 
   countEl.textContent = q ? (shown + ' of ' + total + ' settings') : '';
+  // Filters cleared: sections a search force-opened go back to their gate state.
+  if (tab === 'env' && !anyFilter) _GATE_KEYS.forEach(applyGate);
 }
 
 // -----------------------------------------------------------------------
@@ -2184,7 +2238,8 @@ function getEnvChangedFields() {
     let saved = envValues[key] !== undefined ? String(envValues[key]) : '';
     // A blank boolean runs as off — don't report the rendered 'false' as an edit.
     if (el.dataset.type === 'boolean') saved = saved.toLowerCase() === 'true' ? 'true' : 'false';
-    if (current !== saved) changes.add(key);
+    // Selects match options case-insensitively when rendering; compare the same way.
+    if (el.dataset.type === 'select' ? current.toLowerCase() !== saved.toLowerCase() : current !== saved) changes.add(key);
   });
   return changes;
 }
@@ -2337,6 +2392,7 @@ function resetField(tab, key) {
     // here, and re-apply the modified-only filter so a row reset back to
     // its default drops out of the filtered view immediately.
     updateModifiedChips();
+    if (_GATE_KEYS.has(key)) applyGate(key);   // no input event fired
     const modToggle = document.getElementById('modified-only-toggle');
     if (modToggle && modToggle.checked) toggleModifiedFilter();
   } else {

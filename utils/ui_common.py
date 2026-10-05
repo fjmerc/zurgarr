@@ -14,8 +14,8 @@ BASE_CSS = r"""
 /* --*-solid are the WCAG-safe fills for white-text buttons/badges: the bright
    --blue/--green/--red read fine as text/borders on dark but only hit ~2.5:1
    behind white text, so filled controls use the -solid variants instead. */
-:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--border2:#21262d;--text:#c9d1d9;--text2:#8b949e;--text3:#7d8792;--blue:#58a6ff;--green:#3fb950;--red:#f85149;--yellow:#d29922;--orange:#db6d28;--blue-solid:#1f6feb;--green-solid:#1f7a33;--red-solid:#cf222e;--input-bg:#0d1117;--input-border:#30363d;--input-focus:#58a6ff;--motion-fast:100ms;--motion-normal:200ms;--motion-slow:300ms;--sidebar-bg:#010409;--sidebar-w:220px}
-[data-theme="light"]{--bg:#f6f8fa;--card:#ffffff;--border:#d0d7de;--border2:#d8dee4;--text:#1f2328;--text2:#656d76;--text3:#6a737d;--blue:#0969da;--green:#1a7f37;--red:#cf222e;--yellow:#9a6700;--orange:#bc4c00;--blue-solid:#0969da;--green-solid:#1a7f37;--red-solid:#cf222e;--input-bg:#ffffff;--input-border:#d0d7de;--input-focus:#0969da;--sidebar-bg:#f0f3f6}
+:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--border2:#21262d;--text:#c9d1d9;--text2:#8b949e;--text3:#7d8792;--blue:#58a6ff;--green:#3fb950;--red:#f85149;--yellow:#d29922;--orange:#db6d28;--teal:#2bb5c7;--amber:#c08a1e;--blue-solid:#1f6feb;--green-solid:#1f7a33;--red-solid:#cf222e;--input-bg:#0d1117;--input-border:#30363d;--input-focus:#58a6ff;--motion-fast:100ms;--motion-normal:200ms;--motion-slow:300ms;--sidebar-bg:#010409;--sidebar-w:220px}
+[data-theme="light"]{--bg:#f6f8fa;--card:#ffffff;--border:#d0d7de;--border2:#d8dee4;--text:#1f2328;--text2:#656d76;--text3:#6a737d;--blue:#0969da;--green:#1a7f37;--red:#cf222e;--yellow:#9a6700;--orange:#bc4c00;--teal:#0e7a88;--amber:#8a5a00;--blue-solid:#0969da;--green-solid:#1a7f37;--red-solid:#cf222e;--input-bg:#ffffff;--input-border:#d0d7de;--input-focus:#0969da;--sidebar-bg:#f0f3f6}
 
 /* === Reset === */
 *{margin:0;padding:0;box-sizing:border-box}

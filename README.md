@@ -373,8 +373,8 @@ The web UI has five pages:
   quota/expiry cards, running configuration, and a filtered log viewer
 - **Settings** (`/settings`) — two tabs:
   - **Zurgarr** — an Essentials card first, then each feature's key
-    settings with tuning behind "Show advanced"; every field shows where
-    its value comes from, and values set in docker-compose are read-only.
+    settings with tuning behind "Show advanced"; automatic values explain
+    themselves, and values set in docker-compose are read-only.
     Saving applies changes without a restart (SIGHUP reload)
   - **Watchlist (plex_debrid)** — edit `settings.json` with multi-select
     pickers, list editors, a quality-profile JSON editor, and

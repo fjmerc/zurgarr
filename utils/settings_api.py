@@ -276,7 +276,7 @@ ENV_SCHEMA = [
         'fields': [
             ('STATUS_UI_ENABLED', 'Enable Status UI', 'boolean', False, 'Enable the web status dashboard'),
             ('STATUS_UI_PORT', 'Port', 'number:1-65535', False, 'Port for the status web server'),
-            ('STATUS_UI_AUTH', 'Authentication', 'string', False,
+            ('STATUS_UI_AUTH', 'Authentication', 'secret', False,
              'Basic auth credentials (username:password). '
              'If you forget this password, edit /config/.env on the host volume to recover'),
             ('STATUS_UI_TRUSTED_ORIGINS', 'Trusted origins', 'string', False,
@@ -350,7 +350,7 @@ def _is_sensitive(key):
 
 def get_env_schema():
     """Return the env var schema as a JSON-serializable structure."""
-    from utils.settings_tiers import GATES, tier_for
+    from utils.settings_tiers import ESSENTIAL_GROUPS, GATES, UNGATED_KEYS, tier_for
     categories = []
     for cat in ENV_SCHEMA:
         fields = []
@@ -363,6 +363,7 @@ def get_env_schema():
                 'help': help_text,
                 'sensitive': _is_sensitive(key),
                 'tier': tier_for(key),
+                'ungated': key in UNGATED_KEYS,
             }
             fields.append(field)
         categories.append({
@@ -371,7 +372,8 @@ def get_env_schema():
             'fields': fields,
             'gate': GATES.get(cat['name']),
         })
-    return {'categories': categories}
+    essentials = [{'label': g['label'], 'keys': list(g['keys'])} for g in ESSENTIAL_GROUPS]
+    return {'categories': categories, 'essentials': essentials}
 
 
 # ---------------------------------------------------------------------------
@@ -425,8 +427,12 @@ def _derived_reasons():
             f'{mode} — {len(configured)} debrid provider(s) configured')
         primary = dr.resolve_primary()
         if primary:
-            reasons['BLACKHOLE_DEBRID_PRIMARY'] = f'{primary} — first configured provider'
-        tb_base = dr.symlink_target_base_for_debrid(dr.TORBOX)
+            legacy = (os.environ.get('BLACKHOLE_DEBRID') or '').strip().lower()
+            reasons['BLACKHOLE_DEBRID_PRIMARY'] = (
+                f'{primary} — from the legacy BLACKHOLE_DEBRID setting' if legacy == primary
+                else f'{primary} — first configured provider')
+        tb_base = (dr.symlink_target_base_for_debrid(dr.TORBOX)
+                   if dr.TORBOX in configured else '')
         if tb_base:
             reasons['BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX'] = f'{tb_base} — the Real-Debrid base + _torbox'
     except Exception:
@@ -631,24 +637,30 @@ def write_env_values(values):
     # The actual SIGHUP handler independently re-computes which services restart.
     restarted = []
     try:
-        from utils.config_reload import _determine_restarts
-        # Preview with a dry run of the same resolver the SIGHUP reload
-        # uses, so the banner names only services that will really restart.
-        from base import SECRETS_DIR
-        from utils import config_resolve
-        dry = config_resolve.resolve(
-            os.environ, explicit, config_resolve.present_secrets(SECRETS_DIR),
-            config_resolve.written())
-        current = config_resolve.current()
+        changed = set()
+        try:
+            from utils.config_reload import _determine_restarts
+            # Preview with a dry run of the same resolver the SIGHUP reload
+            # uses, so the banner names only services that will really restart.
+            from base import SECRETS_DIR
+            from utils import config_resolve
+            dry = config_resolve.resolve(
+                os.environ, explicit, config_resolve.present_secrets(SECRETS_DIR),
+                config_resolve.written())
+            current = config_resolve.current()
 
-        def _eff(res, key):
-            r = res.get(key)
-            return r.value if r is not None and r.source != 'unset' else None
+            def _eff(res, key):
+                r = res.get(key)
+                return r.value if r is not None and r.source != 'unset' else None
 
-        changed = {k for k in set(current) | set(dry) if _eff(current, k) != _eff(dry, k)}
-        if changed:
-            restarted = sorted(_determine_restarts(changed))
+            changed = {k for k in set(current) | set(dry) if _eff(current, k) != _eff(dry, k)}
+            if changed:
+                restarted = sorted(_determine_restarts(changed))
 
+        except Exception as e:
+            # Advisory only — a failed preview must never block the apply.
+            logger.warning(f'[settings] Restart preview failed (reload still sent): {e}')
+            restarted = []
         os.kill(os.getpid(), signal.SIGHUP)
         logger.info(f'[settings] Saved .env and triggered reload ({len(changed)} changed vars)')
     except Exception as e:

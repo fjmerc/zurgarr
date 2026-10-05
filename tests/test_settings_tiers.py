@@ -52,3 +52,30 @@ def test_library_metadata_has_no_non_essential_fields():
     # by the renderer (Review Focus 5).
     cat = next(c for c in ENV_SCHEMA if c['name'] == 'Library Metadata')
     assert all(st.tier_for(f[0]) == 'essential' for f in cat['fields'])
+
+
+def test_essentials_order_follows_the_pipeline():
+    # debrid → Sonarr/Radarr → media server (address before token) → TMDB → login
+    keys = [k for group in st.ESSENTIAL_GROUPS for k in group['keys']]
+    assert tuple(keys) == st.ESSENTIAL_KEYS
+    assert keys.index('PLEX_ADDRESS') < keys.index('PLEX_TOKEN')
+    assert keys.index('SONARR_URL') < keys.index('PLEX_ADDRESS')
+    assert keys[-1] == 'STATUS_UI_AUTH'
+    assert all(g['label'] for g in st.ESSENTIAL_GROUPS)
+
+
+def test_ungated_keys_live_in_gated_categories():
+    # Fields read even with the gate off (local library paths feed the
+    # library scanner; the blocklist feeds search) must stay reachable.
+    gated_cat_keys = set()
+    for cat in ENV_SCHEMA:
+        if cat['name'] in st.GATES:
+            gated_cat_keys |= {f[0] for f in cat['fields']}
+    assert st.UNGATED_KEYS <= gated_cat_keys
+    assert {'BLACKHOLE_LOCAL_LIBRARY_TV', 'BLACKHOLE_LOCAL_LIBRARY_MOVIES',
+            'BLOCKLIST_AUTO_ADD'} <= st.UNGATED_KEYS
+
+
+def test_status_ui_auth_is_a_secret_field():
+    types = _types()
+    assert types['STATUS_UI_AUTH'] == 'secret'

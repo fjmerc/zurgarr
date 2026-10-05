@@ -1851,3 +1851,55 @@ class TestSettingsPageTiers:
                        'function applyGate', 'class="category essentials"',
                        'gated-fields', 'src-badge'):
             assert needle in html, needle
+
+
+class TestSchemaEssentials:
+
+    def test_schema_carries_essential_groups_and_ungated(self):
+        schema = get_env_schema()
+        assert [k for g in schema['essentials'] for k in g['keys']][0] == 'RD_API_KEY'
+        fields = {f['key']: f for c in schema['categories'] for f in c['fields']}
+        assert fields['BLACKHOLE_LOCAL_LIBRARY_TV']['ungated'] is True
+        assert fields['BLACKHOLE_DIR']['ungated'] is False
+
+
+class TestPreviewNeverBlocksReload:
+
+    def test_preview_failure_still_sends_sighup(self, tmp_path, monkeypatch):
+        import signal
+        import utils.settings_api as sa
+        from utils import config_resolve
+        path = tmp_path / '.env'
+        path.write_text('')
+        monkeypatch.setattr(sa, 'ENV_FILE', str(path))
+        monkeypatch.setattr(sa, '_sync_env_to_plex_debrid', lambda *a: None)
+        sent = []
+        monkeypatch.setattr('os.kill', lambda pid, sig: sent.append(sig))
+        def boom(*a, **k):
+            raise RuntimeError('preview exploded')
+        monkeypatch.setattr(config_resolve, 'present_secrets', boom)
+        result = sa.write_env_values({'NOTIFICATION_URL': 'json://x'})
+        assert result['status'] == 'saved'
+        assert sent == [signal.SIGHUP]
+
+
+class TestDerivedReasonAccuracy:
+
+    @pytest.fixture(autouse=True)
+    def _fresh(self, monkeypatch):
+        for key in ('RD_API_KEY', 'AD_API_KEY', 'TORBOX_API_KEY', 'BLACKHOLE_DEBRID',
+                    'BLACKHOLE_DEBRID_PRIMARY', 'BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX'):
+            monkeypatch.delenv(key, raising=False)
+
+    def test_primary_reason_names_legacy_key(self, monkeypatch):
+        from utils.settings_api import _derived_reasons
+        monkeypatch.setenv('RD_API_KEY', 'k')
+        monkeypatch.setenv('TORBOX_API_KEY', 'k2')
+        monkeypatch.setenv('BLACKHOLE_DEBRID', 'torbox')
+        assert 'BLACKHOLE_DEBRID' in _derived_reasons()['BLACKHOLE_DEBRID_PRIMARY']
+
+    def test_no_torbox_base_reason_without_torbox(self, monkeypatch):
+        from utils.settings_api import _derived_reasons
+        monkeypatch.setenv('RD_API_KEY', 'k')
+        monkeypatch.setenv('BLACKHOLE_SYMLINK_TARGET_BASE', '/mnt/debrid')
+        assert 'BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX' not in _derived_reasons()
