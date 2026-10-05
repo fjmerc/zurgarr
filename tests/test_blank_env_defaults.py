@@ -252,3 +252,139 @@ class TestZurgLogLevelCleared:
         monkeypatch.setenv('LOG_LEVEL', 'DEBUG')   # stale from before reload
         zurg_setup.apply_zurg_log_level()
         assert 'LOG_LEVEL' not in os.environ
+
+
+class TestSettingsFileBeatsBlankContainerEnv:
+    """The Settings UI saves to /config/.env, but the stock compose passes
+    the same keys blank and load_dotenv(override=False) keeps the blank —
+    so UI-saved settings silently reverted on every container restart."""
+
+    def test_blank_container_value_is_filled_from_file(self, monkeypatch, tmp_path):
+        from base import load_env_file
+        env_file = tmp_path / '.env'
+        env_file.write_text('BH_TEST_ENABLED=true\nBH_TEST_EXPLICIT=fromfile\n'
+                            'BH_TEST_EMPTY=\nBH_TEST_MISSING=x\nBH_TEST_SPACES=filled\n')
+        monkeypatch.setenv('BH_TEST_ENABLED', '')          # compose blank
+        monkeypatch.setenv('BH_TEST_EXPLICIT', 'fromcompose')
+        monkeypatch.setenv('BH_TEST_EMPTY', '')
+        monkeypatch.setenv('BH_TEST_SPACES', '   ')
+        # setenv-then-delenv registers an undo so the loaded key can't leak
+        monkeypatch.setenv('BH_TEST_MISSING', 'placeholder')
+        monkeypatch.delenv('BH_TEST_MISSING')
+        load_env_file(str(env_file))
+        assert os.environ['BH_TEST_ENABLED'] == 'true'
+        assert os.environ['BH_TEST_EXPLICIT'] == 'fromcompose'  # non-blank container value still wins
+        assert os.environ['BH_TEST_EMPTY'] == ''               # blank file values never apply
+        assert os.environ['BH_TEST_MISSING'] == 'x'
+        assert os.environ['BH_TEST_SPACES'] == 'filled'
+
+    @pytest.mark.parametrize('name', ['', 'nope.env'])
+    def test_missing_file_is_a_noop(self, tmp_path, monkeypatch, name):
+        from base import load_env_file
+        monkeypatch.setenv('BH_TEST_ENABLED', '')
+        # find_dotenv() returns '' when the file isn't found
+        load_env_file(str(tmp_path / name) if name else '')
+        assert os.environ['BH_TEST_ENABLED'] == ''
+
+
+CREDENTIAL_KEYS = (
+    'RD_API_KEY', 'AD_API_KEY', 'TORBOX_API_KEY', 'TORBOX_WEBDAV_USER',
+    'TORBOX_WEBDAV_PASS', 'PLEX_TOKEN', 'PLEX_ADDRESS', 'JF_ADDRESS',
+    'JF_API_KEY', 'SEERR_ADDRESS', 'SEERR_API_KEY', 'SONARR_API_KEY',
+    'RADARR_API_KEY', 'ZURG_USER', 'ZURG_PASS', 'PROWLARR_API_KEY',
+    'TAUTULLI_API_KEY',
+)
+
+
+class TestSecretOrEnv:
+    """Docker secrets must win over env for every credential read; direct
+    os.environ reads ignored /run/secrets entirely (secrets-only installs
+    silently lost features) or let a stale .env value shadow the secret."""
+
+    def test_secret_file_wins_over_env(self, monkeypatch, tmp_path):
+        from utils import env
+        (tmp_path / 'rd_api_key').write_text('from-secret\n')
+        monkeypatch.setattr(env, 'SECRETS_DIR', str(tmp_path))
+        monkeypatch.setenv('RD_API_KEY', 'stale-from-env')
+        assert env.secret_or_env('RD_API_KEY') == 'from-secret'
+
+    def test_falls_back_to_env_stripped(self, monkeypatch, tmp_path):
+        from utils import env
+        monkeypatch.setattr(env, 'SECRETS_DIR', str(tmp_path))
+        monkeypatch.setenv('RD_API_KEY', '  abc  ')
+        assert env.secret_or_env('RD_API_KEY') == 'abc'
+        monkeypatch.setenv('RD_API_KEY', '')
+        assert env.secret_or_env('RD_API_KEY') == ''
+
+    def test_no_direct_credential_env_reads(self):
+        keys = '|'.join(CREDENTIAL_KEYS)
+        pat = re.compile(r"""os\.(?:environ\.get|getenv)\(\s*['"](%s)['"]""" % keys)
+        offenders = []
+        for root in ('utils', 'zurg', 'rclone', 'plex_debrid_'):
+            for dirpath, _, names in os.walk(os.path.join(REPO, root)):
+                for name in names:
+                    path = os.path.join(dirpath, name)
+                    if not name.endswith('.py') or path.endswith(os.path.join('utils', 'env.py')):
+                        continue
+                    with open(path) as f:
+                        text = f.read()
+                    for m in pat.finditer(text):
+                        lineno = text.count('\n', 0, m.start()) + 1
+                        offenders.append(f'{os.path.relpath(path, REPO)}:{lineno} {m.group(1)}')
+        assert not offenders, (
+            'Read credentials via utils.env.secret_or_env() so Docker secrets '
+            'are honoured:\n' + '\n'.join(offenders))
+
+
+class TestReloadDoesNotRereadEnvFile:
+
+    def test_reload_once_loads_config_without_rereading_file(self, monkeypatch):
+        # _reload_env already synced os.environ and computed `changed`; a
+        # re-read inside config.load() could apply a newer save uncounted.
+        from base import config
+        from utils import config_reload
+        calls = []
+        monkeypatch.setattr(config_reload, '_reload_env', lambda: {'LIBRARY_SCAN_INTERVAL'})
+        monkeypatch.setattr(config, 'load', lambda **kw: calls.append(kw))
+        monkeypatch.setattr(config_reload, 'SOFT_RELOAD', {'LIBRARY_SCAN_INTERVAL'})
+        monkeypatch.setattr(config_reload, '_notify_reload', lambda *a: None)
+        config_reload._reload_once()
+        assert calls == [{'read_env_file': False}]
+
+
+class TestReviewRound3:
+
+    def test_load_env_file_records_filled_keys(self, monkeypatch, tmp_path):
+        # Upgrade visibility: keys revived from /config/.env must be loggable.
+        import base
+        env_file = tmp_path / '.env'
+        env_file.write_text('BH_TEST_ENABLED=true\n')
+        monkeypatch.setenv('BH_TEST_ENABLED', '')
+        monkeypatch.setattr(base, 'ENV_FILE_FILLED_KEYS', [])
+        base.load_env_file(str(env_file))
+        assert base.ENV_FILE_FILLED_KEYS == ['BH_TEST_ENABLED']
+
+    def test_empty_secret_file_falls_back_to_env(self, monkeypatch, tmp_path):
+        import base
+        secret = tmp_path / 'rd_api_key'
+        secret.write_text('\n')
+        monkeypatch.setattr(base, 'SECRETS_DIR', str(tmp_path))
+        monkeypatch.setenv('RD_API_KEY', 'from-env')
+        assert base.load_secret_or_env('rd_api_key') == 'from-env'
+
+    def test_status_server_secret_helper_matches(self, monkeypatch, tmp_path):
+        from utils import env, status_server
+        (tmp_path / 'plex_token').write_text('')
+        monkeypatch.setattr(env, 'SECRETS_DIR', str(tmp_path))
+        monkeypatch.setenv('PLEX_TOKEN', 'from-env')
+        assert status_server._get_secret_or_env('plex_token', 'PLEX_TOKEN') == 'from-env'
+
+    def test_unknown_alt_debrid_has_no_key(self):
+        from utils import debrid_routing
+        assert debrid_routing._API_KEY_ENV.get('premiumize', '') == ''
+
+    def test_blackhole_numeric_ui_defaults(self):
+        from utils.settings_api import _ENV_DEFAULTS
+        assert _ENV_DEFAULTS['BLACKHOLE_MOUNT_POLL_TIMEOUT'] == '300'
+        assert _ENV_DEFAULTS['BLACKHOLE_MOUNT_POLL_INTERVAL'] == '10'
+        assert _ENV_DEFAULTS['BLACKHOLE_SYMLINK_MAX_AGE'] == '72'

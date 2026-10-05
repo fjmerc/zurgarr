@@ -8,6 +8,7 @@ is launched.
 import os
 import re
 from urllib.parse import urlparse
+from utils.env import secret_or_env
 from utils.logger import get_logger
 
 logger = get_logger()
@@ -79,9 +80,9 @@ def validate_config():
     # non-mount features (cache probes, search add) still work with just
     # the API key — but warn loudly so the user sees that the mount won't
     # come up until WebDAV credentials are also set.
-    torbox_key = os.environ.get('TORBOX_API_KEY', '')
-    torbox_webdav_user = os.environ.get('TORBOX_WEBDAV_USER', '')
-    torbox_webdav_pass = os.environ.get('TORBOX_WEBDAV_PASS', '')
+    torbox_key = secret_or_env('TORBOX_API_KEY')
+    torbox_webdav_user = secret_or_env('TORBOX_WEBDAV_USER')
+    torbox_webdav_pass = secret_or_env('TORBOX_WEBDAV_PASS')
     if torbox_key and not (torbox_webdav_user and torbox_webdav_pass):
         missing = []
         if not torbox_webdav_user:
@@ -106,7 +107,7 @@ def validate_config():
     url_vars = {
         'PLEX_ADDRESS': PLEXADD,
         'JF_ADDRESS': JFADD,
-        'SEERR_ADDRESS': os.environ.get('SEERR_ADDRESS', ''),
+        'SEERR_ADDRESS': secret_or_env('SEERR_ADDRESS'),
     }
     for name, value in url_vars.items():
         if value and not _is_valid_url(value):
@@ -211,7 +212,7 @@ def validate_config():
 
     blackhole_enabled = os.environ.get('BLACKHOLE_ENABLED', 'false').lower() == 'true'
     if blackhole_enabled and not RDAPIKEY and not ADAPIKEY:
-        torbox_key = os.environ.get('TORBOX_API_KEY', '')
+        torbox_key = secret_or_env('TORBOX_API_KEY')
         if not torbox_key:
             result.error(
                 "BLACKHOLE_ENABLED=true but no debrid API key found. "

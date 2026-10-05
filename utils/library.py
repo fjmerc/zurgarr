@@ -14,7 +14,7 @@ import unicodedata
 import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote as urllib_quote
-from utils.env import completed_dir_from_env, env_or_default
+from utils.env import completed_dir_from_env, env_or_default, secret_or_env
 from utils.logger import get_logger
 from utils.quality_parser import parse_quality
 
@@ -1260,8 +1260,8 @@ def _discover_zurg_url(mount_path):
 
 def _get_zurg_auth():
     """Get Zurg WebDAV auth credentials if configured."""
-    user = os.environ.get('ZURG_USER', '').strip()
-    password = os.environ.get('ZURG_PASS', '').strip()
+    user = secret_or_env('ZURG_USER').strip()
+    password = secret_or_env('ZURG_PASS').strip()
     return (user, password) if user and password else None
 
 
@@ -3130,7 +3130,7 @@ class LibraryScanner:
         bind-only dir.  Returning None there avoids logging confusing
         "no items on TB mount" messages.
         """
-        if not os.environ.get('TORBOX_API_KEY'):
+        if not secret_or_env('TORBOX_API_KEY'):
             return None
         try:
             from utils.debrid_routing import mount_for_debrid, TORBOX

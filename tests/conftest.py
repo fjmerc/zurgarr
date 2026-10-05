@@ -6,6 +6,15 @@ import pytest
 import tempfile
 import shutil
 
+# Keep a real /config/.env on the dev host out of the tests.  base resolves
+# its settings file via find_dotenv('./config/.env'), which walks up to '/';
+# on a host that runs zurgarr it finds the live file and loads it into the
+# test env at *import* time (before any fixture runs).  conftest is imported
+# before base, so patching dotenv here covers import time and every
+# Config.load() after it.
+import dotenv  # noqa: E402
+dotenv.find_dotenv = lambda *a, **k: ''
+
 # Ensure project root is on sys.path
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:

@@ -181,7 +181,7 @@ def _reload_once():
         # Reload the Config singleton so module-level vars update
         try:
             from base import Config, config
-            config.load()
+            config.load(read_env_file=False)
         except Exception as e:
             logger.error(f"[reload] Failed to reload base config: {e}")
             return

@@ -20,7 +20,7 @@ import threading
 import uuid
 from datetime import datetime
 import requests
-from utils.env import completed_dir_from_env, env_or_default, watch_dir_from_env
+from utils.env import completed_dir_from_env, env_or_default, secret_or_env, watch_dir_from_env
 from utils.file_utils import atomic_write
 from utils.logger import get_logger
 from utils import attempt_ledger
@@ -5377,7 +5377,7 @@ def setup():
         resolve_primary, resolve_routing_mode, configured_debrids,
         VALID_DEBRIDS,
     )
-    tb_key = os.environ.get('TORBOX_API_KEY')
+    tb_key = secret_or_env('TORBOX_API_KEY')
     debrid_api_keys = {}
     if RDAPIKEY:
         debrid_api_keys['realdebrid'] = RDAPIKEY
@@ -5439,19 +5439,19 @@ def setup():
     symlink_target_base = os.environ.get('BLACKHOLE_SYMLINK_TARGET_BASE', '')
 
     try:
-        mount_poll_timeout = int(os.environ.get('BLACKHOLE_MOUNT_POLL_TIMEOUT', '300'))
+        mount_poll_timeout = int(env_or_default('BLACKHOLE_MOUNT_POLL_TIMEOUT', '300'))
     except (ValueError, TypeError):
         logger.warning("[blackhole] Invalid BLACKHOLE_MOUNT_POLL_TIMEOUT, defaulting to 300s")
         mount_poll_timeout = 300
 
     try:
-        mount_poll_interval = int(os.environ.get('BLACKHOLE_MOUNT_POLL_INTERVAL', '10'))
+        mount_poll_interval = int(env_or_default('BLACKHOLE_MOUNT_POLL_INTERVAL', '10'))
     except (ValueError, TypeError):
         logger.warning("[blackhole] Invalid BLACKHOLE_MOUNT_POLL_INTERVAL, defaulting to 10s")
         mount_poll_interval = 10
 
     try:
-        symlink_max_age = int(os.environ.get('BLACKHOLE_SYMLINK_MAX_AGE', '72'))
+        symlink_max_age = int(env_or_default('BLACKHOLE_SYMLINK_MAX_AGE', '72'))
     except (ValueError, TypeError):
         logger.warning("[blackhole] Invalid BLACKHOLE_SYMLINK_MAX_AGE, defaulting to 72h")
         symlink_max_age = 72

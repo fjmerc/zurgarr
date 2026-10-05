@@ -347,6 +347,11 @@ _ENV_DEFAULTS = {
     # ffprobe monitor defaults ON — matches utils/ffprobe_monitor.py::setup().
     # Without this the UI toggle rendered OFF while the monitor ran.
     'FFPROBE_MONITOR_ENABLED': 'true',
+    # Blackhole mount polling / symlink age — compose no longer supplies these
+    # (it passes them blank so UI saves survive restarts); match base Config.
+    'BLACKHOLE_MOUNT_POLL_TIMEOUT': '300',
+    'BLACKHOLE_MOUNT_POLL_INTERVAL': '10',
+    'BLACKHOLE_SYMLINK_MAX_AGE': '72',
     # Wanted→TorBox recovery is on by default; matches
     # utils/library.py::wanted_tb_recovery_enabled() and base/__init__.py Config.
     'WANTED_TB_RECOVERY_ENABLED': 'true',

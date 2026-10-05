@@ -19,6 +19,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs, unquote as url_unquote
+from utils.env import secret_or_env
 from utils.api_metrics import api_metrics as _api_metrics
 from utils.logger import get_logger
 from version import VERSION
@@ -60,11 +61,8 @@ def _read_cgroup_file(path):
 
 def _get_secret_or_env(secret_name, env_name=None):
     """Read from Docker secret file, fall back to environment variable."""
-    try:
-        with open(f'/run/secrets/{secret_name}', 'r') as f:
-            return f.read().strip()
-    except (FileNotFoundError, PermissionError):
-        return os.environ.get(env_name or secret_name.upper())
+    # Callers always pass secret_name == env_name.lower(); one implementation.
+    return secret_or_env(env_name or secret_name.upper())
 
 
 def get_system_stats():
@@ -423,8 +421,8 @@ def check_services():
         services.append(svc)
 
     # Plex
-    plex_addr = os.environ.get('PLEX_ADDRESS') or _get_secret_or_env('plex_address', 'PLEX_ADDRESS')
-    plex_token = os.environ.get('PLEX_TOKEN') or _get_secret_or_env('plex_token', 'PLEX_TOKEN')
+    plex_addr = secret_or_env('PLEX_ADDRESS')
+    plex_token = secret_or_env('PLEX_TOKEN')
     if plex_addr and plex_token:
         svc, resp = _check_service(
             'Plex', 'media_server',
@@ -434,8 +432,8 @@ def check_services():
         services.append(svc)
 
     # Jellyfin
-    jf_addr = os.environ.get('JF_ADDRESS') or _get_secret_or_env('jf_address', 'JF_ADDRESS')
-    jf_key = os.environ.get('JF_API_KEY') or _get_secret_or_env('jf_api_key', 'JF_API_KEY')
+    jf_addr = secret_or_env('JF_ADDRESS')
+    jf_key = secret_or_env('JF_API_KEY')
     if jf_addr and jf_key:
         svc, resp = _check_service(
             'Jellyfin', 'media_server',
@@ -445,8 +443,8 @@ def check_services():
         services.append(svc)
 
     # Overseerr / Jellyseerr
-    seerr_addr = os.environ.get('SEERR_ADDRESS') or _get_secret_or_env('seerr_address', 'SEERR_ADDRESS')
-    seerr_key = os.environ.get('SEERR_API_KEY') or _get_secret_or_env('seerr_api_key', 'SEERR_API_KEY')
+    seerr_addr = secret_or_env('SEERR_ADDRESS')
+    seerr_key = secret_or_env('SEERR_API_KEY')
     if seerr_addr and seerr_key:
         # /api/v1/request requires a valid key (401 on a dead one) —
         # the original public /status ping showed false green forever.
@@ -473,8 +471,8 @@ def check_services():
     # Zurg WebDAV
     zurg_enabled = (os.environ.get('ZURG_ENABLED') or '').lower() == 'true'
     if zurg_enabled:
-        zurg_user = os.environ.get('ZURG_USER') or _get_secret_or_env('zurg_user', 'ZURG_USER')
-        zurg_pass = os.environ.get('ZURG_PASS') or _get_secret_or_env('zurg_pass', 'ZURG_PASS')
+        zurg_user = secret_or_env('ZURG_USER')
+        zurg_pass = secret_or_env('ZURG_PASS')
         for key_type, env_suffix in [('RD', 'RealDebrid'), ('AD', 'AllDebrid')]:
             port = os.environ.get(f'ZURG_PORT_{env_suffix}')
             if port:

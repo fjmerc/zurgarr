@@ -84,6 +84,12 @@ def main():
     from utils import heartbeat
     heartbeat.reset()
 
+    if ENV_FILE_FILLED_KEYS:
+        logger.info(
+            f"Applied {len(ENV_FILE_FILLED_KEYS)} setting(s) from /config/.env over blank "
+            f"container values: {', '.join(sorted(ENV_FILE_FILLED_KEYS))}"
+        )
+
     if not run_validation():
         sys.exit(1)
 

@@ -8,6 +8,8 @@ These helpers treat blank (or whitespace-only) as unset.
 
 import os
 
+SECRETS_DIR = '/run/secrets'
+
 
 def env_or_default(key, default):
     """Return the stripped value of *key*, or *default* when unset/blank."""
@@ -46,3 +48,17 @@ def child_env():
 def completed_dir_from_env():
     """The blackhole completed dir (BLACKHOLE_COMPLETED_DIR, default ``/completed``)."""
     return env_or_default('BLACKHOLE_COMPLETED_DIR', '/completed')
+
+
+def secret_or_env(key):
+    """Credential lookup: Docker secret ``/run/secrets/<key lowercased>``
+    first (same naming as ``base.load_secret_or_env``), then the env var.
+    Returns a stripped string, ``''`` when neither is set."""
+    try:
+        with open(os.path.join(SECRETS_DIR, key.lower())) as f:
+            value = f.read().strip()
+        if value:
+            return value
+    except OSError:
+        pass
+    return (os.environ.get(key) or '').strip()

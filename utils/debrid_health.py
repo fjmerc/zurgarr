@@ -18,6 +18,7 @@ import os
 import threading
 import time
 
+from utils.env import env_or_default, secret_or_env
 from utils.debrid_client import get_debrid_client, RD_LIST_LIMIT
 from utils.file_utils import atomic_write
 from utils.logger import get_logger
@@ -75,7 +76,7 @@ def _enabled():
     """Master toggle. Honours runtime env-var changes (SIGHUP / UI edits)
     without needing a restart, so the scheduled task can be turned off
     on a live container."""
-    return str(os.environ.get('DEBRID_HEALTH_ENABLED', 'true')).lower() == 'true'
+    return env_or_default('DEBRID_HEALTH_ENABLED', 'true').lower() == 'true'
 
 
 def _auto_remediate_enabled():
@@ -109,8 +110,8 @@ def _cross_rescue_enabled():
         return True
     if explicit in _FALSY_VALUES:
         return False
-    return bool(os.environ.get('RD_API_KEY')
-                and os.environ.get('TORBOX_API_KEY'))
+    return bool(secret_or_env('RD_API_KEY')
+                and secret_or_env('TORBOX_API_KEY'))
 
 
 def _empty_state():
@@ -270,10 +271,9 @@ def get_summary():
     timestamps so existing state files don't need a migration.
     """
     rd_configured = bool(
-        os.environ.get('RD_API_KEY')
-        or os.path.isfile('/run/secrets/rd_api_key')
+        secret_or_env('RD_API_KEY')
     )
-    tb_configured = bool(os.environ.get('TORBOX_API_KEY'))
+    tb_configured = bool(secret_or_env('TORBOX_API_KEY'))
 
     # Plan 39 phase 5: per-provider snapshots so the UI can render side-
     # by-side cards.  Computed from the same state file; the reconciler
@@ -703,8 +703,8 @@ def _plex_session_active_for_release(release_name):
     if not release_name:
         return False
     try:
-        plex_addr = os.environ.get('PLEX_ADDRESS') or os.environ.get('PLEXADD')
-        plex_token = os.environ.get('PLEX_TOKEN') or os.environ.get('PLEXTOKEN')
+        plex_addr = secret_or_env('PLEX_ADDRESS') or os.environ.get('PLEXADD')
+        plex_token = secret_or_env('PLEX_TOKEN') or os.environ.get('PLEXTOKEN')
         if not (plex_addr and plex_token):
             return False
         from plexapi.server import PlexServer

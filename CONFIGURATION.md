@@ -332,11 +332,14 @@ homelab-scale installs — most users don't need to touch these.
 
 ## Docker secrets
 
-Zurgarr reads sensitive values from `/run/secrets/<name>` when the env
-var isn't set. Supported names: `github_token`, `rd_api_key`,
-`ad_api_key`, `torbox_api_key`, `plex_user`, `plex_token`,
+Zurgarr reads sensitive values from `/run/secrets/<name>`. **A secret
+file wins over the env var** of the same setting (an empty secret file is
+ignored). Supported names: `rd_api_key`, `ad_api_key`, `torbox_api_key`,
+`torbox_webdav_user`, `torbox_webdav_pass`, `plex_user`, `plex_token`,
 `plex_address`, `jf_api_key`, `jf_address`, `seerr_api_key`,
-`seerr_address`.
+`seerr_address`, `sonarr_api_key`, `radarr_api_key`, `prowlarr_api_key`,
+`tautulli_api_key`, `zurg_user`, `zurg_pass`, and `GITHUB_TOKEN`
+(uppercase — the only one).
 
 ```yaml
 services:
@@ -353,7 +356,9 @@ secrets:
     file: ./secrets/plex_token.txt
 ```
 
-Remove the corresponding env vars from `.env` when using secrets.
+Remove the corresponding env vars from `.env` when using secrets — a
+leftover value is unused while the secret exists, and takes over silently
+if the secret is later removed.
 
 ---
 

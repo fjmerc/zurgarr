@@ -1,5 +1,5 @@
 from json import load, dump
-from dotenv import load_dotenv, find_dotenv
+from dotenv import load_dotenv, find_dotenv, dotenv_values
 from datetime import datetime, timedelta
 import logging
 from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler, BaseRotatingHandler
@@ -40,7 +40,7 @@ __all__ = [
     'ColoredFormatter', 'YAML',
     # Functions
     'load_secret_or_env', 'is_port_available', 'find_available_port',
-    'refresh_globals',
+    'refresh_globals', 'load_env_file', 'ENV_FILE_FILLED_KEYS',
     # Config
     'Config', 'config',
     # Config variables
@@ -115,16 +115,48 @@ __all__ = [
     'SEASON_PACK_FALLBACK_MIN_RATIO',
 ]
 
-load_dotenv(find_dotenv('./config/.env'))
+def load_env_file(path):
+    """Load *path* into os.environ without overriding real container values.
+
+    load_dotenv(override=False) also refuses to override *blank* values, and
+    the stock compose passes every optional var as ``X=${X:-}`` — so a
+    setting saved via the Settings UI (which writes /config/.env) would
+    silently revert to blank on every restart.  Blank counts as unset here:
+    the file fills it.  Non-blank container values still win; blank file
+    values are never applied.  (A SIGHUP reload is different: config_reload
+    applies .env values over the container's, so UI saves take effect.)
+    """
+    if not path or not os.path.exists(path):
+        return
+    load_dotenv(path, override=False)
+    for key, value in dotenv_values(path).items():
+        if value and not os.environ.get(key, '').strip():
+            os.environ[key] = value
+            if key not in ENV_FILE_FILLED_KEYS:
+                ENV_FILE_FILLED_KEYS.append(key)
+
+
+# Keys whose blank container value was filled from /config/.env — logged
+# by main() once logging is up, so settings revived from the file (e.g.
+# after upgrading from a version where the blank won) are visible.
+ENV_FILE_FILLED_KEYS = []
+SECRETS_DIR = '/run/secrets'
+
+
+load_env_file(find_dotenv('./config/.env'))
 
 
 def load_secret_or_env(secret_name, default=None):
-    secret_file = f'/run/secrets/{secret_name}'
+    secret_file = os.path.join(SECRETS_DIR, secret_name)
     try:
         with open(secret_file, 'r') as file:
-            return file.read().strip()
+            value = file.read().strip()
+        if value:
+            return value
     except IOError:
-        return os.getenv(secret_name.upper(), default)
+        pass
+    # Missing or empty secret file: fall back to env (matches utils.env.secret_or_env).
+    return os.getenv(secret_name.upper(), default)
 
 
 def is_port_available(port):
@@ -174,8 +206,13 @@ class Config:
     def __init__(self):
         self.load()
 
-    def load(self):
-        load_dotenv(find_dotenv('./config/.env'), override=False)
+    def load(self, read_env_file=True):
+        # SIGHUP reload passes False: config_reload._reload_env has just
+        # synced os.environ from the file and computed `changed` from that
+        # sync; re-reading here could pick up a newer save without it being
+        # counted as a change (its service restart would be lost).
+        if read_env_file:
+            load_env_file(find_dotenv('./config/.env'))
 
         self.PLEXDEBRID = os.getenv("PD_ENABLED")
         self.PDLOGLEVEL = os.getenv("PD_LOG_LEVEL")
@@ -267,9 +304,9 @@ class Config:
         # debrid_routing.symlink_target_base_for_debrid() falls back to
         # ``<RD base>_torbox`` so most users get a sensible default.
         self.BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX = os.getenv('BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX')
-        self.BLACKHOLE_MOUNT_POLL_TIMEOUT = os.getenv('BLACKHOLE_MOUNT_POLL_TIMEOUT')
-        self.BLACKHOLE_MOUNT_POLL_INTERVAL = os.getenv('BLACKHOLE_MOUNT_POLL_INTERVAL')
-        self.BLACKHOLE_SYMLINK_MAX_AGE = os.getenv('BLACKHOLE_SYMLINK_MAX_AGE')
+        self.BLACKHOLE_MOUNT_POLL_TIMEOUT = (os.getenv('BLACKHOLE_MOUNT_POLL_TIMEOUT') or '').strip() or '300'
+        self.BLACKHOLE_MOUNT_POLL_INTERVAL = (os.getenv('BLACKHOLE_MOUNT_POLL_INTERVAL') or '').strip() or '10'
+        self.BLACKHOLE_SYMLINK_MAX_AGE = (os.getenv('BLACKHOLE_SYMLINK_MAX_AGE') or '').strip() or '72'
         self.STATUS_UI_ENABLED = os.getenv('STATUS_UI_ENABLED')
         self.STATUS_UI_PORT = os.getenv('STATUS_UI_PORT')
         self.STATUS_UI_AUTH = os.getenv('STATUS_UI_AUTH')
@@ -309,7 +346,7 @@ class Config:
         # remediation (delete + arr re-search) gates separately via
         # AUTO_REMEDIATE — opt-in because the remediation path mutates RD
         # account state (deletes torrents) and triggers arr searches.
-        self.DEBRID_HEALTH_ENABLED = os.getenv('DEBRID_HEALTH_ENABLED', 'true')
+        self.DEBRID_HEALTH_ENABLED = (os.getenv('DEBRID_HEALTH_ENABLED') or '').strip() or 'true'
         self.DEBRID_HEALTH_AUTO_REMEDIATE = os.getenv('DEBRID_HEALTH_AUTO_REMEDIATE', 'false')
         # Cross-debrid rescue (plan 39 phase 3) — when RD filter-blocks
         # a torrent and TB has it cached, re-host on TB instead of just

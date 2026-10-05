@@ -22,6 +22,7 @@ stub the debrid-cache lookup without monkeypatching ``utils.search``.
 import os
 import re
 from datetime import datetime
+from utils.env import secret_or_env
 from utils.logger import get_logger
 
 logger = get_logger()
@@ -35,6 +36,10 @@ logger = get_logger()
 REALDEBRID = 'realdebrid'
 ALLDEBRID = 'alldebrid'
 TORBOX = 'torbox'
+
+# Env var holding each provider's API key.  Not f'{svc.upper()}_API_KEY':
+# AllDebrid's var is AD_API_KEY, not ALLDEBRID_API_KEY.
+_API_KEY_ENV = {REALDEBRID: 'RD_API_KEY', ALLDEBRID: 'AD_API_KEY', TORBOX: 'TORBOX_API_KEY'}
 VALID_DEBRIDS = (REALDEBRID, ALLDEBRID, TORBOX)
 
 # Routing modes (env: BLACKHOLE_DEBRID_ROUTING)
@@ -60,11 +65,11 @@ def configured_debrids():
     pure and returns ``()``).
     """
     services = []
-    if os.environ.get('RD_API_KEY'):
+    if secret_or_env('RD_API_KEY'):
         services.append(REALDEBRID)
-    if os.environ.get('AD_API_KEY'):
+    if secret_or_env('AD_API_KEY'):
         services.append(ALLDEBRID)
-    if os.environ.get('TORBOX_API_KEY'):
+    if secret_or_env('TORBOX_API_KEY'):
         services.append(TORBOX)
     return tuple(services)
 
@@ -161,8 +166,8 @@ def mount_for_debrid(debrid, rclone_mount_base='/data'):
     if not rclonemn:
         return None
 
-    rd_key = bool(os.environ.get('RD_API_KEY'))
-    ad_key = bool(os.environ.get('AD_API_KEY'))
+    rd_key = bool(secret_or_env('RD_API_KEY'))
+    ad_key = bool(secret_or_env('AD_API_KEY'))
     if rd_key and ad_key:
         # Dual-Zurg layout — see rclone/rclone.py setup()
         if debrid == REALDEBRID:
@@ -721,7 +726,7 @@ def attempt_add_rescue(info_hash, source_debrid, *,
             return {'rescued': False, 'reason': 'cache_probe_error',
                     'alt_torrent_id': None}
 
-        alt_key = os.environ.get(f'{alt.upper()}_API_KEY') if alt != REALDEBRID else os.environ.get('RD_API_KEY')
+        alt_key = secret_or_env(_API_KEY_ENV[alt]) if alt in _API_KEY_ENV else ''
 
         def _default_probe(svc, h):
             cache_map = check_debrid_cache([h.lower()], service=svc, api_key=alt_key)
@@ -753,7 +758,7 @@ def attempt_add_rescue(info_hash, source_debrid, *,
             )
             return {'rescued': False, 'reason': 'no_alt_client',
                     'alt_torrent_id': None}
-        alt_key = os.environ.get(f'{alt.upper()}_API_KEY') if alt != REALDEBRID else os.environ.get('RD_API_KEY')
+        alt_key = secret_or_env(_API_KEY_ENV[alt]) if alt in _API_KEY_ENV else ''
         try:
             alt_client, _svc = get_debrid_client(service=alt, api_key=alt_key)
         except Exception as e:

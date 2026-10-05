@@ -10,6 +10,7 @@ import shutil
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from utils.env import secret_or_env
 from utils.logger import get_logger
 
 logger = get_logger()
@@ -1341,9 +1342,9 @@ def mount_liveness_probe():
     # (an unusual but valid config), the bare-discovery code would
     # probe the same mount twice.  Env-gate keeps the probe scoped.
     tb_configured = bool(
-        os.environ.get('TORBOX_API_KEY')
-        and os.environ.get('TORBOX_WEBDAV_USER')
-        and os.environ.get('TORBOX_WEBDAV_PASS')
+        secret_or_env('TORBOX_API_KEY')
+        and secret_or_env('TORBOX_WEBDAV_USER')
+        and secret_or_env('TORBOX_WEBDAV_PASS')
     )
     tb_mount_path = None
     tb_status, tb_msg, tb_items = None, None, 0
@@ -1599,7 +1600,7 @@ def register_all():
     # The sweep itself is a no-op when disabled; this preserves the
     # user's ability to manually trigger from the System page without
     # restarting the container after toggling the env var ON.
-    rd_configured = bool(os.environ.get('RD_API_KEY') or os.path.isfile('/run/secrets/rd_api_key'))
+    rd_configured = bool(secret_or_env('RD_API_KEY'))
     if rd_configured:
         from utils.debrid_health import run_sweep as _debrid_health_run
         scheduler.register(
