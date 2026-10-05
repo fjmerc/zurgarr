@@ -469,13 +469,15 @@ def check_services():
         services.append(svc)
 
     # Zurg WebDAV
-    zurg_enabled = (os.environ.get('ZURG_ENABLED') or '').lower() == 'true'
-    if zurg_enabled:
+    # (the instances started at boot — a runtime change doesn't start/stop them)
+    from utils.config_reload import _BOOT_LAYOUT
+    zurg_on, zurg_instances = _BOOT_LAYOUT
+    if zurg_on:
         zurg_user = secret_or_env('ZURG_USER')
         zurg_pass = secret_or_env('ZURG_PASS')
         for key_type, env_suffix in [('RD', 'RealDebrid'), ('AD', 'AllDebrid')]:
             port = os.environ.get(f'ZURG_PORT_{env_suffix}')
-            if port:
+            if port and key_type in zurg_instances:
                 headers = {}
                 auth = None
                 if zurg_user and zurg_pass:
@@ -1308,20 +1310,21 @@ setInterval(_scTickChecked,5000);
 function recheckSetup(){
   fetch('/api/setup-check?fresh=1').then(function(r){if(!r.ok)throw new Error('http');return r.json();})
     .then(function(sc){
-      var before=_scRenderedSig,ok=renderSetupCheck(sc)!==false;
+      // Your own Recheck is the newest result: always show it.
+      var before=_scRenderedSig;renderSetupCheck(sc,true);
       // Rebuilt? put focus back on the Recheck button the user pressed.
       if(_scRenderedSig!==before){var b=document.querySelector('[data-recheck]');if(b)b.focus();}
-      if(ok&&window.showToast)showToast('Setup checked','success');})
+      if(window.showToast)showToast('Setup checked','success');})
     .catch(function(){if(window.showToast)showToast('Could not run the setup check','error');});
 }
-function renderSetupCheck(sc){
+function renderSetupCheck(sc,force){
   var wrap=document.getElementById('setup-check-wrap'),el=document.getElementById('setup-check'),okEl=document.getElementById('setup-ok');
   if(!wrap||!el)return;
   if(!sc){wrap.hidden=true;if(okEl)okEl.textContent='';_scRenderedSig=null;return;}
   // An in-flight /api/status poll can land after a fresh Recheck: never
   // replace a newer result with an older one (unless it is more than a
   // minute older: the server clock was set back, take the new reality).
-  if(sc.checked_at&&sc.checked_at<_scLatest&&_scLatest-sc.checked_at<=60)return false;
+  if(!force&&sc.checked_at&&sc.checked_at<_scLatest&&_scLatest-sc.checked_at<=60)return false;
   if(sc.checked_at)_scLatest=sc.checked_at;
   if(sc.server_now)_scSkew=Date.now()/1000-sc.server_now;
   var f=sc.findings||[],d=sc.dismissed||0,auth=!!sc.auth_configured;

@@ -32,7 +32,7 @@ ENV_SCHEMA = [
         'name': 'Zurg',
         'description': 'Core debrid service and WebDAV server',
         'fields': [
-            ('ZURG_ENABLED', 'Enable Zurg', 'boolean', True, 'Enable the Zurg WebDAV server. Takes effect when the container starts — restart it after changing this'),
+            ('ZURG_ENABLED', 'Enable Zurg', 'boolean', True, 'Enable the Zurg WebDAV server. Takes effect when the container starts — restart it after changing this, or after adding/removing a Real-Debrid or AllDebrid key'),
             ('RD_API_KEY', 'Real-Debrid API Key', 'secret', False, 'API key from real-debrid.com/apitoken'),
             ('AD_API_KEY', 'AllDebrid API Key', 'secret', False, 'API key from alldebrid.com'),
             ('TORBOX_API_KEY', 'TorBox API Key', 'secret', False, 'API key from torbox.app. Powers cache probes, search-add, and the dual-debrid blackhole routing. For the WebDAV mount, also set TORBOX_WEBDAV_USER + TORBOX_WEBDAV_PASS (see the TorBox section).'),
@@ -348,6 +348,13 @@ def _is_sensitive(key):
 # Schema API
 # ---------------------------------------------------------------------------
 
+# Kept by "Reset all" besides credentials, addresses and usernames: losing
+# these locks you out of the dashboard (proxy origins, the published port)
+# or drops account tokens (Apprise URLs embed them).
+_CONNECTION_KEYS = frozenset({'TRAKT_CLIENT_ID', 'STATUS_UI_TRUSTED_ORIGINS',
+                              'STATUS_UI_PORT', 'NOTIFICATION_URL'})
+
+
 def get_env_schema():
     """Return the env var schema as a JSON-serializable structure."""
     from utils.settings_tiers import ESSENTIAL_GROUPS, GATES, UNGATED_KEYS, tier_for
@@ -368,7 +375,7 @@ def get_env_schema():
                 'auto_capable': key in _RULE_KEYS,
                 # how zurgarr reaches your accounts/servers — "Reset all" keeps these
                 'connection': (_is_sensitive(key) or ftype in ('secret', 'url')
-                               or key in SECRET_FILES or key == 'TRAKT_CLIENT_ID'),
+                               or key in SECRET_FILES or key in _CONNECTION_KEYS),
             }
             fields.append(field)
         categories.append({
@@ -401,7 +408,19 @@ def read_env_values():
         file_values = dotenv_values(ENV_FILE)
 
     from utils import config_resolve
-    _resolved = config_resolve.current()
+    from base import SECRETS_DIR
+    # Resolve against the file as it is now — not what the last reload put in
+    # os.environ: right after a save the reload may not have run yet, and a
+    # just-cleared value read back from os.environ would be re-pinned.
+    _current = config_resolve.current()
+    try:
+        secrets = frozenset(config_resolve.present_secrets(SECRETS_DIR)) | {
+            k for k, r in _current.items() if r.source == 'secret'}
+        _resolved = config_resolve.resolve(os.environ, file_values, secrets,
+                                           config_resolve.written())
+    except Exception as e:
+        logger.warning(f'[settings] Could not resolve settings from the file: {e}')
+        _resolved = _current
 
     def _read(key):
         r = _resolved.get(key)
@@ -409,6 +428,8 @@ def read_env_values():
             return os.environ.get(key, '')
         if r is not None and r.source == 'secret':
             return ''   # the secret is in effect; never echo a stale file copy
+        if r is not None and r.source in ('set', 'auto', 'default') and r.value is not None:
+            return r.value
         # Blank file lines (`KEY=`, left by older versions) count as not
         # set, matching the resolver — show the value actually in effect.
         if (file_values.get(key) or '').strip():
@@ -666,7 +687,10 @@ def write_env_values(values):
     try:
         changed = set()
         try:
-            from utils.config_reload import _services_to_restart
+            from utils.config_reload import (
+                SOFT_RELOAD, _ZURG_LAYOUT_KEYS, _drop_not_running, _layout_keys_changed,
+                _services_to_restart, _zurg_layout, restart_note)
+            from utils.env import secret_or_env
             # Preview with a dry run of the same resolver the SIGHUP reload
             # uses, so the banner names only services that will really restart.
             from base import SECRETS_DIR
@@ -681,12 +705,16 @@ def write_env_values(values):
                 return r.value if r is not None and r.source != 'unset' else None
 
             changed = {k for k in set(current) | set(dry) if _eff(current, k) != _eff(dry, k)}
-            if changed:
-                restarted = sorted(_services_to_restart(changed))
-            if 'ZURG_ENABLED' in changed:
-                validation['warnings'].append(
-                    'ZURG_ENABLED takes effect when you restart the container '
-                    '(Zurg and its mounts only start then).')
+
+            def _new(key):
+                r = dry.get(key)
+                return secret_or_env(key) if r is not None and r.source == 'secret' else _eff(dry, key)
+            layout = _zurg_layout(_new)
+            if changed and not changed <= SOFT_RELOAD:   # mirrors the reload
+                restarted = sorted(_drop_not_running(_services_to_restart(changed, layout)))
+            keys = _layout_keys_changed(layout)
+            if keys and changed & _ZURG_LAYOUT_KEYS:
+                validation['warnings'].append(restart_note(keys))
 
         except Exception as e:
             # Advisory only — a failed preview must never block the apply.
@@ -746,7 +774,8 @@ def validate_env_values(values):
     warnings = []
 
     def _truthy(key):
-        return str(values.get(key, '')).lower() in ('true', '1', 'yes')
+        # exactly what the app treats as on (boolean settings are 'true'/'false')
+        return str(values.get(key, '')).strip().lower() == 'true'
 
     # Required API keys when Zurg enabled
     if _truthy('ZURG_ENABLED'):

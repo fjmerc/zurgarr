@@ -151,6 +151,16 @@ class TestDependencyCheckMultiEntry:
         ])
         assert proc._check_dependencies_alive('plex_debrid') == (False, 'rclone')
 
+    def test_torbox_mount_does_not_wait_for_zurg(self, monkeypatch):
+        # TorBox-only install: no Zurg registered; the TorBox mount uses
+        # TorBox's own WebDAV, so its restart must not be deferred forever
+        import utils.processes as proc
+        from utils import boot_layout
+        monkeypatch.setattr(boot_layout, 'BOOT_TORBOX_MOUNT_NAME', 'torbox')
+        monkeypatch.setattr(proc, '_process_registry', [])
+        assert proc._check_dependencies_alive('rclone', 'torbox') == (True, None)
+        assert proc._check_dependencies_alive('rclone', 'zurgarr') == (False, 'Zurg')
+
     def test_unregistered_dependency_fails(self, monkeypatch):
         import utils.processes as proc
         monkeypatch.setattr(proc, '_process_registry', [])

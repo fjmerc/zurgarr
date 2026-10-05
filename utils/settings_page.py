@@ -943,11 +943,13 @@ function collectEnvData() {
 // that, so the form doesn't keep the old one and re-save it later.
 function syncClearedFrom(values) {
   document.querySelectorAll('#tab-env [data-clear]').forEach(el => {
-    const v = values[el.dataset.key];
+    const k = el.dataset.key, v = values[k];
     if (v === undefined) return;
     if (el.dataset.type === 'boolean') el.checked = String(v).toLowerCase() === 'true';
     else el.value = v;
+    if (_GATE_KEYS.has(k)) applyGate(k);   // open/close the section it gates
   });
+  updateModifiedChips();
 }
 
 // Drop a pending clear and put back the field's original note.

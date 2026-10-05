@@ -1201,9 +1201,11 @@ def _selfheal_enabled():
 
 def _zurg_mount_registered():
     """Whether a Zurg-backed rclone mount is running in this container
-    (it only starts at boot, so a runtime ZURG_ENABLED flip doesn't change it)."""
+    (it only starts at boot, so a runtime ZURG_ENABLED flip doesn't change it).
+    The TorBox mount is told apart by its name at boot — a runtime rename
+    doesn't rename the running process."""
+    from utils.boot_layout import BOOT_TORBOX_MOUNT_NAME as tb
     from utils.processes import _process_registry, _registry_lock
-    tb = (os.environ.get('TORBOX_MOUNT_NAME') or '').strip() or 'torbox'
     with _registry_lock:
         return any(e['process_name'].lower() == 'rclone' and e.get('key_type') != tb
                    for e in _process_registry)
@@ -1505,12 +1507,14 @@ def _compute_digest_delay():
 # ---------------------------------------------------------------------------
 
 def _rclone_mount_expected():
-    """Whether main.py will start an rclone mount: Zurg on, with a debrid key
-    it serves (RD/AD), and a mount name.  (RCLONE_MOUNT_NAME alone always has
-    a default now, so it can't signal "configured".)"""
-    zurg_on = (os.environ.get('ZURG_ENABLED') or '').strip().lower() == 'true'
-    has_key = bool(secret_or_env('RD_API_KEY') or secret_or_env('AD_API_KEY'))
-    return bool(zurg_on and has_key and (os.environ.get('RCLONE_MOUNT_NAME') or '').strip())
+    """Whether main.py started (or is still retrying) a Zurg rclone mount:
+    Zurg on at boot, with a debrid instance (RD/AD), and a mount name.  Fixed
+    at container start — a runtime ZURG_ENABLED change doesn't start or stop
+    mounts (see utils/boot_layout)."""
+    from utils import boot_layout
+    from utils.config_reload import _BOOT_LAYOUT
+    on, instances = _BOOT_LAYOUT
+    return bool(on and instances and boot_layout.BOOT_RCLONE_MOUNT_NAME)
 
 
 def register_all():

@@ -206,11 +206,7 @@ def _check_findings():
             out.append(_finding('gate:SEARCH_REQUIRE_CACHED', 'error', 'SEARCH_REQUIRE_CACHED',
                                 "Search → Require cached is on, so every add from search is refused (Real-Debrid/AllDebrid can't check their cache).",
                                 'Turn off Require cached for search.'))
-    try:
-        from utils.config_reload import RESTART_REQUIRED
-        pending = sorted(RESTART_REQUIRED)
-    except Exception:
-        pending = []
+    pending = _restart_pending()
     if pending:
         out.append(_finding('restart-required', 'warn', pending[0],
                             f"{_names(pending)} changed, but it only takes effect when the container starts.",
@@ -246,6 +242,14 @@ def _recommendations():
                             "A completed folder is mounted, but the blackhole isn't creating symlinks for Sonarr/Radarr to import.",
                             'Turn on symlinks and set the symlink target base (the mount path as Sonarr/Radarr see it).'))
     return out
+
+
+def _restart_pending():
+    """Settings changed since the container started that only apply at
+    start (Zurg on/off, which debrid instances run): compared live, so it's
+    right however the change got in."""
+    from utils import config_reload
+    return sorted(config_reload._layout_keys_changed(config_reload._zurg_layout()))
 
 
 def collect_findings():
@@ -325,16 +329,20 @@ def get_setup_check(fresh=False):
         if _cache['value'] is not None and now - _cache['at'] < _CACHE_TTL:
             return _cache['value']
         gen = _cache['gen']
+    current = False
     try:
         for _attempt in range(3):
+            now = time.time()
             findings = collect_findings()
             dismissed = _clear_resolved_dismissals(_load_dismissed())
             shown = [f for f in findings if dismissed.get(f['id']) != f['sig']]
             dismissed_count = len(findings) - len(shown)
             with _lock:
                 if _cache['gen'] == gen:
+                    current = True
                     break
-                gen = _cache['gen']   # a dismiss landed mid-compute: redo, never return stale
+                gen = _cache['gen']   # a dismiss/invalidate landed mid-compute: redo
+        # (still invalidated after 3 tries: return the last result, uncached)
     except Exception:
         _log().exception('[setup_check] Setup check failed')
         shown = [_finding('setup-check-failed', 'warn', None,
@@ -348,7 +356,7 @@ def get_setup_check(fresh=False):
         'checked_at': now,
     }
     with _lock:
-        if _cache['gen'] == gen:   # a dismiss/invalidate mid-compute makes this stale
+        if current and _cache['gen'] == gen:   # only a result nothing invalidated
             _cache['at'], _cache['value'] = now, value
     return value
 

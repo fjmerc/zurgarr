@@ -1,6 +1,6 @@
 from base import *
 from utils.logger import *
-from utils.processes import ProcessHandler
+from utils.processes import ProcessHandler, lifecycle_lock
 from utils.auto_update import Update
 from utils.file_utils import atomic_write
 from zurg.download import get_latest_release, download_and_unzip_release, get_architecture
@@ -14,40 +14,13 @@ class ZurgUpdate(Update, ProcessHandler):
         # a reload/update stopped one instance and orphaned the other.
         self._instance_handlers = {}
 
-    def terminate_zurg_instance(self, process_name, config_dir, key_type):
-        regex_pattern = re.compile(rf'{re.escape(config_dir)}/zurg.*--preload', re.IGNORECASE)
-        found_process = False
-        self.logger.debug(f"Attempting to terminate {process_name} w/ {key_type} process")
-
-        for proc in psutil.process_iter():
-            try:
-                cmdline = ' '.join(proc.cmdline())
-                self.logger.debug(f"Checking process: PID={proc.pid}, Command Line='{cmdline}'")
-                if regex_pattern.search(cmdline):
-                    found_process = True
-                    self.process = proc
-                    self.stop_process(process_name, key_type)
-                    self.logger.debug(f"Terminated {process_name} w/ {key_type} process: PID={proc.pid}, Command Line='{cmdline}'")
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                pass
-
-        if not found_process:
-            self.logger.debug(f"No matching {process_name} w/ {key_type} processes found")
-        
     def start_process(self, process_name, config_dir=None, suppress_logging=False):
         from base import config
         if str(ZURGLOGLEVEL).lower()=='off':
             suppress_logging = True
             self.logger.info(f"Suppressing {process_name} logging")
 
-        # Only start instances whose API key is actually set
-        instances = []
-        if config.RDAPIKEY:
-            instances.append(("/zurg/RD", "RealDebrid"))
-        if config.ADAPIKEY:
-            instances.append(("/zurg/AD", "AllDebrid"))
-
-        for dir_to_check, key_type in instances:
+        for dir_to_check, key_type in self._instances():
             if config_dir and dir_to_check != config_dir:
                 continue
             zurg_executable = os.path.join(dir_to_check, 'zurg')
@@ -56,7 +29,26 @@ class ZurgUpdate(Update, ProcessHandler):
                 handler = self._instance_handlers.get(key_type)
                 if handler is None:
                     handler = self._instance_handlers[key_type] = ProcessHandler(self.logger)
+                elif handler.process and handler.process.poll() is None:
+                    continue   # already running: a second Popen would orphan it
                 handler.start_process(process_name, dir_to_check, command, key_type, suppress_logging=suppress_logging)
+
+    _DIRS = {'RealDebrid': '/zurg/RD', 'AllDebrid': '/zurg/AD'}
+
+    def _instances(self):
+        """[(dir, key_type)] to manage: the ones started at boot once any
+        has started (Zurg's instances are fixed until the container
+        restarts); before that, those with an API key set."""
+        if self._instance_handlers:
+            return [(self._DIRS[k], k) for k in ('RealDebrid', 'AllDebrid')
+                    if k in self._instance_handlers]
+        from base import config
+        out = []
+        if config.RDAPIKEY:
+            out.append(("/zurg/RD", "RealDebrid"))
+        if config.ADAPIKEY:
+            out.append(("/zurg/AD", "AllDebrid"))
+        return out
 
     def _stop_instance(self, process_name, key_type):
         handler = self._instance_handlers.get(key_type)
@@ -108,31 +100,29 @@ class ZurgUpdate(Update, ProcessHandler):
                 if not success:
                     raise Exception(f"Failed to download and extract the release for {process_name}.")
 
-                from base import config
-                instances = []
-                if config.RDAPIKEY:
-                    instances.append(("/zurg/RD", "RealDebrid"))
-                if config.ADAPIKEY:
-                    instances.append(("/zurg/AD", "AllDebrid"))
-                zurg_presence = {d: os.path.exists(os.path.join(d, 'zurg')) for d, _ in instances}
-
                 updated = False
-                for dir_to_check, key_type in instances:
-                    if zurg_presence.get(dir_to_check):
-                        zurg_app_base = '/zurg/zurg'
+                # Never interleave with a config reload restarting Zurg.
+                with lifecycle_lock:
+                    for dir_to_check, key_type in self._instances():
+                        if not os.path.exists(os.path.join(dir_to_check, 'zurg')):
+                            continue
                         zurg_executable_path = os.path.join(dir_to_check, 'zurg')
                         self._stop_instance(process_name, key_type)
-                        # Atomic copy: the auto-update thread is a daemon, so a
-                        # SIGTERM at interpreter exit can kill it mid-write.
-                        # atomic_write stages to a temp file and only
-                        # os.replace()s on completion (preserving the existing
-                        # binary's +x mode), so an interrupted update can never
-                        # leave a truncated, unexecutable zurg binary on disk.
-                        with open(zurg_app_base, 'rb') as src, \
-                                atomic_write(zurg_executable_path, mode='wb') as dst:
-                            shutil.copyfileobj(src, dst)
+                        try:
+                            # Atomic copy: the auto-update thread is a daemon, so a
+                            # SIGTERM at interpreter exit can kill it mid-write.
+                            # atomic_write stages to a temp file and only
+                            # os.replace()s on completion (preserving the existing
+                            # binary's +x mode), so an interrupted update can never
+                            # leave a truncated, unexecutable zurg binary on disk.
+                            with open('/zurg/zurg', 'rb') as src, \
+                                    atomic_write(zurg_executable_path, mode='wb') as dst:
+                                shutil.copyfileobj(src, dst)
+                            updated = True   # every instance, not just the first
+                        except Exception as e:
+                            self.logger.error(f"Could not update {process_name} w/ {key_type}: {e} — restarting the current version")
+                        # Always bring the instance back (new or old binary).
                         self.start_process('Zurg', dir_to_check)
-                        updated = True   # every instance, not just the first
                 if updated:
                     return True
 

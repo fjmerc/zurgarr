@@ -8,6 +8,8 @@ import pytest
 from utils import setup_check as sc
 
 
+_REAL_RESTART_PENDING = sc._restart_pending
+
 @pytest.fixture
 def clean(monkeypatch):
     """No debrid keys, no auth, features off — then each test sets what it needs."""
@@ -21,6 +23,7 @@ def clean(monkeypatch):
     monkeypatch.setattr(sc, '_validator_messages', lambda: ([], []))
     monkeypatch.setattr(sc, '_locked_schema_keys', lambda: [])
     monkeypatch.setattr(sc, '_completed_dir_mounted', lambda: False)
+    monkeypatch.setattr(sc, '_restart_pending', lambda: [])
     monkeypatch.setenv('RD_API_KEY', 'k')
     monkeypatch.setenv('STATUS_UI_AUTH', 'a:b')
     return monkeypatch
@@ -212,7 +215,7 @@ def test_recheck_toast_only_when_result_accepted_and_clock_step_back_allowed():
     from utils.status_server import get_dashboard_html
     dash = get_dashboard_html()
     i = dash.index('function recheckSetup')
-    assert 'renderSetupCheck(sc)!==false' in dash[i:i + 700]
+    assert 'renderSetupCheck(sc,true)' in dash[i:i + 700]   # your Recheck always shows
     j = dash.index('function renderSetupCheck')
     body = dash[j:j + 900]
     # an older result is ignored (return false) unless the clock stepped back >60s
@@ -407,18 +410,6 @@ def test_status_payload_helper_never_reports_ok_on_crash(monkeypatch):
 
 
 class TestBacklog:
-
-    def test_mount_liveness_only_when_a_mount_will_run(self, monkeypatch):
-        from utils.scheduled_tasks import _rclone_mount_expected
-        monkeypatch.setenv('RCLONE_MOUNT_NAME', 'zurgarr')
-        for k in ('RD_API_KEY', 'AD_API_KEY'):
-            monkeypatch.delenv(k, raising=False)
-        monkeypatch.setenv('ZURG_ENABLED', 'false')
-        assert _rclone_mount_expected() is False
-        monkeypatch.setenv('ZURG_ENABLED', 'true')
-        assert _rclone_mount_expected() is False          # no RD/AD key → Zurg won't start
-        monkeypatch.setenv('RD_API_KEY', 'k')
-        assert _rclone_mount_expected() is True
 
     def test_resolved_tip_dismissal_rearms(self, clean, tmp_path):
         # Dismiss the tip, turn the setting on (resolved), then off again:
@@ -666,10 +657,37 @@ class TestRound7:
         assert writes and writes[0].get('SHOW_MENU') == 'false'
 
     def test_restart_required_finding(self, clean, monkeypatch):
+        # computed from the live settings vs what started — however the
+        # setting changed (reload, plex_debrid sync, failed reload)
         import utils.config_reload as cr
-        monkeypatch.setattr(cr, 'RESTART_REQUIRED', {'ZURG_ENABLED'})
+        clean.setattr(sc, '_restart_pending', _REAL_RESTART_PENDING)
+        monkeypatch.setattr(cr, '_BOOT_LAYOUT', (True, frozenset({'RD'})))
+        monkeypatch.setattr('utils.env.SECRETS_DIR', '/nonexistent-secrets')
+        clean.setenv('RD_API_KEY', 'k')
+        clean.setenv('ZURG_ENABLED', 'false')
         f = next(f for f in sc.collect_findings() if f['id'] == 'restart-required')
         assert f['level'] == 'warn' and f['key'] == 'ZURG_ENABLED'
+        clean.setenv('ZURG_ENABLED', 'true')
+        clean.setenv('AD_API_KEY', 'a')                   # a second instance added
+        f = next(f for f in sc.collect_findings() if f['id'] == 'restart-required')
+        assert f['key'] == 'AD_API_KEY'
+        clean.delenv('AD_API_KEY')
+        assert not any(f['id'] == 'restart-required' for f in sc.collect_findings())
+
+    def test_result_is_not_cached_when_every_attempt_was_invalidated(self, clean, tmp_path):
+        clean.setattr(sc, 'CONFIG_DIR', str(tmp_path))
+        sc._invalidate()
+        calls = []
+        def collect():
+            calls.append(1)
+            sc._invalidate()                              # bumped during every attempt
+            return []
+        clean.setattr(sc, 'collect_findings', collect)
+        sc.get_setup_check()
+        n = len(calls)
+        clean.setattr(sc, 'collect_findings', lambda: calls.append(1) or [])
+        sc.get_setup_check()
+        assert len(calls) == n + 1                        # recomputed, not served from cache
 
     def test_dismiss_mid_compute_recomputes_not_stale(self, clean, tmp_path):
         clean.setattr(sc, 'CONFIG_DIR', str(tmp_path))

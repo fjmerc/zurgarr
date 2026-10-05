@@ -288,7 +288,10 @@ class TestReadEnvValues:
             values = read_env_values()
         # Empty except for keys with declared non-empty application defaults
         # (e.g. true-default boolean toggles that should render as ON in the UI).
+        from utils.config_resolve import RULES
         for key, val in values.items():
+            if key in RULES:          # automatic: shows the value it works out
+                continue
             assert val == _ENV_DEFAULTS.get(key, '')
 
     def test_true_default_booleans_surface_when_unset(self, monkeypatch):
@@ -425,6 +428,11 @@ class TestValidateEnvValues:
     def test_zurg_enabled_no_key(self):
         result = validate_env_values({'ZURG_ENABLED': 'true'})
         assert any('API key' in e for e in result['errors'])
+
+    def test_only_true_counts_as_on(self):
+        # the app runs ZURG_ENABLED=yes as off — validation must agree
+        for v in ('yes', '1', 'on'):
+            assert not any('API key' in e for e in validate_env_values({'ZURG_ENABLED': v})['errors']), v
 
     def test_zurg_disabled_no_key_ok(self):
         result = validate_env_values({'ZURG_ENABLED': 'false'})
@@ -1782,6 +1790,8 @@ class TestSourcesAndExplicitSave:
         from utils import config_resolve
         monkeypatch.delenv('ZURG_ENABLED', raising=False)
         monkeypatch.setenv('RD_API_KEY', 'k' * 20)          # Zurg is automatically on
+        import utils.config_reload as cr
+        monkeypatch.setattr(cr, '_BOOT_LAYOUT', (True, frozenset({'RD'})))
         config_resolve.apply(config_resolve.resolve(os.environ, {}))
         values = self._as_page_posts(read_env_values())
         values.pop('RD_API_KEY', None)
@@ -1790,6 +1800,48 @@ class TestSourcesAndExplicitSave:
         assert result['status'] == 'saved', result
         assert not {'zurg', 'rclone', 'plex_debrid'} & set(result['restarted'])
         assert any("restart the container" in w.lower() for w in result["warnings"]), result
+
+    def test_zurg_toggle_back_to_boot_value_has_no_restart_warning(self, env_file, monkeypatch):
+        import utils.config_reload as cr
+        from utils.settings_api import read_env_values
+        from utils import config_resolve
+        monkeypatch.delenv('ZURG_ENABLED', raising=False)
+        monkeypatch.setenv('RD_API_KEY', 'k' * 20)
+        env_file.write_text('ZURG_ENABLED=false\n')            # off now, but booted on
+        config_resolve.apply(config_resolve.resolve(os.environ, {'ZURG_ENABLED': 'false'}))
+        monkeypatch.setattr(cr, '_BOOT_LAYOUT', (True, frozenset({'RD'})))
+        values = self._as_page_posts(read_env_values())
+        values.pop('RD_API_KEY', None)
+        values['ZURG_ENABLED'] = 'true'
+        result = write_env_values(values)
+        assert result['status'] == 'saved', result
+        assert not any('restart the container' in w.lower() for w in result['warnings']), result
+
+    def test_soft_only_change_previews_no_restarts(self, env_file, monkeypatch):
+        from utils.settings_api import read_env_values
+        from utils import config_resolve
+        monkeypatch.delenv('BLACKHOLE_REQUIRE_CACHED', raising=False)
+        config_resolve.apply(config_resolve.resolve(os.environ, {}))
+        values = self._as_page_posts(read_env_values())
+        values['BLACKHOLE_REQUIRE_CACHED'] = 'true'
+        result = write_env_values(values)
+        assert result['status'] == 'saved', result
+        assert result['restarted'] == []
+
+    def test_read_after_clear_shows_default_before_the_reload_runs(self, env_file, monkeypatch):
+        # Save removed the pinned line and sent SIGHUP; until the reload thread
+        # re-resolves, os.environ still holds the old value — the page must not
+        # read it back (it would re-pin it on the next save).
+        from utils import config_resolve
+        from utils.settings_api import read_env_values
+        monkeypatch.delenv('NOTIFICATION_LEVEL', raising=False)
+        config_resolve.apply(config_resolve.resolve(os.environ, {}, frozenset(), config_resolve.written()))
+        env_file.write_text('NOTIFICATION_LEVEL=error\n')
+        config_resolve.apply(config_resolve.resolve(os.environ, {'NOTIFICATION_LEVEL': 'error'},
+                                                    frozenset(), config_resolve.written()))
+        assert os.environ['NOTIFICATION_LEVEL'] == 'error'
+        env_file.write_text('')                       # the save cleared it; no reload yet
+        assert read_env_values()['NOTIFICATION_LEVEL'] == config_resolve.DEFAULTS.get('NOTIFICATION_LEVEL', '')
 
     def test_save_to_secret_key_rejected(self, env_file, monkeypatch):
         from dotenv import dotenv_values
@@ -1880,7 +1932,10 @@ class TestSchemaEssentials:
         fields = {f['key']: f for c in get_env_schema()['categories'] for f in c['fields']}
         # usernames, addresses and API ids survive "Reset all" — not just secrets
         for k in ('PLEX_USER', 'PLEX_ADDRESS', 'SEERR_ADDRESS', 'ZURG_USER',
-                  'TORBOX_WEBDAV_USER', 'TRAKT_CLIENT_ID', 'RD_API_KEY', 'STATUS_UI_AUTH'):
+                  'TORBOX_WEBDAV_USER', 'TRAKT_CLIENT_ID', 'RD_API_KEY', 'STATUS_UI_AUTH',
+                  # losing these locks you out (proxy origin, published port)
+                  # or drops account tokens (Apprise URLs)
+                  'STATUS_UI_TRUSTED_ORIGINS', 'STATUS_UI_PORT', 'NOTIFICATION_URL'):
             if k in fields:
                 assert fields[k]['connection'] is True, k
         assert fields['BLACKHOLE_DIR']['connection'] is False
@@ -1903,7 +1958,9 @@ class TestSchemaEssentials:
         i = html.index("document.querySelectorAll('#tab-env [data-clear]').forEach(")
         block = html[i - 900:i + 400]
         assert 'syncClearedFrom(' in block
-        assert 'function syncClearedFrom' in html
+        i = html.index('function syncClearedFrom')
+        fn = html[i:i + 900]
+        assert 'applyGate(' in fn and 'updateModifiedChips()' in fn
 
 
 class TestPreviewNeverBlocksReload:

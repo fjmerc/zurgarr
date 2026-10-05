@@ -11,6 +11,7 @@ Usage:
 import os
 import threading
 from dotenv import dotenv_values
+from utils.boot_layout import zurg_layout as _zurg_layout, BOOT_LAYOUT as _BOOT_LAYOUT
 from utils.logger import get_logger
 
 logger = get_logger()
@@ -19,8 +20,10 @@ ENV_FILE = '/config/.env'
 
 # Which env vars affect which services
 SERVICE_DEPENDENCIES = {
+    # (ZURG_ENABLED, and RD/AD keys that add or remove an instance, are
+    # fixed at container start — see _services_to_restart.)
     'zurg': {
-        'RD_API_KEY', 'AD_API_KEY', 'TORBOX_API_KEY', 'ZURG_ENABLED',
+        'RD_API_KEY', 'AD_API_KEY', 'TORBOX_API_KEY',
         'ZURG_VERSION', 'ZURG_LOG_LEVEL', 'ZURG_USER', 'ZURG_PASS',
         'ZURG_PORT',
     },
@@ -56,8 +59,9 @@ SERVICE_DEPENDENCIES = {
 SOFT_RELOAD = {
     # Log levels
     'ZURGARR_LOG_LEVEL', 'ZURGARR_LOG_COUNT', 'ZURGARR_LOG_SIZE',
-    'PD_LOG_LEVEL', 'NOTIFICATION_LEVEL',
-    'NOTIFICATION_EVENTS', 'DUPLICATE_CLEANUP', 'CLEANUP_INTERVAL', 'DUPLICATE_CLEANUP_KEEP',
+    'PD_LOG_LEVEL',
+    # (NOTIFICATION_LEVEL/EVENTS are read by notifications.init() — not soft)
+    'DUPLICATE_CLEANUP', 'CLEANUP_INTERVAL', 'DUPLICATE_CLEANUP_KEEP',
     'PLEX_REFRESH', 'SKIP_VALIDATION', 'LIBRARY_PREFERENCE_AUTO_ENFORCE',
     'BLOCKLIST_AUTO_ADD', 'GAP_FILL_ENABLED',
     # Quality compromise (plan 33): all nine toggles are read fresh
@@ -111,34 +115,67 @@ def _reload_env():
     return set(changes)
 
 
-# Zurg and its rclone mounts only start at container start (main.py), so a
-# runtime ZURG_ENABLED change can't be applied by a reload: leave the
-# processes as they are and say a restart is needed.  Settings whose
-# effect needs a container restart are listed in RESTART_REQUIRED (the
-# Status page Setup check shows them).
-_BOOT_ZURG = (os.environ.get('ZURG_ENABLED') or '').strip().lower() == 'true'
-RESTART_REQUIRED = set()
+# Zurg and its rclone mounts only start at container start (main.py): which
+# instances run — Zurg on/off, and a Real-Debrid and/or AllDebrid instance —
+# is fixed then.  A reload can't change that (zurg_setup would delete a
+# running instance's directory), so it leaves those processes alone and says
+# a restart is needed (the Status page Setup check compares the live settings
+# with _BOOT_LAYOUT and lists them too).
+_ZURG_LAYOUT_KEYS = frozenset({'ZURG_ENABLED', 'RD_API_KEY', 'AD_API_KEY'})
 
 
-def _services_to_restart(changed):
-    """Services a change restarts.  ZURG_ENABLED itself restarts nothing:
-    Zurg and its mounts start only with the container (see
-    _zurg_restart_note), whichever way it is flipped."""
-    return _determine_restarts(set(changed) - {'ZURG_ENABLED'})
+
+
+def _layout_keys_changed(layout):
+    """Settings that moved Zurg's layout away from the boot one."""
+    if layout[0] != _BOOT_LAYOUT[0]:
+        return {'ZURG_ENABLED'}
+    return {f'{k}_API_KEY' for k in layout[1] ^ _BOOT_LAYOUT[1]}
+
+
+def _services_to_restart(changed, layout=None):
+    """Services a change restarts.  Nothing that changes Zurg's layout
+    restarts Zurg or its mount (see above); a key rotation for a running
+    instance does.  *layout*: the new layout (default: the live one)."""
+    changed = set(changed)
+    layout = _zurg_layout() if layout is None else layout
+    frozen = {'ZURG_ENABLED'}
+    if layout != _BOOT_LAYOUT:
+        frozen |= {'RD_API_KEY', 'AD_API_KEY'}
+    if not _BOOT_LAYOUT[0]:
+        # No Zurg running: its settings restart nothing (the TorBox key
+        # still restarts the mounts, as before).
+        frozen |= SERVICE_DEPENDENCIES['zurg'] - {'TORBOX_API_KEY'}
+    services = _determine_restarts(changed - frozen)
+    if not _BOOT_LAYOUT[0]:
+        services.discard('zurg')
+    if changed & SERVICE_DEPENDENCIES['plex_debrid']:
+        services.add('plex_debrid')   # the keys also feed plex_debrid's own config
+    return services
+
+
+def _drop_not_running(services):
+    """*services* without process services that aren't running (nothing to
+    restart — e.g. plex_debrid on an install that doesn't use it)."""
+    from utils.processes import _process_registry, _registry_lock
+    with _registry_lock:
+        running = {e['process_name'].lower() for e in _process_registry}
+    return {s for s in services if s not in ('zurg', 'rclone', 'plex_debrid') or s in running}
+
+
+def restart_note(keys):
+    """User-facing text for settings that need a container restart."""
+    return (f"{', '.join(sorted(keys))} changed — restart the container to apply it "
+            "(Zurg and its mounts only start when the container starts).")
 
 
 def _zurg_restart_note(changed):
-    """Note to surface when ZURG_ENABLED moved away from its boot value
-    (and record it), or None.  Moving back to the boot value clears it."""
-    if 'ZURG_ENABLED' not in changed:
+    """The note to log when this reload moved Zurg away from its boot
+    layout, or None (unrelated change, or moved back to it)."""
+    if not set(changed) & _ZURG_LAYOUT_KEYS:
         return None
-    now = (os.environ.get('ZURG_ENABLED') or '').strip().lower() == 'true'
-    if now == _BOOT_ZURG:
-        RESTART_REQUIRED.discard('ZURG_ENABLED')
-        return None
-    RESTART_REQUIRED.add('ZURG_ENABLED')
-    return ('ZURG_ENABLED changed — restart the container to apply it '
-            '(Zurg and its mounts only start when the container starts).')
+    keys = _layout_keys_changed(_zurg_layout())
+    return restart_note(keys) if keys else None
 
 
 def _determine_restarts(changed_vars):
@@ -184,6 +221,15 @@ def _do_reload():
         _reload_lock.release()
 
 
+def _refresh_setup_check():
+    """Show the new settings on the Setup check now, not when its cache expires."""
+    try:
+        from utils import setup_check
+        setup_check._invalidate()
+    except Exception:
+        pass
+
+
 def _reload_once():
     try:
         import utils.processes as _proc_mod
@@ -212,10 +258,11 @@ def _reload_once():
                 f"[reload] Soft reload complete — {len(changed)} variable(s) updated, "
                 f"no service restarts needed"
             )
+            _refresh_setup_check()
             _notify_reload(changed, set())
             return
 
-        services = _services_to_restart(changed)
+        services = _drop_not_running(_services_to_restart(changed))
         logger.info(f"[reload] Services to restart: {', '.join(sorted(services)) or 'none'}")
 
         # Handle process-based services
@@ -228,80 +275,83 @@ def _reload_once():
             except Exception:
                 pass
         process_services = {'zurg', 'rclone', 'plex_debrid'} & services
-        if process_services:
-            from utils.processes import _process_registry, _registry_lock
+        from utils.processes import lifecycle_lock
+        # (never interleaved with a Zurg auto-update stopping/starting Zurg)
+        with lifecycle_lock:
+            if process_services:
+                from utils.processes import _process_registry, _registry_lock
 
-            # Stop affected services (reverse dependency order)
-            stop_order = ['plex_debrid', 'rclone', 'zurg']
-            start_entries = []
+                # Stop affected services (reverse dependency order)
+                stop_order = ['plex_debrid', 'rclone', 'zurg']
+                start_entries = []
 
-            with _registry_lock:
-                for svc_name in stop_order:
-                    if svc_name not in process_services:
-                        continue
-                    for entry in _process_registry:
-                        name = entry['process_name']
-                        handler = entry['handler']
-                        if name.lower() == svc_name.lower():
-                            if handler.process and handler.process.poll() is None:
-                                desc = f"{name} w/ {entry['key_type']}" if entry['key_type'] else name
-                                logger.info(f"[reload] Stopping {desc}")
-                                handler.stop_process(name, entry['key_type'])
-                            start_entries.append(entry)
+                with _registry_lock:
+                    for svc_name in stop_order:
+                        if svc_name not in process_services:
+                            continue
+                        for entry in _process_registry:
+                            name = entry['process_name']
+                            handler = entry['handler']
+                            if name.lower() == svc_name.lower():
+                                if handler.process and handler.process.poll() is None:
+                                    desc = f"{name} w/ {entry['key_type']}" if entry['key_type'] else name
+                                    logger.info(f"[reload] Stopping {desc}")
+                                    handler.stop_process(name, entry['key_type'])
+                                start_entries.append(entry)
 
-            # Re-run setup functions to regenerate config files before restart
-            if 'zurg' in process_services:
-                try:
-                    from zurg.setup import zurg_setup
-                    logger.info("[reload] Regenerating zurg config")
-                    zurg_setup()
-                except Exception as e:
-                    logger.error(f"[reload] Failed to regenerate zurg config: {e}")
+                # Re-run setup functions to regenerate config files before restart
+                if 'zurg' in process_services:
+                    try:
+                        from zurg.setup import zurg_setup
+                        logger.info("[reload] Regenerating zurg config")
+                        zurg_setup()
+                    except Exception as e:
+                        logger.error(f"[reload] Failed to regenerate zurg config: {e}")
 
-            if 'rclone' in process_services:
-                try:
-                    from rclone.rclone import regenerate_config
-                    logger.info("[reload] Regenerating rclone config")
-                    regenerate_config()
-                except Exception as e:
-                    logger.error(f"[reload] Failed to regenerate rclone config: {e}")
+                if 'rclone' in process_services:
+                    try:
+                        from rclone.rclone import regenerate_config
+                        logger.info("[reload] Regenerating rclone config")
+                        regenerate_config()
+                    except Exception as e:
+                        logger.error(f"[reload] Failed to regenerate rclone config: {e}")
 
-            # Rewrite the plex_debrid Trakt .env if credentials changed
-            if 'plex_debrid' in process_services and changed & {'TRAKT_CLIENT_ID', 'TRAKT_CLIENT_SECRET'}:
-                try:
-                    client_id = os.environ.get('TRAKT_CLIENT_ID', '')
-                    client_secret = os.environ.get('TRAKT_CLIENT_SECRET', '')
-                    if not (client_id and client_secret):
-                        client_id = '0183a05ad97098d87287fe46da4ae286f434f32e8e951caad4cc147c947d79a3'
-                        client_secret = '87109ed53fe1b4d6b0239e671f36cd2f17378384fa1ae09888a32643f83b7e6c'
-                    from utils.file_utils import atomic_write
-                    env_path = './.env'
-                    with atomic_write(env_path) as f:
-                        f.write(f'CLIENT_ID={client_id}\n')
-                        f.write(f'CLIENT_SECRET={client_secret}\n')
-                    logger.info("[reload] Rewrote plex_debrid Trakt .env")
-                except Exception as e:
-                    logger.error(f"[reload] Failed to rewrite Trakt .env: {e}")
+                # Rewrite the plex_debrid Trakt .env if credentials changed
+                if 'plex_debrid' in process_services and changed & {'TRAKT_CLIENT_ID', 'TRAKT_CLIENT_SECRET'}:
+                    try:
+                        client_id = os.environ.get('TRAKT_CLIENT_ID', '')
+                        client_secret = os.environ.get('TRAKT_CLIENT_SECRET', '')
+                        if not (client_id and client_secret):
+                            client_id = '0183a05ad97098d87287fe46da4ae286f434f32e8e951caad4cc147c947d79a3'
+                            client_secret = '87109ed53fe1b4d6b0239e671f36cd2f17378384fa1ae09888a32643f83b7e6c'
+                        from utils.file_utils import atomic_write
+                        env_path = './.env'
+                        with atomic_write(env_path) as f:
+                            f.write(f'CLIENT_ID={client_id}\n')
+                            f.write(f'CLIENT_SECRET={client_secret}\n')
+                        logger.info("[reload] Rewrote plex_debrid Trakt .env")
+                    except Exception as e:
+                        logger.error(f"[reload] Failed to rewrite Trakt .env: {e}")
 
-            # Re-check shutdown before starting new processes
-            if _proc_mod._shutting_down:
-                logger.info("[reload] Aborting restart — shutdown in progress")
-                return
-
-            # Start affected services (forward dependency order)
-            for svc_name in reversed(stop_order):
+                # Re-check shutdown before starting new processes
                 if _proc_mod._shutting_down:
                     logger.info("[reload] Aborting restart — shutdown in progress")
                     return
-                if svc_name not in process_services:
-                    continue
-                for entry in start_entries:
-                    name = entry['process_name']
-                    handler = entry['handler']
-                    if name.lower() == svc_name.lower():
-                        desc = f"{name} w/ {entry['key_type']}" if entry['key_type'] else name
-                        logger.info(f"[reload] Starting {desc}")
-                        handler.restart_process()
+
+                # Start affected services (forward dependency order)
+                for svc_name in reversed(stop_order):
+                    if _proc_mod._shutting_down:
+                        logger.info("[reload] Aborting restart — shutdown in progress")
+                        return
+                    if svc_name not in process_services:
+                        continue
+                    for entry in start_entries:
+                        name = entry['process_name']
+                        handler = entry['handler']
+                        if name.lower() == svc_name.lower():
+                            desc = f"{name} w/ {entry['key_type']}" if entry['key_type'] else name
+                            logger.info(f"[reload] Starting {desc}")
+                            handler.restart_process()
 
         # Handle non-process services
         if 'notifications' in services:
@@ -333,12 +383,7 @@ def _reload_once():
             except Exception as e:
                 logger.error(f"[reload] Failed to update Status UI auth/trusted origins: {e}")
 
-        # Show the new settings on the Setup check now, not after its cache expires
-        try:
-            from utils import setup_check
-            setup_check._invalidate()
-        except Exception:
-            pass
+        _refresh_setup_check()
         logger.info("[reload] Config reload complete")
         _notify_reload(changed, services)
 

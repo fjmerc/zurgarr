@@ -107,16 +107,41 @@ def _status_server_alive(port, timeout):
     return True
 
 
+def _layout_facts(zurg, rd, ad, rclone_mn, torbox_mn):
+    """Zurg on/off, its instances and the mount names to check.  Follows what
+    main.py started at boot (utils/boot_layout) — Zurg and its mounts only
+    start with the container, so a runtime settings change mustn't make the
+    healthcheck expect a process that was never started, or stop watching
+    one that still runs.  Without a boot record: the live settings given."""
+    from utils import boot_layout
+    rec = boot_layout.load()
+    if rec is not None:
+        instances = set(rec.get('instances') or ())
+        zurg_on = bool(rec.get('zurg'))
+        has_rd, has_ad = 'RD' in instances, 'AD' in instances
+        rclone_mn = rec.get('rclone_mount_name') or ''
+        torbox_mn = rec.get('torbox_mount_name') or torbox_mn
+    else:
+        zurg_on = str(zurg).lower() == 'true'
+        has_rd, has_ad = bool(rd), bool(ad)
+    # Dual-provider mount name derivation (must match rclone/rclone.py)
+    if has_rd and has_ad and rclone_mn:
+        rclone_rd, rclone_ad = f"{rclone_mn}_RD", f"{rclone_mn}_AD"
+    else:
+        rclone_rd = rclone_ad = rclone_mn
+    return {'zurg': zurg_on, 'rd': has_rd, 'ad': has_ad,
+            'rclone_rd': rclone_rd, 'rclone_ad': rclone_ad, 'torbox': torbox_mn}
+
+
 def main():
     try:
         error_messages = []
 
-        # Dual-provider mount name derivation (must match rclone/rclone.py)
-        if RDAPIKEY and ADAPIKEY and RCLONEMN:
-            RCLONEMN_RD = f"{RCLONEMN}_RD"
-            RCLONEMN_AD = f"{RCLONEMN}_AD"
-        else:
-            RCLONEMN_RD = RCLONEMN_AD = RCLONEMN
+        facts = _layout_facts(ZURG, RDAPIKEY, ADAPIKEY, RCLONEMN, TORBOX_MOUNT_NAME)
+        RCLONEMN_RD, RCLONEMN_AD = facts['rclone_rd'], facts['rclone_ad']
+        TB_MOUNT = facts['torbox']
+        zurg_rd = facts['zurg'] and facts['rd']
+        zurg_ad = facts['zurg'] and facts['ad']
 
         mount_type = "serve nfs" if NFSMOUNT is not None and str(NFSMOUNT).lower() == 'true' else "mount"
 
@@ -133,12 +158,12 @@ def main():
             "zurg_rd": {
                 "regex": re.compile(r'/zurg/RD/zurg', re.IGNORECASE),
                 "error_message": "The Zurg RD process is not running.",
-                "should_run": str(ZURG).lower() == 'true' and RDAPIKEY
+                "should_run": zurg_rd
             },
             "zurg_ad": {
                 "regex": re.compile(r'/zurg/AD/zurg', re.IGNORECASE),
                 "error_message": "The Zurg AD process is not running.",
-                "should_run": str(ZURG).lower() == 'true' and ADAPIKEY
+                "should_run": zurg_ad
             },
             "plex_debrid": {
                 "regex": re.compile(r'python ./plex_debrid/main.py --config-dir /config'),
@@ -148,17 +173,17 @@ def main():
             "rclonemn_rd": {
                 "regex": re.compile(rf'rclone {mount_type} {re.escape(RCLONEMN_RD)}:'),
                 "error_message": f"The Rclone RD process for {RCLONEMN_RD} is not running.",
-                "should_run": str(ZURG).lower() == 'true' and RDAPIKEY and os.path.exists(f'/healthcheck/{RCLONEMN_RD}')
+                "should_run": zurg_rd and os.path.exists(f'/healthcheck/{RCLONEMN_RD}')
             },
             "rclonemn_ad": {
                 "regex": re.compile(rf'rclone {mount_type} {re.escape(RCLONEMN_AD)}:'),
                 "error_message": f"The Rclone AD process for {RCLONEMN_AD} is not running.",
-                "should_run": str(ZURG).lower() == 'true' and ADAPIKEY and os.path.exists(f'/healthcheck/{RCLONEMN_AD}')
+                "should_run": zurg_ad and os.path.exists(f'/healthcheck/{RCLONEMN_AD}')
             },
             "rclonemn_torbox": {
-                "regex": re.compile(rf'rclone {mount_type} {re.escape(TORBOX_MOUNT_NAME)}:'),
-                "error_message": f"The Rclone TorBox process for {TORBOX_MOUNT_NAME} is not running.",
-                "should_run": torbox_mount_configured and os.path.exists(f'/healthcheck/{TORBOX_MOUNT_NAME}')
+                "regex": re.compile(rf'rclone {mount_type} {re.escape(TB_MOUNT)}:'),
+                "error_message": f"The Rclone TorBox process for {TB_MOUNT} is not running.",
+                "should_run": torbox_mount_configured and os.path.exists(f'/healthcheck/{TB_MOUNT}')
             }
         }
 
@@ -181,13 +206,13 @@ def main():
             return max(0.5, min(_MOUNT_PROBE_TIMEOUT_SEC,
                                 mount_probe_deadline - time.monotonic()))
 
-        if str(ZURG).lower() == 'true':
-            if RDAPIKEY and os.path.exists(f'/healthcheck/{RCLONEMN_RD}'):
+        if facts['zurg']:
+            if zurg_rd and os.path.exists(f'/healthcheck/{RCLONEMN_RD}'):
                 mp = f'/data/{RCLONEMN_RD}'
                 alive, why = _mount_alive(mp, _probe_budget())
                 if not alive:
                     error_messages.append(f"Rclone mount {mp} is not active ({why}).")
-            if ADAPIKEY and os.path.exists(f'/healthcheck/{RCLONEMN_AD}'):
+            if zurg_ad and os.path.exists(f'/healthcheck/{RCLONEMN_AD}'):
                 mp = f'/data/{RCLONEMN_AD}'
                 alive, why = _mount_alive(mp, _probe_budget())
                 if not alive:
@@ -195,8 +220,8 @@ def main():
         # TB mount is NOT under the ZURG guard: TorBox uses its own WebDAV
         # endpoint (webdav.torbox.app) and does not require Zurg to be
         # enabled.  A TB-only setup with ZURG=false is supported.
-        if torbox_mount_configured and os.path.exists(f'/healthcheck/{TORBOX_MOUNT_NAME}'):
-            mp = f'/data/{TORBOX_MOUNT_NAME}'
+        if torbox_mount_configured and os.path.exists(f'/healthcheck/{TB_MOUNT}'):
+            mp = f'/data/{TB_MOUNT}'
             alive, why = _mount_alive(mp, _probe_budget())
             if not alive:
                 error_messages.append(f"Rclone mount {mp} is not active ({why}).")

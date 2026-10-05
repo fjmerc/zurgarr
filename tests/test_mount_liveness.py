@@ -16,9 +16,13 @@ from utils import scheduled_tasks
 
 @pytest.fixture(autouse=True)
 def _zurg_mount_running(monkeypatch):
-    """These tests model a running Real-Debrid mount: Zurg on, an RD key and a
-    mount name.  (The probe and self-heal now skip the Zurg mount when Zurg
-    is off — that path has its own tests in tests/test_setup_check.py.)"""
+    """These tests model a running Real-Debrid mount: Zurg started at boot
+    with an RD instance and a mount name.  (Without one the probe skips the
+    Zurg mount — tests/test_boot_layout.py.)"""
+    import utils.config_reload as cr
+    from utils import boot_layout
+    monkeypatch.setattr(cr, '_BOOT_LAYOUT', (True, frozenset({'RD'})))
+    monkeypatch.setattr(boot_layout, 'BOOT_RCLONE_MOUNT_NAME', 'zurgarr')
     monkeypatch.setenv('ZURG_ENABLED', 'true')
     monkeypatch.setenv('RD_API_KEY', 'test-rd-key')
     monkeypatch.setenv('RCLONE_MOUNT_NAME', 'zurgarr')

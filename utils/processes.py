@@ -31,6 +31,9 @@ _PROCESS_DEPENDENCIES = {
 # Global registry of all tracked processes for graceful shutdown
 _process_registry = []
 _registry_lock = threading.Lock()
+# Held while Zurg/rclone/plex_debrid are stopped and restarted as a group
+# (config reload, Zurg auto-update) so two of those never interleave.
+lifecycle_lock = threading.RLock()
 _shutting_down = False
 _monitor_stop_event = threading.Event()
 _monitor_thread = None
@@ -122,7 +125,7 @@ def _on_restart_exhausted(desc, restart_count, max_restarts):
         pass
 
 
-def _check_dependencies_alive(process_name):
+def _check_dependencies_alive(process_name, key_type=None):
     """Check if all dependencies for a process are alive.
 
     A name can be registered more than once (each rclone mount is its own
@@ -130,8 +133,15 @@ def _check_dependencies_alive(process_name):
     alive, so a single dead mount doesn't wedge dependents that can run
     degraded on the surviving one.
 
+    The TorBox mount (rclone with the TorBox mount name) talks to TorBox's
+    own WebDAV, not Zurg, so it has no dependency.
+
     Returns (ok, dead_dep_name). Caller must acquire _registry_lock.
     """
+    if process_name == 'rclone' and key_type is not None:
+        from utils.boot_layout import BOOT_TORBOX_MOUNT_NAME
+        if key_type == BOOT_TORBOX_MOUNT_NAME:
+            return True, None
     deps = _PROCESS_DEPENDENCIES.get(process_name, [])
     for dep_name in deps:
         any_alive = False
@@ -163,7 +173,7 @@ def _handle_restart(entry, logger):
 
     # Check dependencies before consuming a restart attempt
     with _registry_lock:
-        deps_ok, dead_dep = _check_dependencies_alive(process_name)
+        deps_ok, dead_dep = _check_dependencies_alive(process_name, key_type)
         if not deps_ok:
             # If the dependency has permanently died (every registered
             # instance exhausted its own restarts), mark this process as

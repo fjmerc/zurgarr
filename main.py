@@ -103,6 +103,14 @@ def main():
     notifications.init()
     notifications.notify('startup', 'Zurgarr Started', f'Version {version}')
 
+    # What starts now is fixed until the next container start: record it for
+    # healthcheck.py (a separate process) — see utils/boot_layout.
+    try:
+        from utils import boot_layout
+        boot_layout.record()
+    except Exception as e:
+        logger.warning(f"Could not record the boot layout for the healthcheck: {e}")
+
     if str(ZURG).lower() == 'true':
         if not (RDAPIKEY or ADAPIKEY):
             raise MissingAPIKeyException()
