@@ -314,16 +314,17 @@ class TestReadEnvValues:
         assert values['BLOCKLIST_AUTO_ADD'] == 'false'
         assert values['ROUTING_AUTO_TAG_UNTAGGED'] == 'false'
 
-    def test_explicit_empty_in_file_is_honored(self, tmp_path, monkeypatch):
-        """An explicit `KEY=` in .env declares intent and must not be overridden
-        by _ENV_DEFAULTS — only truly absent keys fall back to the default."""
+    def test_blank_line_in_file_shows_default(self, tmp_path, monkeypatch):
+        """A blank `KEY=` line (written by older versions for untouched
+        fields) counts as not set — the same rule the resolver applies — so
+        the UI shows the default actually in effect, not an empty field."""
         for key in _ALL_KEYS:
             monkeypatch.delenv(key, raising=False)
         env_file = tmp_path / '.env'
         env_file.write_text('BLOCKLIST_AUTO_ADD=\n')
         with patch('utils.settings_api.ENV_FILE', str(env_file)):
             values = read_env_values()
-        assert values['BLOCKLIST_AUTO_ADD'] == ''
+        assert values['BLOCKLIST_AUTO_ADD'] == 'true'
         # But a key NOT in the file still gets the default
         assert values['ROUTING_AUTO_TAG_UNTAGGED'] == 'true'
 
@@ -1693,6 +1694,58 @@ class TestSourcesAndExplicitSave:
         assert 'BLACKHOLE_DIR' not in text
         assert os.environ['PD_LOG_LEVEL'] == 'DEBUG'
         assert config_resolve.current()['PD_LOG_LEVEL'].source == 'set'
+
+    @staticmethod
+    def _as_page_posts(values):
+        """Encode values the way the Settings page posts them: every
+        boolean field as 'true'/'false' (never '')."""
+        from utils.settings_api import ENV_SCHEMA
+        out = dict(values)
+        for cat in ENV_SCHEMA:
+            for key, _label, ftype, *_ in cat['fields']:
+                if ftype == 'boolean':
+                    out[key] = 'true' if str(out.get(key, '')).lower() == 'true' else 'false'
+        return out
+
+    def test_page_boolean_encoding_does_not_write_untouched_booleans(self, env_file):
+        from utils.settings_api import read_env_values
+        values = self._as_page_posts(read_env_values())
+        values['NOTIFICATION_URL'] = 'json://x'
+        assert write_env_values(values)['status'] == 'saved'
+        text = env_file.read_text()
+        assert 'NOTIFICATION_URL=json://x' in text
+        assert '=false' not in text and '=true' not in text
+
+    def test_capitalised_locked_boolean_does_not_block_save(self, env_file, monkeypatch):
+        monkeypatch.setenv('PD_ENABLED', 'True')
+        monkeypatch.setenv('NOTIFICATION_LEVEL', 'INFO')
+        self._resolve_again(env_file)
+        from utils.settings_api import read_env_values
+        values = self._as_page_posts(read_env_values())
+        values['NOTIFICATION_LEVEL'] = 'info'      # select re-rendered in canonical case
+        values['NOTIFICATION_URL'] = 'json://x'
+        result = write_env_values(values)
+        assert result['status'] == 'saved', result
+
+    def test_blank_file_line_shows_effective_default(self, env_file):
+        env_file.write_text('BLACKHOLE_DIR=\n')
+        self._resolve_again(env_file)
+        from utils.settings_api import read_env_values
+        assert read_env_values()['BLACKHOLE_DIR'] == '/watch'
+
+    def test_secret_key_not_synced_blank_to_plex_debrid(self, env_file, monkeypatch):
+        import utils.settings_api as sa
+        from dotenv import dotenv_values
+        from utils import config_resolve
+        config_resolve.apply(config_resolve.resolve(
+            os.environ, dotenv_values(str(env_file)), frozenset({'RD_API_KEY'}),
+            config_resolve.written()))
+        synced = {}
+        monkeypatch.setattr(sa, '_sync_env_to_plex_debrid', lambda v: synced.update(v))
+        values = sa.read_env_values()
+        values['NOTIFICATION_URL'] = 'json://x'
+        assert sa.write_env_values(values)['status'] == 'saved'
+        assert 'RD_API_KEY' not in synced    # would blank plex_debrid's debrid key
 
     def test_save_to_secret_key_rejected(self, env_file, monkeypatch):
         from dotenv import dotenv_values

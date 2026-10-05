@@ -383,9 +383,8 @@ def read_env_values():
     application defaults (_ENV_DEFAULTS) so the UI shows true-default
     booleans as ON when the var isn't set anywhere.
 
-    When a key IS present in the .env file, its value is honored as-is
-    (including an explicit empty string) — the default only fills in
-    when the user hasn't declared an intent for the key at all.
+    A blank file line (`KEY=`) counts as not set, as in the resolver; locked
+    keys show the container value and secret-backed keys show ''.
     """
     file_values = {}
     if os.path.exists(ENV_FILE):
@@ -400,8 +399,10 @@ def read_env_values():
             return os.environ.get(key, '')
         if r is not None and r.source == 'secret':
             return ''   # the secret is in effect; never echo a stale file copy
-        if key in file_values:
-            return file_values[key] or ''
+        # Blank file lines (`KEY=`, left by older versions) count as not
+        # set, matching the resolver — show the value actually in effect.
+        if (file_values.get(key) or '').strip():
+            return file_values[key]
         return os.environ.get(key, '') or _ENV_DEFAULTS.get(key, '')
 
     result = {}
@@ -461,6 +462,26 @@ def _format_env_line(key, value):
         escaped = value.replace('\\', '\\\\').replace('"', '\\"')
         return f'{key}="{escaped}"'
     return f'{key}={value}'
+
+
+_FIELD_TYPES = {f[0]: f[2] for cat in ENV_SCHEMA for f in cat['fields']}
+
+
+def _same_value(key, a, b):
+    """Whether two values for *key* mean the same thing to the app.
+
+    Booleans compare by truthiness ('' / 'false' / 'False' are all off) and
+    selects case-insensitively, so the page's canonical encoding of a value
+    isn't mistaken for an edit.
+    """
+    a = (a or '').strip()
+    b = (b or '').strip()
+    ftype = _FIELD_TYPES.get(key, '')
+    if ftype == 'boolean':
+        return (a.lower() == 'true') == (b.lower() == 'true')
+    if ftype.startswith('select:'):
+        return a.lower() == b.lower()
+    return a == b
 
 
 def _write_env_file(explicit):
@@ -523,7 +544,7 @@ def write_env_values(values):
         for key, value in filtered.items():
             src = sources.get(key, {}).get('source')
             if src in ('locked', 'secret'):
-                if value and value != existing.get(key, ''):
+                if value and not _same_value(key, value, existing.get(key, '')):
                     locked_errors.append(
                         f'{key}: set in docker-compose — edit it there' if src == 'locked'
                         else f'{key}: set via Docker secret — edit the secret file')
@@ -533,7 +554,7 @@ def write_env_values(values):
                     explicit[key] = value
                 else:
                     del explicit[key]
-            elif value and value != existing.get(key, ''):
+            elif value and not _same_value(key, value, existing.get(key, '')):
                 explicit[key] = value
         if locked_errors:
             return {'status': 'error', 'errors': locked_errors, 'warnings': []}
@@ -563,7 +584,10 @@ def write_env_values(values):
     # Sync relevant .env changes into settings.json so plex_debrid picks
     # them up immediately on restart (not just on container restart)
     try:
-        _sync_env_to_plex_debrid(merged)
+        # Secret-backed keys show (and post) '' — syncing that would blank
+        # the debrid key plex_debrid got from the secret.
+        _sync_env_to_plex_debrid({k: v for k, v in merged.items()
+                                  if sources.get(k, {}).get('source') != 'secret'})
     except Exception as e:
         logger.warning(f'[settings] settings.json sync failed (.env still saved): {e}')
 

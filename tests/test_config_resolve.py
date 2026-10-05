@@ -234,3 +234,35 @@ class TestApply:
         res = cr.resolve(env, {})
         cr.apply(res, env)
         assert cr.current() == res
+
+
+class TestNoRuntimeWritersOfSettings:
+    """Locked = an os.environ value the resolver didn't write.  Any code that
+    writes a settings key straight into os.environ would make that key look
+    compose-locked (UI edits refused, file ignored).  Route such writes
+    through the resolver instead."""
+
+    # utils/logger.py deliberately mirrors ZURGARR_LOG_LEVEL into rclone's
+    # level; it wins at every get_logger() call regardless, so showing it
+    # as locked reflects reality.
+    _ALLOWED = {('utils/logger.py', 'RCLONE_LOG_LEVEL')}
+
+    def test_no_direct_environ_writes_of_schema_keys(self):
+        from utils.settings_api import _ALL_KEYS
+        pat = re.compile(r"""os\.environ\[\s*['"]([A-Z][A-Z0-9_]+)['"]\s*\]\s*=(?!=)""")
+        offenders = []
+        for root in ('utils', 'base', 'zurg', 'rclone', 'plex_debrid_'):
+            for dirpath, _, names in os.walk(os.path.join(REPO, root)):
+                for name in names:
+                    if not name.endswith('.py'):
+                        continue
+                    path = os.path.join(dirpath, name)
+                    rel = os.path.relpath(path, REPO)
+                    with open(path) as f:
+                        text = f.read()
+                    for m in pat.finditer(text):
+                        key = m.group(1)
+                        if key in _ALL_KEYS and (rel, key) not in self._ALLOWED:
+                            line = text.count('\n', 0, m.start()) + 1
+                            offenders.append(f'{rel}:{line} {key}')
+        assert not offenders, '\n'.join(offenders)
