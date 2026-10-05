@@ -130,3 +130,53 @@ def test_findings_sorted_errors_first(clean):
     clean.setenv('PD_ENABLED', 'true')
     levels = [f['level'] for f in sc.collect_findings()]
     assert levels == sorted(levels, key=['error', 'warn', 'recommend'].index)
+
+
+class TestDismissals:
+
+    @pytest.fixture
+    def store(self, clean, tmp_path):
+        clean.setattr(sc, 'CONFIG_DIR', str(tmp_path))
+        sc._invalidate()
+        return tmp_path
+
+    def test_dismissal_persists_and_rearms(self, store, monkeypatch):
+        monkeypatch.setenv('PLEX_ADDRESS', 'http://plex:32400')
+        monkeypatch.setenv('PLEX_TOKEN', 't')
+        monkeypatch.setenv('PLEX_MOUNT_DIR', '/data')
+        assert sc.dismiss('rec:PLEX_REFRESH') is True
+        sc._invalidate()
+        assert 'rec:PLEX_REFRESH' not in {f['id'] for f in sc.get_setup_check()['findings']}
+        assert sc.get_setup_check()['dismissed'] == 1
+        assert (store / 'setup_dismissed.json').exists()
+        # situation changes → the recommendation comes back
+        monkeypatch.setenv('PLEX_ADDRESS', 'http://other:32400')
+        sc._invalidate()
+        assert 'rec:PLEX_REFRESH' in {f['id'] for f in sc.get_setup_check()['findings']}
+
+    def test_only_recommendations_can_be_dismissed(self, store, monkeypatch):
+        monkeypatch.delenv('STATUS_UI_AUTH')
+        assert sc.dismiss('no-auth') is False
+        assert sc.dismiss('rec:does-not-exist') is False
+
+    def test_get_setup_check_never_raises(self, store, monkeypatch):
+        def boom():
+            raise RuntimeError('x')
+        monkeypatch.setattr(sc, 'collect_findings', boom)
+        sc._invalidate()
+        assert sc.get_setup_check() == {'findings': [], 'dismissed': 0}
+
+    def test_result_is_cached(self, store, monkeypatch):
+        calls = []
+        monkeypatch.setattr(sc, 'collect_findings', lambda: calls.append(1) or [])
+        sc._invalidate()
+        sc.get_setup_check()
+        sc.get_setup_check()
+        assert len(calls) == 1
+
+
+def test_status_payload_includes_setup_check(monkeypatch):
+    from utils import status_server
+    monkeypatch.setattr(sc, 'get_setup_check', lambda: {'findings': [], 'dismissed': 0})
+    monkeypatch.setattr(status_server, 'check_services', lambda: [])
+    assert status_server.status_data.to_dict()['setup_check'] == {'findings': [], 'dismissed': 0}

@@ -676,6 +676,14 @@ def _merge_recent_events(inmem_events, limit=15):
 # Status data singleton
 # ---------------------------------------------------------------------------
 
+def _setup_check_payload():
+    try:
+        from utils.setup_check import get_setup_check
+        return get_setup_check()
+    except Exception:
+        return {'findings': [], 'dismissed': 0}
+
+
 class StatusData:
     """Singleton collecting status from all components."""
 
@@ -808,6 +816,7 @@ class StatusData:
             'error_count': error_count,
             'provider_health': provider_health,
             'library': library_stats,
+            'setup_check': _setup_check_payload(),
         }
 
 
@@ -3386,6 +3395,24 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 logger.exception("[stuck] retry failed")
                 self._send_json_response(500, json.dumps({'error': 'Internal server error'}))
+        elif self.path == '/api/setup-check/dismiss':
+            try:
+                content_length = int(self.headers.get('Content-Length', 0))
+                if content_length > 10_000:
+                    self._send_json_response(400, json.dumps({'error': 'Request body too large'}))
+                    return
+                values = json.loads(self.rfile.read(content_length).decode('utf-8'))
+                fid = (values.get('id') or '').strip() if isinstance(values, dict) else ''
+                if not fid or len(fid) > 200:
+                    self._send_json_response(400, json.dumps({'error': 'id required'}))
+                    return
+                from utils import setup_check
+                if not setup_check.dismiss(fid):
+                    self._send_json_response(400, json.dumps({'error': 'Only current recommendations can be dismissed'}))
+                    return
+                self._send_json_response(200, json.dumps({'status': 'dismissed'}))
+            except (ValueError, UnicodeDecodeError):
+                self._send_json_response(400, json.dumps({'error': 'Invalid JSON'}))
         elif self.path == '/api/stuck/dismiss':
             try:
                 content_length = int(self.headers.get('Content-Length', 0))

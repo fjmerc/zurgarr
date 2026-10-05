@@ -144,3 +144,69 @@ def _recommendations():
 def collect_findings():
     findings = _check_findings() + _validator_findings() + _recommendations()
     return sorted(findings, key=lambda f: _LEVEL_ORDER.index(f['level']))
+
+
+# --- dismissals + cache -----------------------------------------------------
+
+_CACHE_TTL = 15
+_lock = threading.Lock()
+_cache = {'at': 0.0, 'value': None}
+
+
+def _invalidate():
+    with _lock:
+        _cache['at'] = 0.0
+        _cache['value'] = None
+
+
+def _dismissed_path():
+    return os.path.join(CONFIG_DIR, 'setup_dismissed.json')
+
+
+def _load_dismissed():
+    import json
+    try:
+        with open(_dismissed_path()) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def get_setup_check():
+    """{'findings': [...], 'dismissed': n} for /api/status. Cached; never raises."""
+    now = time.time()
+    with _lock:
+        if _cache['value'] is not None and now - _cache['at'] < _CACHE_TTL:
+            return _cache['value']
+    try:
+        findings = collect_findings()
+        dismissed = _load_dismissed()
+        shown = [f for f in findings if dismissed.get(f['id']) != f['sig']]
+        value = {'findings': shown, 'dismissed': len(findings) - len(shown)}
+    except Exception:
+        value = {'findings': [], 'dismissed': 0}
+    with _lock:
+        _cache['at'], _cache['value'] = now, value
+    return value
+
+
+def dismiss(fid):
+    """Dismiss a current recommendation until its inputs change.  True on success."""
+    import json
+    from utils.file_utils import atomic_write
+    try:
+        current = {f['id']: f for f in collect_findings()}
+    except Exception:
+        return False
+    f = current.get(fid)
+    if not f or f['level'] != 'recommend':
+        return False
+    data = _load_dismissed()
+    data = {k: v for k, v in data.items() if k in current}   # prune stale ids
+    data[fid] = f['sig']
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with atomic_write(_dismissed_path()) as out:
+        json.dump(data, out, indent=2, sort_keys=True)
+    _invalidate()
+    return True
