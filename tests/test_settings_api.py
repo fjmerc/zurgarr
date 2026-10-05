@@ -1767,6 +1767,16 @@ class TestSourcesAndExplicitSave:
         assert sa.write_env_values(values)['status'] == 'saved'
         assert 'RD_API_KEY' not in synced    # would blank plex_debrid's debrid key
 
+    def test_restart_preview_matches_what_reload_would_restart(self, env_file):
+        # The banner said "restarting rclone, plex_debrid" for a
+        # notification-only change; the reload restarted notifications only.
+        from utils.settings_api import read_env_values
+        values = self._as_page_posts(read_env_values())
+        values['NOTIFICATION_URL'] = 'json://x'
+        result = write_env_values(values)
+        assert result['status'] == 'saved'
+        assert result['restarted'] == ['notifications']
+
     def test_save_to_secret_key_rejected(self, env_file, monkeypatch):
         from dotenv import dotenv_values
         from utils import config_resolve
@@ -1830,3 +1840,14 @@ class TestAutoSourcesForDerivedKeys:
         config_resolve.apply(config_resolve.resolve(
             os.environ, {'BLACKHOLE_DEBRID_ROUTING': 'primary_only'}))
         assert get_env_sources()['BLACKHOLE_DEBRID_ROUTING']['source'] == 'set'
+
+
+class TestSettingsPageTiers:
+
+    def test_page_has_tier_rendering_hooks(self):
+        from utils.settings_page import get_settings_html
+        html = get_settings_html(get_env_schema(), {'categories': []})
+        for needle in ('function refreshEnvSources', '/api/settings/env/sources',
+                       'function applyGate', 'class="category essentials"',
+                       'gated-fields', 'src-badge'):
+            assert needle in html, needle

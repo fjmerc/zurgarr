@@ -203,6 +203,17 @@ textarea{min-height:120px;resize:vertical;font-family:monospace;font-size:.8em;l
    yellow highlight on the row; this is a small teal pill on the label. */
 .field-modified-chip{display:none;align-items:center;font-size:.68em;font-weight:600;color:var(--teal,#27aabc);background:rgba(39,170,188,.12);border:1px solid rgba(39,170,188,.35);border-radius:3px;padding:1px 5px;margin-left:5px;white-space:nowrap;vertical-align:middle;line-height:1.4}
 .field.is-nondefault .field-modified-chip{display:inline-flex}
+.gated-fields{display:none}
+.gated-fields.open{display:block}
+.gate-note{font-size:.82em;color:var(--text2);padding:8px 0 2px}
+.category.essentials{border-color:var(--blue)}
+.src-badge{display:inline-flex;align-items:center;font-size:.66em;font-weight:600;border-radius:3px;padding:1px 5px;margin-left:6px;white-space:nowrap;vertical-align:middle;line-height:1.4;color:var(--text2);border:1px solid var(--border2)}
+.src-badge.src-set{color:var(--blue);border-color:var(--blue)}
+.src-badge.src-auto{color:var(--teal,#27aabc);border-color:rgba(39,170,188,.45)}
+.src-badge.src-locked,.src-badge.src-secret{color:#c08a1e;border-color:rgba(192,138,30,.5)}
+[data-theme="light"] .src-badge.src-locked,[data-theme="light"] .src-badge.src-secret{color:#8a5a00;border-color:rgba(138,90,0,.45)}
+.field-src-note{font-size:.72em;color:var(--text3);margin-top:3px}
+.field.is-locked input,.field.is-locked select{opacity:.65;cursor:not-allowed}
 [data-theme="light"] .field-modified-chip{color:#0e7a88;background:rgba(14,122,136,.1);border-color:rgba(14,122,136,.3)}
 
 /* "Show only modified" toggle button in the env toolbar */
@@ -332,6 +343,23 @@ const ENV_SCHEMA = __ENV_SCHEMA_JSON__;
 const PD_SCHEMA = __PD_SCHEMA_JSON__;
 let envValues = {};
 let envDefaults = {};  // application defaults from /api/settings/reset/env
+let envSources = {};  // key -> {source, reason} from /api/settings/env/sources
+const _ENV_FIELD_BY_KEY = {};
+ENV_SCHEMA.categories.forEach(c => c.fields.forEach(f => { _ENV_FIELD_BY_KEY[f.key] = f; }));
+const _GATE_KEYS = new Set(ENV_SCHEMA.categories.filter(c => c.gate).map(c => c.gate.key));
+
+async function refreshEnvSources() {
+  try {
+    const resp = await fetch('/api/settings/env/sources');
+    const body = resp.ok ? await resp.json() : null;
+    envSources = (body && typeof body === 'object' && !Array.isArray(body)) ? body : {};
+  } catch (_) {
+    envSources = {};   // badges just don't render; page still works
+  }
+}
+
+const _SRC_LABEL = {set: 'set by you', default: 'default', auto: 'auto',
+                    locked: 'locked', secret: 'Docker secret'};
 let pdValues = {};
 let isDirty = false;  // combined flag for beforeunload
 let envDirty = false;
@@ -677,9 +705,16 @@ function renderEnvField(field, value) {
     inputHtml = `<input type="text" id="${id}" data-key="${esc(field.key)}" data-type="string" value="${esc(value || '')}">`;
   }
 
+  const src = envSources[field.key] || {};
+  const isLocked = src.source === 'locked' || src.source === 'secret';
+  if (isLocked) inputHtml = inputHtml.replace(/<(input|select)\b/g, '<$1 disabled');
+  const srcBadge = _SRC_LABEL[src.source]
+    ? `<span class="src-badge src-${esc(src.source)}" title="${esc(src.reason || '')}">${esc(_SRC_LABEL[src.source])}</span>` : '';
+  const srcNote = (src.reason && (src.source === 'auto' || isLocked))
+    ? `<div class="field-src-note">${esc(src.source === 'auto' ? 'Automatic: ' : '')}${esc(src.reason)}${isLocked && src.source === 'locked' ? ' — edit it there' : ''}</div>` : '';
   const helpHtml = field.help ? `<div class="field-help">${esc(field.help)}</div>` : '';
   const reqMark = field.required ? '<span class="required">*</span>' : '';
-  const resetBtn = `<button type="button" class="field-reset" onclick="resetField('env','${escJs(field.key)}')" title="Undo change">\u21BA</button>`;
+  const resetBtn = isLocked ? '' : `<button type="button" class="field-reset" onclick="resetField('env','${escJs(field.key)}')" title="Undo change">↺</button>`;
   // "modified" chip \u2014 always present in the DOM; visibility driven by
   // .is-nondefault on the parent .field row (set by updateModifiedChips).
   const modChip = `<span class="field-modified-chip" aria-label="modified from default">modified</span>`;
@@ -696,27 +731,83 @@ function renderEnvField(field, value) {
   const initNonDefault = isNonDefault(field.key, value, ftype);
   const nonDefaultClass = initNonDefault ? ' is-nondefault' : '';
 
-  return `<div class="field${nonDefaultClass}" id="row-${field.key}" data-field-key="${esc(field.key)}"><div class="field-label"><span><span class="label-text">${esc(field.label)}</span>${reqMark}${modChip}</span><span class="key">${esc(field.key)}</span></div><div class="field-input"><div style="display:flex;gap:6px;align-items:start">${inputHtml}${resetBtn}</div>${helpHtml}<div class="field-error" id="err-${field.key}"></div></div></div>`;
+  return `<div class="field${nonDefaultClass}${isLocked ? ' is-locked' : ''}" id="row-${field.key}" data-field-key="${esc(field.key)}"><div class="field-label"><span><span class="label-text">${esc(field.label)}</span>${reqMark}${modChip}${srcBadge}</span><span class="key">${esc(field.key)}</span></div><div class="field-input"><div style="display:flex;gap:6px;align-items:start">${inputHtml}${resetBtn}</div>${helpHtml}${srcNote}<div class="field-error" id="err-${field.key}"></div></div></div>`;
+}
+
+function _gateOn(key, values) {
+  const v = String(values[key] ?? '').trim();
+  const f = _ENV_FIELD_BY_KEY[key];
+  return f && f.type === 'boolean' ? v.toLowerCase() === 'true' : v !== '';
+}
+
+function _catHeader(name, desc, open) {
+  return `<div class="cat-header${open ? ' open' : ''}" role="button" tabindex="0" aria-expanded="${open}" onclick="toggleCategory(this)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleCategory(this)}"><h2><span class="cat-name">${esc(name)}</span> <span class="desc">— ${esc(desc)}</span></h2><span class="cat-dirty"><span class="cat-dirty-dot"></span><span class="cat-dirty-count"></span></span><span class="arrow" aria-hidden="true">&#9660;</span></div>`;
 }
 
 function renderEnvCategories(values) {
   const container = document.getElementById('env-categories');
   let html = '';
+
+  // Essentials card: the few values most setups need, always first + open.
+  let essHtml = '';
+  ENV_SCHEMA.categories.forEach(cat => cat.fields.forEach(f => {
+    if (f.tier === 'essential') essHtml += renderEnvField(f, values[f.key] || '');
+  }));
+  if (essHtml) {
+    html += `<div class="category essentials" data-tab="env">${_catHeader('Essentials', 'the settings most setups need', true)}<div class="cat-body open">${essHtml}</div></div>`;
+  }
+
   ENV_SCHEMA.categories.forEach((cat, i) => {
-    let fieldsHtml = '';
-    cat.fields.forEach(f => { fieldsHtml += renderEnvField(f, values[f.key] || ''); });
-    html += `<div class="category" data-cat-idx="${i}" data-tab="env"><div class="cat-header" role="button" tabindex="0" aria-expanded="false" onclick="toggleCategory(this)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleCategory(this)}"><h2><span class="cat-name">${esc(cat.name)}</span> <span class="desc">\u2014 ${esc(cat.description)}</span></h2><span class="cat-dirty"><span class="cat-dirty-dot"></span><span class="cat-dirty-count"></span></span><span class="arrow" aria-hidden="true">&#9660;</span></div><div class="cat-body">${fieldsHtml}</div></div>`;
+    const gate = cat.gate;
+    let gateField = '', main = '', adv = '';
+    cat.fields.forEach(f => {
+      if (f.tier === 'essential') return;
+      const rendered = renderEnvField(f, values[f.key] || '');
+      if (gate && f.key === gate.key) gateField = rendered;   // the switch stays visible
+      else if (f.tier === 'feature') main += rendered;
+      else adv += rendered;
+    });
+    if (!gateField && !main && !adv) return;   // everything moved to Essentials
+
+    const advHtml = adv
+      ? `<div class="advanced-toggle" onclick="toggleAdvanced(this)">Show advanced settings</div><div class="advanced-fields">${adv}</div>` : '';
+    let bodyHtml = gateField + main + advHtml;
+    if (gate) {
+      const open = _gateOn(gate.key, values);
+      bodyHtml = `${gateField}<div class="gate-note" data-gate-note="${esc(gate.key)}"${open ? ' hidden' : ''}>${esc(gate.note)}</div><div class="gated-fields${open ? ' open' : ''}" data-gate="${esc(gate.key)}">${main}${advHtml}</div>`;
+    }
+    html += `<div class="category" data-cat-idx="${i}" data-tab="env">${_catHeader(cat.name, cat.description, false)}<div class="cat-body">${bodyHtml}</div></div>`;
   });
+
   container.innerHTML = html;
-  // Re-run chips and count after every full render (init, undo, post-save)
   updateModifiedChips();
-  // Re-apply the modified-only filter if it was active before the re-render
   const modToggle = document.getElementById('modified-only-toggle');
   if (modToggle && modToggle.checked) {
     const searchInput = document.getElementById('search-env');
     filterSettings('env', searchInput ? searchInput.value : '');
   }
 }
+
+// Expand/collapse every section gated on `key` from the live input value
+// (no re-render, so other unsaved edits survive).
+function applyGate(key) {
+  const el = document.getElementById('env-' + key);
+  if (!el) return;
+  const values = {};
+  values[key] = el.dataset.type === 'boolean' ? (el.checked ? 'true' : 'false') : el.value;
+  const open = _gateOn(key, values);
+  document.querySelectorAll(`.gated-fields[data-gate="${key}"]`).forEach(g => g.classList.toggle('open', open));
+  document.querySelectorAll(`.gate-note[data-gate-note="${key}"]`).forEach(n => { n.hidden = open; });
+}
+
+document.addEventListener('input', e => {
+  const k = e.target && e.target.dataset ? e.target.dataset.key : null;
+  if (k && _GATE_KEYS.has(k)) applyGate(k);
+});
+document.addEventListener('change', e => {
+  const k = e.target && e.target.dataset ? e.target.dataset.key : null;
+  if (k && _GATE_KEYS.has(k)) applyGate(k);
+});
 
 function collectEnvData() {
   const data = {};
@@ -817,6 +908,7 @@ async function envSave() {
             && !activeEl.matches('button');
           if (isPlainObject) {
             envValues = body;
+            await refreshEnvSources();
             if (!userEditing) renderEnvCategories(envValues);
           } else {
             envValues = collectEnvData();
@@ -2064,6 +2156,11 @@ function filterSettings(tab, query) {
         });
         if (advVisible > 0) { adv.classList.add('open'); }
       }
+      body.querySelectorAll('.gated-fields').forEach(g => {
+        let gVisible = 0;
+        g.querySelectorAll('.field').forEach(f => { if (f.style.display !== 'none') gVisible++; });
+        if (gVisible > 0) g.classList.add('open');
+      });
     }
 
     cat.style.display = (anyFilter && catVisible === 0) ? 'none' : '';
@@ -2084,7 +2181,9 @@ function getEnvChangedFields() {
   document.querySelectorAll('#tab-env [data-key]').forEach(el => {
     const key = el.dataset.key;
     const current = el.dataset.type === 'boolean' ? (el.checked ? 'true' : 'false') : el.value;
-    const saved = envValues[key] !== undefined ? String(envValues[key]) : '';
+    let saved = envValues[key] !== undefined ? String(envValues[key]) : '';
+    // A blank boolean runs as off — don't report the rendered 'false' as an edit.
+    if (el.dataset.type === 'boolean') saved = saved.toLowerCase() === 'true' ? 'true' : 'false';
     if (current !== saved) changes.add(key);
   });
   return changes;
@@ -2193,16 +2292,14 @@ function updateFieldAndCategoryIndicators(tab, changes, schema) {
     field.classList.toggle('changed', changes.has(field.dataset.fieldKey));
   });
 
-  // Category indicators
-  container.querySelectorAll('.category[data-cat-idx]').forEach(catEl => {
-    const idx = parseInt(catEl.dataset.catIdx);
-    const cat = schema.categories[idx];
-    if (!cat) return;
+  // Category indicators — count the fields rendered inside each category
+  // (Essentials pulls fields out of their schema category).
+  container.querySelectorAll('.category').forEach(catEl => {
     let count = 0;
-    cat.fields.forEach(f => { if (changes.has(f.key)) count++; });
+    catEl.querySelectorAll('.field[data-field-key]').forEach(f => { if (changes.has(f.dataset.fieldKey)) count++; });
     const header = catEl.querySelector('.cat-header');
     const countSpan = catEl.querySelector('.cat-dirty-count');
-    header.classList.toggle('has-changes', count > 0);
+    if (header) header.classList.toggle('has-changes', count > 0);
     if (countSpan) countSpan.textContent = count > 0 ? count + ' changed' : '';
   });
 }
@@ -2323,7 +2420,7 @@ async function init() {
     })
     .catch(e => showBanner('error', 'Failed to load plex_debrid settings: ' + esc(e.message)));
 
-  await Promise.all([envFetch, defaultsFetch, pdFetch]);
+  await Promise.all([envFetch, defaultsFetch, pdFetch, refreshEnvSources()]);
   renderEnvCategories(envValues);
   renderPdCategories(pdValues);
 }

@@ -632,11 +632,20 @@ def write_env_values(values):
     restarted = []
     try:
         from utils.config_reload import _determine_restarts
-        changed = set()
-        for key, new_val in merged.items():
-            old_val = os.environ.get(key, '')
-            if old_val != (new_val or ''):
-                changed.add(key)
+        # Preview with a dry run of the same resolver the SIGHUP reload
+        # uses, so the banner names only services that will really restart.
+        from base import SECRETS_DIR
+        from utils import config_resolve
+        dry = config_resolve.resolve(
+            os.environ, explicit, config_resolve.present_secrets(SECRETS_DIR),
+            config_resolve.written())
+        current = config_resolve.current()
+
+        def _eff(res, key):
+            r = res.get(key)
+            return r.value if r is not None and r.source != 'unset' else None
+
+        changed = {k for k in set(current) | set(dry) if _eff(current, k) != _eff(dry, k)}
         if changed:
             restarted = sorted(_determine_restarts(changed))
 
