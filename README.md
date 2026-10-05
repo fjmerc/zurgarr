@@ -363,9 +363,10 @@ The Plex container should wait for Zurgarr's mount to be ready:
 
 The web UI has five pages:
 
-- **Status** (`/status`) — process health (Zurg, rclone, plex_debrid),
-  mount status, connected-service tiles, system resources, and recent
-  events
+- **Status** (`/status`) — a Setup check (what's misconfigured, with
+  one-click jumps to the setting), process health (Zurg, rclone,
+  plex_debrid), mount status, connected-service tiles, system resources,
+  and recent events
 - **Library** (`/library`) — the unified local + debrid browser with
   per-item preferences and interactive search
 - **Activity** (`/activity`) — the history log, filterable by type and time
