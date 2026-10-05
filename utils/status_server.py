@@ -488,8 +488,8 @@ def check_services():
 
     # Zurg WebDAV
     # (the instances started at boot — a runtime change doesn't start/stop them)
-    from utils.config_reload import _BOOT_LAYOUT
-    zurg_on, zurg_instances = _BOOT_LAYOUT.zurg, _BOOT_LAYOUT.instances
+    from utils import boot_layout
+    zurg_on, zurg_instances = boot_layout.BOOT_LAYOUT.zurg, boot_layout.BOOT_LAYOUT.instances
     if zurg_on:
         for key_type, env_suffix in [('RD', 'RealDebrid'), ('AD', 'AllDebrid')]:
             # Port and login Zurg is running with (its config.yml) — a change

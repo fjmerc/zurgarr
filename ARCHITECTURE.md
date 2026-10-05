@@ -394,8 +394,10 @@ docker kill -s HUP zurgarr
   or: Settings editor "Save & Reload"
          │
          ▼
-handle_sighup() → spawns background thread (waits until main.py has
-finished starting up — utils/config_reload.mark_startup_complete)
+handle_sighup() → spawns background thread (applies at once; restarting
+plex_debrid/blackhole is deferred until boot_layout.STARTUP_COMPLETE —
+zurg_setup/rclone.setup use the settings imported at start, so a reload
+can't change what they're setting up)
          │
          ▼
 _reload_env()

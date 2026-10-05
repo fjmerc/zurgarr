@@ -196,6 +196,12 @@ def cleanup_interval():
         return 24
 
 def start_cleanup():
+    from base import config
+    if str(config.DUPECLEAN).lower() != 'true':
+        # switched off after start: the task stays registered until a
+        # restart, but must not delete anything
+        logger.info("Duplicate cleanup is off — skipping")
+        return
     logger.info("Starting duplicate cleanup")
     start_time = get_start_time()
     try:

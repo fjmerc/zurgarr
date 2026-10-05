@@ -168,6 +168,10 @@ def mount_for_debrid(debrid, rclone_mount_base='/data'):
     rclonemn = boot_layout.rclone_mount_name()
     if not rclonemn:
         return None
+    if boot_layout.BOOTED and debrid in (REALDEBRID, ALLDEBRID):
+        inst = 'RD' if debrid == REALDEBRID else 'AD'
+        if inst not in boot_layout.BOOT_LAYOUT.instances:
+            return None   # no Zurg mount for it until the container restarts
 
     rd_key = boot_layout.debrid_key_at_start('RD_API_KEY')
     ad_key = boot_layout.debrid_key_at_start('AD_API_KEY')

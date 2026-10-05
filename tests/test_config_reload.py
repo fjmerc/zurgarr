@@ -285,16 +285,16 @@ class TestZurgRcloneApplyAtStartup:
         """boot(**env) — snapshot those settings as the startup ones."""
         import utils.config_reload as cr
         from utils import boot_layout
-        for k in boot_layout.STARTUP_KEYS | {'TORBOX_API_KEY'}:
+        for k in boot_layout.SNAPSHOT_KEYS | {'TORBOX_API_KEY'}:
             monkeypatch.delenv(k, raising=False)
         monkeypatch.setattr('utils.env.SECRETS_DIR', '/nonexistent-secrets')
 
         def _boot(**env):
             for k, v in env.items():
                 monkeypatch.setenv(k, v)
-            monkeypatch.setattr(cr, '_BOOT_LAYOUT', boot_layout.zurg_layout())
+            monkeypatch.setattr('utils.boot_layout.BOOT_LAYOUT', boot_layout.zurg_layout())
             monkeypatch.setattr(boot_layout, 'BOOT_VALUES',
-                                {k: boot_layout.startup_value(k) for k in boot_layout.STARTUP_KEYS})
+                                {k: boot_layout.startup_value(k) for k in boot_layout.SNAPSHOT_KEYS})
             return cr
         return _boot
 
@@ -344,6 +344,38 @@ class TestZurgRcloneApplyAtStartup:
         cr = boot(TORBOX_WEBDAV_USER='u', TORBOX_WEBDAV_PASS='p', **self.RD_BOOT)
         monkeypatch.setenv('TORBOX_API_KEY', 't')               # now all three: mount would start
         assert cr.restart_pending() == ['TORBOX_API_KEY']
+
+    def test_boolean_spellings_that_mean_the_same_are_not_listed(self, boot, monkeypatch):
+        cr = boot(NFS_ENABLED='false', **self.RD_BOOT)
+        monkeypatch.delenv('NFS_ENABLED')                     # cleared: still off
+        assert cr.restart_pending() == []
+
+    def test_torbox_and_nfs_only_tuning_listed_only_where_it_matters(self, boot, monkeypatch):
+        cr = boot(**self.RD_BOOT)                              # no TorBox mount
+        monkeypatch.setenv('TORBOX_RCLONE_TPSLIMIT', '9')
+        monkeypatch.setenv('TORBOX_RCLONE_DIR_CACHE_TIME', '5h')
+        assert cr.restart_pending() == []
+        cr = boot(NFS_ENABLED='true', **self.RD_BOOT)          # NFS: no FUSE-only flags
+        monkeypatch.setenv('RCLONE_POLL_INTERVAL', '1m')
+        assert cr.restart_pending() == []
+
+    def test_removing_the_only_debrid_key_does_not_name_torbox(self, boot, monkeypatch):
+        cr = boot(TORBOX_API_KEY='t', TORBOX_WEBDAV_USER='u', TORBOX_WEBDAV_PASS='p', **self.RD_BOOT)
+        monkeypatch.delenv('RD_API_KEY')
+        monkeypatch.setenv('ZURG_ENABLED', 'false')
+        assert cr.restart_pending(auto=True) == ['RD_API_KEY']
+
+    def test_partly_live_settings(self, boot, monkeypatch):
+        cr = boot(DUPLICATE_CLEANUP='true', ZURG_UPDATE='false', PLEX_REFRESH='true',
+                  PLEX_MOUNT_DIR='/media', **self.RD_BOOT)
+        monkeypatch.setenv('DUPLICATE_CLEANUP', 'false')       # off applies at once
+        assert cr.restart_pending() == []
+        monkeypatch.setenv('ZURG_UPDATE', 'true')              # on needs the update thread
+        monkeypatch.setenv('CLEANUP_INTERVAL', '6')            # re-scheduling needs a restart
+        monkeypatch.setenv('PLEX_MOUNT_DIR', '/plex')          # Zurg's refresh hook
+        assert cr.restart_pending() == ['CLEANUP_INTERVAL', 'PLEX_MOUNT_DIR', 'ZURG_UPDATE']
+        monkeypatch.setenv('PLEX_REFRESH', 'false')            # Zurg's hook keeps firing
+        assert 'PLEX_REFRESH' in cr.restart_pending()
 
     def _reload(self, cr, monkeypatch, changed):
         monkeypatch.setattr(cr, '_reload_env', lambda: set(changed))
@@ -396,6 +428,9 @@ class TestZurgRcloneApplyAtStartup:
                             [{'process_name': 'plex_debrid', 'key_type': None, 'handler': h}])
         self._reload(cr, monkeypatch, {'PLEX_USER'})
         h.restart_process.assert_not_called()
+        # supervised again: the monitor relaunches it once it finally exits
+        from utils.processes import RestartPolicy
+        assert isinstance(h.restart_policy, RestartPolicy)
 
     def test_reload_logs_and_shows_the_restart_note(self, boot, monkeypatch):
         cr = boot(**self.RD_BOOT)
@@ -403,19 +438,38 @@ class TestZurgRcloneApplyAtStartup:
         assert 'ZURG_LOG_LEVEL' in cr._zurg_restart_note({'ZURG_LOG_LEVEL'})
         assert cr._zurg_restart_note({'PLEX_USER'}) is None
 
-    def test_reload_waits_for_startup(self, boot, monkeypatch):
+    def test_service_restarts_are_deferred_to_the_end_of_startup(self, boot, monkeypatch):
+        # main.py still sets up plex_debrid/blackhole after Zurg/rclone read
+        # their settings: a reload must not start them in between (duplicate
+        # watcher, plex_debrid change lost) — but it must not block either:
+        # later saves would queue behind it (rclone can wait minutes)
         import threading
+        import time
+        from utils import boot_layout
+        import utils.blackhole as bh
+        import utils.notifications as n
         cr = boot(**self.RD_BOOT)
-        ran = []
-        monkeypatch.setattr(cr, '_reload_once', lambda: ran.append(1))
-        cr._startup_done.clear()
-        t = threading.Thread(target=cr._do_reload, daemon=True)
-        t.start()
-        t.join(0.3)
-        assert ran == [] and t.is_alive()
-        cr.mark_startup_complete()
-        t.join(2)
-        assert ran == [1]
+        calls = []
+        monkeypatch.setattr(n, 'init', lambda: calls.append('notifications'))
+        monkeypatch.setattr(bh, 'stop', lambda: calls.append('bh-stop'))
+        monkeypatch.setattr(bh, 'setup', lambda: calls.append('bh-setup'))
+        boot_layout.STARTUP_COMPLETE.clear()
+        try:
+            monkeypatch.setattr('base.config.load', lambda **kw: None)
+            monkeypatch.setattr(cr, '_notify_reload', lambda *a, **k: None)
+            monkeypatch.setattr(cr, '_reload_env', lambda: {'BLACKHOLE_DIR', 'NOTIFICATION_URL'})
+            cr._reload_once()                                   # returns right away
+            monkeypatch.setattr(cr, '_reload_env', lambda: {'BLACKHOLE_POLL_INTERVAL'})
+            cr._reload_once()                                   # a second save isn't stuck
+            assert calls == ['notifications']
+            boot_layout.STARTUP_COMPLETE.set()
+            for _ in range(100):
+                if 'bh-setup' in calls:
+                    break
+                time.sleep(0.02)
+            assert calls == ['notifications', 'bh-stop', 'bh-setup']   # once, for both saves
+        finally:
+            boot_layout.STARTUP_COMPLETE.set()
 
     def test_reload_refreshes_the_setup_check(self, boot, monkeypatch):
         cr = boot(**self.RD_BOOT)

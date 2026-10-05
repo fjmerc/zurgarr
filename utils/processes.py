@@ -31,8 +31,10 @@ _PROCESS_DEPENDENCIES = {
 # Global registry of all tracked processes for graceful shutdown
 _process_registry = []
 _registry_lock = threading.Lock()
-# Held while Zurg/rclone/plex_debrid are stopped and restarted as a group
-# (config reload, Zurg auto-update) so two of those never interleave.
+# Held while a process is stopped and started again — a settings reload
+# (plex_debrid), restart_service (System page, mount self-heal), the Zurg
+# and plex_debrid auto-updates, main's plex_debrid setup — so two of those
+# never interleave.
 lifecycle_lock = threading.RLock()
 _shutting_down = False
 _monitor_stop_event = threading.Event()
@@ -228,15 +230,15 @@ def _handle_restart(entry, logger):
     handler.run_pre_restart()
 
     # Re-check shutdown and restart_policy under lock to close TOCTOU gap.
-    # restart_policy is set to None by stop_process() during config reload —
-    # if reload already restarted this process, we must not start a duplicate.
+    # restart_policy is set to None by stop_process() (reload, update) —
+    # if one of those already restarted this process, we must not start a duplicate.
     with _registry_lock:
         if _shutting_down:
             return
         if handler.restart_policy is None:
             return
         # Process was dead at collection time but may have been restarted
-        # by config reload or restart_service during the backoff delay.
+        # by a reload, an update or restart_service during the backoff delay.
         # Never double-start.
         if handler.process and handler.process.poll() is None:
             return
@@ -391,7 +393,7 @@ def restart_service(service_name, key_type=None):
     logger = get_logger()
 
     restarted_any = False
-    # Never interleaved with a config reload / auto-update restarting it.
+    # Never interleaved with a reload / auto-update restarting it.
     with lifecycle_lock:
         with _registry_lock:
             for entry in _process_registry:
@@ -450,6 +452,7 @@ class ProcessHandler:
         self.stderr = ""
         self.returncode = None
         # Restart support
+        self.env_overrides = {}   # per-process env on top of child_env (None = remove)
         self.no_dependencies = False   # see _check_dependencies_alive
         self.restart_policy = None
         self._restart_count = 0
@@ -502,7 +505,7 @@ class ProcessHandler:
                 stderr=_stream,
                 start_new_session=True,
                 cwd=config_dir,
-                env=child_env(),
+                env=self._child_env(),
                 universal_newlines=True,
                 bufsize=1
             )
@@ -578,7 +581,7 @@ class ProcessHandler:
                 stderr=_stream,
                 start_new_session=True,
                 cwd=self._config_dir,
-                env=child_env(),
+                env=self._child_env(),
                 universal_newlines=True,
                 bufsize=1
             )
@@ -599,6 +602,15 @@ class ProcessHandler:
             if self.subprocess_logger:
                 self.subprocess_logger.stop_logging_stdout()
                 self.subprocess_logger.stop_monitoring_stderr()
+
+    def _child_env(self):
+        env = child_env()
+        for k, v in self.env_overrides.items():
+            if v is None:
+                env.pop(k, None)
+            else:
+                env[k] = v
+        return env
 
     def stop_process(self, process_name, key_type=None):
         # Disable auto-restart for intentional stops (e.g., during updates)

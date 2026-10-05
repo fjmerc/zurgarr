@@ -15,7 +15,7 @@ import os
 import threading
 from dotenv import dotenv_values
 from utils import boot_layout as _boot
-from utils.boot_layout import zurg_layout as _zurg_layout, BOOT_LAYOUT as _BOOT_LAYOUT
+from utils.boot_layout import zurg_layout as _zurg_layout
 from utils.logger import get_logger
 
 logger = get_logger()
@@ -114,19 +114,9 @@ def _reload_env():
 # Stateless — compares the live settings with those in effect at startup —
 # so it is right however the change got in and clears when reverted.
 STARTUP_KEYS = _boot.STARTUP_KEYS
-_TORBOX_MOUNT_KEYS = frozenset({'TORBOX_MOUNT_NAME', 'TORBOX_WEBDAV_USER', 'TORBOX_WEBDAV_PASS'})
-
-# Reloads wait until Zurg/rclone have read their configuration at startup
-# (utils/boot_layout.SETUP_CAPTURED — set by rclone.setup, or main.py), so a
-# save during startup can't change what's being set up.  Not until rclone's
-# mounts are up: that can take minutes (a down WebDAV), and the dashboard
-# login etc. must stay editable meanwhile.
-_startup_done = _boot.SETUP_CAPTURED
-
-
-def mark_startup_complete():
-    _startup_done.set()
-
+_TORBOX_MOUNT_KEYS = frozenset({'TORBOX_MOUNT_NAME', 'TORBOX_WEBDAV_USER', 'TORBOX_WEBDAV_PASS',
+                                'TORBOX_RCLONE_TPSLIMIT', 'TORBOX_RCLONE_TPSLIMIT_BURST',
+                                'TORBOX_RCLONE_DIR_CACHE_TIME'})
 
 def _zurg_auto():
     from utils import config_resolve
@@ -134,24 +124,62 @@ def _zurg_auto():
     return r is not None and r.source == 'auto'
 
 
+_FUSE_ONLY_KEYS = frozenset({'RCLONE_POLL_INTERVAL', 'TORBOX_RCLONE_TPSLIMIT',
+                             'TORBOX_RCLONE_TPSLIMIT_BURST'})
+# Every setting restart_pending can name (the save banner checks these).
+REPORTED_KEYS = _boot.SNAPSHOT_KEYS | {'TORBOX_API_KEY'}
+
+
 def restart_pending(get=None, auto=None):
-    """Sorted names of settings that differ from the ones Zurg/rclone were
-    started with — only those that would change something after a restart.
-    *get*: settings lookup (default live); *auto*: ZURG_ENABLED is automatic
-    (then it isn't named next to the key that flipped it)."""
+    """Sorted names of settings that differ from the ones in effect at
+    container start and only take effect after a restart — only those that
+    would change something.  *get*: settings lookup (default live); *auto*:
+    ZURG_ENABLED is automatic (then it isn't named next to the key that
+    flipped it)."""
     get = get or _boot.live_getter()
-    boot, live = _BOOT_LAYOUT, _zurg_layout(get)
-    if not (boot.zurg or live.zurg):
-        return []   # Zurg off then and now: none of this runs
-    keys = {k for k in STARTUP_KEYS if _boot.startup_value(k, get) != _boot.BOOT_VALUES.get(k, '')}
-    if not (boot.nfs or live.nfs):
-        keys.discard('NFS_PORT')
-    if not (boot.torbox or live.torbox):
-        keys -= _TORBOX_MOUNT_KEYS          # no TorBox mount then or now
-    if boot.torbox != live.torbox and not keys & {'TORBOX_WEBDAV_USER', 'TORBOX_WEBDAV_PASS'}:
-        keys.add('TORBOX_API_KEY')          # the key alone switched the TorBox mount
-    if 'ZURG_ENABLED' in keys and len(keys) > 1 and (_zurg_auto() if auto is None else auto):
-        keys.discard('ZURG_ENABLED')        # name what the user changed
+    boot, live = _boot.BOOT_LAYOUT, _zurg_layout(get)
+    start = _boot.BOOT_VALUES
+
+    def now(k):
+        return _boot.startup_value(k, get)
+
+    def changed(k):
+        return now(k) != start.get(k, '')
+
+    keys = set()
+    if boot.zurg or live.zurg:   # Zurg off then and now: none of this runs
+        keys = {k for k in STARTUP_KEYS if changed(k)}
+        if not (boot.nfs or live.nfs):
+            keys.discard('NFS_PORT')
+        if boot.nfs and live.nfs:
+            keys -= _FUSE_ONLY_KEYS         # `rclone serve nfs` takes none of them
+        if not (boot.torbox or live.torbox):
+            keys -= _TORBOX_MOUNT_KEYS      # no TorBox mount then or now
+        if (boot.zurg and live.zurg and boot.torbox != live.torbox
+                and not keys & {'TORBOX_WEBDAV_USER', 'TORBOX_WEBDAV_PASS'}):
+            keys.add('TORBOX_API_KEY')      # the key alone switched the TorBox mount
+        if 'ZURG_ENABLED' in keys and len(keys) > 1 and (_zurg_auto() if auto is None else auto):
+            keys.discard('ZURG_ENABLED')    # name what the user changed
+    if boot.zurg:
+        # Zurg's Plex-refresh hook is written into its config at start
+        if changed('PLEX_REFRESH'):
+            keys.add('PLEX_REFRESH')
+        if start.get('PLEX_REFRESH') and changed('PLEX_MOUNT_DIR'):
+            keys.add('PLEX_MOUNT_DIR')
+        # duplicate cleanup / Zurg updates: switching off applies at once,
+        # switching on (or re-scheduling) needs the start-up registration
+        if not start.get('DUPLICATE_CLEANUP') and now('DUPLICATE_CLEANUP'):
+            keys.add('DUPLICATE_CLEANUP')
+        if start.get('DUPLICATE_CLEANUP') and changed('CLEANUP_INTERVAL'):
+            keys.add('CLEANUP_INTERVAL')
+        if not start.get('ZURG_UPDATE') and now('ZURG_UPDATE'):
+            keys.add('ZURG_UPDATE')
+    pd_at_start = bool(start.get('PD_ENABLED'))
+    if pd_at_start and not start.get('PD_UPDATE') and now('PD_UPDATE'):
+        keys.add('PD_UPDATE')
+    if (((boot.zurg and start.get('ZURG_UPDATE')) or (pd_at_start and start.get('PD_UPDATE')))
+            and changed('AUTO_UPDATE_INTERVAL')):
+        keys.add('AUTO_UPDATE_INTERVAL')
     return sorted(keys)
 
 
@@ -177,13 +205,13 @@ def _drop_not_running(services):
 def restart_note(keys):
     """User-facing text for settings that need a container restart."""
     return (f"{', '.join(sorted(keys))} changed — restart the container to apply it "
-            "(Zurg and its mounts are set up only when the container starts).")
+            "(set up only when the container starts).")
 
 
 def _zurg_restart_note(changed):
     """The note to log when this reload changed settings that need a
     container restart, or None."""
-    if not set(changed) & (STARTUP_KEYS | {'TORBOX_API_KEY'}):
+    if not set(changed) & REPORTED_KEYS:
         return None
     pending = restart_pending()
     return restart_note(pending) if pending else None
@@ -200,7 +228,6 @@ _reload_pending = threading.Event()
 
 def _do_reload():
     """Perform the actual reload work. Runs in a separate thread."""
-    _startup_done.wait()   # never while main.py is still setting things up
     if not _reload_lock.acquire(blocking=False):
         # The in-flight reload has likely already snapshotted os.environ,
         # so env changes behind this trigger would be lost if we just
@@ -266,9 +293,66 @@ def _restart_plex_debrid(changed):
             h = e['handler']
             if h.process and h.process.poll() is None:
                 logger.warning("[reload] plex_debrid is still running after stop — not starting a second one")
+                from utils.processes import RestartPolicy
+                h.restart_policy = RestartPolicy()   # the monitor restarts it once it exits
                 continue
             logger.info("[reload] Starting plex_debrid")
             h.restart_process()
+
+
+_DEFERRED_SERVICES = ('plex_debrid', 'blackhole')
+_deferred = {'services': set(), 'changed': set(), 'thread': None}
+_deferred_lock = threading.Lock()
+
+
+def _apply_service_restarts(services, changed):
+    services = _drop_not_running(services)
+    if services:
+        logger.info(f"[reload] Restarting: {', '.join(service_labels(services))}")
+    if 'plex_debrid' in services:
+        _restart_plex_debrid(changed)
+    if 'blackhole' in services:
+        try:
+            from utils import blackhole
+            blackhole.stop()
+            blackhole.setup()
+            logger.info("[reload] Blackhole watcher restarted")
+        except Exception as e:
+            logger.error(f"[reload] Failed to restart blackhole: {e}")
+    return services
+
+
+def _run_deferred():
+    # (not under _reload_lock: a reload arriving meanwhile would only queue a
+    # follow-up nobody runs; the restarts themselves are serialised by
+    # processes.lifecycle_lock and blackhole's own lock)
+    _boot.STARTUP_COMPLETE.wait()
+    with _deferred_lock:
+        services, changed = _deferred['services'], _deferred['changed']
+        _deferred.update(services=set(), changed=set(), thread=None)
+    if services:
+        logger.info("[reload] Startup finished — applying deferred service restarts")
+        _apply_service_restarts(services, changed)
+
+
+def _restart_services(services, changed):
+    """Restart plex_debrid / blackhole now, or — while main.py is still
+    starting up — once it has finished (one pass for all saves meanwhile).
+    Returns what was restarted now."""
+    todo = set(services) & set(_DEFERRED_SERVICES)
+    if not todo:
+        return set()
+    if _boot.STARTUP_COMPLETE.is_set():
+        return _apply_service_restarts(todo, changed)
+    with _deferred_lock:
+        _deferred['services'] |= todo
+        _deferred['changed'] |= set(changed)
+        if _deferred['thread'] is None:
+            t = threading.Thread(target=_run_deferred, daemon=True, name='reload-deferred')
+            _deferred['thread'] = t
+            t.start()
+    logger.info(f"[reload] Startup still running — will restart {', '.join(sorted(todo))} once it has finished")
+    return set()
 
 
 def _reload_once():
@@ -312,13 +396,9 @@ def _reload_once():
             _notify_reload(changed, set())
             return
 
-        services = _drop_not_running(_services_to_restart(changed))
-        logger.info(f"[reload] Services to restart: {', '.join(service_labels(services)) or 'none'}")
+        services = _services_to_restart(changed)
 
-        if 'plex_debrid' in services:
-            _restart_plex_debrid(changed)
-
-        # Handle non-process services
+        # Settings that only need re-reading apply now …
         if 'notifications' in services:
             try:
                 from utils.notifications import init
@@ -326,15 +406,6 @@ def _reload_once():
                 logger.info("[reload] Notifications reinitialized")
             except Exception as e:
                 logger.error(f"[reload] Failed to reinitialize notifications: {e}")
-
-        if 'blackhole' in services:
-            try:
-                from utils import blackhole
-                blackhole.stop()
-                blackhole.setup()
-                logger.info("[reload] Blackhole watcher restarted")
-            except Exception as e:
-                logger.error(f"[reload] Failed to restart blackhole: {e}")
 
         if 'status_ui' in services:
             try:
@@ -347,6 +418,11 @@ def _reload_once():
                 logger.info("[reload] Status UI auth credentials and trusted origins updated")
             except Exception as e:
                 logger.error(f"[reload] Failed to update Status UI auth/trusted origins: {e}")
+
+        # … services main.py is still setting up are restarted once startup
+        # has finished (else: a second blackhole watcher, a plex_debrid
+        # change lost under its own setup) — without blocking this reload.
+        services = (services - set(_DEFERRED_SERVICES)) | _restart_services(services, changed)
 
         _refresh_setup_check()
         logger.info("[reload] Config reload complete")

@@ -46,6 +46,8 @@ except ImportError:
 from utils.api_metrics import tracked_request
 
 _watcher = None
+_watcher_thread = None
+_watcher_lock = threading.Lock()
 
 # Liveness ceiling for the healthcheck.  The loop also beats before each
 # watch-file it processes, so the gap is bounded by ONE file's debrid
@@ -5352,8 +5354,16 @@ class BlackholeWatcher:
 
 
 def setup():
-    """Initialize and start the blackhole watcher if enabled."""
-    global _watcher
+    """Initialize and start the blackhole watcher if enabled.  Stops a
+    running one first (a reload and main's startup can both call this):
+    two watchers would poll the same folder and double-add torrents."""
+    with _watcher_lock:
+        _stop_locked()
+        return _setup_locked()
+
+
+def _setup_locked():
+    global _watcher, _watcher_thread
     from base import config
     RDAPIKEY = config.RDAPIKEY
     ADAPIKEY = config.ADAPIKEY
@@ -5509,12 +5519,23 @@ def setup():
         local_library_movies=local_library_movies,
         debrid_api_keys=debrid_api_keys,
     )
-    thread = threading.Thread(target=_watcher.run, daemon=True)
-    thread.start()
+    _watcher_thread = threading.Thread(target=_watcher.run, daemon=True)
+    _watcher_thread.start()
     return _watcher
+
+
+def _stop_locked():
+    global _watcher, _watcher_thread
+    if _watcher:
+        _watcher.stop()
+        if _watcher_thread is not None:
+            _watcher_thread.join(timeout=30)   # let its current pass finish
+            if _watcher_thread.is_alive():
+                logger.warning("[blackhole] Watcher still finishing a pass after 30s")
+    _watcher = _watcher_thread = None
 
 
 def stop():
     """Stop the blackhole watcher if running."""
-    if _watcher:
-        _watcher.stop()
+    with _watcher_lock:
+        _stop_locked()

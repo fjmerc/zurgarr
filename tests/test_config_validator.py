@@ -114,18 +114,20 @@ class TestConfigValidation:
         assert 'TORBOX_WEBDAV_PASS' in torbox_warns[0]
         assert 'TORBOX_WEBDAV_USER' not in torbox_warns[0]
 
-    def test_torbox_mount_name_collision_errors(self, clean_env, env_vars):
-        """TORBOX_MOUNT_NAME identical to RCLONE_MOUNT_NAME is a hard error —
-        overlapping /data/<name>/ would corrupt RD's view."""
+    def test_torbox_mount_name_collision_warns(self, clean_env, env_vars):
+        """TORBOX_MOUNT_NAME naming a Zurg mount: rclone skips the TorBox
+        mount (it never shares /data/<name>/ with RD), so the container
+        starts and the user is told — no crash loop over it."""
         env_vars(
+            RD_API_KEY='rd-key',
             TORBOX_API_KEY='tb-trial-key',
             RCLONE_MOUNT_NAME='zurgarr',
             TORBOX_MOUNT_NAME='zurgarr',
         )
         result = _validate_with_reload()
-        collision = [e for e in result.errors if 'TORBOX_MOUNT_NAME' in e]
-        assert len(collision) == 1
-        assert 'collides' in collision[0].lower()
+        assert not [e for e in result.errors if 'TORBOX_MOUNT_NAME' in e]
+        collision = [w for w in result.warnings if 'TORBOX_MOUNT_NAME' in w]
+        assert len(collision) == 1 and 'skipped' in collision[0]
 
     def test_no_torbox_no_warning(self, clean_env, env_vars):
         """Single-debrid users (no TORBOX_API_KEY) see zero TorBox messages."""

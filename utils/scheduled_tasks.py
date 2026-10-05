@@ -1512,8 +1512,8 @@ def _rclone_mount_expected():
     at container start — a runtime ZURG_ENABLED change doesn't start or stop
     mounts (see utils/boot_layout)."""
     from utils import boot_layout
-    from utils.config_reload import _BOOT_LAYOUT
-    return bool(_BOOT_LAYOUT.zurg and _BOOT_LAYOUT.instances and boot_layout.BOOT_RCLONE_MOUNT_NAME)
+    started = boot_layout.BOOT_LAYOUT
+    return bool(started.zurg and started.instances and boot_layout.BOOT_RCLONE_MOUNT_NAME)
 
 
 def register_all():

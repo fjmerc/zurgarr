@@ -23,7 +23,7 @@ def _zurg_mount_running(monkeypatch):
     Zurg mount — tests/test_boot_layout.py.)"""
     import utils.config_reload as cr
     from utils import boot_layout
-    monkeypatch.setattr(cr, '_BOOT_LAYOUT', Layout(True, frozenset({'RD'}), 'zurgarr', False, '', '', False))
+    monkeypatch.setattr('utils.boot_layout.BOOT_LAYOUT', Layout(True, frozenset({'RD'}), 'zurgarr', False, '', '', False))
     monkeypatch.setattr(boot_layout, 'BOOT_RCLONE_MOUNT_NAME', 'zurgarr')
     monkeypatch.setenv('ZURG_ENABLED', 'true')
     monkeypatch.setenv('RD_API_KEY', 'test-rd-key')

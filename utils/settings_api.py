@@ -37,9 +37,9 @@ ENV_SCHEMA = [
             ('ZURG_ENABLED', 'Enable Zurg', 'boolean', True, 'Enable the Zurg WebDAV server.'+_RESTART_HELP),
             ('RD_API_KEY', 'Real-Debrid API Key', 'secret', False, 'API key from real-debrid.com/apitoken. Search, blackhole and plex_debrid use a new key right away; Zurg picks it up when the container starts — restart it after changing this.'),
             ('AD_API_KEY', 'AllDebrid API Key', 'secret', False, 'API key from alldebrid.com. Search, blackhole and plex_debrid use a new key right away; Zurg picks it up when the container starts — restart it after changing this.'),
-            ('TORBOX_API_KEY', 'TorBox API Key', 'secret', False, 'API key from torbox.app. Powers cache probes, search-add, and the dual-debrid blackhole routing. For the WebDAV mount, also set TORBOX_WEBDAV_USER + TORBOX_WEBDAV_PASS (see the TorBox section).'),
+            ('TORBOX_API_KEY', 'TorBox API Key', 'secret', False, 'API key from torbox.app. Powers cache probes, search-add, and the dual-debrid blackhole routing. For the WebDAV mount, also set TORBOX_WEBDAV_USER + TORBOX_WEBDAV_PASS (see the TorBox section). Adding or removing it (with the WebDAV login set) starts or stops the TorBox mount when the container starts.'),
             ('ZURG_VERSION', 'Zurg Version', 'string', False, 'Pin to specific version (e.g., v0.9.2-hotfix.4)'),
-            ('ZURG_UPDATE', 'Auto-Update Zurg', 'boolean', False, 'Check for Zurg updates on startup'),
+            ('ZURG_UPDATE', 'Auto-Update Zurg', 'boolean', False, 'Check for Zurg updates on startup and every Auto-Update Interval. Switching it off applies right away; switching it on takes effect when the container starts.'),
             ('ZURG_LOG_LEVEL', 'Zurg Log Level', 'select:DEBUG,INFO,WARNING,ERROR', False, 'Log level for Zurg process'),
             ('ZURG_PORT', 'Zurg Port', 'number:1-65535', False, 'WebDAV server port (auto-assigned if empty). With both Real-Debrid and AllDebrid, AllDebrid uses this port + 1.'),
             ('ZURG_USER', 'Zurg Username', 'string', False, 'Basic auth username for WebDAV'),
@@ -215,7 +215,7 @@ ENV_SCHEMA = [
             ('SEERR_WRITEBACK_ENABLED', 'Seerr Request Writeback', 'boolean', False,
              'Close the request loop: when the library scanner delivers requested content, mark the matching Overseerr/Jellyseerr request available (movies always; shows once complete); when Wanted recovery terminally gives up on a movie, decline its request so the requester sees "not coming" instead of eternal processing. OFF by default because it changes user-visible request state in Seerr. Requires the address + API key above (default: OFF).'),
             ('PD_LOG_LEVEL', 'Log Level', 'select:DEBUG,INFO,WARNING,ERROR,CRITICAL', False, 'plex_debrid log level'),
-            ('PD_UPDATE', 'Auto-Update plex_debrid', 'boolean', False, 'Check for updates on startup'),
+            ('PD_UPDATE', 'Auto-Update plex_debrid', 'boolean', False, 'Check for plex_debrid updates on startup and every Auto-Update Interval. Switching it off applies right away; switching it on takes effect when the container starts.'),
             ('PD_REPO', 'plex_debrid Repository', 'string', False, 'GitHub repo (owner/repo format)'),
             ('TRAKT_CLIENT_ID', 'Trakt Client ID', 'string', False, 'Trakt API application client ID'),
             ('TRAKT_CLIENT_SECRET', 'Trakt Client Secret', 'secret', False, 'Trakt API application client secret'),
@@ -235,10 +235,10 @@ ENV_SCHEMA = [
         'name': 'Plex Library',
         'description': 'Plex library maintenance features',
         'fields': [
-            ('PLEX_REFRESH', 'Auto Refresh Library', 'boolean', False, 'Automatically refresh Plex libraries after mount changes'),
-            ('PLEX_MOUNT_DIR', 'Plex Mount Directory', 'string', False, 'Path where Plex sees the rclone mount'),
-            ('DUPLICATE_CLEANUP', 'Duplicate Cleanup', 'boolean', False, 'Automatically remove duplicate media entries'),
-            ('CLEANUP_INTERVAL', 'Cleanup Interval (hours)', 'number:1-168', False, 'How often to run duplicate cleanup'),
+            ('PLEX_REFRESH', 'Auto Refresh Library', 'boolean', False, 'Automatically refresh Plex libraries after mount changes. The library scanner follows a change right away; Zurg\'s own refresh hook (Real-Debrid/AllDebrid content) when the container starts.'),
+            ('PLEX_MOUNT_DIR', 'Plex Mount Directory', 'string', False, 'Path where Plex sees the rclone mount (used by Zurg\'s refresh hook — takes effect when the container starts).'),
+            ('DUPLICATE_CLEANUP', 'Duplicate Cleanup', 'boolean', False, 'Automatically remove duplicate media entries. Switching it off applies right away; switching it on takes effect when the container starts.'),
+            ('CLEANUP_INTERVAL', 'Cleanup Interval (hours)', 'number:1-168', False, 'How often to run duplicate cleanup. Takes effect when the container starts.'),
             ('DUPLICATE_CLEANUP_KEEP', 'Keep Copy From', 'select:local,zurg', False, 'Which copy to keep: "local" (default, logs Zurg dupes) or "zurg" (deletes local copies)'),
             ('TAUTULLI_URL', 'Tautulli URL', 'url', False, 'Tautulli base URL (e.g. http://tautulli:8181). Enables watch-history correlation: the wanted-recovery pass reads play history to deprioritize never-played titles (see Recovery & Reconciliation). Read-only — zurgarr never writes to Tautulli.'),
             ('TAUTULLI_API_KEY', 'Tautulli API Key', 'secret', False, 'Tautulli API key (Settings → Web Interface → API). Sent as a query parameter (Tautulli has no header auth); zurgarr strips query strings from logged URLs so the key never reaches logs.'),
@@ -269,7 +269,7 @@ ENV_SCHEMA = [
             ('FFPROBE_MONITOR_ENABLED', 'Enable ffprobe Monitor', 'boolean', False, 'Monitor for stuck ffprobe processes'),
             ('FFPROBE_STUCK_TIMEOUT', 'Stuck Timeout (seconds)', 'number:10-600', False, 'Seconds before an ffprobe process is considered stuck'),
             ('FFPROBE_POLL_INTERVAL', 'Poll Interval (seconds)', 'number:5-300', False, 'How often to check for stuck processes'),
-            ('AUTO_UPDATE_INTERVAL', 'Auto-Update Interval (hours)', 'number:1-168', False, 'How often to check for Zurg/plex_debrid updates'),
+            ('AUTO_UPDATE_INTERVAL', 'Auto-Update Interval (hours)', 'number:1-168', False, 'How often to check for Zurg/plex_debrid updates. Takes effect when the container starts.'),
         ],
     },
     {
@@ -369,9 +369,10 @@ def _dry_resolve(explicit):
 
 
 def _fixed_port_problems(values):
-    """Errors for fixed ports that can't all bind: Zurg's (AllDebrid takes
-    ZURG_PORT + 1 next to Real-Debrid), NFS (one port per mount from
-    NFS_PORT) and the dashboard's — out of range or shared."""
+    """(errors, warnings) for fixed ports that can't all bind: Zurg's
+    (AllDebrid takes ZURG_PORT + 1 next to Real-Debrid), NFS (one port per
+    mount from NFS_PORT) and the dashboard's — out of range or shared.
+    Warnings when every port involved is set in compose / a Docker secret."""
     def on(key):
         return str(values.get(key, '')).strip().lower() == 'true'
 
@@ -381,6 +382,11 @@ def _fixed_port_problems(values):
         except ValueError:
             return None
     rd, ad = bool(values.get('RD_API_KEY')), bool(values.get('AD_API_KEY'))
+    try:   # ports the Settings page can't change (compose / Docker secret)
+        from utils import config_resolve
+        fixed = {k for k, r in config_resolve.current().items() if r.source in ('locked', 'secret')}
+    except Exception:
+        fixed = set()
     used = []   # (port, label)
     zp = num('ZURG_PORT')
     if on('ZURG_ENABLED') and zp is not None:
@@ -396,15 +402,21 @@ def _fixed_port_problems(values):
     sp = num('STATUS_UI_PORT')
     if sp is not None:
         used.append((sp, 'STATUS_UI_PORT'))
-    errors, seen = [], {}
+    errors, warnings, seen = [], [], {}
+
+    def report(keys, msg):
+        # all from compose/secrets: the page can't fix it — don't block saves
+        (warnings if set(keys) <= fixed else errors).append(msg)
     for port, label in used:
+        key = label.split(' ')[0]
         if not 1 <= port <= 65535:
-            errors.append(f"{label.split(' ')[0]}: {label} would be port {port}, outside 1-65535.")
+            report({key}, f"{key}: {label} would be port {port}, outside 1-65535.")
         elif port in seen:
-            errors.append(f"{label.split(' ')[0]}: {label} and {seen[port]} would both use port {port}.")
+            report({key, seen[port].split(' ')[0]},
+                   f"{key}: {label} and {seen[port]} would both use port {port}.")
         else:
             seen[port] = label
-    return errors
+    return errors, warnings
 
 
 def get_env_schema():
@@ -756,9 +768,9 @@ def write_env_values(values):
         changed = set()
         try:
             from utils.config_reload import (
-                SOFT_RELOAD, STARTUP_KEYS, _drop_not_running, service_labels,
+                SOFT_RELOAD, REPORTED_KEYS, _drop_not_running, service_labels,
                 _services_to_restart, restart_note, restart_pending)
-            from utils.env import secret_or_env
+            from utils.boot_layout import live_getter as _boot_live_getter
             # Preview with a dry run of the same resolver the SIGHUP reload
             # uses, so the banner names only services that will really restart.
             from utils import config_resolve
@@ -772,16 +784,18 @@ def write_env_values(values):
 
             changed = {k for k in set(current) | set(dry) if _eff(current, k) != _eff(dry, k)}
 
+            live = _boot_live_getter()
+
             def _new(key):
                 r = dry.get(key)
                 if r is None:
                     return os.environ.get(key)
-                return secret_or_env(key) if r.source == 'secret' else _eff(dry, key)
+                return live(key) if r.source == 'secret' else _eff(dry, key)
             if changed and not changed <= SOFT_RELOAD:   # mirrors the reload
                 restarted = service_labels(_drop_not_running(_services_to_restart(changed)))
             zr = dry.get('ZURG_ENABLED')
             pending = restart_pending(_new, zr is not None and zr.source == 'auto')
-            if pending and changed & (STARTUP_KEYS | {'TORBOX_API_KEY'}):
+            if pending and changed & REPORTED_KEYS:
                 validation['warnings'].append(restart_note(pending))
 
         except Exception as e:
@@ -940,7 +954,18 @@ def validate_env_values(values):
             except ValueError:
                 errors.append(f"{var}='{val}' is not a valid integer")
 
-    errors.extend(_fixed_port_problems(values))
+    port_errors, port_warnings = _fixed_port_problems(values)
+    errors.extend(port_errors)
+    warnings.extend(port_warnings)
+
+    # The TorBox mount can't share a name with one of Zurg's mounts (rclone
+    # would skip it — same naming rule as rclone/rclone.py).
+    from utils.boot_layout import zurg_mount_names
+    tb_name = str(values.get('TORBOX_MOUNT_NAME') or '').strip() or 'torbox'
+    if values.get('TORBOX_API_KEY') and tb_name in zurg_mount_names(
+            str(values.get('RCLONE_MOUNT_NAME') or '').strip(),
+            bool(values.get('RD_API_KEY')), bool(values.get('AD_API_KEY'))):
+        errors.append(f"TORBOX_MOUNT_NAME '{tb_name}' is the name of a Zurg mount — pick another (default 'torbox').")
 
     # Quality compromise ratio — float in [0, 1].  Declared as 'string'
     # in the schema because the number:MIN-MAX renderer coerces to int,
@@ -1483,7 +1508,7 @@ def _sync_plex_debrid_to_env(values):
     """Sync plex_debrid settings back to .env so pd_setup() stays consistent.
 
     Only updates keys that actually changed.  Does NOT trigger SIGHUP
-    (except during startup) because the caller already handles the
+    because the caller already handles the
     plex_debrid restart; Zurg/rclone keys changed here (e.g. a debrid key)
     show up on the Setup check as needing a container restart.
     """
@@ -1566,26 +1591,20 @@ def _sync_plex_debrid_to_env(values):
             logger.error(f'[settings] Failed to sync plex_debrid settings to .env: {e}')
             return
 
-        from utils import config_reload
-        if not config_reload._startup_done.is_set():
-            # Still starting up: don't change settings under Zurg/rclone
-            # being set up — the reload applies the file once startup is done.
-            os.kill(os.getpid(), signal.SIGHUP)
-        else:
-            # Re-resolve so in-process reads are consistent.  Writing os.environ
-            # directly would make these look compose-locked to the resolver.
-            from base import SECRETS_DIR, config
-            config_resolve.resolve_and_apply(
-                dotenv_values(ENV_FILE), config_resolve.present_secrets(SECRETS_DIR))
-            try:
-                config.load(read_env_file=False)   # module globals follow too
-            except Exception as e:
-                logger.warning(f'[settings] Could not refresh config after sync: {e}')
-            try:
-                from utils import setup_check
-                setup_check._invalidate()   # e.g. a Zurg key changed: restart needed
-            except Exception:
-                pass
+        # Re-resolve so in-process reads are consistent.  Writing os.environ
+        # directly would make these look compose-locked to the resolver.
+        from base import SECRETS_DIR, config
+        config_resolve.resolve_and_apply(
+            dotenv_values(ENV_FILE), config_resolve.present_secrets(SECRETS_DIR))
+        try:
+            config.load(read_env_file=False)   # the config singleton follows too
+        except Exception as e:
+            logger.warning(f'[settings] Could not refresh config after sync: {e}')
+        try:
+            from utils import setup_check
+            setup_check._invalidate()   # e.g. a Zurg key changed: restart needed
+        except Exception:
+            pass
 
     logger.info(
         f'[settings] Synced {len(changed)} plex_debrid setting(s) back to .env: '

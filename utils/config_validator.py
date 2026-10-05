@@ -95,12 +95,16 @@ def validate_config():
             "work).  Generate a WebDAV-only password in the TorBox dashboard "
             "(Settings → Integrations → WebDAV) to enable the mount."
         )
+    from utils.boot_layout import zurg_mount_names
     torbox_mount_name = env_or_default('TORBOX_MOUNT_NAME', 'torbox')
-    rclone_mount_name = os.environ.get('RCLONE_MOUNT_NAME', '')
-    if torbox_key and torbox_mount_name == rclone_mount_name:
-        result.error(
-            f"TORBOX_MOUNT_NAME='{torbox_mount_name}' collides with "
-            f"RCLONE_MOUNT_NAME.  Pick a unique name (default is 'torbox')."
+    rclone_mount_name = (os.environ.get('RCLONE_MOUNT_NAME') or '').strip()
+    if torbox_key and torbox_mount_name in zurg_mount_names(
+            rclone_mount_name, bool(secret_or_env('RD_API_KEY')), bool(secret_or_env('AD_API_KEY'))):
+        # rclone skips the TorBox mount then — say so rather than refusing
+        # to start (the rest works without it)
+        result.warn(
+            f"TORBOX_MOUNT_NAME='{torbox_mount_name}' is the name of a Zurg mount, so the "
+            f"TorBox mount is skipped.  Pick a unique name (default is 'torbox')."
         )
 
     # --- URL Format Validation ---

@@ -1260,9 +1260,11 @@ def _discover_zurg_url(mount_path):
 
 
 def _get_zurg_auth():
-    """Get Zurg WebDAV auth credentials if configured."""
-    user = secret_or_env('ZURG_USER').strip()
-    password = secret_or_env('ZURG_PASS').strip()
+    """Zurg WebDAV login — the one Zurg is running with (set at container
+    start; a change in Settings applies at the next restart)."""
+    from utils import boot_layout
+    user = boot_layout.setting_at_start('ZURG_USER')
+    password = boot_layout.setting_at_start('ZURG_PASS')
     return (user, password) if user and password else None
 
 
@@ -3131,7 +3133,8 @@ class LibraryScanner:
         bind-only dir.  Returning None there avoids logging confusing
         "no items on TB mount" messages.
         """
-        if not secret_or_env('TORBOX_API_KEY'):
+        from utils import boot_layout
+        if not boot_layout.torbox_mount_started():   # the mount that's running
             return None
         try:
             from utils.debrid_routing import mount_for_debrid, TORBOX
@@ -7943,7 +7946,8 @@ class LibraryScanner:
                 )
                 return
             recorded_version = raw.get('zurg_version')
-            current_version = os.environ.get('ZURG_VERSION') or None
+            from utils import boot_layout   # the running Zurg's (applies at container start)
+            current_version = boot_layout.setting_at_start('ZURG_VERSION') or None
             if recorded_version != current_version:
                 logger.info(
                     f"[library] ZURG_VERSION changed ({recorded_version!r} -> "
@@ -7972,11 +7976,12 @@ class LibraryScanner:
         """
         try:
             from utils.file_utils import atomic_write
+            from utils import boot_layout   # the running Zurg's version
             import json as _json
             payload = {
                 'webdav_unsupported': True,
                 'ts': time.time(),
-                'zurg_version': os.environ.get('ZURG_VERSION') or None,
+                'zurg_version': boot_layout.setting_at_start('ZURG_VERSION') or None,
             }
             with atomic_write(self._capabilities_path) as fh:
                 _json.dump(payload, fh)

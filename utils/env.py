@@ -74,11 +74,13 @@ def completed_dir_from_env():
 
 
 def secret_or_env(key):
-    """Credential lookup: Docker secret ``/run/secrets/<key lowercased>``
-    first (same naming as ``base.load_secret_or_env``), then the env var.
+    """Credential lookup: Docker secret first (file names as the settings
+    resolver has them — ``config_resolve.SECRET_FILES``, e.g. lower-case
+    ``rd_api_key`` but upper-case ``GITHUB_TOKEN``), then the env var.
     Returns a stripped string, ``''`` when neither is set."""
+    from utils.config_resolve import SECRET_FILES
     try:
-        with open(os.path.join(SECRETS_DIR, key.lower())) as f:
+        with open(os.path.join(SECRETS_DIR, SECRET_FILES.get(key, key.lower()))) as f:
             value = f.read().strip()
         if value:
             return value

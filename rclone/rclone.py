@@ -413,10 +413,11 @@ def nfs_port_for(nfs_port, idx):
 
 
 def setup():
-    refresh_globals(globals())
-    # Settings read: config reloads may run from here on (they never touch
-    # rclone; later per-mount reads use the startup values).
-    boot_layout.mark_setup_captured()
+    # Runs once, at container start: uses the settings this module imported
+    # then (no refresh_globals) and the startup snapshot for the rest — a
+    # settings save during setup (rclone can wait minutes for a WebDAV)
+    # can't change what's being set up; rclone settings apply at the next
+    # container start.
     _rc_urls.clear()
     _pending_mounts.clear()
     _pending_last_retry.clear()

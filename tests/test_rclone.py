@@ -775,3 +775,18 @@ class TestPortsAndNames:
                                        '/zurg/RD/config.yml', '/zurg/AD/config.yml')
         tb.assert_not_called()
         assert out == ('9999', None, False)
+
+
+def test_setup_never_rereads_settings(rclone_env, monkeypatch):
+    # setup runs once, at container start, on the settings imported then: a
+    # settings save during setup (rclone can wait minutes for a WebDAV, and
+    # reloads aren't held back) must not change what's being set up
+    import inspect
+    import rclone.rclone as mod
+    assert 'refresh_globals(' not in inspect.getsource(mod.setup)
+
+
+def test_zurg_setup_never_rereads_settings():
+    import inspect
+    from zurg import setup as zs
+    assert 'refresh_globals(' not in inspect.getsource(zs.zurg_setup)

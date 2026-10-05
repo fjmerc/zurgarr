@@ -89,12 +89,12 @@ def _isolate_env_and_resolver():
 
 @pytest.fixture(autouse=True)
 def _startup_complete():
-    """Tests run as if main.py finished starting up (reloads not gated);
-    tests of the startup gate clear it themselves."""
-    from utils import config_reload
-    config_reload._startup_done.set()
+    """Tests run as if main.py finished starting up (service restarts not
+    deferred); tests of the deferral clear it themselves."""
+    from utils import boot_layout
+    boot_layout.STARTUP_COMPLETE.set()
     yield
-    config_reload._startup_done.set()
+    boot_layout.STARTUP_COMPLETE.set()
 
 
 @pytest.fixture
@@ -105,7 +105,7 @@ def snapshot_boot(monkeypatch):
         import utils.config_reload as cr
         from utils import boot_layout
         monkeypatch.setattr('utils.env.SECRETS_DIR', '/nonexistent-secrets')
-        monkeypatch.setattr(cr, '_BOOT_LAYOUT', boot_layout.zurg_layout())
+        monkeypatch.setattr('utils.boot_layout.BOOT_LAYOUT', boot_layout.zurg_layout())
         monkeypatch.setattr(boot_layout, 'BOOT_VALUES',
-                            {k: boot_layout.startup_value(k) for k in boot_layout.STARTUP_KEYS})
+                            {k: boot_layout.startup_value(k) for k in boot_layout.SNAPSHOT_KEYS})
     return _snap

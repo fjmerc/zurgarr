@@ -5,6 +5,17 @@ from utils.auto_update import Update
 from utils.file_utils import atomic_write
 from zurg.download import get_latest_release, download_and_unzip_release, get_architecture
 
+def zurg_log_level():
+    """Zurg's LOG_LEVEL: ZURG_LOG_LEVEL, else zurgarr's level — as at
+    container start (Zurg settings apply then)."""
+    from utils import boot_layout
+    if boot_layout.BOOTED:
+        level = boot_layout.setting_at_start('ZURG_LOG_LEVEL') or boot_layout.BOOT_ZURGARR_LOG_LEVEL
+    else:
+        level = (os.environ.get('ZURG_LOG_LEVEL') or os.environ.get('ZURGARR_LOG_LEVEL') or '').strip()
+    return level.upper()
+
+
 class ZurgUpdate(Update, ProcessHandler):
     def __init__(self):
         Update.__init__(self)
@@ -29,28 +40,32 @@ class ZurgUpdate(Update, ProcessHandler):
                 handler = self._instance_handlers.get(key_type)
                 if handler is None:
                     handler = self._instance_handlers[key_type] = ProcessHandler(self.logger)
+                    # its own LOG_LEVEL (not the shared os.environ one, which
+                    # zurgarr's logger rewrites), kept for every restart
+                    level = zurg_log_level()
+                    handler.env_overrides = {'LOG_LEVEL': level or None}
                 elif handler.process and handler.process.poll() is None:
                     # Still running (stop_process reaps what it kills, so this
                     # is a live process): a second Popen would clash with it.
+                    # Keep it supervised so the monitor restarts it on exit.
+                    if handler.restart_policy is None:
+                        from utils.processes import RestartPolicy
+                        handler.restart_policy = RestartPolicy()
                     continue
                 handler.start_process(process_name, dir_to_check, command, key_type, suppress_logging=suppress_logging)
 
-    _DIRS = {'RealDebrid': '/zurg/RD', 'AllDebrid': '/zurg/AD'}
-
     def _instances(self):
-        """[(dir, key_type)] to manage: the ones started at boot once any
-        has started (Zurg's instances are fixed until the container
-        restarts); before that, those with an API key set."""
-        if self._instance_handlers:
-            return [(self._DIRS[k], k) for k in ('RealDebrid', 'AllDebrid')
-                    if k in self._instance_handlers]
-        from base import config
-        out = []
-        if config.RDAPIKEY:
-            out.append(("/zurg/RD", "RealDebrid"))
-        if config.ADAPIKEY:
-            out.append(("/zurg/AD", "AllDebrid"))
-        return out
+        """[(dir, key_type)] of the Zurg instances: the ones set up at
+        container start (utils/boot_layout) — they only change with a
+        restart; before boot (tests/tools), those with an API key set."""
+        from utils import boot_layout
+        if boot_layout.BOOTED:
+            have = boot_layout.BOOT_LAYOUT.instances
+        else:
+            from base import config
+            have = {k for k, v in (('RD', config.RDAPIKEY), ('AD', config.ADAPIKEY)) if v}
+        return [(d, kt) for d, kt, k in (('/zurg/RD', 'RealDebrid', 'RD'), ('/zurg/AD', 'AllDebrid', 'AD'))
+                if k in have]
 
     def _stop_instance(self, process_name, key_type):
         handler = self._instance_handlers.get(key_type)
@@ -58,6 +73,11 @@ class ZurgUpdate(Update, ProcessHandler):
             handler.stop_process(process_name, key_type)
                 
     def update_check(self, process_name):
+        if (os.environ.get('ZURG_UPDATE') or '').strip().lower() != 'true':
+            # switched off after start: the update thread runs until a
+            # restart, but must not update (stop/start) Zurg any more
+            self.logger.info(f"Automatic {process_name} updates are off — skipping")
+            return False
         # ZURG_VERSION / GITHUB_TOKEN as at container start, on purpose: like
         # every Zurg setting they apply when the container restarts.
         self.logger.info(f"Checking for available {process_name} updates")
@@ -106,7 +126,7 @@ class ZurgUpdate(Update, ProcessHandler):
 
                 updated = False
                 failed = False
-                # Never interleave with a config reload restarting Zurg.
+                # Never interleave with restart_service / self-heal restarting Zurg.
                 with lifecycle_lock:
                     for dir_to_check, key_type in self._instances():
                         if not os.path.exists(os.path.join(dir_to_check, 'zurg')):

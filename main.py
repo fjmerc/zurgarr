@@ -134,11 +134,6 @@ def main():
             except Exception as e:
                 logger.error(f"Error in rclone/cleanup setup: {e}", exc_info=True)
 
-    # Zurg/rclone have read their settings (rclone.setup marks it itself;
-    # this covers no rclone at all): config reloads may run from here on.
-    from utils.config_reload import mark_startup_complete
-    mark_startup_complete()
-
     if str(PLEXDEBRID).lower() == 'true':
         # (a settings reload restarting plex_debrid waits until it's set up)
         from utils.processes import lifecycle_lock
@@ -180,6 +175,10 @@ def main():
         scheduler.start()
     except Exception as e:
         logger.error(f"Error starting task scheduler: {e}", exc_info=True)
+
+    # Startup finished: queued reloads may restart services now.
+    from utils import boot_layout
+    boot_layout.STARTUP_COMPLETE.set()
 
     while True:
         signal.pause()

@@ -16,6 +16,62 @@ def apply_zurg_log_level():
         os.environ.pop('LOG_LEVEL', None)
 
 
+_PLEX_HOOK = (
+    "tmpfile=$(mktemp)\n"
+    "for arg in \"$@\"\n"
+    "do\n"
+    "    echo \"$arg\" >> \"$tmpfile\"\n"
+    "done\n\n"
+    "unique_args=$(sort -u \"$tmpfile\")\n\n"
+    "if [ -n \"$unique_args\" ]; then\n"
+    "    IFS=$'\\n'\n"
+    "    for line in $unique_args; do\n"
+    "        python plex_refresh.py \"$line\"\n"
+    "    done\n"
+    "    unset IFS\n"
+    "fi\n"
+    "rm \"$tmpfile\"\n"
+)
+
+
+def apply_plex_refresh_hook(config_file_path, refresh_file_path, plex_refresh, addr, token, mount):
+    """Zurg's own Plex refresh (on_library_update → plex_refresh.py) for the
+    content Zurg serves.  Added when PLEX_REFRESH is on and Plex is fully
+    configured; otherwise our hook is removed (turning PLEX_REFRESH off must
+    stop it) — a hook that isn't ours is left alone.  A missing Plex setting
+    skips the hook with a warning instead of failing Zurg's setup: the
+    library scanner's refresh doesn't need PLEX_MOUNT_DIR."""
+    from ruamel.yaml import YAML
+    logger = get_logger()
+    yaml = YAML()
+    yaml.indent(mapping=4, sequence=4, offset=2)
+    yaml.preserve_quotes = True
+    with open(config_file_path) as f:
+        config = yaml.load(f) or {}
+    want = str(plex_refresh or '').strip().lower() == 'true'
+    if want:
+        missing = [n for n, v in (('PLEX_ADDRESS', addr), ('PLEX_TOKEN', token),
+                                  ('PLEX_MOUNT_DIR', mount)) if not v]
+        if missing:
+            logger.warning(f"Plex Refresh: {', '.join(missing)} not set — Zurg's own refresh hook "
+                           "is skipped (the library scanner's refresh still runs)")
+            want = False
+    ours = 'plex_refresh.py' in str(config.get('on_library_update') or '')
+    if want:
+        logger.info(f"Updating Plex Refresh in config file: {config_file_path}")
+        config['on_library_update'] = _PLEX_HOOK
+        if not os.path.exists(refresh_file_path):
+            logger.debug(f"Copying Plex Refresh script from base: /zurg/plex_refresh.py to {refresh_file_path}")
+            shutil.copy('/zurg/plex_refresh.py', refresh_file_path)
+    elif ours:
+        logger.info(f"Removing Zurg's Plex Refresh hook from {config_file_path}")
+        del config['on_library_update']
+    else:
+        return
+    with atomic_write(config_file_path) as f:
+        yaml.dump(config, f)
+
+
 def instance_port(key_type, zurg_port, both):
     """Fixed port for a Zurg instance, or None (auto-assign).  With both a
     Real-Debrid and an AllDebrid instance, AllDebrid takes ZURG_PORT + 1 —
@@ -27,7 +83,9 @@ def instance_port(key_type, zurg_port, both):
 
 
 def zurg_setup():
-    refresh_globals(globals())
+    # Runs once, at container start: uses the settings this module imported
+    # then (no refresh_globals) — a settings save during setup can't change
+    # what's being set up; Zurg settings apply at the next container start.
     logger = get_logger()
     logger.info("Setting up Zurg")
     zurg_app_override = '/config/zurg'
@@ -126,34 +184,6 @@ def zurg_setup():
                 else:
                     file.write(line)
 
-    def plex_refresh(file_path):
-        logger.info(f"Updating Plex Refresh in config file: {file_path}")
-        yaml = YAML()
-        yaml.indent(mapping=4, sequence=4, offset=2)
-        yaml.preserve_quotes = True
-        with open(file_path, 'r') as file:
-            config = yaml.load(file)
-
-        config['on_library_update'] = (
-            "tmpfile=$(mktemp)\n"
-            "for arg in \"$@\"\n"
-            "do\n"
-            "    echo \"$arg\" >> \"$tmpfile\"\n"
-            "done\n\n"
-            "unique_args=$(sort -u \"$tmpfile\")\n\n"
-            "if [ -n \"$unique_args\" ]; then\n"
-            "    IFS=$'\\n'\n"
-            "    for line in $unique_args; do\n"
-            "        python plex_refresh.py \"$line\"\n"
-            "    done\n"
-            "    unset IFS\n"
-            "fi\n"
-            "rm \"$tmpfile\"\n"
-        )
-
-        with atomic_write(file_path) as file:
-            yaml.dump(config, file)
-            
     def check_and_set_zurg_version(dir_path):
         zurg_binary_path = os.path.join(dir_path, 'zurg')
         if os.path.exists(zurg_binary_path) and not ZURGVERSION:
@@ -223,19 +253,8 @@ def zurg_setup():
             
             update_token(config_file_path, token)
             disable_zurg_rclone(config_file_path)
-            if PLEXREFRESH is not None and PLEXREFRESH.lower() == "true":
-                if PLEXADD and PLEXTOKEN and PLEXMOUNT:
-                    plex_refresh(config_file_path)
-                    if not os.path.exists(refresh_file_path):
-                        logger.debug(f"Copying Plex Refresh script from base: /zurg/plex_refresh.py to {refresh_file_path}")
-                        shutil.copy('/zurg/plex_refresh.py', refresh_file_path)
-                else:
-                    if not PLEXTOKEN:
-                        raise Exception("PLEX_TOKEN is required for Plex Refresh")
-                    if not PLEXADD:
-                        raise Exception("PLEX_ADDRESS is required for Plex Refresh") 
-                    if not PLEXMOUNT:
-                        raise Exception("PLEX_MOUNT_DIR is required for Plex Refresh")
+            apply_plex_refresh_hook(config_file_path, refresh_file_path,
+                                    PLEXREFRESH, PLEXADD, PLEXTOKEN, PLEXMOUNT)
         except Exception as e:
             raise Exception(f"Error setting up Zurg instance for {key_type}: {e}")
 

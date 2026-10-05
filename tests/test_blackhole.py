@@ -5930,3 +5930,20 @@ class TestRequireCachedTbCrossProbeReroute:
 
         assert added == []
         assert os.path.exists(magnet_path), "unknown-everywhere drop must stay in watch dir"
+
+
+class TestSetupIdempotent:
+
+    def test_setup_stops_a_running_watcher_first(self, monkeypatch):
+        # a reload during startup and main's own setup() both start one:
+        # two watchers would poll /watch and double-add torrents
+        from unittest.mock import MagicMock
+        import utils.blackhole as bh
+        old, thread = MagicMock(), MagicMock()
+        monkeypatch.setattr(bh, '_watcher', old)
+        monkeypatch.setattr(bh, '_watcher_thread', thread, raising=False)
+        monkeypatch.setenv('BLACKHOLE_ENABLED', 'false')
+        bh.setup()
+        old.stop.assert_called_once()
+        thread.join.assert_called_once()
+        assert bh._watcher is None

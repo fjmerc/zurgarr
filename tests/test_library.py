@@ -6424,6 +6424,20 @@ class TestWebDAVCapabilityPersistence:
         scanner._load_webdav_capability()
         assert scanner._webdav_unsupported is False
 
+    def test_runtime_zurg_version_change_keeps_cache_until_restart(self, tmp_dir, monkeypatch):
+        # the running binary is still the old one: the cache stays valid
+        import json
+        from utils import boot_layout
+        path = os.path.join(tmp_dir, 'library_capabilities.json')
+        with open(path, 'w') as fh:
+            json.dump({'webdav_unsupported': True, 'ts': time.time(), 'zurg_version': 'v0.9.2'}, fh)
+        monkeypatch.setattr(boot_layout, 'BOOTED', True)
+        monkeypatch.setattr(boot_layout, 'BOOT_VALUES', dict(boot_layout.BOOT_VALUES, ZURG_VERSION='v0.9.2'))
+        monkeypatch.setenv('ZURG_VERSION', 'v0.9.3')            # pending a restart
+        scanner = self._make_scanner(path)
+        scanner._load_webdav_capability()
+        assert scanner._webdav_unsupported is True
+
     def test_zurg_version_match_keeps_cache(self, tmp_dir, monkeypatch):
         """Matching ZURG_VERSION → cache trusted, flag pre-set."""
         import json
@@ -7322,6 +7336,8 @@ class TestPhase4DiscoverTorboxMount:
         asserts the predicate logic via a temp dir that we explicitly
         configure as the TB mount via monkeypatching the helper."""
         monkeypatch.setenv('TORBOX_API_KEY', 'tb-key')
+        monkeypatch.setenv('TORBOX_WEBDAV_USER', 'u')     # the mount needs all three
+        monkeypatch.setenv('TORBOX_WEBDAV_PASS', 'p')
         monkeypatch.setenv('TORBOX_MOUNT_NAME', 'torbox')
         fake_mount = tmp_path / 'torbox_mount'
         fake_mount.mkdir()

@@ -132,10 +132,10 @@ class TestInProcessFollowsBoot:
         from utils.scheduled_tasks import _rclone_mount_expected
         monkeypatch.setattr(boot_layout, 'BOOT_RCLONE_MOUNT_NAME', 'zurgarr')
         monkeypatch.setenv('ZURG_ENABLED', 'true')        # turned on at runtime
-        monkeypatch.setattr(cr, '_BOOT_LAYOUT', Layout(False, frozenset(), '', False, '', '', False))
+        monkeypatch.setattr('utils.boot_layout.BOOT_LAYOUT', Layout(False, frozenset(), '', False, '', '', False))
         assert _rclone_mount_expected() is False
         monkeypatch.setenv('ZURG_ENABLED', 'false')       # turned off at runtime
-        monkeypatch.setattr(cr, '_BOOT_LAYOUT', Layout(True, frozenset({'RD'}), 'zurgarr', False, '', '', False))
+        monkeypatch.setattr('utils.boot_layout.BOOT_LAYOUT', Layout(True, frozenset({'RD'}), 'zurgarr', False, '', '', False))
         assert _rclone_mount_expected() is True
         monkeypatch.setattr(boot_layout, 'BOOT_RCLONE_MOUNT_NAME', '')
         assert _rclone_mount_expected() is False
@@ -165,7 +165,7 @@ class TestInProcessFollowsBoot:
         monkeypatch.setenv('ZURG_PORT_RealDebrid', '9999')
         monkeypatch.setenv('ZURG_PORT_AllDebrid', '9998')
         monkeypatch.setenv('ZURG_ENABLED', 'false')        # off now, but running since boot
-        monkeypatch.setattr(cr, '_BOOT_LAYOUT', Layout(True, frozenset({'RD'}), 'zurgarr', False, '', '', False))
+        monkeypatch.setattr('utils.boot_layout.BOOT_LAYOUT', Layout(True, frozenset({'RD'}), 'zurgarr', False, '', '', False))
         ss.check_services()
         assert 'Zurg WebDAV (RD)' in seen and 'Zurg WebDAV (AD)' not in seen
 
@@ -217,16 +217,26 @@ class TestMountNamesFollowStartup:
         monkeypatch.setattr(boot_layout, 'BOOT_RCLONE_MOUNT_NAME', 'zurgarr')
         monkeypatch.setattr(boot_layout, 'BOOT_TORBOX_MOUNT_NAME', 'torbox')
         monkeypatch.setattr(boot_layout, 'BOOT_VALUES', {'RD_API_KEY': 'k', 'AD_API_KEY': 'a'})
+        monkeypatch.setattr(boot_layout, 'BOOT_LAYOUT', Layout(True, frozenset({'RD', 'AD'}), 'zurgarr', False, '', 'torbox', True))
         monkeypatch.setenv('RCLONE_MOUNT_NAME', 'renamed')
         monkeypatch.setenv('TORBOX_MOUNT_NAME', 'renamed_tb')
         monkeypatch.delenv('AD_API_KEY', raising=False)            # AD removed after start
         assert mount_for_debrid(REALDEBRID, rclone_mount_base='/data') == '/data/zurgarr_RD'
         assert mount_for_debrid(TORBOX, rclone_mount_base='/data') == '/data/torbox'
 
-    def test_main_marks_booted(self):
+    def test_main_startup_marks_are_in_order(self):
+        # booted before Zurg/rclone are set up; deferred service restarts
+        # run only once startup has finished
         import pathlib
         src = pathlib.Path(__file__).resolve().parents[1].joinpath('main.py').read_text()
-        assert 'boot_layout.mark_booted()' in src
+        pos = {m: src.index(m) for m in ('boot_layout.mark_booted()', 'z.setup.zurg_setup()',
+                                          'rclone.setup()',
+                                          'p.setup.pd_setup()', 'scheduler.start()',
+                                          'boot_layout.STARTUP_COMPLETE.set()', 'signal.pause()')}
+        order = sorted(pos, key=pos.get)
+        assert order == ['boot_layout.mark_booted()', 'z.setup.zurg_setup()', 'rclone.setup()',
+                         'p.setup.pd_setup()', 'scheduler.start()',
+                         'boot_layout.STARTUP_COMPLETE.set()', 'signal.pause()']
 
 
 class TestHealthcheckMountProbes:
@@ -290,7 +300,98 @@ class TestRcloneUsesStartupValues:
         for k in ('RCLONE_POLL_INTERVAL', 'TORBOX_RCLONE_TPSLIMIT', 'TORBOX_RCLONE_TPSLIMIT_BURST'):
             assert k in boot_layout.STARTUP_KEYS
 
-    def test_rclone_marks_its_config_captured(self):
+
+
+class TestLibraryFollowsRunningZurg:
+
+    def test_webdav_scan_uses_the_login_zurg_runs_with(self, monkeypatch):
+        from utils import library
+        monkeypatch.setattr(boot_layout, 'BOOTED', True)
+        monkeypatch.setattr(boot_layout, 'BOOT_VALUES',
+                            dict(boot_layout.BOOT_VALUES, ZURG_USER='u', ZURG_PASS='old'))
+        monkeypatch.setenv('ZURG_USER', 'u')
+        monkeypatch.setenv('ZURG_PASS', 'new')                  # pending a restart
+        assert library._get_zurg_auth() == ('u', 'old')
+
+    def test_torbox_scan_follows_the_started_mount(self, monkeypatch, tmp_path):
+        from utils import library
+        monkeypatch.setattr(boot_layout, 'BOOTED', True)
+        monkeypatch.setattr(boot_layout, 'BOOT_LAYOUT',
+                            Layout(True, frozenset({'RD'}), 'z', False, '', 'torbox', True))
+        monkeypatch.delenv('TORBOX_API_KEY', raising=False)     # removed after start
+        assert boot_layout.torbox_mount_started() is True
         import inspect
-        import rclone.rclone as mod
-        assert 'mark_setup_captured()' in inspect.getsource(mod.setup)
+        assert 'torbox_mount_started()' in inspect.getsource(library.LibraryScanner._discover_torbox_mount)
+
+
+def test_no_mount_for_an_instance_that_did_not_start(monkeypatch):
+    # boot RD-only, AD key added later: AD grabs must not be looked for on
+    # the RD mount (plain name)
+    from utils.debrid_routing import mount_for_debrid, ALLDEBRID, REALDEBRID
+    monkeypatch.setattr(boot_layout, 'BOOTED', True)
+    monkeypatch.setattr(boot_layout, 'BOOT_RCLONE_MOUNT_NAME', 'zurgarr')
+    monkeypatch.setattr(boot_layout, 'BOOT_VALUES', dict(boot_layout.BOOT_VALUES, RD_API_KEY='k', AD_API_KEY=''))
+    monkeypatch.setattr(boot_layout, 'BOOT_LAYOUT', Layout(True, frozenset({'RD'}), 'zurgarr', False, '', '', False))
+    monkeypatch.setenv('AD_API_KEY', 'a')
+    assert mount_for_debrid(ALLDEBRID, rclone_mount_base='/data') is None
+    assert mount_for_debrid(REALDEBRID, rclone_mount_base='/data') == '/data/zurgarr'
+
+
+def test_secret_file_names_match_the_resolver(monkeypatch, tmp_path):
+    # GITHUB_TOKEN's secret file is upper-case; a lower-cased lookup missed it
+    # (and the save banner then claimed "GITHUB_TOKEN changed")
+    from utils import env
+    (tmp_path / 'GITHUB_TOKEN').write_text('ghp_x\n')
+    (tmp_path / 'rd_api_key').write_text('rd\n')
+    monkeypatch.setattr(env, 'SECRETS_DIR', str(tmp_path))
+    monkeypatch.delenv('GITHUB_TOKEN', raising=False)
+    assert env.secret_or_env('GITHUB_TOKEN') == 'ghp_x'
+    assert env.secret_or_env('RD_API_KEY') == 'rd'
+
+
+def test_torbox_mount_named_like_a_zurg_mount_is_not_started(no_secrets, monkeypatch):
+    # rclone skips it (the names would clash); the layout must agree
+    for k, v in (('ZURG_ENABLED', 'true'), ('RD_API_KEY', 'k'), ('AD_API_KEY', 'a'),
+                 ('RCLONE_MOUNT_NAME', 'zurgarr'), ('TORBOX_MOUNT_NAME', 'zurgarr_RD'),
+                 ('TORBOX_API_KEY', 't'), ('TORBOX_WEBDAV_USER', 'u'), ('TORBOX_WEBDAV_PASS', 'p')):
+        monkeypatch.setenv(k, v)
+    assert boot_layout.zurg_layout().torbox is False
+    monkeypatch.setenv('TORBOX_MOUNT_NAME', 'torbox')
+    assert boot_layout.zurg_layout().torbox is True
+
+
+def _settings_read_by(paths):
+    """Env settings a module reads: literal os.environ/getenv/setting_at_start
+    keys, plus base.Config globals it uses (mapped back to their env names)."""
+    import pathlib
+    import re
+    root = pathlib.Path(__file__).resolve().parents[1]
+    base_src = (root / 'base' / '__init__.py').read_text()
+    attr_env = {a: e.upper() for a, e in re.findall(
+        r"self\.(\w+) = (?:os\.getenv|load_secret_or_env|_env|os\.environ\.get)\(['\"](\w+)['\"]", base_src)}
+    keys = set()
+    for p in paths:
+        src = (root / p).read_text()
+        keys |= set(re.findall(r"(?:os\.environ\.get|os\.getenv|setting_at_start|secret_or_env)\(['\"]([A-Z_]+)['\"]", src))
+        keys |= {attr_env[a] for a in set(re.findall(r"\b([A-Z][A-Z0-9_]+)\b", src)) if a in attr_env}
+    return keys
+
+
+def test_every_setting_zurg_and_rclone_setup_read_is_startup_only():
+    # a setting read only when Zurg/rclone are set up must be reported as
+    # needing a restart — or be listed here with the reason it isn't
+    not_startup = {
+        'ZURG_CURRENT_VERSION': 'internal state, not a setting',
+        'LOG_LEVEL': 'derived per process (zurg_log_level)',
+        'TORBOX_API_KEY': 'reported when it alone switches the TorBox mount',
+        'PLEX_ADDRESS': "plex_refresh.py reads it live from Zurg's env at each run",
+        'PLEX_TOKEN': "plex_refresh.py reads it live from Zurg's env at each run",
+        'ZURGARR_LOG_LEVEL': 'zurgarr setting; rclone/Zurg use its startup value',
+        'PLEXDEBRID': None, 'PD_ENABLED': 'plex_debrid, applied by reload',
+        'DUPLICATE_CLEANUP': 'conditional (restart_pending rules)',
+        'SKIP_VALIDATION': 'not used by setup',
+    }
+    read = _settings_read_by(['rclone/rclone.py', 'zurg/setup.py', 'zurg/update.py'])
+    read = {k for k in read if not k.startswith('ZURG_PORT_')}       # internal
+    missing = sorted(read - boot_layout.SNAPSHOT_KEYS - set(not_startup))
+    assert missing == []

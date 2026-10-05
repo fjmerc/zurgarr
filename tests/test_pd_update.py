@@ -8,6 +8,7 @@ from plex_debrid_ import update as pu
 def test_update_restart_holds_the_lifecycle_lock(monkeypatch):
     from utils import processes
     monkeypatch.setenv('PD_REPO', 'owner,repo,main')
+    monkeypatch.setenv('PD_UPDATE', 'true')
     monkeypatch.setattr(pu, 'parse_repo_info', lambda k: ('o', 'r', 'main'))
     u = pu.PlexDebridUpdate()
     monkeypatch.setattr(u, 'extract_version_from_ui_settings', lambda: '1.0')
@@ -20,3 +21,13 @@ def test_update_restart_holds_the_lifecycle_lock(monkeypatch):
     monkeypatch.setattr(u, 'start_process', lambda *a: seen.append(processes.lifecycle_lock._is_owned()))
     assert u.update_check('plex_debrid') is True
     assert seen == [True, True]
+
+
+def test_switching_plex_debrid_updates_off_stops_them_at_once(monkeypatch):
+    monkeypatch.setenv('PD_UPDATE', 'false')
+    monkeypatch.setenv('PD_REPO', 'owner,repo,main')
+    u = pu.PlexDebridUpdate()
+    called = []
+    monkeypatch.setattr(pu, 'parse_repo_info', lambda k: called.append(1) or ('o', 'r', 'main'))
+    assert u.update_check('plex_debrid') is False
+    assert called == []

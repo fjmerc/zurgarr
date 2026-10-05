@@ -25,6 +25,16 @@ _OFF = Layout(False, frozenset(), '', False, '', '', False)
 TORBOX_KEYS = ('TORBOX_API_KEY', 'TORBOX_WEBDAV_USER', 'TORBOX_WEBDAV_PASS')
 
 
+def zurg_mount_names(rclone_mount_name, rd, ad):
+    """Names of Zurg's rclone mounts (as rclone/rclone.py names them): the
+    plain name for one instance, name_RD / name_AD for both."""
+    if not rclone_mount_name:
+        return set()
+    if rd and ad:
+        return {f'{rclone_mount_name}_RD', f'{rclone_mount_name}_AD'}
+    return {rclone_mount_name} if (rd or ad) else set()
+
+
 def live_getter():
     """Settings lookup: Docker secret first for credentials, else os.environ."""
     from utils import env
@@ -55,10 +65,13 @@ def zurg_layout(get=None):
     if val('ZURG_ENABLED').lower() != 'true':
         return _OFF
     nfs = val('NFS_ENABLED').lower() == 'true'
-    torbox = all(val(k) for k in TORBOX_KEYS)
-    return Layout(True, frozenset(k for k in ('RD', 'AD') if val(f'{k}_API_KEY')),
-                  val('RCLONE_MOUNT_NAME'), nfs, val('NFS_PORT') if nfs else '',
-                  (val('TORBOX_MOUNT_NAME') or 'torbox') if torbox else '', torbox)
+    instances = frozenset(k for k in ('RD', 'AD') if val(f'{k}_API_KEY'))
+    tb_name = val('TORBOX_MOUNT_NAME') or 'torbox'
+    # rclone skips a TorBox mount named like a Zurg mount
+    torbox = (all(val(k) for k in TORBOX_KEYS) and tb_name not in zurg_mount_names(
+        val('RCLONE_MOUNT_NAME'), 'RD' in instances, 'AD' in instances))
+    return Layout(True, instances, val('RCLONE_MOUNT_NAME'), nfs, val('NFS_PORT') if nfs else '',
+                  tb_name if torbox else '', torbox)
 
 
 # Settings Zurg and rclone read only when they're set up — at container
@@ -73,31 +86,39 @@ STARTUP_KEYS = frozenset({
     'RCLONE_VFS_READ_CHUNK_SIZE', 'RCLONE_VFS_READ_CHUNK_SIZE_LIMIT', 'RCLONE_BUFFER_SIZE',
     'RCLONE_TRANSFERS', 'RCLONE_POLL_INTERVAL', 'NFS_ENABLED', 'NFS_PORT',
     'TORBOX_MOUNT_NAME', 'TORBOX_WEBDAV_USER', 'TORBOX_WEBDAV_PASS',
-    'TORBOX_RCLONE_TPSLIMIT', 'TORBOX_RCLONE_TPSLIMIT_BURST',
+    'TORBOX_RCLONE_TPSLIMIT', 'TORBOX_RCLONE_TPSLIMIT_BURST', 'TORBOX_RCLONE_DIR_CACHE_TIME',
 })
+# Partly applied at runtime, partly only at start (config_reload.restart_pending
+# has the rules): Zurg's Plex-refresh hook, duplicate cleanup and the
+# auto-update threads are set up at start; switching cleanup/updates off
+# applies at once.
+CONDITIONAL_KEYS = frozenset({
+    'PLEX_REFRESH', 'PLEX_MOUNT_DIR', 'DUPLICATE_CLEANUP', 'CLEANUP_INTERVAL',
+    'ZURG_UPDATE', 'AUTO_UPDATE_INTERVAL', 'PD_ENABLED', 'PD_UPDATE',
+})
+SNAPSHOT_KEYS = STARTUP_KEYS | CONDITIONAL_KEYS
+_BOOL_KEYS = frozenset({'ZURG_ENABLED', 'NFS_ENABLED', 'PLEX_REFRESH', 'DUPLICATE_CLEANUP',
+                        'ZURG_UPDATE', 'PD_ENABLED', 'PD_UPDATE'})
 
 
 def startup_value(key, get=None):
-    """A STARTUP_KEYS setting, normalised for comparison."""
+    """A SNAPSHOT_KEYS setting, normalised for comparison."""
     v = ((get or live_getter())(key) or '').strip()
-    return v.lower() if key in ('ZURG_ENABLED', 'NFS_ENABLED') else v
+    if key in _BOOL_KEYS:   # on or off — 'false', '' and 'no' all mean off
+        return 'true' if v.lower() == 'true' else ''
+    return v
 
 
 BOOT_LAYOUT = zurg_layout()
-BOOT_VALUES = {k: startup_value(k) for k in STARTUP_KEYS}
+BOOT_VALUES = {k: startup_value(k) for k in SNAPSHOT_KEYS}
 # rclone's log level follows ZURGARR_LOG_LEVEL unless RCLONE_LOG_LEVEL is set
 BOOT_ZURGARR_LOG_LEVEL = (os.environ.get('ZURGARR_LOG_LEVEL') or '').strip()
-
-# Set once Zurg/rclone have read their configuration at startup (by
-# rclone.setup, or main.py when no rclone starts): config reloads wait for
-# it, so a save during startup can't change what's being set up.
-SETUP_CAPTURED = threading.Event()
-
-
-def mark_setup_captured():
-    SETUP_CAPTURED.set()
 BOOT_RCLONE_MOUNT_NAME = (os.environ.get('RCLONE_MOUNT_NAME') or '').strip()
 BOOT_TORBOX_MOUNT_NAME = (os.environ.get('TORBOX_MOUNT_NAME') or '').strip() or 'torbox'
+
+# Set by main.py when startup has finished (plex_debrid, blackhole and the
+# rest are set up): a reload restarts those services only after it.
+STARTUP_COMPLETE = threading.Event()
 
 
 # True once main.py has started Zurg/rclone: from then on the mount names and

@@ -21,6 +21,7 @@ def z(monkeypatch):
     monkeypatch.setattr(zu, 'download_and_unzip_release', lambda *a: True)
     monkeypatch.setattr(zu.os.path, 'exists', lambda p: True)
     monkeypatch.setenv('ZURG_CURRENT_VERSION', 'v1')
+    monkeypatch.setenv('ZURG_UPDATE', 'true')
     return zu.ZurgUpdate()
 
 
@@ -58,6 +59,10 @@ def _no_copy(monkeypatch, fail_for=()):
 
 def test_update_touches_only_instances_started_at_boot(z, monkeypatch):
     _no_copy(monkeypatch)
+    from utils import boot_layout
+    monkeypatch.setattr(boot_layout, 'BOOTED', True)
+    monkeypatch.setattr(boot_layout, 'BOOT_LAYOUT',
+                        boot_layout.Layout(True, frozenset({'RD'}), 'z', False, '', '', False))
     z._instance_handlers = {'RealDebrid': _handler()}    # AD key added later
     started = []
     monkeypatch.setattr(z, 'start_process', lambda name, d=None, **k: started.append(d))
@@ -109,6 +114,8 @@ def test_start_never_doubles_a_process_that_is_still_alive(z):
     z._instance_handlers = {'RealDebrid': h}
     z.start_process('Zurg', '/zurg/RD')
     h.start_process.assert_not_called()
+    from utils.processes import RestartPolicy
+    assert isinstance(h.restart_policy, RestartPolicy)   # monitor restarts it when it exits
 
 
 def test_version_not_advanced_when_an_instance_kept_the_old_binary(z, monkeypatch):
@@ -129,3 +136,98 @@ def test_fixed_zurg_port_gives_each_instance_its_own_port():
     assert instance_port('AllDebrid', '9090', both=True) == 9091
     assert instance_port('AllDebrid', '9090', both=False) == 9090
     assert instance_port('RealDebrid', '', both=True) is None      # auto-assigned
+
+
+def test_boot_update_with_both_instances_starts_both(z, monkeypatch):
+    # first start_process creates the RD handler; _instances() must not then
+    # shrink to the handlers that exist and skip AllDebrid
+    _no_copy(monkeypatch)
+    from utils import boot_layout
+    monkeypatch.setattr(boot_layout, 'BOOTED', True)
+    monkeypatch.setattr(boot_layout, 'BOOT_LAYOUT',
+                        boot_layout.Layout(True, frozenset({'RD', 'AD'}), 'z', False, '', '', False))
+    started = []
+    monkeypatch.setattr(zu.ProcessHandler, 'start_process',
+                        lambda self, name, d, cmd, key_type=None, suppress_logging=False: started.append(key_type))
+    assert z.update_check('Zurg') is True
+    assert sorted(started) == ['AllDebrid', 'RealDebrid']
+
+
+def test_instances_are_the_ones_started_at_boot(z, monkeypatch):
+    from utils import boot_layout
+    monkeypatch.setattr(boot_layout, 'BOOTED', True)
+    monkeypatch.setattr(boot_layout, 'BOOT_LAYOUT',
+                        boot_layout.Layout(True, frozenset({'RD'}), 'z', False, '', '', False))
+    assert z._instances() == [('/zurg/RD', 'RealDebrid')]            # AD key added later
+
+
+def test_switching_zurg_updates_off_stops_them_at_once(z, monkeypatch):
+    monkeypatch.setenv('ZURG_UPDATE', 'false')
+    fetched = []
+    monkeypatch.setattr(zu, 'get_latest_release', lambda *a, **k: fetched.append(1) or ('v2', None))
+    assert z.update_check('Zurg') is False
+    assert fetched == []
+
+
+class TestPlexRefreshHook:
+
+    def _cfg(self, tmp_path, text="zurg: v1\ntoken: x\n"):
+        p = tmp_path / 'config.yml'
+        p.write_text(text)
+        return p
+
+    def test_added_when_on_and_configured(self, tmp_path, monkeypatch):
+        from zurg import setup as zs
+        monkeypatch.setattr(zs.shutil, 'copy', lambda *a: None)
+        cfg = self._cfg(tmp_path)
+        zs.apply_plex_refresh_hook(str(cfg), str(tmp_path / 'plex_refresh.py'),
+                                   'true', 'http://plex:32400', 'tok', '/media')
+        assert 'plex_refresh.py' in cfg.read_text()
+
+    def test_missing_setting_skips_the_hook_instead_of_failing_zurg(self, tmp_path):
+        # PLEX_REFRESH also drives the scanner's refresh, which doesn't need
+        # PLEX_MOUNT_DIR: raising here kept Zurg from starting at all
+        from zurg import setup as zs
+        cfg = self._cfg(tmp_path)
+        zs.apply_plex_refresh_hook(str(cfg), str(tmp_path / 'p.py'), 'true', 'http://plex', 'tok', '')
+        assert 'plex_refresh.py' not in cfg.read_text()
+
+    def test_off_removes_our_hook_only(self, tmp_path, monkeypatch):
+        from zurg import setup as zs
+        monkeypatch.setattr(zs.shutil, 'copy', lambda *a: None)
+        cfg = self._cfg(tmp_path)
+        zs.apply_plex_refresh_hook(str(cfg), str(tmp_path / 'p.py'), 'true', 'http://plex', 'tok', '/m')
+        zs.apply_plex_refresh_hook(str(cfg), str(tmp_path / 'p.py'), 'false', '', '', '')
+        assert 'on_library_update' not in cfg.read_text()
+        other = self._cfg(tmp_path, "zurg: v1\non_library_update: sh plex_update.sh \"$@\"\n")
+        zs.apply_plex_refresh_hook(str(other), str(tmp_path / 'p.py'), 'false', '', '', '')
+        assert 'plex_update.sh' in other.read_text()                # not ours: left alone
+
+
+class TestZurgLogLevel:
+
+    def test_zurg_gets_its_own_startup_level(self, z, monkeypatch):
+        # ZURGARR_LOG_LEVEL used to overwrite LOG_LEVEL before Zurg started,
+        # and a later Zurg restart took whatever it was then
+        from utils import boot_layout
+        monkeypatch.setattr(boot_layout, 'BOOTED', True)
+        monkeypatch.setattr(boot_layout, 'BOOT_LAYOUT',
+                            boot_layout.Layout(True, frozenset({'RD'}), 'z', False, '', '', False))
+        monkeypatch.setattr(boot_layout, 'BOOT_VALUES', dict(boot_layout.BOOT_VALUES, ZURG_LOG_LEVEL='DEBUG'))
+        monkeypatch.setattr(boot_layout, 'BOOT_ZURGARR_LOG_LEVEL', 'INFO')
+        monkeypatch.setattr(zu.ProcessHandler, 'start_process', lambda self, *a, **k: None)
+        z.start_process('Zurg', '/zurg/RD')
+        h = z._instance_handlers['RealDebrid']
+        assert h.env_overrides == {'LOG_LEVEL': 'DEBUG'}
+        monkeypatch.setattr(boot_layout, 'BOOT_VALUES', dict(boot_layout.BOOT_VALUES, ZURG_LOG_LEVEL=''))
+        assert zu.zurg_log_level() == 'INFO'                  # falls back to zurgarr's
+
+    def test_process_env_applies_overrides(self, monkeypatch):
+        from unittest.mock import MagicMock
+        from utils import processes
+        h = processes.ProcessHandler(MagicMock())
+        h.env_overrides = {'LOG_LEVEL': 'DEBUG', 'DROP_ME': None}
+        monkeypatch.setenv('LOG_LEVEL', 'INFO')
+        monkeypatch.setenv('DROP_ME', 'x')
+        env = h._child_env()
+        assert env['LOG_LEVEL'] == 'DEBUG' and 'DROP_ME' not in env

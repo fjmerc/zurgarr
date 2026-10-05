@@ -442,6 +442,27 @@ class TestValidateEnvValues:
         assert not validate_env_values(dict(base, ZURG_PORT='9100', NFS_ENABLED='true',
                                             NFS_PORT='9200', STATUS_UI_PORT='8080'))['errors']
 
+    def test_port_clash_set_entirely_in_compose_is_a_warning(self, monkeypatch):
+        # the page can't change compose values: an error would block every save
+        from utils import config_resolve
+        cur = {'ZURG_PORT': config_resolve.Resolved('8081', 'locked', 'x'),
+               'STATUS_UI_PORT': config_resolve.Resolved('8081', 'locked', 'x')}
+        monkeypatch.setattr(config_resolve, 'current', lambda: cur)
+        r = validate_env_values({'ZURG_ENABLED': 'true', 'RD_API_KEY': 'k', 'RCLONE_MOUNT_NAME': 'm',
+                                 'ZURG_PORT': '8081', 'STATUS_UI_PORT': '8081'})
+        assert not [e for e in r['errors'] if 'port' in e.lower()], r
+        assert any('8081' in w for w in r['warnings']), r
+
+    def test_torbox_mount_name_must_not_clash_with_a_zurg_mount(self):
+        base = {'ZURG_ENABLED': 'true', 'RD_API_KEY': 'k', 'RCLONE_MOUNT_NAME': 'zurgarr',
+                'TORBOX_API_KEY': 't', 'TORBOX_WEBDAV_USER': 'u', 'TORBOX_WEBDAV_PASS': 'p'}
+        errs = validate_env_values(dict(base, TORBOX_MOUNT_NAME='zurgarr'))['errors']
+        assert any(e.startswith('TORBOX_MOUNT_NAME') for e in errs), errs
+        errs = validate_env_values(dict(base, AD_API_KEY='a', TORBOX_MOUNT_NAME='zurgarr_AD'))['errors']
+        assert any(e.startswith('TORBOX_MOUNT_NAME') for e in errs), errs
+        assert not [e for e in validate_env_values(dict(base, TORBOX_MOUNT_NAME='torbox'))['errors']
+                    if e.startswith('TORBOX_MOUNT_NAME')]
+
     def test_only_true_counts_as_on(self):
         # the app runs ZURG_ENABLED=yes as off — validation must agree
         for v in ('yes', '1', 'on'):
@@ -1745,20 +1766,6 @@ class TestSourcesAndExplicitSave:
         monkeypatch.delenv('PD_LOG_LEVEL', raising=False)
         _sync_plex_debrid_to_env({'Debug printing': 'true'})
         assert loads == [{'read_env_file': False}] and inval
-
-    def test_plex_debrid_sync_during_startup_defers_to_the_reload(self, env_file, monkeypatch):
-        # never change settings in-process while Zurg/rclone are being set up
-        import signal
-        from utils import config_reload
-        from utils.settings_api import _sync_plex_debrid_to_env
-        config_reload._startup_done.clear()
-        sent = []
-        monkeypatch.setattr('os.kill', lambda pid, sig: sent.append(sig))
-        monkeypatch.delenv('PD_LOG_LEVEL', raising=False)
-        _sync_plex_debrid_to_env({'Debug printing': 'true'})
-        assert 'PD_LOG_LEVEL=DEBUG' in env_file.read_text()
-        assert 'PD_LOG_LEVEL' not in os.environ
-        assert sent == [signal.SIGHUP]
 
     @staticmethod
     def _as_page_posts(values):
