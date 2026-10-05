@@ -96,7 +96,7 @@ ENV_SCHEMA = [
             ('BLACKHOLE_ENABLED', 'Enable Blackhole', 'boolean', False, 'Watch a directory for .torrent/.magnet files'),
             ('BLACKHOLE_DIR', 'Watch Directory', 'string', False, 'Directory to watch for torrent files'),
             ('BLACKHOLE_POLL_INTERVAL', 'Poll Interval (seconds)', 'number:1-3600', False, 'How often to check for new files'),
-            ('BLACKHOLE_DEBRID', 'Debrid Service', 'select:realdebrid,alldebrid,torbox', False, 'Which debrid service to use'),
+            ('BLACKHOLE_DEBRID', 'Debrid Service (legacy)', 'select:realdebrid,alldebrid,torbox', False, 'Legacy — superseded by Primary Debrid in Multi-Debrid Routing; only used when that is unset'),
             ('BLACKHOLE_SYMLINK_ENABLED', 'Enable Symlinks', 'boolean', False, 'Create symlinks in completed dir after debrid download finishes'),
             ('BLACKHOLE_COMPLETED_DIR', 'Completed Directory', 'string', False, 'Directory for completed symlinks (container path, default: /completed)'),
             ('BLACKHOLE_RCLONE_MOUNT', 'rclone Mount Path', 'string', False, 'rclone mount path inside container (default: /data)'),
@@ -351,6 +351,7 @@ def _is_sensitive(key):
 def get_env_schema():
     """Return the env var schema as a JSON-serializable structure."""
     from utils.settings_tiers import ESSENTIAL_GROUPS, GATES, UNGATED_KEYS, tier_for
+    from utils.config_resolve import RULES as _RULE_KEYS
     categories = []
     for cat in ENV_SCHEMA:
         fields = []
@@ -364,6 +365,7 @@ def get_env_schema():
                 'sensitive': _is_sensitive(key),
                 'tier': tier_for(key),
                 'ungated': key in UNGATED_KEYS,
+                'auto_capable': key in _RULE_KEYS,
             }
             fields.append(field)
         categories.append({
@@ -1394,7 +1396,7 @@ def _sync_plex_debrid_to_env(values):
                 continue
             file_val = current.get(key)
             old_val = file_val if file_val is not None else os.environ.get(key, '')
-            if old_val != new_val:
+            if not _same_value(key, old_val, new_val):   # '' vs 'false' isn't a change
                 changed[key] = new_val
 
         if not changed:

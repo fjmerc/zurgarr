@@ -392,3 +392,83 @@ def test_status_payload_helper_never_reports_ok_on_crash(monkeypatch):
     monkeypatch.setattr(sc, 'get_setup_check', boom)
     payload = status_server._setup_check_payload()
     assert [f['id'] for f in payload['findings']] == ['setup-check-failed']
+
+
+class TestBacklog:
+
+    def test_mount_liveness_only_when_a_mount_will_run(self, monkeypatch):
+        from utils.scheduled_tasks import _rclone_mount_expected
+        monkeypatch.setenv('RCLONE_MOUNT_NAME', 'zurgarr')
+        for k in ('RD_API_KEY', 'AD_API_KEY'):
+            monkeypatch.delenv(k, raising=False)
+        monkeypatch.setenv('ZURG_ENABLED', 'false')
+        assert _rclone_mount_expected() is False
+        monkeypatch.setenv('ZURG_ENABLED', 'true')
+        assert _rclone_mount_expected() is False          # no RD/AD key → Zurg won't start
+        monkeypatch.setenv('RD_API_KEY', 'k')
+        assert _rclone_mount_expected() is True
+
+    def test_resolved_tip_dismissal_rearms(self, clean, tmp_path):
+        # Dismiss the tip, turn the setting on (resolved), then off again:
+        # the tip comes back instead of staying dismissed forever.
+        clean.setattr(sc, 'CONFIG_DIR', str(tmp_path))
+        clean.setenv('PD_ENABLED', 'true')
+        sc._invalidate()
+        assert sc.dismiss('rec:PD_ENFORCE_CACHED_VERSIONS')
+        clean.setenv('PD_ENFORCE_CACHED_VERSIONS', 'true')
+        sc._invalidate(); sc.get_setup_check()
+        clean.setenv('PD_ENFORCE_CACHED_VERSIONS', 'false')
+        sc._invalidate()
+        assert 'rec:PD_ENFORCE_CACHED_VERSIONS' in {f['id'] for f in sc.get_setup_check()['findings']}
+
+    def test_short_credentials_do_not_blank_words(self):
+        out = sc._redact('ZURG_PASS is missing; other mounts are there', ['the'])
+        assert 'other mounts are there' in out     # never blanked inside a word
+        assert sc._redact("ZURG_USER the user", ['the']).count('…') == 1   # standalone word still blanked
+
+    def test_payload_has_checked_at(self, clean, tmp_path):
+        clean.setattr(sc, 'CONFIG_DIR', str(tmp_path))
+        sc._invalidate()
+        assert isinstance(sc.get_setup_check()['checked_at'], (int, float))
+
+    def test_recheck_endpoint_bypasses_cache(self):
+        from utils.status_server import get_dashboard_html
+        html = get_dashboard_html()
+        assert '/api/setup-check?fresh=1' in html
+
+
+def test_legacy_key_is_labelled():
+    from utils.settings_api import get_env_schema
+    fields = {f['key']: f for c in get_env_schema()['categories'] for f in c['fields']}
+    assert 'legacy' in fields['BLACKHOLE_DEBRID']['label'].lower()
+
+
+def test_resolver_readers_take_the_lock():
+    import threading
+    from utils import config_resolve as cr
+    done = threading.Event()
+    cr._LOCK.acquire()
+    try:
+        t = threading.Thread(target=lambda: (cr.current(), cr.written(), done.set()))
+        t.start()
+        assert not done.wait(0.2)
+    finally:
+        cr._LOCK.release()
+    assert done.wait(2)
+
+
+def test_pd_sync_ignores_equivalent_boolean(tmp_path, monkeypatch):
+    # settings.json "Show Menu on Startup": false vs unset SHOW_MENU must not
+    # rewrite .env on every watcher tick.
+    import utils.settings_api as sa
+    from utils import config_resolve
+    monkeypatch.setattr(config_resolve, '_WRITTEN', {})
+    monkeypatch.setattr(config_resolve, '_CURRENT', {})
+    monkeypatch.delenv('SHOW_MENU', raising=False)
+    env_file = tmp_path / '.env'
+    env_file.write_text('')
+    monkeypatch.setattr(sa, 'ENV_FILE', str(env_file))
+    writes = []
+    monkeypatch.setattr(sa, '_write_env_file', lambda explicit: writes.append(explicit))
+    sa._sync_plex_debrid_to_env({'Show Menu on Startup': False})
+    assert writes == []

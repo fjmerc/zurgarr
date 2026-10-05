@@ -290,3 +290,20 @@ def test_notification_url_is_masked_in_reload_log(tmp_path, monkeypatch):
     cr_mod._reload_env()
     assert any('NOTIFICATION_URL' in m for m in logged)
     assert not any('tok123' in m for m in logged)
+
+
+class TestZurgToggleOnReload:
+
+    def test_turning_zurg_off_stops_without_restart(self):
+        from utils.config_reload import _zurg_toggle_plan
+        stop_only, note = _zurg_toggle_plan({'ZURG_ENABLED'}, zurg_on=False, zurg_registered=True)
+        assert stop_only == {'zurg', 'rclone'} and note is None
+
+    def test_turning_zurg_on_when_never_started_asks_for_restart(self):
+        from utils.config_reload import _zurg_toggle_plan
+        stop_only, note = _zurg_toggle_plan({'ZURG_ENABLED'}, zurg_on=True, zurg_registered=False)
+        assert stop_only == set() and 'restart the container' in note.lower()
+
+    def test_unrelated_change_is_untouched(self):
+        from utils.config_reload import _zurg_toggle_plan
+        assert _zurg_toggle_plan({'RD_API_KEY'}, zurg_on=True, zurg_registered=True) == (set(), None)

@@ -1482,6 +1482,15 @@ def _compute_digest_delay():
 # Registration
 # ---------------------------------------------------------------------------
 
+def _rclone_mount_expected():
+    """Whether main.py will start an rclone mount: Zurg on, with a debrid key
+    it serves (RD/AD), and a mount name.  (RCLONE_MOUNT_NAME alone always has
+    a default now, so it can't signal "configured".)"""
+    zurg_on = (os.environ.get('ZURG_ENABLED') or '').strip().lower() == 'true'
+    has_key = bool(secret_or_env('RD_API_KEY') or secret_or_env('AD_API_KEY'))
+    return bool(zurg_on and has_key and (os.environ.get('RCLONE_MOUNT_NAME') or '').strip())
+
+
 def register_all():
     """Register all scheduled tasks with the central scheduler.
 
@@ -1584,8 +1593,7 @@ def register_all():
         logger.info('[scheduler] Scheduled config backups disabled (CONFIG_BACKUP_INTERVAL=0)')
 
     # Mount liveness — register if rclone is configured (mount may not exist yet at startup)
-    rclone_configured = os.environ.get('RCLONE_MOUNT_NAME', '') or os.environ.get('BLACKHOLE_RCLONE_MOUNT', '')
-    if rclone_configured:
+    if _rclone_mount_expected():
         scheduler.register(
             'mount_liveness',
             mount_liveness_probe,

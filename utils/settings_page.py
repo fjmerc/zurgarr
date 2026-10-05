@@ -203,6 +203,8 @@ textarea{min-height:120px;resize:vertical;font-family:monospace;font-size:.8em;l
    yellow highlight on the row; this is a small teal pill on the label. */
 .field-modified-chip{display:none;align-items:center;font-size:.68em;font-weight:600;color:var(--teal,#27aabc);background:rgba(39,170,188,.12);border:1px solid rgba(39,170,188,.35);border-radius:3px;padding:1px 5px;margin-left:5px;white-space:nowrap;vertical-align:middle;line-height:1.4}
 .field.is-nondefault .field-modified-chip{display:inline-flex}
+.cat-group-label{font-size:.72em;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--text2);margin:22px 0 8px;padding-top:12px;border-top:1px solid var(--border)}
+.link-btn{background:none;border:0;padding:2px 4px;margin-left:4px;color:var(--blue);font:inherit;text-decoration:underline;cursor:pointer;min-height:24px}
 .deep-link-flash{outline:2px solid var(--blue);outline-offset:4px;border-radius:6px}
 .gated-fields{display:none}
 .gated-fields.open{display:block}
@@ -676,7 +678,7 @@ function updateModifiedChips() {
   const countEl = document.getElementById('modified-count');
   if (countEl) {
     countEl.textContent = (totalCount > 0 && Object.keys(envDefaults).length > 0)
-      ? modifiedCount + ' of ' + totalCount + ' modified'
+      ? modifiedCount + ' set by you'
       : '';
   }
 }
@@ -748,7 +750,9 @@ function renderEnvField(field, value) {
     ? `<div class="field-src-note" id="${esc(noteId)}">${esc(src.source === 'auto' ? 'Automatic: ' : '')}${esc(src.reason)}${src.source === 'locked' ? ' — edit it there, then recreate the container' : ''}</div>` : '';
   const helpHtml = field.help ? `<div class="field-help">${esc(field.help)}</div>` : '';
   const reqMark = field.required ? '<span class="required">*</span>' : '';
-  const resetBtn = isLocked ? '' : `<button type="button" class="field-reset" onclick="resetField('env','${escJs(field.key)}')" title="Undo change">↺</button>`;
+  const resetBtn = (isLocked ? '' : `<button type="button" class="field-reset" onclick="resetField('env','${escJs(field.key)}')" title="Undo change">↺</button>`)
+    + (field.auto_capable && src.source === 'set'
+      ? `<button type="button" class="btn btn-ghost btn-sm use-auto" onclick="useAutomatic('${escJs(field.key)}')" title="Remove your setting and let Zurgarr decide">Use automatic</button>` : '');
   // "modified" chip \u2014 always present in the DOM; visibility driven by
   // .is-nondefault on the parent .field row (set by updateModifiedChips).
   const modChip = `<span class="field-modified-chip" aria-label="modified from default">modified</span>`;
@@ -800,6 +804,7 @@ function renderEnvCategories(values) {
   const advSection = adv => adv
     ? `<button type="button" class="advanced-toggle" aria-expanded="false" onclick="toggleAdvanced(this)">Show advanced settings</button><div class="advanced-fields">${adv}</div>` : '';
 
+  let tuningHtml = '';
   ENV_SCHEMA.categories.forEach((cat, i) => {
     const gate = cat.gate;
     let gateField = '', main = '', adv = '', freeMain = '', freeAdv = '';
@@ -814,7 +819,8 @@ function renderEnvCategories(values) {
     if (!gateField && !main && !adv && !freeMain && !freeAdv) return;   // all moved to Essentials
 
     let bodyHtml;
-    if (!gate && !main) {
+    const tuningOnly = !gate && !main;
+    if (tuningOnly) {
       // Nothing but tuning here: opening the section already says "show me".
       bodyHtml = adv;
     } else if (!gate) {
@@ -823,10 +829,19 @@ function renderEnvCategories(values) {
       const open = _gateOn(gate.key, values);
       const gateSrc = envSources[gate.key] || {};
       const note = gate.note + (gateSrc.source === 'locked' ? ' (The switch is set in docker-compose — change it there.)' : '');
-      bodyHtml = `${gateField}${freeMain}<div class="gate-note" data-gate-note="${esc(gate.key)}"${open ? ' hidden' : ''}>${esc(note)}</div><div class="gated-fields${open ? ' open' : ''}" data-gate="${esc(gate.key)}">${main}${advSection(adv)}</div>${advSection(freeAdv)}`;
+      // The switch lives in another section: offer a jump to it.
+      const homeCat = gateField ? null : ENV_SCHEMA.categories.find(c => c.fields.some(f => f.key === gate.key));
+      const goTo = homeCat ? ` <button type="button" class="link-btn" onclick="goToField('${escJs(gate.key)}')">Go to the ${esc(homeCat.name)} switch</button>` : '';
+      const gatedWrap = inner => `<div class="gated-fields${open ? ' open' : ''}" data-gate="${esc(gate.key)}">${inner}</div>`;
+      // One "Show advanced" per section: switch-dependent tuning nests inside
+      // the always-available one when both exist.
+      const advHtml = freeAdv ? advSection(freeAdv + (adv ? gatedWrap(adv) : '')) : '';
+      bodyHtml = `${gateField}${freeMain}<div class="gate-note" data-gate-note="${esc(gate.key)}"${open ? ' hidden' : ''}>${esc(note)}${goTo}</div>${gatedWrap(main + (freeAdv ? '' : advSection(adv)))}${advHtml}`;
     }
-    html += `<div class="category" data-cat-idx="${i}" data-tab="env">${_catHeader(cat.name, cat.description, false)}<div class="cat-body">${bodyHtml}</div></div>`;
+    const catHtml = `<div class="category" data-cat-idx="${i}" data-tab="env">${_catHeader(cat.name, cat.description, false)}<div class="cat-body">${bodyHtml}</div></div>`;
+    if (tuningOnly) tuningHtml += catHtml; else html += catHtml;
   });
+  if (tuningHtml) html += `<div class="cat-group-label">Tuning &amp; maintenance</div>${tuningHtml}`;
 
   container.innerHTML = html;
   updateModifiedChips();
@@ -847,6 +862,12 @@ function applyGate(key) {
   const open = _gateOn(key, values);
   document.querySelectorAll(`.gated-fields[data-gate="${key}"]`).forEach(g => g.classList.toggle('open', open));
   document.querySelectorAll(`.gate-note[data-gate-note="${key}"]`).forEach(n => { n.hidden = open; });
+}
+
+// Jump to a field on this page (same path as a /settings#KEY deep link).
+function goToField(key) {
+  if (location.hash === '#' + key) openFieldFromHash();
+  else location.hash = key;
 }
 
 // /settings#KEY (from the Status page's Setup check): open the field's
@@ -900,9 +921,39 @@ document.addEventListener('change', e => {
 function collectEnvData() {
   const data = {};
   document.querySelectorAll('#tab-env [data-key]').forEach(el => {
-    data[el.dataset.key] = el.dataset.type === 'boolean' ? (el.checked ? 'true' : 'false') : el.value;
+    // data-clear: post '' so the server removes the key from config/.env
+    // (back to default / automatic) — set by Reset All and "Use automatic".
+    data[el.dataset.key] = el.dataset.clear === '1' ? ''
+      : (el.dataset.type === 'boolean' ? (el.checked ? 'true' : 'false') : el.value);
   });
   return data;
+}
+
+// Any real edit to a field cancels a pending clear on it.
+['input', 'change'].forEach(ev => document.addEventListener(ev, e => {
+  if (e.isTrusted && e.target && e.target.dataset && e.target.dataset.clear === '1') delete e.target.dataset.clear;
+}, true));
+
+function useAutomatic(key) {
+  const el = document.getElementById('env-' + key);
+  if (!el) return;
+  el.dataset.clear = '1';
+  const note = document.getElementById('src-' + key);
+  const msg = 'Switches back to automatic when you save.';
+  if (note) note.textContent = msg;
+  else el.closest('.field-input').insertAdjacentHTML('beforeend', `<div class="field-src-note" id="src-${esc(key)}">${msg}</div>`);
+  updateDirtyUI();
+}
+
+// Reset All to Defaults: show the defaults AND mark every editable field to
+// be cleared on save, so the saved file drops back to "nothing set" instead
+// of pinning today's defaults.
+function applyResetToDefaults(defaults) {
+  renderEnvCategories(defaults);
+  document.querySelectorAll('#tab-env [data-key]').forEach(el => {
+    if (!el.disabled && !el.readOnly) el.dataset.clear = '1';
+  });
+  updateDirtyUI();
 }
 
 function clearFieldErrors(container) {
@@ -973,8 +1024,7 @@ async function envSave() {
       let html = '<strong>Settings saved and applied!</strong>';
       if (result.restarted && result.restarted.length) html += '<br>Services restarting: ' + result.restarted.map(s => esc(s)).join(', ');
       if (result.warnings && result.warnings.length) html += '<br><br><strong>Warnings:</strong><br>' + result.warnings.map(w => '&bull; ' + esc(w)).join('<br>');
-      showBanner('success', html);
-      showToast('Settings saved and applied!', 'success');
+      showBanner('success', html);   // the banner carries the confirmation (no duplicate toast)
       // Re-fetch canonical values so the form reflects server-side
       // sanitization (trailing-whitespace strip, etc). Three guards:
       //   (1) skip the re-render if the user is already typing into a
@@ -1867,8 +1917,7 @@ async function envResetDefaults() {
   try {
     const resp = await fetch('/api/settings/reset/env', {method: 'POST'});
     const defaults = await resp.json();
-    renderEnvCategories(defaults);
-    updateDirtyUI();
+    applyResetToDefaults(defaults);
     showBanner('info', 'Form reset to defaults. Click <strong>Save &amp; Apply</strong> to write changes.');
   } catch (e) { showBanner('error', 'Reset failed: ' + esc(e.message)); }
 }
@@ -2280,6 +2329,7 @@ function getEnvChangedFields() {
     if (el.dataset.type === 'boolean') saved = saved.toLowerCase() === 'true' ? 'true' : 'false';
     // Selects match options case-insensitively when rendering; compare the same way.
     if (el.dataset.type === 'select' ? current.toLowerCase() !== saved.toLowerCase() : current !== saved) changes.add(key);
+    else if (el.dataset.clear === '1' && (envSources[key] || {}).source === 'set') changes.add(key);   // pending clear
   });
   return changes;
 }

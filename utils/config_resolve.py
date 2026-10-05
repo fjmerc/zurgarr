@@ -257,11 +257,13 @@ def apply(resolved, environ=None):
 
 
 def current():
-    return dict(_CURRENT)
+    with _LOCK:
+        return dict(_CURRENT)
 
 
 def written():
-    return dict(_WRITTEN)
+    with _LOCK:
+        return dict(_WRITTEN)
 
 
 # Serializes resolve+apply across threads (startup, SIGHUP reload, the

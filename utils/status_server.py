@@ -1296,12 +1296,24 @@ function renderBanners(alerts){
 }
 function dismissBanners(){_bannerDismissedSig=_bannerSig(_lastAlerts);_bannerRenderedSig=null;var el=document.getElementById('banner');if(el)el.innerHTML='';}
 
-var _scRenderedSig=null,_scAnnounced=null;
+var _scRenderedSig=null,_scAnnounced=null,_scCheckedAt=null;
+function _scTickChecked(){
+  var t=document.getElementById('sc-checked');if(!t||!_scCheckedAt)return;
+  var s=Math.max(0,Math.round(Date.now()/1000-_scCheckedAt));
+  t.textContent='checked '+(s<5?'just now':(s<60?s+'s ago':Math.round(s/60)+'m ago'));
+}
+setInterval(_scTickChecked,5000);
+function recheckSetup(){
+  fetch('/api/setup-check?fresh=1').then(function(r){return r.json();})
+    .then(function(sc){_scRenderedSig=null;renderSetupCheck(sc);if(window.showToast)showToast('Setup checked','success');})
+    .catch(function(){if(window.showToast)showToast('Could not run the setup check','error');});
+}
 function renderSetupCheck(sc){
   var wrap=document.getElementById('setup-check-wrap'),el=document.getElementById('setup-check'),okEl=document.getElementById('setup-ok');
   if(!wrap||!el)return;
   if(!sc){wrap.hidden=true;if(okEl)okEl.textContent='';_scRenderedSig=null;return;}
   var f=sc.findings||[],d=sc.dismissed||0,auth=!!sc.auth_configured;
+  _scCheckedAt=sc.checked_at||null;_scTickChecked();
   // Rebuild only when something changed: a rebuild on every poll would
   // throw away keyboard focus inside the card.
   var sig=JSON.stringify([f.map(function(x){return [x.id,x.level,x.key,x.label,x.message,x.fix];}),d,auth]);
@@ -1315,7 +1327,8 @@ function renderSetupCheck(sc){
   if(!f.length){
     // Nothing to act on: no card, just a quiet note in the meta line.
     wrap.hidden=true;
-    if(okEl)okEl.textContent='Setup OK'+(tips?' · '+tips:'');
+    if(okEl)okEl.innerHTML=esc('Setup OK'+(tips?' · '+tips:''))+' · <span id="sc-checked"></span> <button type="button" class="link-btn" data-recheck>Recheck</button>';
+    _scTickChecked();
     return;
   }
   if(okEl)okEl.textContent='';
@@ -1329,8 +1342,9 @@ function renderSetupCheck(sc){
       (x.level==='recommend'&&auth?'<button type="button" data-dismiss="'+esc(x.id)+'">Dismiss tip</button>':'')+
       '</div></div></li>';
   });
-  h+='</ul>'+(tips?'<div class="sc-footer">'+tips+'</div>':'');
+  h+='</ul><div class="sc-footer">'+(tips?tips+' · ':'')+'<span id="sc-checked"></span> <button type="button" class="link-btn" data-recheck>Recheck now</button></div>';
   el.innerHTML=h;
+  _scTickChecked();
   var worst=f[0].level;
   // Tips alone aren't a health state — no coloured border for them.
   setCardHealth('Setup check',worst==='error'?'card-crit':(worst==='warn'?'card-warn':''));
@@ -1353,6 +1367,8 @@ function dismissFinding(id){
 document.addEventListener('click',function(e){
   var b=e.target&&e.target.closest?e.target.closest('[data-dismiss]'):null;
   if(b)dismissFinding(b.getAttribute('data-dismiss'));
+  var rc=e.target&&e.target.closest?e.target.closest('[data-recheck]'):null;
+  if(rc)recheckSetup();
 });
 function update(){
   var _fd=document.getElementById('fetch-dot');if(_fd)_fd.className='pulse-dot fetching';
@@ -1601,6 +1617,7 @@ _DASHBOARD_EXTRA_CSS = """
 .sc-actions a:hover,.sc-actions button:hover{border-color:var(--blue)}
 .sc-footer{font-size:.8em;color:var(--text2);padding-top:6px;border-top:1px solid var(--border2)}
 #sc-title:focus{outline:none}
+.link-btn{background:none;border:0;padding:2px 4px;color:var(--blue);font:inherit;text-decoration:underline;cursor:pointer;min-height:24px}
 /* Library source colors. Single value per theme: darkened enough that the
    white in-bar labels clear WCAG AA (4.5:1) in both light and dark. */
 :root{--lib-local:#9333ea;--lib-cloud:#0e7490}
@@ -1845,6 +1862,15 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
         if self.path == '/api/status':
             data = json.dumps(self.status_data_ref.to_dict())
             self._send_json_response(200, data)
+        elif urlparse(self.path).path == '/api/setup-check':
+            # "Recheck now" — ?fresh=1 bypasses the 15s cache.
+            fresh = parse_qs(urlparse(self.path).query).get('fresh', [''])[0] == '1'
+            try:
+                from utils.setup_check import get_setup_check
+                payload = get_setup_check(fresh=fresh)
+            except Exception:
+                payload = _setup_check_payload()
+            self._send_json_response(200, json.dumps(payload))
         elif self.path.startswith('/api/logs'):
             parsed = urlparse(self.path)
             params = parse_qs(parsed.query)

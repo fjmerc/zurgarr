@@ -1242,7 +1242,9 @@ class TestSyncPlexDebridToEnv:
         assert written['SEERR_API_KEY'] == 'newkey'
 
     def test_syncs_all_simple_mappings(self, tmp_path):
-        env_file = self._make_env(tmp_path, '')
+        # SHOW_MENU starts explicitly 'true' so 'false' is a real change
+        # (an unset boolean already means off — syncing that would be a no-op rewrite).
+        env_file = self._make_env(tmp_path, 'SHOW_MENU=true\n')
         values = {
             'Overseerr Base URL': 'http://seerr:5055',
             'Overseerr API Key': 'seerrkey',

@@ -93,7 +93,12 @@ def _redact(message, values=()):
     backstop — quoted values and anything URL-shaped.  The key name stays;
     the card's "Open setting" link leads to the value."""
     for v in values:
-        message = message.replace(v, '…')
+        if len(v) < 8:
+            # Short values: only as a standalone word, so a 3-letter username
+            # like "the" doesn't blank ordinary words in the message.
+            message = re.sub(r'(?<![A-Za-z0-9])' + re.escape(v) + r'(?![A-Za-z0-9])', '…', message)
+        else:
+            message = message.replace(v, '…')
     message = re.sub(r'"[^"]*"', '"…"', message)   # repr() of values with an apostrophe
     message = re.sub(r"'[^']*'", "'…'", message)
     return re.sub(r'\b[a-zA-Z][a-zA-Z0-9+.-]*://\S+', '…', message)
@@ -278,9 +283,29 @@ def _log():
     return get_logger()
 
 
-def get_setup_check():
+def _clear_resolved_dismissals(data):
+    """Forget a tip's dismissal once the user acts on it (its setting is
+    turned on), so it can come back if the setting is turned off again."""
+    resolved = [k for k in data if k.startswith('rec:') and _on(k[4:])]
+    if not resolved:
+        return data
+    import json
+    from utils.file_utils import atomic_write
+    data = {k: v for k, v in data.items() if k not in resolved}
+    with _dismiss_lock:
+        try:
+            with atomic_write(_dismissed_path()) as out:
+                json.dump(data, out, indent=2, sort_keys=True)
+        except OSError:
+            pass
+    return data
+
+
+def get_setup_check(fresh=False):
     """Payload for /api/status: {'findings', 'dismissed', 'auth_configured'}.
     Cached for 15s; never raises (a crash becomes a warning, never "OK")."""
+    if fresh:
+        _invalidate()
     now = time.time()
     with _lock:
         if _cache['value'] is not None and now - _cache['at'] < _CACHE_TTL:
@@ -288,7 +313,7 @@ def get_setup_check():
         gen = _cache['gen']
     try:
         findings = collect_findings()
-        dismissed = _load_dismissed()
+        dismissed = _clear_resolved_dismissals(_load_dismissed())
         shown = [f for f in findings if dismissed.get(f['id']) != f['sig']]
         dismissed_count = len(findings) - len(shown)
     except Exception:
@@ -301,6 +326,7 @@ def get_setup_check():
         'findings': [{k: v for k, v in f.items() if k != 'sig'} for f in shown],
         'dismissed': dismissed_count,
         'auth_configured': _auth_configured(),
+        'checked_at': now,
     }
     with _lock:
         if _cache['gen'] == gen:   # a dismiss/invalidate mid-compute makes this stale

@@ -111,6 +111,22 @@ def _reload_env():
     return set(changes)
 
 
+def _zurg_toggle_plan(changed, zurg_on, zurg_registered):
+    """How a SIGHUP should treat a ZURG_ENABLED flip.
+
+    Returns (stop_only, note): services to stop and NOT restart, and a note
+    to surface.  Zurg (and its rclone mount) only start at container boot,
+    so turning it on when it never started needs a container restart.
+    """
+    if 'ZURG_ENABLED' not in changed:
+        return set(), None
+    if not zurg_on:
+        return {'zurg', 'rclone'}, None
+    if not zurg_registered:
+        return set(), 'Zurg was turned on — restart the container to start Zurg and its mount.'
+    return set(), None
+
+
 def _determine_restarts(changed_vars):
     """Given changed env var names, return services that need restart."""
     services = set()
@@ -190,8 +206,20 @@ def _reload_once():
 
         # Handle process-based services
         process_services = {'zurg', 'rclone', 'plex_debrid'} & services
+        from utils.processes import _process_registry, _registry_lock
+        with _registry_lock:
+            zurg_registered = any(e['process_name'].lower() == 'zurg' for e in _process_registry)
+        stop_only, zurg_note = _zurg_toggle_plan(
+            changed, os.environ.get('ZURG_ENABLED', '').strip().lower() == 'true', zurg_registered)
+        if zurg_note:
+            logger.warning(f"[reload] {zurg_note}")
+            process_services -= {'zurg', 'rclone'}
+            try:
+                from utils.status_server import status_data
+                status_data.add_event('config_reload', zurg_note)
+            except Exception:
+                pass
         if process_services:
-            from utils.processes import _process_registry, _registry_lock
 
             # Stop affected services (reverse dependency order)
             stop_order = ['plex_debrid', 'rclone', 'zurg']
@@ -255,8 +283,8 @@ def _reload_once():
                 if _proc_mod._shutting_down:
                     logger.info("[reload] Aborting restart — shutdown in progress")
                     return
-                if svc_name not in process_services:
-                    continue
+                if svc_name not in process_services or svc_name in stop_only:
+                    continue   # stop_only: Zurg was turned off — stay stopped
                 for entry in start_entries:
                     name = entry['process_name']
                     handler = entry['handler']
