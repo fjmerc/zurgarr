@@ -261,20 +261,22 @@ class TestSettingsFileBeatsBlankContainerEnv:
 
     def test_blank_container_value_is_filled_from_file(self, monkeypatch, tmp_path):
         from base import load_env_file
+        from utils import config_resolve as cr
+        monkeypatch.setattr(cr, '_WRITTEN', {})
+        monkeypatch.setattr(cr, '_CURRENT', {})
         env_file = tmp_path / '.env'
         env_file.write_text('BH_TEST_ENABLED=true\nBH_TEST_EXPLICIT=fromfile\n'
                             'BH_TEST_EMPTY=\nBH_TEST_MISSING=x\nBH_TEST_SPACES=filled\n')
-        monkeypatch.setenv('BH_TEST_ENABLED', '')          # compose blank
+        monkeypatch.setenv('BH_TEST_ENABLED', '')
         monkeypatch.setenv('BH_TEST_EXPLICIT', 'fromcompose')
         monkeypatch.setenv('BH_TEST_EMPTY', '')
         monkeypatch.setenv('BH_TEST_SPACES', '   ')
-        # setenv-then-delenv registers an undo so the loaded key can't leak
         monkeypatch.setenv('BH_TEST_MISSING', 'placeholder')
         monkeypatch.delenv('BH_TEST_MISSING')
         load_env_file(str(env_file))
         assert os.environ['BH_TEST_ENABLED'] == 'true'
-        assert os.environ['BH_TEST_EXPLICIT'] == 'fromcompose'  # non-blank container value still wins
-        assert os.environ['BH_TEST_EMPTY'] == ''               # blank file values never apply
+        assert os.environ['BH_TEST_EXPLICIT'] == 'fromcompose'
+        assert os.environ['BH_TEST_EMPTY'] == ''
         assert os.environ['BH_TEST_MISSING'] == 'x'
         assert os.environ['BH_TEST_SPACES'] == 'filled'
 
@@ -357,6 +359,9 @@ class TestReviewRound3:
     def test_load_env_file_records_filled_keys(self, monkeypatch, tmp_path):
         # Upgrade visibility: keys revived from /config/.env must be loggable.
         import base
+        from utils import config_resolve as cr
+        monkeypatch.setattr(cr, '_WRITTEN', {})
+        monkeypatch.setattr(cr, '_CURRENT', {})
         env_file = tmp_path / '.env'
         env_file.write_text('BH_TEST_ENABLED=true\n')
         monkeypatch.setenv('BH_TEST_ENABLED', '')

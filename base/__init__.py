@@ -1,5 +1,5 @@
 from json import load, dump
-from dotenv import load_dotenv, find_dotenv, dotenv_values
+from dotenv import find_dotenv, dotenv_values
 from datetime import datetime, timedelta
 import logging
 from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler, BaseRotatingHandler
@@ -116,25 +116,23 @@ __all__ = [
 ]
 
 def load_env_file(path):
-    """Load *path* into os.environ without overriding real container values.
+    """Resolve every setting (utils/config_resolve.py) and apply it to os.environ.
 
-    load_dotenv(override=False) also refuses to override *blank* values, and
-    the stock compose passes every optional var as ``X=${X:-}`` — so a
-    setting saved via the Settings UI (which writes /config/.env) would
-    silently revert to blank on every restart.  Blank counts as unset here:
-    the file fills it.  Non-blank container values still win; blank file
-    values are never applied.  (A SIGHUP reload is different: config_reload
-    applies .env values over the container's, so UI saves take effect.)
+    Precedence: Docker secret > locked (container env the resolver didn't
+    write) > /config/.env > derivation rule > DEFAULTS.  Blank counts as
+    not provided.  Records keys whose blank container value was filled from
+    the file in ENV_FILE_FILLED_KEYS for main()'s startup log.
     """
-    if not path or not os.path.exists(path):
-        return
-    load_dotenv(path, override=False)
-    for key, value in dotenv_values(path).items():
-        if value and not os.environ.get(key, '').strip():
-            os.environ[key] = value
-            if key not in ENV_FILE_FILLED_KEYS:
-                ENV_FILE_FILLED_KEYS.append(key)
-
+    from utils import config_resolve
+    file_env = dotenv_values(path) if path and os.path.exists(path) else {}
+    blank_before = {k for k, v in os.environ.items() if not v.strip()}
+    resolved = config_resolve.resolve(
+        os.environ, file_env, config_resolve.present_secrets(SECRETS_DIR),
+        config_resolve.written())
+    config_resolve.apply(resolved)
+    for key, r in resolved.items():
+        if r.source == 'set' and key in blank_before and key not in ENV_FILE_FILLED_KEYS:
+            ENV_FILE_FILLED_KEYS.append(key)
 
 # Keys whose blank container value was filled from /config/.env — logged
 # by main() once logging is up, so settings revived from the file (e.g.

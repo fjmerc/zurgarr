@@ -108,10 +108,17 @@ class TestDefaultsTable:
             'BLACKHOLE_MOUNT_POLL_TIMEOUT': '300', 'BLACKHOLE_MOUNT_POLL_INTERVAL': '10',
             'BLACKHOLE_SYMLINK_MAX_AGE': '72', 'SYMLINK_REPAIR_AUTO_SEARCH': 'false',
             'DEBRID_HEALTH_ENABLED': 'true', 'DEBRID_HEALTH_AUTO_REMEDIATE': 'false',
-            'STATUS_UI_ENABLED': 'true', 'STATUS_UI_PORT': '8080',
+            'STATUS_UI_PORT': '8080',
         }
         assert {k: cr.DEFAULTS.get(k) for k in expected} == expected
         assert 'ZURG_ENABLED' in cr.RULES
+
+    def test_status_ui_is_off_unless_configured(self):
+        # Security: the dashboard's read-only pages are open without
+        # STATUS_UI_AUTH, so it must not switch itself on for users who
+        # never configured it. The starter config/.env enables it next to
+        # the STATUS_UI_AUTH it needs.
+        assert cr.DEFAULTS['STATUS_UI_ENABLED'] == 'false'
 
     def test_only_rclone_mount_name_among_rclone_keys(self):
         # rclone parses every RCLONE_<FLAG> env var; a default here would
@@ -187,3 +194,43 @@ class TestDefaultsSync:
     def test_settings_ui_defaults_are_a_view_of_defaults(self):
         from utils.settings_api import _ENV_DEFAULTS, _ALL_KEYS
         assert _ENV_DEFAULTS == {k: v for k, v in cr.DEFAULTS.items() if k in _ALL_KEYS}
+
+
+class TestApply:
+
+    @pytest.fixture(autouse=True)
+    def _fresh_state(self, monkeypatch):
+        monkeypatch.setattr(cr, '_WRITTEN', {})
+        monkeypatch.setattr(cr, '_CURRENT', {})
+
+    def test_writes_defaults_and_set_values(self):
+        env = {}
+        cr.apply(cr.resolve(env, {'NOTIFICATION_URL': 'json://x'}), env)
+        assert env['BLACKHOLE_DIR'] == '/watch'
+        assert env['NOTIFICATION_URL'] == 'json://x'
+
+    def test_never_writes_locked_or_secret(self):
+        env = {'BLACKHOLE_DIR': '/c', 'RD_API_KEY': 'env-key'}
+        cr.apply(cr.resolve(env, {}, frozenset({'RD_API_KEY'})), env)
+        assert env['BLACKHOLE_DIR'] == '/c'
+        assert env['RD_API_KEY'] == 'env-key'
+        assert 'BLACKHOLE_DIR' not in cr.written()
+
+    def test_removed_set_key_is_popped(self):
+        env = {}
+        cr.apply(cr.resolve(env, {'NOTIFICATION_URL': 'json://x'}), env)
+        cr.apply(cr.resolve(env, {}, written=cr.written()), env)
+        assert 'NOTIFICATION_URL' not in env
+
+    def test_env_set_after_apply_is_treated_as_locked(self):
+        env = {}
+        cr.apply(cr.resolve(env, {}), env)
+        env['BLACKHOLE_DIR'] = '/runtime'          # e.g. a test's setenv
+        res = cr.resolve(env, {}, written=cr.written())
+        assert (res['BLACKHOLE_DIR'].value, res['BLACKHOLE_DIR'].source) == ('/runtime', 'locked')
+
+    def test_current_reflects_last_apply(self):
+        env = {}
+        res = cr.resolve(env, {})
+        cr.apply(res, env)
+        assert cr.current() == res

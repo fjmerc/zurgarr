@@ -64,3 +64,24 @@ def clean_env(monkeypatch):
     for var in pd_vars:
         monkeypatch.delenv(var, raising=False)
     return monkeypatch
+
+
+@pytest.fixture(autouse=True)
+def _isolate_env_and_resolver():
+    """Restore os.environ and resolver state after every test.
+
+    Config() / load_env_file() now write resolved defaults into os.environ;
+    without this, one test's writes (and the resolver's memory of them)
+    would leak into the next.  Uses no monkeypatch on purpose (see the
+    note on fixture teardown order above).
+    """
+    from utils import config_resolve
+    saved_env = dict(os.environ)
+    saved_written = dict(config_resolve._WRITTEN)
+    saved_current = dict(config_resolve._CURRENT)
+    yield
+    os.environ.clear()
+    os.environ.update(saved_env)
+    config_resolve._WRITTEN.clear()
+    config_resolve._WRITTEN.update(saved_written)
+    config_resolve._CURRENT = saved_current

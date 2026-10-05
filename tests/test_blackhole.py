@@ -1087,6 +1087,13 @@ class TestExtractTorrentId:
 
 class TestFindOnMount:
 
+    @pytest.fixture(autouse=True)
+    def _flat_mount_root(self, monkeypatch):
+        # These tests pass the mount root itself as rclone_mount; with
+        # RCLONE_MOUNT_NAME set (the resolver applies its 'zurgarr'
+        # default) the search would look under <root>/zurgarr instead.
+        monkeypatch.delenv('RCLONE_MOUNT_NAME', raising=False)
+
     def test_finds_in_shows(self, tmp_dir):
         """Should find content in the shows category."""
         shows_dir = os.path.join(tmp_dir, 'shows', 'My.Show.S01')

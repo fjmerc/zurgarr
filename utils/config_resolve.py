@@ -40,7 +40,7 @@ DEFAULTS = {
     'TORBOX_SCAN_TIMEOUT': '180',
     'MOUNT_SELFHEAL_ENABLED': 'true',
     # Status UI
-    'STATUS_UI_ENABLED': 'true',
+    'STATUS_UI_ENABLED': 'false',
     'STATUS_UI_PORT': '8080',
     # Blackhole
     'BLACKHOLE_ENABLED': 'false',
@@ -225,3 +225,39 @@ def resolve(environ, file_env, secrets=frozenset(), written=None):
                   'secret': 'set via Docker secret'}.get(source)
         out[key] = Resolved(value, source, reason)
     return out
+
+
+# Resolver state: what apply() last wrote into the environ, and the last
+# applied resolution (read by the Settings API for provenance).
+_WRITTEN = {}
+_CURRENT = {}
+
+
+def apply(resolved, environ=None):
+    """Write resolved values into *environ* (default os.environ).
+
+    set/auto/default are written; unset keys the resolver previously wrote
+    are removed; locked and secret keys are never touched.
+    """
+    global _CURRENT
+    environ = os.environ if environ is None else environ
+    for key, r in resolved.items():
+        if r.source in ('locked', 'secret'):
+            _WRITTEN.pop(key, None)
+            continue
+        if r.source == 'unset':
+            if key in _WRITTEN:
+                environ.pop(key, None)
+                _WRITTEN.pop(key, None)
+            continue
+        environ[key] = r.value
+        _WRITTEN[key] = r.value
+    _CURRENT = dict(resolved)
+
+
+def current():
+    return dict(_CURRENT)
+
+
+def written():
+    return dict(_WRITTEN)
