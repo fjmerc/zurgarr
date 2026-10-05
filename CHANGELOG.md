@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Docs: README/CONFIGURATION no longer overstate debrid provider support**: both claimed AllDebrid or TorBox could stand in for Real-Debrid. Public Zurg is Real-Debrid only (AllDebrid needs the sponsors-only nightly via `GITHUB_TOKEN` + `ZURG_VERSION=nightly`), and TorBox is an add-on co-debrid whose mount goes through rclone WebDAV and needs `TORBOX_WEBDAV_USER`/`TORBOX_WEBDAV_PASS` — a TorBox-only setup fails startup validation. The README also now lists features added since its last pass (dual-debrid routing, Prowlarr search, Wanted recovery + Tautulli ordering, Seerr writeback, debrid health/quota dashboards, scanner Plex refresh). It describes all five web UI pages and the real Settings tabs (there was never a separate OAuth tab), uses `:rslave` on local-library binds in its compose examples, and correctly states that without `STATUS_UI_AUTH` only Settings and state-changing actions are locked while the read-only pages stay open.
+
 - **Status page: long service errors no longer spill across neighbouring cards**: the "Last error" line on a provider card inherited the metric chips' no-wrap styling, so long upstream errors (e.g. `HTTPSConnectionPool(...)` traces) ran straight across the rest of the Services row. The error now wraps (breaking long tokens), is clamped to three lines, and shows the full text on hover.
 
 - **Status page: the Overseerr tile can now actually turn red**: the tile probed the public `/api/v1/status` endpoint, which answers 200 with a dead or wrong API key — the long-documented "Seerr tile mistake". It now probes the authenticated `/api/v1/request?take=1`, so a bad key finally shows as an error instead of false green.

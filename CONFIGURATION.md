@@ -21,7 +21,7 @@ Three options, any of them work:
 
 | Variable | Why |
 |---|---|
-| `RD_API_KEY` (or `AD_API_KEY` or `TORBOX_API_KEY`) | Zurg can't connect without a debrid account |
+| `RD_API_KEY` (or `AD_API_KEY` with Zurg nightly) | Zurg can't connect without a debrid account. TorBox alone isn't enough — Zurg can't serve TorBox; it's an add-on (see [TorBox co-debrid](#torbox-co-debrid-mount-plan-39)) |
 | `STATUS_UI_AUTH` | Unlocks the web UI at `/settings`. Format: `user:password` |
 
 Everything else has a sensible default or is opt-in.
@@ -35,7 +35,7 @@ Everything else has a sensible default or is opt-in.
 | `TZ` | [Timezone](http://en.wikipedia.org/wiki/List_of_tz_database_time_zones) | |
 | `ZURG_ENABLED` | Enable Zurg | `false` |
 | `RD_API_KEY` | [Real-Debrid API key](https://real-debrid.com/apitoken) | |
-| `AD_API_KEY` | [AllDebrid API key](https://alldebrid.com/apikeys/) | |
+| `AD_API_KEY` | [AllDebrid API key](https://alldebrid.com/apikeys/). Public Zurg is Real-Debrid only — AllDebrid needs the sponsors-only nightly (`ZURG_VERSION=nightly` + `GITHUB_TOKEN`) | |
 | `TORBOX_API_KEY` | [TorBox API key](https://torbox.app/settings). Powers cache probes, search-add, and dual-debrid blackhole routing. For the WebDAV mount, see [TorBox co-debrid](#torbox-co-debrid-mount-plan-39). | |
 | `RCLONE_MOUNT_NAME` | Name for the rclone mount | |
 | `RCLONE_LOG_LEVEL` | [rclone log level](https://rclone.org/docs/#log-level-level). `OFF` to suppress | `NOTICE` |

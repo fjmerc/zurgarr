@@ -4,13 +4,13 @@ Local media and debrid content, managed as one library — for Plex, Jellyfin, S
 
 ## What is Zurgarr?
 
-Zurgarr bridges your local media library and a Real-Debrid / AllDebrid /
-TorBox account so your *arr stack and media server see them as one
-unified library instead of two parallel systems.
+Zurgarr bridges your local media library and your debrid account(s) —
+Real-Debrid, optionally alongside TorBox — so your *arr stack and media
+server see them as one unified library instead of two parallel systems.
 
 At its base it packages
 **[Zurg](https://github.com/debridmediamanager/zurg-public)** (WebDAV
-for your debrid account), **[rclone](https://github.com/rclone/rclone)**
+for your Real-Debrid account), **[rclone](https://github.com/rclone/rclone)**
 (mounts it as a local directory), and optionally
 **[plex_debrid](https://github.com/itsToggle/plex_debrid)** (watchlist
 automation) into a single ~150 MB Alpine container — your media server
@@ -48,8 +48,12 @@ observe. Capabilities grouped by intent:
 - **Auto debrid symlinks** — debrid-only content appears in your local
   library paths so Sonarr/Radarr can discover and manage it alongside
   local files
-- **Interactive Torrentio search** with per-provider cache annotations
-  and one-click add-to-debrid, straight from the Library detail view
+- **Dual-debrid** — run TorBox alongside Real-Debrid; each blackhole grab
+  is routed to whichever side has it cached, and TorBox content gets its
+  own mount and Plex library
+- **Interactive search** across Torrentio and (optionally) every
+  Prowlarr indexer, with per-provider cache annotations and one-click
+  add-to-debrid, straight from the Library detail view
 - **Cross-machine setup** — expose Zurg's WebDAV and mount the debrid
   library from any host, not just the Zurgarr container
 
@@ -67,8 +71,16 @@ observe. Capabilities grouped by intent:
 - **TMDB gap-fill** — for every monitored show, diffs the aired-episode
   list against what exists across debrid + local and searches
   Sonarr/Radarr for the missing pieces, regardless of source preference
+- **Wanted recovery** — for titles the arr never grabbed, searches
+  Torrentio/Prowlarr directly and adds a cached release straight to
+  debrid, bypassing the arr's indexer pool; optional Tautulli watch
+  history puts titles people actually watch first
 - **Debrid-account dedup + require-cached gates** stop uncached junk and
   duplicate hashes from landing in your account in the first place
+- **Seerr request writeback** (opt-in) — marks Overseerr/Jellyseerr
+  requests available when Zurgarr delivers them, and declines movie
+  requests it has given up on, so requests don't sit at "processing"
+  forever
 
 **Self-healing — fewer manual interventions**
 
@@ -79,6 +91,12 @@ observe. Capabilities grouped by intent:
   re-search so RD cache evictions close automatically
 - **Hash blocklist** with configurable auto-expiry prevents re-grab
   loops on terminally failed torrents
+- **Debrid health reconciler** finds Real-Debrid torrents that have
+  become filter-blocked and (opt-in) blocklists, removes, and re-searches
+  them
+- **Plex refresh for scanner-delivered content** — TorBox and other
+  content that reaches the arr via a disk rescan still triggers a Plex
+  library scan
 - **ffprobe recovery** kills stuck Plex scans on expired debrid links
 - **Process auto-restart** with exponential backoff (5 s → 300 s, resets
   after 1 h stable)
@@ -89,6 +107,8 @@ observe. Capabilities grouped by intent:
   reload — edit most env vars without restarting the container
 - **Activity history log** — every grab, compromise, symlink event, and
   debrid add, filterable by type and time
+- **Debrid quota & expiry dashboard** — per-provider account expiry,
+  storage usage, and TorBox torrents about to expire
 - **Apprise notifications** across 90+ services (Discord, Telegram,
   Slack, email, etc.) with optional daily digest mode
 - **Prometheus metrics endpoint** for Grafana / Alertmanager (canned dashboard in [`grafana/`](grafana/))
@@ -129,7 +149,7 @@ Overseerr (requests) → Sonarr / Radarr (tag-based routing)
   │
   └─ Debrid path (tag: debrid — no VPN needed):
        Blackhole (/watch)
-         → Zurgarr (submit to Real-Debrid)
+         → Zurgarr (submit to Real-Debrid / TorBox, cache-aware)
            → Zurg / rclone (mount)
              → Symlinks (/completed)
                → Sonarr / Radarr (import) → Plex (stream)
@@ -142,9 +162,15 @@ Overseerr (requests) → Sonarr / Radarr (tag-based routing)
 - A **Linux Docker host** (not Docker Desktop — it lacks
   [mount propagation](https://docs.docker.com/storage/bind-mounts/#configure-bind-propagation)
   support)
-- A [Real-Debrid](https://real-debrid.com/apitoken),
-  [AllDebrid](https://alldebrid.com/apikeys/), or
-  [TorBox](https://torbox.app/settings) account with an API key
+- A [Real-Debrid](https://real-debrid.com/apitoken) account with an API
+  key. Optional extras:
+  - **[TorBox](https://torbox.app/settings)** as a co-debrid alongside
+    Real-Debrid. Its mount goes through rclone's WebDAV (Zurg can't serve
+    TorBox), so it also needs `TORBOX_WEBDAV_USER` / `TORBOX_WEBDAV_PASS` —
+    see [TorBox co-debrid](CONFIGURATION.md#torbox-co-debrid-mount-plan-39)
+  - **[AllDebrid](https://alldebrid.com/apikeys/)** instead of Real-Debrid
+    only works with Zurg's sponsors-only nightly build (`GITHUB_TOKEN` +
+    `ZURG_VERSION=nightly`); public Zurg is Real-Debrid only
 - FUSE support on the host (`/dev/fuse`)
 
 ### 1. Build the image
@@ -161,7 +187,7 @@ wget https://raw.githubusercontent.com/fjmerc/zurgarr/master/.env.example -O .en
 wget https://raw.githubusercontent.com/fjmerc/zurgarr/master/docker-compose.yml
 
 # Edit — at minimum set:
-#   RD_API_KEY        (or AD_API_KEY / TORBOX_API_KEY)
+#   RD_API_KEY        (plus TORBOX_API_KEY + TORBOX_WEBDAV_* for TorBox)
 #   STATUS_UI_AUTH    (e.g., admin:yourpassword)
 nano .env
 ```
@@ -239,9 +265,10 @@ BLACKHOLE_LOCAL_LIBRARY_MOVIES=/data/media/movies
 volumes:
   - /opt/blackhole:/watch            # Sonarr/Radarr drop .torrent files here
   - /opt/completed:/completed        # Zurgarr creates symlinks here
-  # Local library (read-write — needed for auto debrid symlinks):
-  - /path/to/library/tv:/data/media/tv
-  - /path/to/library/movies:/data/media/movies
+  # Local library (read-write — needed for auto debrid symlinks;
+  # :rslave so a network share mounted after boot still shows up):
+  - /path/to/library/tv:/data/media/tv:rslave
+  - /path/to/library/movies:/data/media/movies:rslave
 ```
 
 See the **[Blackhole Symlink Guide](BLACKHOLE_SYMLINK_GUIDE.md)** for
@@ -294,8 +321,8 @@ services:
       # - /opt/blackhole:/watch
       # - /opt/completed:/completed
       ## Uncomment for local library (read-write for auto debrid symlinks):
-      # - /path/to/library/tv:/data/media/tv
-      # - /path/to/library/movies:/data/media/movies
+      # - /path/to/library/tv:/data/media/tv:rslave
+      # - /path/to/library/movies:/data/media/movies:rslave
     ports:
       - "8080:8080"                  # Status UI
     devices:
@@ -332,22 +359,29 @@ The Plex container should wait for Zurgarr's mount to be ready:
 
 ## Web UI & Settings editor
 
-The **status dashboard** at `/status` shows process health (Zurg, rclone,
-plex_debrid), mount status, system resources, recent events, and a
-filtered log viewer.
+The web UI has five pages:
 
-The **settings editor** at `/settings` provides:
+- **Status** (`/status`) — process health (Zurg, rclone, plex_debrid),
+  mount status, connected-service tiles, system resources, and recent
+  events
+- **Library** (`/library`) — the unified local + debrid browser with
+  per-item preferences and interactive search
+- **Activity** (`/activity`) — the history log, filterable by type and time
+- **System** (`/system`) — scheduled tasks, debrid health and
+  quota/expiry cards, running configuration, and a filtered log viewer
+- **Settings** (`/settings`) — two tabs:
+  - **Zurgarr** — every env var with toggles, dropdowns, password
+    fields, inline validation, and SIGHUP reload (no restart needed)
+  - **Watchlist (plex_debrid)** — edit `settings.json` with multi-select
+    pickers, list editors, a quality-profile JSON editor, and
+    device-code OAuth buttons for Trakt, Debrid Link, Put.io, and Orionoid
+  - Each tab can export its config (`.env` / `settings.json`) for backup
+    or migration
 
-- **Zurgarr tab** — every env var with toggles, dropdowns, password
-  fields, inline validation, and SIGHUP reload (no restart needed)
-- **plex_debrid tab** — edit `settings.json` with multi-select pickers,
-  list editors, and a quality-profile JSON editor
-- **OAuth tab** — connect Trakt, Debrid Link, Put.io, and Orionoid via
-  device-code flow
-- **Import/Export** — download or upload settings for backup/migration
-
-Requires `STATUS_UI_AUTH` (e.g., `admin:changeme`). Not accessible
-without authentication.
+Set `STATUS_UI_AUTH` (e.g., `admin:changeme`) to put the whole UI behind
+basic auth. Without it, the Settings editor and state-changing actions
+stay locked, but the other pages are open to anyone who can reach the
+port. `/metrics` is always served without auth, for Prometheus scrapers.
 
 ## Docs
 
