@@ -398,6 +398,8 @@ def read_env_values():
         r = _resolved.get(key)
         if r is not None and r.source == 'locked':
             return os.environ.get(key, '')
+        if r is not None and r.source == 'secret':
+            return ''   # the secret is in effect; never echo a stale file copy
         if key in file_values:
             return file_values[key] or ''
         return os.environ.get(key, '') or _ENV_DEFAULTS.get(key, '')
@@ -461,6 +463,25 @@ def _format_env_line(key, value):
     return f'{key}={value}'
 
 
+def _write_env_file(explicit):
+    """Atomically write only *explicit* keys to ENV_FILE, grouped by category.
+
+    Callers hold _env_write_lock.  Never pass a defaulted/resolved view: a
+    default written here would be frozen as if the user had set it.
+    """
+    with atomic_write(ENV_FILE) as f:
+        f.write('# Zurgarr configuration — managed by settings editor\n')
+        f.write('# Only settings you changed are stored; everything else uses its default\n\n')
+        for cat in ENV_SCHEMA:
+            lines = [_format_env_line(key, explicit[key])
+                     for key, *_ in cat['fields'] if key in explicit]
+            if lines:
+                f.write(f'# --- {cat["name"]} ---\n')
+                for line in lines:
+                    f.write(line + '\n')
+                f.write('\n')
+
+
 def write_env_values(values):
     """Validate and write env var values to .env, then trigger reload.
 
@@ -494,11 +515,10 @@ def write_env_values(values):
         existing = read_env_values()
         file_values = dotenv_values(ENV_FILE) if os.path.exists(ENV_FILE) else {}
         sources = get_env_sources()
-        # A locked/secret key left over in the file is dropped on the next
-        # save: it can't take effect, and keeping it would mislead readers.
-        explicit = {k: v for k, v in file_values.items()
-                    if k in _ALL_KEYS and v
-                    and sources.get(k, {}).get('source') not in ('locked', 'secret')}
+        # Keep every non-blank schema key already in the file — including
+        # locked/secret ones: they're inert while compose/secrets win, but
+        # they're the migration path off compose and part of every backup.
+        explicit = {k: v for k, v in file_values.items() if k in _ALL_KEYS and v}
         locked_errors = []
         for key, value in filtered.items():
             src = sources.get(key, {}).get('source')
@@ -531,17 +551,7 @@ def write_env_values(values):
 
         # Write .env file atomically — explicit keys only
         try:
-            with atomic_write(ENV_FILE) as f:
-                f.write('# Zurgarr configuration — managed by settings editor\n')
-                f.write('# Only settings you changed are stored; everything else uses its default\n\n')
-                for cat in ENV_SCHEMA:
-                    lines = [_format_env_line(key, explicit[key])
-                             for key, *_ in cat['fields'] if key in explicit]
-                    if lines:
-                        f.write(f'# --- {cat["name"]} ---\n')
-                        for line in lines:
-                            f.write(line + '\n')
-                        f.write('\n')
+            _write_env_file(explicit)
         except Exception as e:
             logger.error(f'[settings] Failed to write .env: {e}')
             return {
@@ -1302,34 +1312,28 @@ def _sync_plex_debrid_to_env(values):
         if not changed:
             return
 
-        # Merge and rewrite .env (preserves all existing keys)
-        existing = read_env_values()
-        merged = {**existing, **changed}
+        # Rewrite .env with the explicit keys already there plus these
+        # changes (a blank change removes the key) — never a defaulted view.
+        explicit = {k: v for k, v in current.items() if k in _ALL_KEYS and v}
+        for key, val in changed.items():
+            if val:
+                explicit[key] = val
+            else:
+                explicit.pop(key, None)
 
         try:
-            with atomic_write(ENV_FILE) as f:
-                f.write('# Zurgarr configuration — managed by settings editor\n')
-                f.write('# Manual edits are preserved on next save\n\n')
-                for cat in ENV_SCHEMA:
-                    cat_has_values = False
-                    lines = []
-                    for key, label, ftype, required, help_text in cat['fields']:
-                        val = merged.get(key, '')
-                        if val:
-                            cat_has_values = True
-                        lines.append(_format_env_line(key, val))
-                    if cat_has_values:
-                        f.write(f'# --- {cat["name"]} ---\n')
-                        for line in lines:
-                            f.write(line + '\n')
-                        f.write('\n')
+            _write_env_file(explicit)
         except Exception as e:
             logger.error(f'[settings] Failed to sync plex_debrid settings to .env: {e}')
             return
 
-    # Update os.environ so in-process reads are consistent
-    for key, val in changed.items():
-        os.environ[key] = val
+        # Re-resolve so in-process reads are consistent.  Writing os.environ
+        # directly would make these look compose-locked to the resolver.
+        from base import SECRETS_DIR
+        from utils import config_resolve
+        config_resolve.apply(config_resolve.resolve(
+            os.environ, dotenv_values(ENV_FILE),
+            config_resolve.present_secrets(SECRETS_DIR), config_resolve.written()))
 
     logger.info(
         f'[settings] Synced {len(changed)} plex_debrid setting(s) back to .env: '

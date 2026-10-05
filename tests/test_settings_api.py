@@ -1326,13 +1326,29 @@ class TestSyncPlexDebridToEnv:
             _sync_plex_debrid_to_env(values)
         mock_write.assert_not_called()
 
-    def test_updates_os_environ(self, tmp_path):
+    def test_updates_os_environ(self, tmp_path, monkeypatch):
+        from dotenv import dotenv_values
+        from utils import config_resolve
+        monkeypatch.setattr(config_resolve, '_WRITTEN', {})
+        monkeypatch.setattr(config_resolve, '_CURRENT', {})
+        monkeypatch.delenv('SEERR_ADDRESS', raising=False)
         env_file = self._make_env(tmp_path, 'SEERR_ADDRESS=http://old:5055\n')
+        # Old value arrives from the file, as at startup (not compose-locked).
+        config_resolve.apply(config_resolve.resolve(os.environ, dotenv_values(env_file)))
         values = {'Overseerr Base URL': 'http://new:5055'}
-        with patch('utils.settings_api.ENV_FILE', env_file), \
-             patch.dict(os.environ, {'SEERR_ADDRESS': 'http://old:5055'}):
+        with patch('utils.settings_api.ENV_FILE', env_file):
             _sync_plex_debrid_to_env(values)
             assert os.environ['SEERR_ADDRESS'] == 'http://new:5055'
+
+    def test_compose_locked_value_is_not_overridden(self, tmp_path, monkeypatch):
+        from utils import config_resolve
+        monkeypatch.setattr(config_resolve, '_WRITTEN', {})
+        monkeypatch.setattr(config_resolve, '_CURRENT', {})
+        env_file = self._make_env(tmp_path, '')
+        monkeypatch.setenv('SEERR_ADDRESS', 'http://compose:5055')
+        with patch('utils.settings_api.ENV_FILE', env_file):
+            _sync_plex_debrid_to_env({'Overseerr Base URL': 'http://new:5055'})
+        assert os.environ['SEERR_ADDRESS'] == 'http://compose:5055'
 
     def test_boolean_values_lowercased(self, tmp_path):
         """Python bool True/False should become 'true'/'false' in .env."""
@@ -1638,6 +1654,45 @@ class TestSourcesAndExplicitSave:
         assert result['status'] == 'error'
         assert any('NOTIFICATION_URL' in e and 'docker-compose' in e for e in result['errors'])
         assert 'json://ui' not in env_file.read_text()
+
+    def test_save_keeps_locked_file_entries(self, env_file, monkeypatch):
+        # Prod passes every key via compose (all Locked); a UI save must not
+        # strip those keys out of config/.env — they're the migration path
+        # off compose and part of every config backup.
+        env_file.write_text('NOTIFICATION_URL=json://file-copy\n')
+        monkeypatch.setenv('NOTIFICATION_URL', 'json://compose')
+        self._resolve_again(env_file)
+        from utils.settings_api import read_env_values
+        values = read_env_values()
+        values['BLACKHOLE_DIR'] = '/custom'
+        assert write_env_values(values)['status'] == 'saved'
+        text = env_file.read_text()
+        assert 'NOTIFICATION_URL=json://file-copy' in text
+        assert 'BLACKHOLE_DIR=/custom' in text
+
+    def test_secret_backed_key_shows_no_stale_file_value(self, env_file):
+        from dotenv import dotenv_values
+        from utils import config_resolve
+        env_file.write_text('RD_API_KEY=stale-file-key\n')
+        config_resolve.apply(config_resolve.resolve(
+            os.environ, dotenv_values(str(env_file)), frozenset({'RD_API_KEY'}),
+            config_resolve.written()))
+        from utils.settings_api import read_env_values
+        assert read_env_values()['RD_API_KEY'] == ''
+
+    def test_plex_debrid_sync_writes_only_explicit_and_resolves(self, env_file, monkeypatch):
+        # The plex_debrid tab syncs some values back into config/.env; that
+        # path must not freeze every default into the file, and the synced
+        # value must resolve as 'set' (not look compose-locked).
+        from utils import config_resolve
+        from utils.settings_api import _sync_plex_debrid_to_env
+        monkeypatch.delenv('PD_LOG_LEVEL', raising=False)
+        _sync_plex_debrid_to_env({'Debug printing': 'true'})
+        text = env_file.read_text()
+        assert 'PD_LOG_LEVEL=DEBUG' in text
+        assert 'BLACKHOLE_DIR' not in text
+        assert os.environ['PD_LOG_LEVEL'] == 'DEBUG'
+        assert config_resolve.current()['PD_LOG_LEVEL'].source == 'set'
 
     def test_save_to_secret_key_rejected(self, env_file, monkeypatch):
         from dotenv import dotenv_values
