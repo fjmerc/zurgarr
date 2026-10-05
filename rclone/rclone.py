@@ -4,6 +4,7 @@ from utils.processes import ProcessHandler
 from utils.notifications import notify
 from utils.network import wait_for_url
 from utils.file_utils import atomic_write
+from utils.env import child_env
 
 logger = get_logger()
 
@@ -328,7 +329,8 @@ def obscure_password(password):
     """
     try:
         result = subprocess.run(["rclone", "obscure", "-"], check=True,
-                                input=password.encode(), stdout=subprocess.PIPE)
+                                input=password.encode(), stdout=subprocess.PIPE,
+                                env=child_env())
         return result.stdout.decode().strip()
     except (subprocess.CalledProcessError, OSError) as e:
         logger.error(f"Error obscuring password: rclone obscure exited with "

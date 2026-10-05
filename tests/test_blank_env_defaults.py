@@ -1,0 +1,254 @@
+"""Blank env values must fall back to the documented default.
+
+The stock docker-compose.yml passes every optional var as ``X=${X:-}``,
+so an unset var arrives as an empty string, not as missing.  A read like
+``os.environ.get('X', 'default')`` then returns ``''`` and the default is
+silently lost.  These tests pin the reads that had a user-visible effect.
+"""
+
+import os
+import re
+from unittest.mock import patch
+
+import pytest
+
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+class TestFfprobeMonitorBlank:
+
+    def test_blank_enabled_means_default_on(self, monkeypatch):
+        from utils import ffprobe_monitor
+        monkeypatch.setenv('FFPROBE_MONITOR_ENABLED', '')
+        monkeypatch.setenv('FFPROBE_STUCK_TIMEOUT', '')
+        monkeypatch.setenv('FFPROBE_POLL_INTERVAL', '')
+        with patch('utils.task_scheduler.scheduler.register') as reg:
+            monitor = ffprobe_monitor.setup()
+        assert monitor is not None
+        assert monitor.stuck_timeout == 300
+        assert monitor.poll_interval == 30
+        reg.assert_called_once()
+
+    def test_explicit_false_still_disables(self, monkeypatch):
+        from utils import ffprobe_monitor
+        monkeypatch.setenv('FFPROBE_MONITOR_ENABLED', 'false')
+        with patch('utils.task_scheduler.scheduler.register') as reg:
+            assert ffprobe_monitor.setup() is None
+        reg.assert_not_called()
+
+
+class TestBlackholeWatchDirBlank:
+
+    @pytest.mark.parametrize('value', [None, '', '   '])
+    def test_blank_or_unset_uses_default(self, monkeypatch, value):
+        from utils.env import watch_dir_from_env
+        if value is None:
+            monkeypatch.delenv('BLACKHOLE_DIR', raising=False)
+        else:
+            monkeypatch.setenv('BLACKHOLE_DIR', value)
+        assert watch_dir_from_env() == '/watch'
+
+    def test_explicit_value_wins(self, monkeypatch):
+        from utils.env import watch_dir_from_env
+        monkeypatch.setenv('BLACKHOLE_DIR', '/custom/watch')
+        assert watch_dir_from_env() == '/custom/watch'
+
+    def test_stuck_scan_sees_default_watch_dir(self, monkeypatch):
+        # The watcher writes pending_monitors.json to /watch when symlinks
+        # are off; the stuck scan must look there too when the var is blank.
+        from utils import stuck
+        monkeypatch.setenv('BLACKHOLE_DIR', '')
+        monkeypatch.setenv('BLACKHOLE_COMPLETED_DIR', '')
+        monkeypatch.setenv('BLACKHOLE_SYMLINK_ENABLED', '')
+        assert stuck._pending_monitor_files() == [
+            '/watch/pending_monitors.json', '/completed/pending_monitors.json']
+
+    def test_completed_dir_default_matches_blackhole(self, monkeypatch):
+        from utils.env import completed_dir_from_env
+        monkeypatch.delenv('BLACKHOLE_COMPLETED_DIR', raising=False)
+        assert completed_dir_from_env() == '/completed'
+        monkeypatch.setenv('BLACKHOLE_COMPLETED_DIR', ' ')
+        assert completed_dir_from_env() == '/completed'
+
+
+class TestDuplicateCleanupIntervalBlank:
+    """get_interval_seconds() drives the scheduler; cleanup_interval() the
+    log line.  Both must agree and survive blank/whitespace values."""
+
+    @pytest.mark.parametrize('value', [None, '', '  '])
+    def test_blank_or_unset_is_24h(self, monkeypatch, value):
+        from base import config
+        from utils import duplicate_cleanup
+        monkeypatch.setattr(config, 'CLEANUPINT', value)
+        assert duplicate_cleanup.cleanup_interval() == 24
+        assert duplicate_cleanup.get_interval_seconds() == 24 * 3600
+
+    def test_explicit_value_wins(self, monkeypatch):
+        from base import config
+        from utils import duplicate_cleanup
+        monkeypatch.setattr(config, 'CLEANUPINT', '6')
+        assert duplicate_cleanup.cleanup_interval() == 6.0
+        assert duplicate_cleanup.get_interval_seconds() == 6 * 3600
+
+    def test_garbage_falls_back_instead_of_raising(self, monkeypatch):
+        from base import config
+        from utils import duplicate_cleanup
+        monkeypatch.setattr(config, 'CLEANUPINT', 'daily')
+        assert duplicate_cleanup.get_interval_seconds() == 24 * 3600
+
+
+class TestNotificationLevelBlank:
+
+    def test_blank_level_is_info_without_warning(self, monkeypatch):
+        from utils import notifications
+        monkeypatch.setenv('NOTIFICATION_URL', 'json://localhost')
+        monkeypatch.setenv('NOTIFICATION_LEVEL', '')
+        with patch.object(notifications.logger, 'warning') as warn:
+            notifications.init()
+        assert notifications._min_level == 'info'
+        assert not any('NOTIFICATION_LEVEL' in str(c) for c in warn.call_args_list)
+
+
+class TestBlankSafeReadGuard:
+    """Sync guard: a key the stock compose passes blank must not rely on
+    ``os.environ.get(KEY, '<literal>')`` for its default — the literal is
+    unreachable for compose users.  ``'false'``/``''`` defaults are exempt
+    (blank already behaves like them).  Limitation: a consumer that reads
+    the key with no default at all (``os.getenv(KEY) or ''``) and then
+    skips on blank is a different shape this guard can't see."""
+
+    def _blank_passed_keys(self):
+        with open(os.path.join(REPO, 'docker-compose.yml')) as f:
+            return set(re.findall(r'- ([A-Z0-9_]+)=\$\{\1:-\}', f.read()))
+
+    def test_no_unreachable_bool_or_path_defaults(self):
+        blank = self._blank_passed_keys()
+        assert blank, 'compose parse found no blank-passed keys'
+        # Whole-file scan so calls wrapped across lines are caught.
+        pat = re.compile(
+            r"""os\.(?:environ\.get|getenv)\(\s*['"]([A-Z0-9_]+)['"]\s*,"""
+            r"""\s*(['"][^'"]+['"]|[0-9.]+)\s*\)""")
+        exempt = {"'false'", '"false"'}
+        files = [os.path.join(REPO, f) for f in os.listdir(REPO) if f.endswith('.py')]
+        for root in ('utils', 'base', 'zurg', 'rclone', 'plex_debrid_', 'scripts'):
+            for dirpath, _, names in os.walk(os.path.join(REPO, root)):
+                files += [os.path.join(dirpath, n) for n in names if n.endswith('.py')]
+        offenders = []
+        for path in files:
+            with open(path) as f:
+                text = f.read()
+            for m in pat.finditer(text):
+                key, default = m.group(1), m.group(2)
+                if key in blank and default.lower() not in exempt:
+                    lineno = text.count('\n', 0, m.start()) + 1
+                    rel = os.path.relpath(path, REPO)
+                    offenders.append(f'{rel}:{lineno} {key} default={default}')
+        assert not offenders, (
+            'Blank compose values bypass these defaults; use '
+            '`os.environ.get(KEY) or DEFAULT` (or .strip() first):\n'
+            + '\n'.join(offenders))
+
+
+class TestChildEnvScrubsBlankRclone:
+    """rclone applies every RCLONE_<FLAG> env var as a flag and exits on a
+    parse error, so the stock compose's blank RCLONE_BUFFER_SIZE etc. kill
+    the mount (verified against the pinned rclone/rclone:1.73.2).  Blank
+    RCLONE_* must never reach a child process."""
+
+    def test_child_env_drops_only_blank_rclone_vars(self, monkeypatch):
+        from utils.env import child_env
+        monkeypatch.setenv('RCLONE_BUFFER_SIZE', '')
+        monkeypatch.setenv('RCLONE_TRANSFERS', '   ')
+        monkeypatch.setenv('RCLONE_LOG_LEVEL', 'INFO')
+        monkeypatch.setenv('SOME_OTHER_VAR', '')
+        env = child_env()
+        assert 'RCLONE_BUFFER_SIZE' not in env
+        assert 'RCLONE_TRANSFERS' not in env
+        assert env['RCLONE_LOG_LEVEL'] == 'INFO'
+        assert env['SOME_OTHER_VAR'] == ''   # only the RCLONE_ prefix is scrubbed
+
+    def test_child_env_does_not_mutate_os_environ(self, monkeypatch):
+        from utils.env import child_env
+        monkeypatch.setenv('RCLONE_BUFFER_SIZE', '')
+        child_env()
+        assert os.environ['RCLONE_BUFFER_SIZE'] == ''
+
+    @pytest.mark.parametrize('method', ['start', 'restart'])
+    def test_process_spawns_get_scrubbed_env(self, monkeypatch, method):
+        import logging
+        from utils.processes import ProcessHandler
+        monkeypatch.setenv('RCLONE_BUFFER_SIZE', '')
+        h = ProcessHandler(logging.getLogger('t'))
+        captured = {}
+
+        class _FakeProc:
+            pid = 12345
+            def poll(self):
+                return None
+
+        def fake_popen(cmd, **kwargs):
+            captured['env'] = kwargs.get('env')
+            return _FakeProc()
+
+        monkeypatch.setattr('utils.processes.subprocess.Popen', fake_popen)
+        if method == 'start':
+            h.start_process('rclone', '/tmp', ['rclone', 'version'],
+                            suppress_logging=True)
+        else:
+            h._command = ['rclone', 'version']
+            h._config_dir = '/tmp'
+            h._process_name = 'rclone'
+            h._key_type = None
+            h._suppress_logging = True
+            h.restart_process()
+        assert captured.get('env') is not None
+        assert 'RCLONE_BUFFER_SIZE' not in captured['env']
+
+    def test_obscure_password_gets_scrubbed_env(self, monkeypatch):
+        from rclone import rclone as rclone_mod
+        monkeypatch.setenv('RCLONE_BUFFER_SIZE', '')
+        captured = {}
+
+        class _Result:
+            stdout = b'obscured'
+
+        def fake_run(cmd, **kwargs):
+            captured['env'] = kwargs.get('env')
+            return _Result()
+
+        monkeypatch.setattr(rclone_mod.subprocess, 'run', fake_run)
+        assert rclone_mod.obscure_password('pw') == 'obscured'
+        assert captured.get('env') is not None
+        assert 'RCLONE_BUFFER_SIZE' not in captured['env']
+
+
+class TestZurgLogLevelBlank:
+
+    def test_blank_zurg_log_level_keeps_inherited_log_level(self, monkeypatch):
+        # utils/logger.py seeds LOG_LEVEL from ZURGARR_LOG_LEVEL; a blank
+        # ZURG_LOG_LEVEL must not overwrite it with ''.
+        from zurg import setup as zurg_setup
+        monkeypatch.setattr(zurg_setup, 'ZURGLOGLEVEL', '', raising=False)
+        monkeypatch.setenv('ZURGARR_LOG_LEVEL', 'DEBUG')
+        monkeypatch.setenv('LOG_LEVEL', 'DEBUG')   # seeded by utils/logger.py
+        zurg_setup.apply_zurg_log_level()
+        assert os.environ['LOG_LEVEL'] == 'DEBUG'
+
+    def test_explicit_zurg_log_level_wins(self, monkeypatch):
+        from zurg import setup as zurg_setup
+        monkeypatch.setattr(zurg_setup, 'ZURGLOGLEVEL', 'WARNING', raising=False)
+        monkeypatch.setenv('LOG_LEVEL', 'DEBUG')
+        zurg_setup.apply_zurg_log_level()
+        assert os.environ['LOG_LEVEL'] == 'WARNING'
+
+
+class TestZurgLogLevelCleared:
+
+    def test_cleared_level_with_nothing_to_inherit_is_dropped(self, monkeypatch):
+        from zurg import setup as zurg_setup
+        monkeypatch.setattr(zurg_setup, 'ZURGLOGLEVEL', '', raising=False)
+        monkeypatch.setenv('ZURGARR_LOG_LEVEL', '')
+        monkeypatch.setenv('LOG_LEVEL', 'DEBUG')   # stale from before reload
+        zurg_setup.apply_zurg_log_level()
+        assert 'LOG_LEVEL' not in os.environ

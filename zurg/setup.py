@@ -3,6 +3,19 @@ from utils.logger import *
 from utils.file_utils import atomic_write
 
 
+def apply_zurg_log_level():
+    """Pass ZURG_LOG_LEVEL to zurg as LOG_LEVEL.  Blank counts as unset
+    (stock compose passes it as ''), so LOG_LEVEL inherited from
+    ZURGARR_LOG_LEVEL (utils/logger.py) isn't clobbered with ''."""
+    level = (ZURGLOGLEVEL or '').strip()
+    if level:
+        os.environ['LOG_LEVEL'] = level
+    elif not os.environ.get('ZURGARR_LOG_LEVEL', '').strip():
+        # Cleared on SIGHUP with nothing to inherit: drop the stale level
+        # so the restarted zurg falls back to its own default.
+        os.environ.pop('LOG_LEVEL', None)
+
+
 def zurg_setup():
     refresh_globals(globals())
     logger = get_logger()
@@ -14,12 +27,7 @@ def zurg_setup():
     zurg_plex_update_base = '/zurg/plex_update.sh'
   
     try:
-        if ZURGLOGLEVEL is not None:    # Needs additional testing
-            os.environ['LOG_LEVEL'] = ZURGLOGLEVEL
-            LOGLEVEL = os.environ.get('LOG_LEVEL')
-            # logger.debug(f"'LOG_LEVEL' set to '{LOGLEVEL}' based on 'ZURG_LOG_LEVEL'")
-        # else:
-            # logger.info("'ZURG_LOG_LEVEL' not set. Default log level INFO will be used for Zurg.")
+        apply_zurg_log_level()
     except Exception as e:
         logger.error(f"Error setting Zurg log level from 'ZURG_LOG_LEVEL': {e}")
 

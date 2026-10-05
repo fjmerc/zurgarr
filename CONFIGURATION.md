@@ -164,7 +164,7 @@ for recommended settings per provider.
 | Variable | Description | Default |
 |---|---|---|
 | `BLACKHOLE_DEBRID_DEDUP_ENABLED` | Skip if the hash is already on the debrid account. Stops Sonarr/Radarr re-grabs from producing duplicate entries in DMM | `true` |
-| `BLACKHOLE_REQUIRE_CACHED` | Refuse `.torrent`/`.magnet` drops that aren't confirmed cached. **RD users leave OFF** (RD deprecated its cache probe Nov 2024); AD/TB users can turn this ON | `false` |
+| `BLACKHOLE_REQUIRE_CACHED` | Refuse `.torrent`/`.magnet` drops that aren't confirmed cached. Only TorBox has a working cache probe: turn ON when TorBox is configured (grabs routed to RD/AD are cross-checked against TorBox). **Without TorBox leave OFF** — RD (Nov 2024) and AD (May 2026) retired their probes, so every drop would be deferred forever | `false` |
 | `BLACKHOLE_DELETE_UNCACHED_ON_TIMEOUT` | When the blackhole gives up waiting for debrid to cache a torrent (`BLACKHOLE_MOUNT_POLL_TIMEOUT`), actively delete it from the debrid account instead of leaving it as a 0%/0-seed entry. **Recommended ON for RD users** — see [TROUBLESHOOTING](TROUBLESHOOTING.md#uncached-torrents-pile-up-on-my-debrid-account-from-the-blackhole) | `false` |
 | `BLACKHOLE_TB_ALT_RECOVERY_ENABLED` | When a grabbed release is uncached and would be rejected, search Torrentio for other releases of the same title cached on **TorBox** (at the same quality tier the arr approved) and grab one instead. Stops well-cached titles falling to "Wanted" because the specific hash Sonarr/Radarr picked is uncached. Requires TorBox configured; no-op without it | `true` |
 | `BLACKHOLE_TB_ALT_MAX_ATTEMPTS` | Cached-alternative grabs for one season before giving up and letting the title fall back to "Wanted". Each grab re-arms TorBox's abuse cooldown, so this caps re-grabbing a never-completing title on every `.magnet` re-drop. Persists across restarts; decays after 30 idle days | `12` |
@@ -199,7 +199,7 @@ here is inert while it's OFF.
 | `PROWLARR_URL` | Prowlarr base URL (e.g. `http://prowlarr:9696`). With `PROWLARR_API_KEY` set, manual search merges results from every indexer configured in Prowlarr, and the Wanted recovery pass falls back to them when Torrentio has nothing usable for a title. Only torrent results carrying an infohash are used (hashless results are skipped and counted in the log) | |
 | `PROWLARR_API_KEY` | Prowlarr API key (Prowlarr → Settings → General → Security). Sent as a request header, never in URLs. Also drives the Prowlarr tile on the Status page, which probes an authenticated endpoint — a dead key shows red | |
 | `SEARCH_DEDUP_ENABLED` | Before submitting an "Add" click, check the account and refuse duplicates | `true` |
-| `SEARCH_REQUIRE_CACHED` | Refuse the Add button when the hash isn't confirmed cached. Same RD caveat as `BLACKHOLE_REQUIRE_CACHED` — leave OFF on RD | `false` |
+| `SEARCH_REQUIRE_CACHED` | Refuse the Add button when the hash isn't confirmed cached. No TorBox cross-check here, so it refuses every RD/AD add — turn ON only when TorBox is your only debrid | `false` |
 
 ---
 
@@ -296,22 +296,23 @@ the metrics the exporter actually emits.
 
 ## Scheduled task intervals (advanced)
 
-All intervals are in minutes unless noted. Defaults are tuned for
+All intervals are in **seconds**. Defaults are tuned for
 homelab-scale installs — most users don't need to touch these.
 
 | Variable | Description | Default |
 |---|---|---|
-| `ROUTING_AUDIT_INTERVAL` | Minutes between Sonarr/Radarr routing audits (debrid-tag self-heal) | `360` (6h) |
-| `QUEUE_CLEANUP_INTERVAL` | Minutes between Sonarr/Radarr queue cleanup passes | `60` |
-| `LIBRARY_SCAN_INTERVAL` | Minutes between library scans | `60` |
+| `ROUTING_AUDIT_INTERVAL` | Seconds between Sonarr/Radarr routing audits (debrid-tag self-heal) | `21600` (6h) |
+| `QUEUE_CLEANUP_INTERVAL` | Seconds between Sonarr/Radarr queue cleanup passes | `900` (15m) |
+| `STALE_GRAB_INTERVAL` | Seconds between checks for grabs that silently failed (re-triggers the arr search) | `900` (15m) |
+| `LIBRARY_SCAN_INTERVAL` | Seconds between library scans | `3600` (1h) |
 | `LIBRARY_RESCAN_NFS_DELAY` | Seconds to sleep between symlink creation and the immediate Sonarr/Radarr rescan trigger, to let an NFS attribute cache invalidate before the arr walks the share. `0` disables (default; correct for local-FS arr-side libraries). Bump to `30` when symptomatic — see TROUBLESHOOTING for "Sonarr says hasFile=false right after a scan but imports correctly a minute later". Clamped to `[0, 300]`. | `0` |
-| `SYMLINK_VERIFY_INTERVAL` | Minutes between symlink verification sweeps | `360` (6h) |
-| `PREFERENCE_ENFORCE_INTERVAL` | Minutes between preference-enforcement passes | `60` |
-| `HOUSEKEEPING_INTERVAL` | Minutes between housekeeping (history prune, cache rotation) | `1440` (24h) |
+| `SYMLINK_VERIFY_INTERVAL` | Seconds between symlink verification sweeps | `21600` (6h) |
+| `PREFERENCE_ENFORCE_INTERVAL` | Seconds between preference-enforcement passes | `21600` (6h) |
+| `HOUSEKEEPING_INTERVAL` | Seconds between housekeeping (history prune, cache rotation) | `86400` (24h) |
 | `CONFIG_BACKUP_INTERVAL` | Seconds between scheduled config backups (archive of `.env`, `settings.json`, `library_prefs.json`, `blocklist.json`). `0` disables scheduled backups — manual backup/restore in the Settings UI still work | `86400` (24h) |
 | `CONFIG_BACKUP_RETENTION` | Number of scheduled backup archives to retain. Older ones are pruned after each run | `7` |
 | `CONFIG_BACKUP_DIR` | Directory that receives scheduled backup archives. Pre-restore snapshots also land here (under `pre-restore-<timestamp>/` subdirs) | `/config/backups` |
-| `MOUNT_LIVENESS_INTERVAL` | Minutes between rclone mount liveness probes | `5` |
+| `MOUNT_LIVENESS_INTERVAL` | Seconds between rclone mount liveness probes | `60` (1m) |
 | `MOUNT_SELFHEAL_ENABLED` | When the liveness probe finds a dead FUSE mount (stale mount-table entry after a container recreate — rclone crashloops on "directory already mounted"), automatically lazy-unmount the corpse and restart the owning rclone process. Fires only after 2 consecutive dead probes, only for the dead-daemon signature (never a merely slow or rate-limited mount), at most once per 10 minutes per mount. Also retries mounts that were *skipped at startup* because their WebDAV endpoint was unreachable (e.g. container started before the host network was ready) — first retry immediate, then at most once per 10 minutes per mount, until the mount comes up. Set `false` to require manual recovery | `true` |
 
 ---

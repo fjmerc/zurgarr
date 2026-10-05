@@ -14,6 +14,7 @@ import unicodedata
 import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote as urllib_quote
+from utils.env import completed_dir_from_env, env_or_default
 from utils.logger import get_logger
 from utils.quality_parser import parse_quality
 
@@ -2915,7 +2916,7 @@ class LibraryScanner:
         self._load_wanted_memos()
         self._alias_norms = {}     # {norm_title: set of alias norm_titles}
         try:
-            self._debrid_unavailable_days = int(os.environ.get('DEBRID_UNAVAILABLE_THRESHOLD_DAYS', '3'))
+            self._debrid_unavailable_days = int(env_or_default('DEBRID_UNAVAILABLE_THRESHOLD_DAYS', '3'))
         except (ValueError, TypeError):
             self._debrid_unavailable_days = 3
         try:
@@ -2923,7 +2924,7 @@ class LibraryScanner:
         except (ValueError, TypeError):
             self._force_grab_max_attempts = 12
         try:
-            self._pending_warning_hours = int(os.environ.get('PENDING_WARNING_HOURS', '24'))
+            self._pending_warning_hours = int(env_or_default('PENDING_WARNING_HOURS', '24'))
         except (ValueError, TypeError):
             self._pending_warning_hours = 24
         self._last_had_local = None    # None=unknown, True=had local content
@@ -8895,7 +8896,7 @@ def remove_title_symlinks(title, media_type, year=None):
     # via iter_release_dirs. Under labeled mode, the same release title
     # may exist under multiple labels (e.g. sonarr/ and radarr/); we
     # remove it everywhere it matches.
-    completed_dir = os.environ.get('BLACKHOLE_COMPLETED_DIR', '').strip()
+    completed_dir = completed_dir_from_env()
     if completed_dir and os.path.isdir(completed_dir):
         try:
             from utils.blackhole import iter_release_dirs

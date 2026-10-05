@@ -20,6 +20,7 @@ import threading
 import uuid
 from datetime import datetime
 import requests
+from utils.env import completed_dir_from_env, env_or_default, watch_dir_from_env
 from utils.file_utils import atomic_write
 from utils.logger import get_logger
 from utils import attempt_ledger
@@ -5360,9 +5361,9 @@ def setup():
     if not blackhole_enabled:
         return None
 
-    watch_dir = os.environ.get('BLACKHOLE_DIR', '/watch')
+    watch_dir = watch_dir_from_env()
     try:
-        poll_interval = int(os.environ.get('BLACKHOLE_POLL_INTERVAL', '5'))
+        poll_interval = int(env_or_default('BLACKHOLE_POLL_INTERVAL', '5'))
     except (ValueError, TypeError):
         logger.warning("[blackhole] Invalid BLACKHOLE_POLL_INTERVAL, defaulting to 5s")
         poll_interval = 5
@@ -5426,7 +5427,7 @@ def setup():
 
     # Symlink configuration
     symlink_enabled = os.environ.get('BLACKHOLE_SYMLINK_ENABLED', 'false').lower() == 'true'
-    completed_dir = os.environ.get('BLACKHOLE_COMPLETED_DIR', '/completed')
+    completed_dir = completed_dir_from_env()
     rclone_mount = os.environ.get('BLACKHOLE_RCLONE_MOUNT', '/data')
     # Auto-detect mount name subdirectory if not explicitly configured
     if rclone_mount == '/data' and os.environ.get('RCLONE_MOUNT_NAME'):

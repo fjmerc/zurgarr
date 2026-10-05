@@ -38,6 +38,7 @@ sys.path.insert(0, '/')
 import re
 
 from utils.blackhole import BlackholeWatcher, _is_safe_mount_name  # noqa: E402
+from utils.env import watch_dir_from_env  # noqa: E402
 from utils.arr_client import RadarrClient, SonarrClient  # noqa: E402
 from utils.debrid_routing import TORBOX, mount_for_debrid  # noqa: E402
 from utils.library import parse_folder_name  # noqa: E402
@@ -121,7 +122,7 @@ def main() -> int:
         return 1
 
     watcher = BlackholeWatcher(
-        os.environ.get('BLACKHOLE_DIR', '/watch'),
+        watch_dir_from_env(),
         'sweeper',  # bogus API key — we do not make debrid API calls
         'torbox',
         symlink_enabled=True,

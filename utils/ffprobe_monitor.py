@@ -14,7 +14,6 @@ Recovery strategy (from DUMB):
 
 import os
 import signal
-import subprocess
 import threading
 import time
 from utils.logger import get_logger
@@ -64,9 +63,19 @@ class FfprobeMonitor:
         except (FileNotFoundError, PermissionError):
             return []
 
+    def _get_ppid(self, pid):
+        """Parent PID from /proc/PID/stat (field after the parenthesised comm)."""
+        try:
+            with open(f'/proc/{pid}/stat') as f:
+                stat = f.read()
+            return int(stat[stat.rindex(')') + 2:].split()[1])
+        except (OSError, ValueError, IndexError):
+            return None
+
     def _find_ffprobe_pids(self):
-        """Find all ffprobe process PIDs."""
+        """Find all ffprobe process PIDs, excluding our own pokes."""
         pids = []
+        own_pid = os.getpid()
         try:
             for entry in os.listdir('/proc'):
                 if not entry.isdigit():
@@ -74,6 +83,11 @@ class FfprobeMonitor:
                 pid = int(entry)
                 cmdline = self._get_cmdline(pid)
                 if cmdline and any('ffprobe' in arg for arg in cmdline[:2]):
+                    # A poke abandoned by run_bounded is itself a stuck
+                    # ffprobe; tracking it would poke/kill our own children
+                    # and burn the hourly kill budget meant for real scans.
+                    if self._get_ppid(pid) == own_pid:
+                        continue
                     pids.append((pid, cmdline))
         except (FileNotFoundError, PermissionError):
             pass
@@ -134,16 +148,16 @@ class FfprobeMonitor:
     def _poke_process(self, pid, file_path):
         """Run a quick ffprobe on the same file to generate I/O."""
         logger.info(f"[ffprobe_monitor] Poking stuck ffprobe (pid {pid}) by probing: {file_path}")
+        from utils.processes import run_bounded
         try:
-            subprocess.run(
+            # Bounded: the poke can wedge on the same dead mount as the
+            # process it's poking, and must not wedge the monitor with it.
+            if run_bounded(
                 ['ffprobe', '-v', 'quiet', '-select_streams', 'v:0',
                  '-show_entries', 'format=duration', file_path],
                 timeout=10,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-        except subprocess.TimeoutExpired:
-            logger.debug(f"[ffprobe_monitor] Poke ffprobe also timed out for pid {pid}")
+            ) is None:
+                logger.debug(f"[ffprobe_monitor] Poke ffprobe also stuck for pid {pid}; abandoned")
         except FileNotFoundError:
             logger.debug("[ffprobe_monitor] ffprobe binary not found, cannot poke")
         except Exception as e:
@@ -251,16 +265,17 @@ class FfprobeMonitor:
 
 def setup():
     """Register the ffprobe monitor with the task scheduler if enabled."""
-    enabled = os.environ.get('FFPROBE_MONITOR_ENABLED', 'true').lower() == 'true'
+    # `or 'true'`: stock compose passes the var blank, which must mean default-on.
+    enabled = (os.environ.get('FFPROBE_MONITOR_ENABLED', '').strip() or 'true').lower() == 'true'
     if not enabled:
         return None
 
     try:
-        stuck_timeout = int(os.environ.get('FFPROBE_STUCK_TIMEOUT', '300'))
+        stuck_timeout = int(os.environ.get('FFPROBE_STUCK_TIMEOUT', '').strip() or '300')
     except ValueError:
         stuck_timeout = 300
     try:
-        poll_interval = int(os.environ.get('FFPROBE_POLL_INTERVAL', '30'))
+        poll_interval = int(os.environ.get('FFPROBE_POLL_INTERVAL', '').strip() or '30')
     except ValueError:
         poll_interval = 30
 

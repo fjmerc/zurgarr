@@ -419,7 +419,8 @@ def _attempt_arr_research(release_name, force_episodes=False):
 
 def verify_symlinks():
     """Walk completed dir and local library for debrid-pointing symlinks, remove broken ones."""
-    completed_dir = os.environ.get('BLACKHOLE_COMPLETED_DIR', '/completed')
+    from utils.env import completed_dir_from_env
+    completed_dir = completed_dir_from_env()
     local_tv = os.environ.get('BLACKHOLE_LOCAL_LIBRARY_TV', '').strip()
     local_movies = os.environ.get('BLACKHOLE_LOCAL_LIBRARY_MOVIES', '').strip()
     rclone_mount = os.path.realpath(os.environ.get('BLACKHOLE_RCLONE_MOUNT', '/data'))
@@ -724,7 +725,8 @@ def housekeeping():
     # we walk bottom-up and re-check emptiness at each level (os.walk's
     # `dirs` list goes stale once we remove children). The top-level
     # completed_dir itself is never removed.
-    completed_dir = os.environ.get('BLACKHOLE_COMPLETED_DIR', '/completed')
+    from utils.env import completed_dir_from_env
+    completed_dir = completed_dir_from_env()
     try:
         if os.path.isdir(completed_dir):
             for root, _dirs, _files in os.walk(completed_dir, topdown=False):
@@ -758,7 +760,8 @@ def housekeeping():
     # Non-retry file types are preserved so a misplaced file can be
     # inspected manually.
     now = time.time()
-    watch_dir = os.environ.get('BLACKHOLE_DIR', '/watch')
+    from utils.env import watch_dir_from_env
+    watch_dir = watch_dir_from_env()
     try:
         failed_root = os.path.join(watch_dir, 'failed')
         if os.path.isdir(failed_root):

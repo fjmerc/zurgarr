@@ -183,11 +183,17 @@ def setup():
         logger.error(e)
 
 def cleanup_interval():
-    if CLEANUPINT is None:
-        interval = 24
-    else:
-        interval = float(CLEANUPINT)
-    return interval
+    """Cleanup interval in hours. Blank counts as unset (stock compose passes
+    CLEANUP_INTERVAL as ''); an unparseable value warns and uses 24."""
+    from base import config
+    raw = str(config.CLEANUPINT or '').strip()
+    if not raw:
+        return 24
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(f"Invalid CLEANUP_INTERVAL '{raw}', defaulting to 24 hours")
+        return 24
 
 def start_cleanup():
     logger.info("Starting duplicate cleanup")
@@ -210,6 +216,4 @@ def start_cleanup():
 
 def get_interval_seconds():
     """Return cleanup interval in seconds (for task scheduler)."""
-    from base import config
-    hours = float(config.CLEANUPINT) if config.CLEANUPINT else 24
-    return int(hours * 3600)
+    return int(cleanup_interval() * 3600)

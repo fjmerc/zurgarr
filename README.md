@@ -284,13 +284,15 @@ content through the blackhole while plex_debrid handles watchlist items.
 ## Recommended settings per debrid provider
 
 Uncached junk (0%/0-seed entries in DMM) and duplicate hashes are
-common pain points. Defaults handle dedup automatically; the
-cache-required gates need one flip depending on your provider:
+common pain points. Defaults handle dedup automatically. The
+cache-required gates depend on a working cache check, and today only
+TorBox has one — so what to flip depends on whether TorBox is configured:
 
-| Your provider | Flip ON in the Settings UI |
+| Your setup | Flip ON in the Settings UI |
 |---|---|
-| **Real-Debrid** | `PD_ENFORCE_CACHED_VERSIONS` |
-| **AllDebrid or TorBox** | `BLACKHOLE_REQUIRE_CACHED` and `SEARCH_REQUIRE_CACHED`, plus `PD_ENFORCE_CACHED_VERSIONS` if using plex_debrid |
+| **TorBox configured** (alone or alongside RD/AD) | `BLACKHOLE_REQUIRE_CACHED` — grabs for any provider are checked against TorBox's cache. Add `SEARCH_REQUIRE_CACHED` only if TorBox is your *only* debrid (it refuses every RD/AD add) |
+| **Real-Debrid or AllDebrid, no TorBox** | Leave both gates **OFF** — RD and AD no longer offer a cache check, so they would hold back every grab |
+| **Using plex_debrid** (any provider) | `PD_ENFORCE_CACHED_VERSIONS` |
 
 Background and more symptom-based fixes in
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md).

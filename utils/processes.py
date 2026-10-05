@@ -1,6 +1,7 @@
 from base import *
 from utils.logger import SubprocessLogger
 from utils import heartbeat
+from utils.env import child_env
 
 
 class RestartPolicy:
@@ -234,6 +235,27 @@ def _handle_restart(entry, logger):
         handler.restart_process(run_pre_restart=False, restore_policy=False)
 
 
+def run_bounded(command, timeout, kill_grace=5):
+    """Run a short-lived child with a hard bound on how long we wait.
+
+    Unlike ``subprocess.run(timeout=...)``, whose post-kill ``wait()`` has
+    no limit, this never blocks past ``timeout + kill_grace``: a child stuck
+    in uninterruptible I/O (D state on a dead FUSE mount) ignores SIGKILL,
+    so it is abandoned and ``_reap_orphans`` collects it once it finally
+    exits.  Returns the exit code, or None if the child was abandoned.
+    """
+    proc = subprocess.Popen(command, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, env=child_env())
+    try:
+        return proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            return proc.wait(timeout=kill_grace)
+        except subprocess.TimeoutExpired:
+            return None
+
+
 def _reap_orphans():
     """Drain zombie children reparented to PID 1 (orphaned grandchildren
     of managed processes). Called each monitor tick AFTER every registered
@@ -461,6 +483,7 @@ class ProcessHandler:
                 stderr=_stream,
                 start_new_session=True,
                 cwd=config_dir,
+                env=child_env(),
                 universal_newlines=True,
                 bufsize=1
             )
@@ -536,6 +559,7 @@ class ProcessHandler:
                 stderr=_stream,
                 start_new_session=True,
                 cwd=self._config_dir,
+                env=child_env(),
                 universal_newlines=True,
                 bufsize=1
             )

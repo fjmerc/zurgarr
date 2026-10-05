@@ -85,7 +85,7 @@ def init():
         if events_str:
             _enabled_events = set(e.strip() for e in events_str.split(','))
 
-        _min_level = os.environ.get('NOTIFICATION_LEVEL', 'info').lower()
+        _min_level = (os.environ.get('NOTIFICATION_LEVEL', '').strip() or 'info').lower()
         if _min_level not in _VALID_LEVELS:
             logger.warning(f"Invalid NOTIFICATION_LEVEL '{_min_level}', defaulting to 'info'")
             _min_level = 'info'

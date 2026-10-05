@@ -1095,6 +1095,7 @@ class TestReset:
         'FORCE_GRAB_MAX_ATTEMPTS',
         'BLACKHOLE_TB_ALT_MAX_ATTEMPTS',
         'BLACKHOLE_ARR_FEEDBACK_MAX_STRIKES',
+        'FFPROBE_MONITOR_ENABLED',
     }
 
     def test_env_defaults_stays_in_sync_with_config(self, monkeypatch):
@@ -1133,14 +1134,23 @@ class TestReset:
         constant) would not match and trip the `key in found` assertion."""
         import pathlib
         import utils
+        keys = "|".join(self._LIVE_ENV_KEYS)
+        # Bare fallback: os.environ.get('K', '12')
         pattern = re.compile(
-            r"os\.environ\.get\(\s*['\"](" + "|".join(self._LIVE_ENV_KEYS)
-            + r")['\"]\s*,\s*['\"]([^'\"]*)['\"]"
+            r"os\.environ\.get\(\s*['\"](" + keys
+            + r")['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*\)(?!\.strip\(\)\s*or)"
+        )
+        # Blank-safe fallback: os.environ.get('K', '').strip() or 'true'
+        blank_safe = re.compile(
+            r"os\.environ\.get\(\s*['\"](" + keys
+            + r")['\"]\s*,\s*['\"]['\"]\s*\)\.strip\(\)\s*or\s*['\"]([^'\"]*)['\"]"
         )
         found = {}
         for py in pathlib.Path(utils.__file__).parent.glob('*.py'):
-            for m in pattern.finditer(py.read_text()):
-                found.setdefault(m.group(1), set()).add(m.group(2))
+            text = py.read_text()
+            for pat in (pattern, blank_safe):
+                for m in pat.finditer(text):
+                    found.setdefault(m.group(1), set()).add(m.group(2))
         for key in self._LIVE_ENV_KEYS:
             assert key in found, (
                 f"no os.environ.get('{key}', ...) fallback literal found in "

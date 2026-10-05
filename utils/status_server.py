@@ -773,8 +773,10 @@ class StatusData:
             pass
 
         # Blackhole + local library paths from env (bind mounts from the host)
-        _probe(os.environ.get('BLACKHOLE_DIR'), 'Blackhole')
-        _probe(os.environ.get('BLACKHOLE_COMPLETED_DIR'), 'Blackhole')
+        if os.environ.get('BLACKHOLE_ENABLED', '').lower() == 'true':
+            from utils.env import completed_dir_from_env, watch_dir_from_env
+            _probe(watch_dir_from_env(), 'Blackhole')
+            _probe(completed_dir_from_env(), 'Blackhole')
         _probe(os.environ.get('BLACKHOLE_LOCAL_LIBRARY_MOVIES'), 'Local Library')
         _probe(os.environ.get('BLACKHOLE_LOCAL_LIBRARY_TV'), 'Local Library')
 

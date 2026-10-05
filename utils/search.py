@@ -1022,10 +1022,10 @@ def add_to_debrid(info_hash, title='', media_title=None, episode=None,
 
     try:
         # Require-cached — opt-in gate that refuses uncached torrents before
-        # they land in the account as 0%/0-seed entries.  RD's cache probe
-        # is a no-op (deprecated Nov 2024) so on RD this effectively blocks
-        # all adds; users who still want the gate on AD/TB and not RD
-        # should leave it OFF.
+        # they land in the account as 0%/0-seed entries.  Only TorBox has a
+        # working probe: RD (Nov 2024) and AD (May 2026) are stubs that
+        # return None, so on RD/AD this blocks every add.  Only safe when
+        # TorBox is the sole debrid.
         if str(os.environ.get('SEARCH_REQUIRE_CACHED', 'false')).lower() == 'true':
             cache_map = check_debrid_cache([lowered], service=service, api_key=api_key)
             cached = cache_map.get(lowered)

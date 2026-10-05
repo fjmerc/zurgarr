@@ -35,6 +35,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 
+from utils.env import completed_dir_from_env, env_or_default, watch_dir_from_env
 from utils.logger import get_logger
 
 logger = get_logger()
@@ -103,8 +104,8 @@ def _pending_monitor_files():
     completed-dir-when-symlinking / watch-dir-otherwise placement.  Both
     are returned (dedup'd) so a mode flip doesn't hide the old file."""
     paths = []
-    completed = (os.getenv('BLACKHOLE_COMPLETED_DIR') or '').strip()
-    watch = (os.getenv('BLACKHOLE_DIR') or '').strip()
+    completed = completed_dir_from_env()
+    watch = watch_dir_from_env()
     symlinking = os.environ.get('BLACKHOLE_SYMLINK_ENABLED', '').lower() == 'true'
     ordered = [completed, watch] if symlinking else [watch, completed]
     for d in ordered:
@@ -144,7 +145,7 @@ def _load_pending_entries():
 
 def _pending_stuck_threshold_seconds():
     try:
-        hours = int(os.environ.get('PENDING_WARNING_HOURS', '24'))
+        hours = int(env_or_default('PENDING_WARNING_HOURS', '24'))
     except (ValueError, TypeError):
         hours = 24
     if hours <= 0:

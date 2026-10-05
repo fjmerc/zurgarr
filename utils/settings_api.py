@@ -111,7 +111,7 @@ ENV_SCHEMA = [
             ('BLACKHOLE_LOCAL_LIBRARY_TV', 'Local TV Library Path', 'string', False, 'Path to local TV library (for dedup and auto debrid symlinks)'),
             ('BLACKHOLE_LOCAL_LIBRARY_MOVIES', 'Local Movie Library Path', 'string', False, 'Path to local movie library (for dedup and auto debrid symlinks)'),
             ('BLACKHOLE_DEBRID_DEDUP_ENABLED', 'Skip If Already in Debrid Account', 'boolean', False, 'Before adding, query the debrid account and skip hashes already present. Prevents duplicate torrent entries when Sonarr/Radarr re-grabs the same release after a failed import (default: ON).'),
-            ('BLACKHOLE_REQUIRE_CACHED', 'Require Cached on Debrid', 'boolean', False, 'Refuse .torrent / .magnet drops whose hash is not confirmed cached on the debrid provider. Real-Debrid deprecated its cache probe in Nov 2024, so on RD this will block all adds — leave OFF for RD or switch to AllDebrid/TorBox to use this gate (default: OFF).'),
+            ('BLACKHOLE_REQUIRE_CACHED', 'Require Cached on Debrid', 'boolean', False, 'Refuse .torrent / .magnet drops whose hash is not confirmed cached. Only TorBox has a working cache probe; grabs routed to Real-Debrid/AllDebrid are cross-checked against TorBox. Turn ON only when TorBox is configured — without it every drop is deferred forever (RD and AD retired their probes) (default: OFF).'),
             ('BLACKHOLE_DELETE_UNCACHED_ON_TIMEOUT', 'Delete Uncached Torrents on Timeout', 'boolean', False, 'When the blackhole gives up waiting for debrid to cache a torrent (BLACKHOLE_MOUNT_POLL_TIMEOUT — default 5 min), actively delete it from the debrid account instead of leaving it as a 0%/0-seed entry. Recommended ON for Real-Debrid users where no pre-add cache probe is available — see TROUBLESHOOTING.md "Uncached torrents pile up on my debrid account from the blackhole" (default: OFF).'),
             ('BLACKHOLE_TB_ALT_RECOVERY_ENABLED', 'TorBox Cached-Alternative Recovery', 'boolean', False, 'When a grabbed release is uncached and would be rejected, search Torrentio for other releases of the same title that ARE cached on TorBox (at the same quality tier the arr approved) and grab one of those instead. Prevents abundantly-cached titles from silently falling back to "Wanted" just because the specific hash Sonarr/Radarr picked is uncached. Requires TorBox configured (default: ON).'),
             ('BLACKHOLE_TB_ALT_MAX_ATTEMPTS', 'TB-Alt Give-Up After (attempts)', 'number:1-100', False, 'How many cached-alternative grabs the recovery path will make for one season before giving up and letting the title fall back to "Wanted". Each grab re-arms TorBox\'s abuse cooldown, so a never-completing title would otherwise be re-grabbed every time its .magnet re-drops. The counter persists across restarts and decays after 30 idle days (default: 12).'),
@@ -142,7 +142,7 @@ ENV_SCHEMA = [
             ('SEARCH_DEDUP_ENABLED', 'Skip If Already in Debrid Account', 'boolean', False,
              'Before the one-click Add, query the debrid account and refuse hashes already present. Prevents a double-click from creating two entries for the same torrent (default: ON).'),
             ('SEARCH_REQUIRE_CACHED', 'Require Cached on Debrid', 'boolean', False,
-             'Refuse the Add button when the hash is not confirmed cached on the debrid provider. Real-Debrid deprecated its cache probe in Nov 2024, so on RD this will block all adds — leave OFF for RD or switch to AllDebrid/TorBox to use this gate (default: OFF).'),
+             'Refuse the Add button when the hash is not confirmed cached on the target debrid. Only TorBox has a working cache probe and there is no cross-check here, so this refuses every Real-Debrid/AllDebrid add — turn ON only when TorBox is your sole debrid (default: OFF).'),
         ],
     },
     {
@@ -344,6 +344,9 @@ _ENV_DEFAULTS = {
     # as ON when the var isn't set in .env, matching runtime behavior in
     # utils/library.py::gap_fill_enabled().
     'GAP_FILL_ENABLED': 'true',
+    # ffprobe monitor defaults ON — matches utils/ffprobe_monitor.py::setup().
+    # Without this the UI toggle rendered OFF while the monitor ran.
+    'FFPROBE_MONITOR_ENABLED': 'true',
     # Wanted→TorBox recovery is on by default; matches
     # utils/library.py::wanted_tb_recovery_enabled() and base/__init__.py Config.
     'WANTED_TB_RECOVERY_ENABLED': 'true',

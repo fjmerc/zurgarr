@@ -92,3 +92,49 @@ class TestProcessStateParser:
         cmdline = ['ffprobe', '-v', 'quiet', '-select_streams', 'v:0',
                    '-show_entries', 'format=duration', '/mnt/media/file.mp4', '']
         assert m._extract_file_path(cmdline) == '/mnt/media/file.mp4'
+
+
+class TestRunBoundedNeverBlocks:
+    """A poke child stuck in D state ignores SIGKILL; subprocess.run's
+    unbounded post-kill wait() would then wedge the monitor thread forever.
+    run_bounded() must return even when the child refuses to die."""
+
+    def test_returns_none_when_child_survives_kill(self, monkeypatch):
+        from utils import processes
+
+        class _Unkillable:
+            killed = False
+            def wait(self, timeout=None):
+                import subprocess as sp
+                raise sp.TimeoutExpired('ffprobe', timeout)
+            def kill(self):
+                self.killed = True
+
+        proc = _Unkillable()
+        monkeypatch.setattr(processes.subprocess, 'Popen', lambda *a, **k: proc)
+        start = time.time()
+        assert processes.run_bounded(['ffprobe'], timeout=0.01, kill_grace=0.01) is None
+        assert proc.killed
+        assert time.time() - start < 5
+
+    def test_returns_exit_code_on_normal_exit(self):
+        from utils import processes
+        assert processes.run_bounded(['true'], timeout=5) == 0
+
+
+class TestOwnPokesAreNeverTargets:
+    """An abandoned poke is itself a stuck ffprobe; if the monitor tracked
+    it, it would poke it (spawning more) and kill it, burning the hourly
+    kill budget meant for real stuck scans."""
+
+    def test_children_of_this_process_are_skipped(self, monkeypatch):
+        import os as _os
+        m = FfprobeMonitor()
+        monkeypatch.setattr('utils.ffprobe_monitor.os.listdir', lambda p: ['100', '200'])
+        monkeypatch.setattr(m, '_get_cmdline', lambda pid: ['ffprobe', '/data/x.mkv'])
+        monkeypatch.setattr(m, '_get_ppid', lambda pid: _os.getpid() if pid == 200 else 1)
+        assert [pid for pid, _ in m._find_ffprobe_pids()] == [100]
+
+    def test_get_ppid_parses_proc_stat(self):
+        import os as _os
+        assert FfprobeMonitor()._get_ppid(_os.getpid()) == _os.getppid()

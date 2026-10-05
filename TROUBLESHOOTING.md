@@ -36,10 +36,11 @@ and the Sonarr/Radarr blackhole watcher, plus the automated
 
 **Fix, by provider:**
 
-| Your provider | What to flip ON in Settings |
+| Your setup | What to flip ON in Settings |
 |---|---|
-| **Real-Debrid** | `PD_ENFORCE_CACHED_VERSIONS`. RD has no working pre-add cache probe, so this is the only gate that works on RD — it configures plex_debrid to reject uncached releases after they're probed post-add. |
-| **AllDebrid or TorBox** | `BLACKHOLE_REQUIRE_CACHED` and `SEARCH_REQUIRE_CACHED`. These use AD/TB's working cache-probe endpoints to refuse uncached releases before they're submitted. You can also flip `PD_ENFORCE_CACHED_VERSIONS` if you use plex_debrid. |
+| **TorBox configured** (alone or alongside RD/AD) | `BLACKHOLE_REQUIRE_CACHED`. TorBox is the only provider with a working pre-add cache probe; for grabs routed to RD/AD the blackhole cross-checks TorBox's cache (re-routing to TorBox when it's cached there). Add `SEARCH_REQUIRE_CACHED` only if TorBox is your *only* debrid — the search gate has no cross-check, so it refuses every RD/AD add. |
+| **Real-Debrid or AllDebrid, no TorBox** | Leave `BLACKHOLE_REQUIRE_CACHED` and `SEARCH_REQUIRE_CACHED` **OFF**. RD deprecated its cache probe (Nov 2024) and AD discontinued its own (May 2026), so with these on every blackhole drop is deferred forever ("cache status unknown") and every search Add is refused. |
+| **Using plex_debrid** (any provider) | `PD_ENFORCE_CACHED_VERSIONS` — configures plex_debrid to reject uncached releases after they're probed post-add, so it works without a pre-add probe. |
 
 After flipping the setting, hit Save & Apply in the UI. For
 `PD_ENFORCE_CACHED_VERSIONS` a plex_debrid restart is needed — the UI
