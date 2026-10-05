@@ -192,9 +192,10 @@ class TestDismissals:
 
 def test_status_payload_includes_setup_check(monkeypatch):
     from utils import status_server
-    monkeypatch.setattr(sc, 'get_setup_check', lambda: {'findings': [], 'dismissed': 0})
+    monkeypatch.setattr(sc, 'get_setup_check', lambda fresh=False: {'findings': [], 'dismissed': 0})
     monkeypatch.setattr(status_server, 'check_services', lambda: [])
-    assert status_server.status_data.to_dict()['setup_check'] == {'findings': [], 'dismissed': 0}
+    payload = status_server.status_data.to_dict()['setup_check']
+    assert payload['findings'] == [] and 'server_now' in payload
 
 
 def test_pages_have_setup_check_hooks():
@@ -458,17 +459,197 @@ def test_resolver_readers_take_the_lock():
 
 
 def test_pd_sync_ignores_equivalent_boolean(tmp_path, monkeypatch):
-    # settings.json "Show Menu on Startup": false vs unset SHOW_MENU must not
-    # rewrite .env on every watcher tick.
+    # settings.json "Log to file": false vs unset PD_LOGFILE (unset runs as
+    # off) must not rewrite .env on every watcher tick.
     import utils.settings_api as sa
     from utils import config_resolve
     monkeypatch.setattr(config_resolve, '_WRITTEN', {})
     monkeypatch.setattr(config_resolve, '_CURRENT', {})
-    monkeypatch.delenv('SHOW_MENU', raising=False)
+    monkeypatch.delenv('PD_LOGFILE', raising=False)
     env_file = tmp_path / '.env'
     env_file.write_text('')
     monkeypatch.setattr(sa, 'ENV_FILE', str(env_file))
     writes = []
     monkeypatch.setattr(sa, '_write_env_file', lambda explicit: writes.append(explicit))
-    sa._sync_plex_debrid_to_env({'Show Menu on Startup': False})
+    sa._sync_plex_debrid_to_env({'Log to file': False})
     assert writes == []
+
+
+def test_show_menu_defaults_on_like_plex_debrid():
+    # plex_debrid_/setup.py resets an unset SHOW_MENU to "true" at every
+    # boot, so "menu off" must be stored explicitly — DEFAULTS says true.
+    from utils.config_resolve import DEFAULTS
+    assert DEFAULTS['SHOW_MENU'] == 'true'
+
+
+class TestRound5:
+
+    @pytest.fixture
+    def env_file(self, tmp_path, monkeypatch):
+        import utils.settings_api as sa
+        from utils import config_resolve
+        path = tmp_path / '.env'
+        path.write_text('')
+        monkeypatch.setattr(sa, 'ENV_FILE', str(path))
+        monkeypatch.setattr(config_resolve, '_WRITTEN', {})
+        monkeypatch.setattr(config_resolve, '_CURRENT', {})
+        for k in ('RD_API_KEY', 'AD_API_KEY', 'TORBOX_API_KEY', 'ZURG_ENABLED', 'STATUS_UI_AUTH'):
+            monkeypatch.delenv(k, raising=False)
+        monkeypatch.setattr('os.kill', lambda *a: None)
+        monkeypatch.setattr(sa, '_sync_env_to_plex_debrid', lambda *a: None)
+        return path
+
+    def _apply(self, path, secrets=frozenset()):
+        from dotenv import dotenv_values
+        from utils import config_resolve
+        config_resolve.apply(config_resolve.resolve(
+            os.environ, dotenv_values(str(path)), secrets, config_resolve.written()))
+
+    def test_secret_debrid_key_does_not_fail_every_save(self, env_file):
+        import utils.settings_api as sa
+        self._apply(env_file, frozenset({'RD_API_KEY'}))   # ZURG_ENABLED auto 'true'
+        values = sa.read_env_values()
+        values['ZURG_ENABLED'] = 'true'                     # what the page posts
+        values['NOTIFICATION_URL'] = 'json://x'
+        result = sa.write_env_values(values)
+        assert result['status'] == 'saved', result
+
+    def test_save_cannot_remove_the_dashboard_login(self, env_file):
+        import utils.settings_api as sa
+        env_file.write_text('STATUS_UI_AUTH=admin:pw\n')
+        self._apply(env_file)
+        values = sa.read_env_values()
+        values['STATUS_UI_AUTH'] = ''
+        result = sa.write_env_values(values)
+        assert result['status'] == 'error'
+        assert any('login' in e.lower() for e in result['errors'])
+        assert 'STATUS_UI_AUTH=admin:pw' in env_file.read_text()
+
+    def test_selfheal_and_pending_retry_off_when_zurg_off(self, monkeypatch):
+        from utils import scheduled_tasks as st
+        monkeypatch.setenv('MOUNT_SELFHEAL_ENABLED', 'true')
+        monkeypatch.setenv('RD_API_KEY', 'k')
+        monkeypatch.setenv('RCLONE_MOUNT_NAME', 'zurgarr')
+        monkeypatch.setenv('ZURG_ENABLED', 'false')
+        assert st._mount_should_run('zurgarr') is False   # per mount now: TorBox still heals
+        monkeypatch.setenv('ZURG_ENABLED', 'true')
+        assert st._mount_should_run('zurgarr') is True
+
+    def test_stop_only_disarms_dead_processes(self):
+        from utils.config_reload import _disarm_stopped
+        class H:
+            restart_policy = object()
+            process = None
+        entries = [{'process_name': 'Zurg', 'handler': H()}, {'process_name': 'rclone', 'handler': H()},
+                   {'process_name': 'plex_debrid', 'handler': H()}]
+        _disarm_stopped(entries, {'zurg', 'rclone'})
+        assert entries[0]['handler'].restart_policy is None
+        assert entries[1]['handler'].restart_policy is None
+        assert entries[2]['handler'].restart_policy is not None
+
+    def test_clear_resolved_keeps_concurrent_dismissal(self, clean, tmp_path):
+        import json
+        clean.setattr(sc, 'CONFIG_DIR', str(tmp_path))
+        clean.setenv('PD_ENFORCE_CACHED_VERSIONS', 'true')          # rec resolved
+        stale = {'rec:PD_ENFORCE_CACHED_VERSIONS': 'a'}
+        # a concurrent dismiss wrote a new entry after `stale` was loaded
+        (tmp_path / 'setup_dismissed.json').write_text(json.dumps(
+            {'rec:PD_ENFORCE_CACHED_VERSIONS': 'a', 'rec:PLEX_REFRESH': 'b'}))
+        sc._clear_resolved_dismissals(stale)
+        saved = json.loads((tmp_path / 'setup_dismissed.json').read_text())
+        assert saved == {'rec:PLEX_REFRESH': 'b'}
+
+
+
+class TestRound6:
+
+    def _entries(self):
+        class H:
+            def __init__(self):
+                self.restart_policy = object()
+                self.process = None
+        return [{'process_name': 'Zurg', 'key_type': 'RealDebrid', 'handler': H()},
+                {'process_name': 'rclone', 'key_type': 'zurgarr', 'handler': H()},
+                {'process_name': 'rclone', 'key_type': 'torbox', 'handler': H()},
+                {'process_name': 'plex_debrid', 'key_type': None, 'handler': H()}]
+
+    def test_torbox_mount_is_not_part_of_the_zurg_stop(self, monkeypatch):
+        from utils import config_reload as cr
+        monkeypatch.setenv('TORBOX_MOUNT_NAME', 'torbox')
+        e = self._entries()
+        cr._disarm_stopped(e, {'zurg', 'rclone'})
+        assert e[0]['handler'].restart_policy is None and e[1]['handler'].restart_policy is None
+        assert e[2]['handler'].restart_policy is not None      # TorBox untouched
+        assert [x['key_type'] for x in e if cr._in_stop_only(x, {'zurg', 'rclone'})] == ['RealDebrid', 'zurgarr']
+
+    def test_stopped_zurg_entries_are_retired_from_the_registry(self, monkeypatch, tmp_path):
+        from utils import config_reload as cr
+        monkeypatch.setenv('TORBOX_MOUNT_NAME', 'torbox')
+        cleared = []
+        monkeypatch.setattr(cr, '_clear_mount', lambda mn: cleared.append(mn))
+        reg = self._entries()
+        cr._retire_stopped(reg, {'zurg', 'rclone'})
+        assert [(x['process_name'], x['key_type']) for x in reg] == [('rclone', 'torbox'), ('plex_debrid', None)]
+        assert cleared == ['zurgarr']
+
+    def test_restarted_services_exclude_stopped(self):
+        from utils.config_reload import _restarted_services
+        assert _restarted_services({'zurg', 'rclone', 'plex_debrid'}, {'zurg', 'rclone'}) == {'plex_debrid'}
+
+    def test_mount_liveness_wanted_for_local_library_without_zurg(self, monkeypatch):
+        from utils import scheduled_tasks as st
+        monkeypatch.setenv('ZURG_ENABLED', 'false')
+        monkeypatch.delenv('TORBOX_API_KEY', raising=False)
+        monkeypatch.delenv('BLACKHOLE_LOCAL_LIBRARY_TV', raising=False)
+        monkeypatch.delenv('BLACKHOLE_LOCAL_LIBRARY_MOVIES', raising=False)
+        assert st._mount_liveness_wanted() is False
+        monkeypatch.setenv('BLACKHOLE_LOCAL_LIBRARY_TV', '/tv')
+        assert st._mount_liveness_wanted() is True
+
+    def test_selfheal_per_mount(self, monkeypatch):
+        from utils import scheduled_tasks as st
+        monkeypatch.setenv('TORBOX_MOUNT_NAME', 'torbox')
+        monkeypatch.setenv('ZURG_ENABLED', 'false')
+        assert st._mount_should_run('zurgarr') is False
+        assert st._mount_should_run('torbox') is True
+
+    def test_cleared_keys_sync_their_effective_value(self, tmp_path, monkeypatch):
+        import utils.settings_api as sa
+        from utils import config_resolve
+        path = tmp_path / '.env'
+        path.write_text('SHOW_MENU=false\n')
+        monkeypatch.setattr(sa, 'ENV_FILE', str(path))
+        monkeypatch.setattr(config_resolve, '_WRITTEN', {})
+        monkeypatch.setattr(config_resolve, '_CURRENT', {})
+        monkeypatch.delenv('SHOW_MENU', raising=False)
+        from dotenv import dotenv_values
+        config_resolve.apply(config_resolve.resolve(os.environ, dotenv_values(str(path))))
+        monkeypatch.setattr('os.kill', lambda *a: None)
+        synced = {}
+        monkeypatch.setattr(sa, '_sync_env_to_plex_debrid', lambda v: synced.update(v))
+        values = sa.read_env_values()
+        values['SHOW_MENU'] = ''          # Reset All / clear
+        assert sa.write_env_values(values)['status'] == 'saved'
+        assert synced['SHOW_MENU'] == 'true'
+
+    def test_fresh_is_throttled(self, clean, tmp_path):
+        clean.setattr(sc, 'CONFIG_DIR', str(tmp_path))
+        calls = []
+        clean.setattr(sc, 'collect_findings', lambda: calls.append(1) or [])
+        sc._invalidate()
+        sc.get_setup_check(fresh=True)
+        sc.get_setup_check(fresh=True)
+        assert len(calls) == 1
+
+    def test_short_value_respects_underscores(self):
+        assert sc._redact('ZURG_USER is missing', ['ZURG']).startswith('ZURG_USER')
+
+    def test_payload_carries_server_time(self, monkeypatch):
+        from utils import status_server
+        monkeypatch.setattr(sc, 'get_setup_check', lambda fresh=False: {'findings': [], 'dismissed': 0})
+        assert isinstance(status_server._setup_check_payload()['server_now'], (int, float))
+
+    def test_resolver_snapshot_is_consistent(self):
+        from utils import config_resolve as cr
+        cur, wr = cr.snapshot()
+        assert isinstance(cur, dict) and isinstance(wr, dict)

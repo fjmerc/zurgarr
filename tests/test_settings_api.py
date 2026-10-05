@@ -1242,9 +1242,7 @@ class TestSyncPlexDebridToEnv:
         assert written['SEERR_API_KEY'] == 'newkey'
 
     def test_syncs_all_simple_mappings(self, tmp_path):
-        # SHOW_MENU starts explicitly 'true' so 'false' is a real change
-        # (an unset boolean already means off — syncing that would be a no-op rewrite).
-        env_file = self._make_env(tmp_path, 'SHOW_MENU=true\n')
+        env_file = self._make_env(tmp_path, '')
         values = {
             'Overseerr Base URL': 'http://seerr:5055',
             'Overseerr API Key': 'seerrkey',
@@ -1376,14 +1374,14 @@ class TestSyncPlexDebridToEnv:
     def test_boolean_values_lowercased(self, tmp_path):
         """Python bool True/False should become 'true'/'false' in .env."""
         env_file = self._make_env(tmp_path, '')
-        values = {'Show Menu on Startup': True}
+        values = {'Show Menu on Startup': False}   # True is the default (a no-op)
         with patch('utils.settings_api.ENV_FILE', env_file), \
              patch.dict(os.environ, {}, clear=False):
             _sync_plex_debrid_to_env(values)
 
         from dotenv import dotenv_values
         written = dotenv_values(env_file)
-        assert written.get('SHOW_MENU') == 'true'
+        assert written.get('SHOW_MENU') == 'false'
 
     def test_write_plex_debrid_triggers_sync(self, tmp_path):
         """write_plex_debrid_values() should call _sync_plex_debrid_to_env."""

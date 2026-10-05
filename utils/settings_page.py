@@ -296,7 +296,7 @@ mark{background:var(--yellow);color:#0d1117;border-radius:2px;padding:0 1px}
   <div class="tab" role="tab" tabindex="0" aria-selected="false" aria-controls="tab-pd" data-kb="tab-2" onclick="switchTab('pd')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('pd')}">Watchlist (plex_debrid)</div>
 </div>
 
-<div class="banner" id="banner"></div>
+<div class="banner" id="banner" role="status" aria-live="polite"></div>
 
 <!-- Zurgarr env vars tab -->
 <div class="tab-content active" id="tab-env" role="tabpanel">
@@ -678,7 +678,7 @@ function updateModifiedChips() {
   const countEl = document.getElementById('modified-count');
   if (countEl) {
     countEl.textContent = (totalCount > 0 && Object.keys(envDefaults).length > 0)
-      ? modifiedCount + ' set by you'
+      ? modifiedCount + ' changed from default'
       : '';
   }
 }
@@ -918,6 +918,15 @@ document.addEventListener('change', e => {
   if (k && _GATE_KEYS.has(k)) applyGate(k);
 });
 
+// The values the form shows (ignores pending clears) — for snapshots.
+function renderedEnvData() {
+  const data = {};
+  document.querySelectorAll('#tab-env [data-key]').forEach(el => {
+    data[el.dataset.key] = el.dataset.type === 'boolean' ? (el.checked ? 'true' : 'false') : el.value;
+  });
+  return data;
+}
+
 function collectEnvData() {
   const data = {};
   document.querySelectorAll('#tab-env [data-key]').forEach(el => {
@@ -929,9 +938,18 @@ function collectEnvData() {
   return data;
 }
 
+// Drop a pending clear and put back the field's original note.
+function cancelClear(el) {
+  delete el.dataset.clear;
+  const note = document.getElementById('src-' + el.dataset.key);
+  if (!note) return;
+  if (note.dataset.inserted === '1') note.remove();
+  else if (note.dataset.orig !== undefined) { note.textContent = note.dataset.orig; delete note.dataset.orig; }
+}
+
 // Any real edit to a field cancels a pending clear on it.
 ['input', 'change'].forEach(ev => document.addEventListener(ev, e => {
-  if (e.isTrusted && e.target && e.target.dataset && e.target.dataset.clear === '1') delete e.target.dataset.clear;
+  if (e.isTrusted && e.target && e.target.dataset && e.target.dataset.clear === '1') cancelClear(e.target);
 }, true));
 
 function useAutomatic(key) {
@@ -940,8 +958,8 @@ function useAutomatic(key) {
   el.dataset.clear = '1';
   const note = document.getElementById('src-' + key);
   const msg = 'Switches back to automatic when you save.';
-  if (note) note.textContent = msg;
-  else el.closest('.field-input').insertAdjacentHTML('beforeend', `<div class="field-src-note" id="src-${esc(key)}">${msg}</div>`);
+  if (note) { if (note.dataset.orig === undefined) note.dataset.orig = note.textContent; note.textContent = msg; }
+  else el.closest('.field-input').insertAdjacentHTML('beforeend', `<div class="field-src-note" id="src-${esc(key)}" data-inserted="1">${msg}</div>`);
   updateDirtyUI();
 }
 
@@ -949,8 +967,16 @@ function useAutomatic(key) {
 // be cleared on save, so the saved file drops back to "nothing set" instead
 // of pinning today's defaults.
 function applyResetToDefaults(defaults) {
-  renderEnvCategories(defaults);
+  // An automatic setting has no fixed default — after the reset it stays
+  // automatic, so preview the value it will actually have.
+  const preview = Object.assign({}, defaults);
+  Object.keys(envSources).forEach(k => { if (envSources[k].source === 'auto') preview[k] = envValues[k]; });
+  renderEnvCategories(preview);
   document.querySelectorAll('#tab-env [data-key]').forEach(el => {
+    const f = _ENV_FIELD_BY_KEY[el.dataset.key] || {};
+    // Credentials (API keys, the dashboard login) are kept: a reset must
+    // never lock you out or disconnect your accounts.
+    if (f.sensitive || f.type === 'secret') { el.value = envValues[el.dataset.key] ?? el.value; return; }
     if (!el.disabled && !el.readOnly) el.dataset.clear = '1';
   });
   updateDirtyUI();
@@ -1049,14 +1075,17 @@ async function envSave() {
             envValues = body;
             if (!userEditing) renderEnvCategories(envValues);
           } else {
-            envValues = collectEnvData();
+            envValues = renderedEnvData();
           }
         } else {
-          envValues = collectEnvData();
+          envValues = renderedEnvData();
         }
       } catch (_) {
-        envValues = collectEnvData();
+        envValues = renderedEnvData();
       }
+      // Saved: no field keeps a pending clear (a skipped re-render — the
+      // user was typing — would otherwise re-post '' on every later save).
+      document.querySelectorAll('#tab-env [data-clear]').forEach(cancelClear);
       envDirty = false;
       updateDirtyUI();
     } else {
@@ -1909,7 +1938,7 @@ function oauthCancel(service, fieldId) {
 async function envResetDefaults() {
   const ok = await inlineConfirm({
     title: 'Reset Zurgarr form to defaults?',
-    message: 'This clears every field back to its schema default — nothing is written to disk yet. You still need to click <strong>Save &amp; Apply</strong> afterwards to persist. Click Cancel to keep the current form values.',
+    message: 'This clears every setting back to its default (API keys and the dashboard login are kept) — nothing is written to disk yet. You still need to click <strong>Save &amp; Apply</strong> afterwards to persist. Click Cancel to keep the current form values.',
     confirmText: 'Reset form',
     danger: true,
   });
@@ -2298,7 +2327,9 @@ function filterSettings(tab, query) {
         g.querySelectorAll('.field').forEach(f => { if (f.style.display !== 'none') gVisible++; });
         if (gVisible > 0) {
           g.classList.add('open');
-          const note = body.querySelector(`.gate-note[data-gate-note="${g.dataset.gate}"]`);
+          // Only the main gated block replaces the note; a match nested in
+          // "Show advanced" leaves the note (main block stays closed).
+          const note = g.parentElement === body ? body.querySelector(`.gate-note[data-gate-note="${g.dataset.gate}"]`) : null;
           if (note) note.hidden = true;
         }
       });
@@ -2308,6 +2339,13 @@ function filterSettings(tab, query) {
   });
 
   countEl.textContent = q ? (shown + ' of ' + total + ' settings') : '';
+  // Hide the "Tuning & maintenance" heading when a filter empties its group.
+  const groupLabel = container.querySelector('.cat-group-label');
+  if (groupLabel) {
+    let anyTuning = false, n = groupLabel.nextElementSibling;
+    while (n) { if (n.classList.contains('category') && n.style.display !== 'none') anyTuning = true; n = n.nextElementSibling; }
+    groupLabel.style.display = anyTuning ? '' : 'none';
+  }
   // Filters cleared: sections a search force-opened go back to their gate state.
   if (tab === 'env' && !anyFilter) _GATE_KEYS.forEach(applyGate);
 }
@@ -2481,6 +2519,7 @@ function resetField(tab, key) {
     // document-level markDirty listener never refreshes the chip — do it
     // here, and re-apply the modified-only filter so a row reset back to
     // its default drops out of the filtered view immediately.
+    cancelClear(el);   // ↺ also undoes Reset All / "Use automatic" on this field
     updateModifiedChips();
     if (_GATE_KEYS.has(key)) applyGate(key);   // no input event fired
     const modToggle = document.getElementById('modified-only-toggle');

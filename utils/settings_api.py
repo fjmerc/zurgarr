@@ -452,8 +452,7 @@ def _derived_reasons():
 def get_env_sources():
     """Provenance for every schema key: {'source', 'reason'} (see config_resolve)."""
     from utils import config_resolve
-    resolved = config_resolve.current()
-    written = config_resolve.written()
+    resolved, written = config_resolve.snapshot()
     out = {}
     for key in sorted(_ALL_KEYS):
         r = resolved.get(key)
@@ -525,6 +524,16 @@ def _same_value(key, a, b):
     if ftype.startswith('select:'):
         return a.lower() == b.lower()
     return a == b
+
+
+def _bool_equivalent(a, b):
+    """'' and 'false' mean the same for an on/off value (whatever the field
+    is typed as — PD_LOGFILE is a text field holding a boolean)."""
+    a = (a or '').strip().lower()
+    b = (b or '').strip().lower()
+    if b not in ('true', 'false') and a not in ('true', 'false'):
+        return False
+    return (a == 'true') == (b == 'true')
 
 
 def _write_env_file(explicit):
@@ -604,6 +613,16 @@ def write_env_values(values):
 
         merged = {**existing, **filtered}
 
+        # Never let a save drop a working dashboard login: the reload would
+        # make the dashboard public and lock Settings (POSTs need a login),
+        # so the admin couldn't undo it from the UI.
+        auth_src = sources.get('STATUS_UI_AUTH', {}).get('source')
+        if (auth_src == 'set' and ':' in (existing.get('STATUS_UI_AUTH') or '')
+                and ':' not in (explicit.get('STATUS_UI_AUTH') or '')):
+            return {'status': 'error', 'warnings': [], 'errors': [
+                'STATUS_UI_AUTH: removing the dashboard login would lock you out of Settings. '
+                'Enter a new username:password instead, or remove it from config/.env by hand.']}
+
         # Validate before writing
         validation = validate_env_values(merged)
         if validation['errors']:
@@ -629,7 +648,9 @@ def write_env_values(values):
     try:
         # Secret-backed keys show (and post) '' — syncing that would blank
         # the debrid key plex_debrid got from the secret.
-        _sync_env_to_plex_debrid({k: v for k, v in merged.items()
+        # Cleared keys sync their effective value (the default), not ''.
+        _sync_env_to_plex_debrid({k: (v if v != '' else _ENV_DEFAULTS.get(k, v))
+                                  for k, v in merged.items()
                                   if sources.get(k, {}).get('source') != 'secret'})
     except Exception as e:
         logger.warning(f'[settings] settings.json sync failed (.env still saved): {e}')
@@ -694,8 +715,24 @@ def _is_valid_url(url):
         return False
 
 
+def _with_secret_placeholders(values):
+    """Docker-secret credentials are never in env or the form (they show
+    as ''), but they ARE set — validate as if present."""
+    try:
+        from utils import config_resolve
+        secret = {k for k, r in config_resolve.current().items() if r.source == 'secret'}
+    except Exception:
+        secret = set()
+    out = dict(values)
+    for k in secret:
+        if not out.get(k):
+            out[k] = '<docker-secret>'
+    return out
+
+
 def validate_env_values(values):
     """Validate a dict of proposed env var values. Returns {errors:[], warnings:[]}."""
+    values = _with_secret_placeholders(values)
     errors = []
     warnings = []
 
@@ -1396,7 +1433,7 @@ def _sync_plex_debrid_to_env(values):
                 continue
             file_val = current.get(key)
             old_val = file_val if file_val is not None else os.environ.get(key, '')
-            if not _same_value(key, old_val, new_val):   # '' vs 'false' isn't a change
+            if not _same_value(key, old_val, new_val) and not _bool_equivalent(old_val, new_val):
                 changed[key] = new_val
 
         if not changed:

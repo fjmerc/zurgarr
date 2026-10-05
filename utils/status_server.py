@@ -676,17 +676,18 @@ def _merge_recent_events(inmem_events, limit=15):
 # Status data singleton
 # ---------------------------------------------------------------------------
 
-def _setup_check_payload():
+def _setup_check_payload(fresh=False):
     try:
         from utils.setup_check import get_setup_check
-        return get_setup_check()
+        # server_now lets the page compute "checked Ns ago" without clock skew
+        return dict(get_setup_check(fresh=fresh), server_now=time.time())
     except Exception:
         logger.exception('[setup_check] Setup check unavailable')
         # Never an empty list — the card would read "Setup OK".
         return {'findings': [{'id': 'setup-check-failed', 'level': 'warn', 'key': None, 'label': None,
                               'message': "The setup check couldn't run — check the container log for details.",
                               'fix': None}],
-                'dismissed': 0, 'auth_configured': False}
+                'dismissed': 0, 'auth_configured': False, 'server_now': time.time()}
 
 
 class StatusData:
@@ -1296,22 +1297,32 @@ function renderBanners(alerts){
 }
 function dismissBanners(){_bannerDismissedSig=_bannerSig(_lastAlerts);_bannerRenderedSig=null;var el=document.getElementById('banner');if(el)el.innerHTML='';}
 
-var _scRenderedSig=null,_scAnnounced=null,_scCheckedAt=null;
+var _scRenderedSig=null,_scAnnounced=null,_scCheckedAt=null,_scSkew=0,_scLatest=0;
 function _scTickChecked(){
   var t=document.getElementById('sc-checked');if(!t||!_scCheckedAt)return;
-  var s=Math.max(0,Math.round(Date.now()/1000-_scCheckedAt));
+  // Age on the server's clock (browser clock minus the measured skew).
+  var s=Math.max(0,Math.round(Date.now()/1000-_scSkew-_scCheckedAt));
   t.textContent='checked '+(s<5?'just now':(s<60?s+'s ago':Math.round(s/60)+'m ago'));
 }
 setInterval(_scTickChecked,5000);
 function recheckSetup(){
-  fetch('/api/setup-check?fresh=1').then(function(r){return r.json();})
-    .then(function(sc){_scRenderedSig=null;renderSetupCheck(sc);if(window.showToast)showToast('Setup checked','success');})
+  fetch('/api/setup-check?fresh=1').then(function(r){if(!r.ok)throw new Error('http');return r.json();})
+    .then(function(sc){
+      var before=_scRenderedSig;renderSetupCheck(sc);
+      // Rebuilt? put focus back on the Recheck button the user pressed.
+      if(_scRenderedSig!==before){var b=document.querySelector('[data-recheck]');if(b)b.focus();}
+      if(window.showToast)showToast('Setup checked','success');})
     .catch(function(){if(window.showToast)showToast('Could not run the setup check','error');});
 }
 function renderSetupCheck(sc){
   var wrap=document.getElementById('setup-check-wrap'),el=document.getElementById('setup-check'),okEl=document.getElementById('setup-ok');
   if(!wrap||!el)return;
   if(!sc){wrap.hidden=true;if(okEl)okEl.textContent='';_scRenderedSig=null;return;}
+  // An in-flight /api/status poll can land after a fresh Recheck: never
+  // replace a newer result with an older one.
+  if(sc.checked_at&&sc.checked_at<_scLatest)return;
+  if(sc.checked_at)_scLatest=sc.checked_at;
+  if(sc.server_now)_scSkew=Date.now()/1000-sc.server_now;
   var f=sc.findings||[],d=sc.dismissed||0,auth=!!sc.auth_configured;
   _scCheckedAt=sc.checked_at||null;_scTickChecked();
   // Rebuild only when something changed: a rebuild on every poll would
@@ -1865,12 +1876,7 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
         elif urlparse(self.path).path == '/api/setup-check':
             # "Recheck now" — ?fresh=1 bypasses the 15s cache.
             fresh = parse_qs(urlparse(self.path).query).get('fresh', [''])[0] == '1'
-            try:
-                from utils.setup_check import get_setup_check
-                payload = get_setup_check(fresh=fresh)
-            except Exception:
-                payload = _setup_check_payload()
-            self._send_json_response(200, json.dumps(payload))
+            self._send_json_response(200, json.dumps(_setup_check_payload(fresh=fresh)))
         elif self.path.startswith('/api/logs'):
             parsed = urlparse(self.path)
             params = parse_qs(parsed.query)

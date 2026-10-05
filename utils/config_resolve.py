@@ -99,6 +99,8 @@ DEFAULTS = {
     'BLOCKLIST_AUTO_ADD': 'true',
     'BLOCKLIST_EXPIRY_DAYS': '0',
     'SEERR_WRITEBACK_ENABLED': 'false',
+    # plex_debrid_/setup.py turns an unset SHOW_MENU into "true" at every boot
+    'SHOW_MENU': 'true',
     'PD_ENFORCE_CACHED_VERSIONS': 'false',
     # Notifications
     'NOTIFICATION_LEVEL': 'info',
@@ -259,6 +261,12 @@ def apply(resolved, environ=None):
 def current():
     with _LOCK:
         return dict(_CURRENT)
+
+
+def snapshot():
+    """(current, written) taken together, so no apply() lands in between."""
+    with _LOCK:
+        return dict(_CURRENT), dict(_WRITTEN)
 
 
 def written():

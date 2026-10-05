@@ -96,7 +96,7 @@ def _redact(message, values=()):
         if len(v) < 8:
             # Short values: only as a standalone word, so a 3-letter username
             # like "the" doesn't blank ordinary words in the message.
-            message = re.sub(r'(?<![A-Za-z0-9])' + re.escape(v) + r'(?![A-Za-z0-9])', '…', message)
+            message = re.sub(r'(?<![A-Za-z0-9_])' + re.escape(v) + r'(?![A-Za-z0-9_])', '…', message)
         else:
             message = message.replace(v, '…')
     message = re.sub(r'"[^"]*"', '"…"', message)   # repr() of values with an apostrophe
@@ -252,6 +252,7 @@ def collect_findings():
 # --- dismissals + cache -----------------------------------------------------
 
 _CACHE_TTL = 15
+_FRESH_MIN_GAP = 5
 _lock = threading.Lock()
 _dismiss_lock = threading.Lock()
 _cache = {'at': 0.0, 'value': None, 'gen': 0}
@@ -291,8 +292,9 @@ def _clear_resolved_dismissals(data):
         return data
     import json
     from utils.file_utils import atomic_write
-    data = {k: v for k, v in data.items() if k not in resolved}
     with _dismiss_lock:
+        # Re-read under the lock: a concurrent dismiss() may have added one.
+        data = {k: v for k, v in _load_dismissed().items() if k not in resolved}
         try:
             with atomic_write(_dismissed_path()) as out:
                 json.dump(data, out, indent=2, sort_keys=True)
@@ -304,9 +306,12 @@ def _clear_resolved_dismissals(data):
 def get_setup_check(fresh=False):
     """Payload for /api/status: {'findings', 'dismissed', 'auth_configured'}.
     Cached for 15s; never raises (a crash becomes a warning, never "OK")."""
-    if fresh:
-        _invalidate()
     now = time.time()
+    if fresh:
+        with _lock:
+            recent = _cache['value'] is not None and now - _cache['at'] < _FRESH_MIN_GAP
+        if not recent:   # throttled: /api/setup-check?fresh=1 can be public
+            _invalidate()
     with _lock:
         if _cache['value'] is not None and now - _cache['at'] < _CACHE_TTL:
             return _cache['value']

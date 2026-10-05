@@ -14,6 +14,16 @@ from unittest.mock import patch
 from utils import scheduled_tasks
 
 
+@pytest.fixture(autouse=True)
+def _zurg_mount_running(monkeypatch):
+    """These tests model a running Real-Debrid mount: Zurg on, an RD key and a
+    mount name.  (The probe and self-heal now skip the Zurg mount when Zurg
+    is off — that path has its own tests in tests/test_setup_check.py.)"""
+    monkeypatch.setenv('ZURG_ENABLED', 'true')
+    monkeypatch.setenv('RD_API_KEY', 'test-rd-key')
+    monkeypatch.setenv('RCLONE_MOUNT_NAME', 'zurgarr')
+
+
 # ---------------------------------------------------------------------------
 # _probe_mount — unit
 # ---------------------------------------------------------------------------

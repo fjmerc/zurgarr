@@ -127,6 +127,61 @@ def _zurg_toggle_plan(changed, zurg_on, zurg_registered):
     return set(), None
 
 
+def _tb_mount_name():
+    return (os.environ.get('TORBOX_MOUNT_NAME') or '').strip() or 'torbox'
+
+
+def _in_stop_only(entry, stop_only):
+    """Whether a registry entry belongs to a stop-only service.  Every rclone
+    mount registers as 'rclone' (told apart by key_type); the TorBox WebDAV
+    mount doesn't depend on Zurg, so a Zurg stop never touches it."""
+    name = entry['process_name'].lower()
+    if name not in stop_only:
+        return False
+    return not (name == 'rclone' and entry.get('key_type') == _tb_mount_name())
+
+
+def _disarm_stopped(entries, stop_only):
+    """Clear the auto-restart policy of every registered process in a
+    stop_only service — including ones already dead/in backoff, which the
+    stop loop skips, or the process monitor would relaunch them."""
+    for entry in entries:
+        if _in_stop_only(entry, stop_only):
+            entry['handler'].restart_policy = None
+
+
+def _clear_mount(mn):
+    """Best effort: remove a stopped rclone mount's FUSE leftovers and its
+    healthcheck marker, so probes and the healthcheck don't report it dead."""
+    try:
+        from rclone.rclone import _force_clear_stale_mount
+        _force_clear_stale_mount(f'/data/{mn}', logger)
+    except Exception as e:
+        logger.debug(f"[reload] Could not clear /data/{mn}: {e}")
+    try:
+        os.rmdir(f'/healthcheck/{mn}')
+    except OSError:
+        pass
+
+
+def _retire_stopped(registry, stop_only, clear=True):
+    """Remove intentionally-stopped entries from the process registry (so
+    the Processes card, healthcheck and self-heal treat them as off, not
+    dead) and clear their mounts.  Returns the removed entries."""
+    removed = [e for e in registry if _in_stop_only(e, stop_only)]
+    for e in removed:
+        registry.remove(e)
+    if clear:
+        for e in removed:
+            if e['process_name'].lower() == 'rclone' and e.get('key_type'):
+                _clear_mount(e['key_type'])
+    return removed
+
+
+def _restarted_services(services, stop_only):
+    return set(services) - set(stop_only)
+
+
 def _determine_restarts(changed_vars):
     """Given changed env var names, return services that need restart."""
     services = set()
@@ -214,6 +269,8 @@ def _reload_once():
         if zurg_note:
             logger.warning(f"[reload] {zurg_note}")
             process_services -= {'zurg', 'rclone'}
+            if not (changed & SERVICE_DEPENDENCIES['plex_debrid']):
+                process_services.discard('plex_debrid')   # only cascaded from ZURG_ENABLED
             try:
                 from utils.status_server import status_data
                 status_data.add_event('config_reload', zurg_note)
@@ -226,6 +283,7 @@ def _reload_once():
             start_entries = []
 
             with _registry_lock:
+                _disarm_stopped(_process_registry, stop_only)
                 for svc_name in stop_order:
                     if svc_name not in process_services:
                         continue
@@ -233,6 +291,8 @@ def _reload_once():
                         name = entry['process_name']
                         handler = entry['handler']
                         if name.lower() == svc_name.lower():
+                            if stop_only and name.lower() in stop_only and not _in_stop_only(entry, stop_only):
+                                continue   # TorBox mount: independent of Zurg, leave it running
                             if handler.process and handler.process.poll() is None:
                                 desc = f"{name} w/ {entry['key_type']}" if entry['key_type'] else name
                                 logger.info(f"[reload] Stopping {desc}")
@@ -240,7 +300,20 @@ def _reload_once():
                             start_entries.append(entry)
 
             # Re-run setup functions to regenerate config files before restart
-            if 'zurg' in process_services:
+            if stop_only:
+                with _registry_lock:
+                    retired = _retire_stopped(_process_registry, stop_only, clear=False)
+                for e in retired:
+                    if e['process_name'].lower() == 'rclone' and e.get('key_type'):
+                        _clear_mount(e['key_type'])
+                try:
+                    from rclone import rclone as _rc
+                    for mn in list(_rc._pending_mounts):   # no deferred retries either
+                        if mn != _tb_mount_name():
+                            _rc._pending_mounts.pop(mn, None)
+                except Exception:
+                    pass
+            if 'zurg' in process_services and 'zurg' not in stop_only:
                 try:
                     from zurg.setup import zurg_setup
                     logger.info("[reload] Regenerating zurg config")
@@ -248,7 +321,7 @@ def _reload_once():
                 except Exception as e:
                     logger.error(f"[reload] Failed to regenerate zurg config: {e}")
 
-            if 'rclone' in process_services:
+            if 'rclone' in process_services and 'rclone' not in stop_only:
                 try:
                     from rclone.rclone import regenerate_config
                     logger.info("[reload] Regenerating rclone config")
@@ -283,9 +356,11 @@ def _reload_once():
                 if _proc_mod._shutting_down:
                     logger.info("[reload] Aborting restart — shutdown in progress")
                     return
-                if svc_name not in process_services or svc_name in stop_only:
-                    continue   # stop_only: Zurg was turned off — stay stopped
+                if svc_name not in process_services:
+                    continue
                 for entry in start_entries:
+                    if _in_stop_only(entry, stop_only):
+                        continue   # Zurg was turned off — stay stopped
                     name = entry['process_name']
                     handler = entry['handler']
                     if name.lower() == svc_name.lower():
@@ -324,13 +399,16 @@ def _reload_once():
                 logger.error(f"[reload] Failed to update Status UI auth/trusted origins: {e}")
 
         logger.info("[reload] Config reload complete")
-        _notify_reload(changed, services)
+        stopped = sorted(stop_only & services)
+        services = _restarted_services(services, stop_only)
+        _notify_reload(changed, services, stopped)
 
         try:
             from utils.status_server import status_data
             status_data.add_event(
                 'config_reload',
                 f'Reloaded {len(changed)} var(s), restarted: {", ".join(sorted(services)) or "none"}'
+                + (f', stopped: {", ".join(stopped)}' if stopped else '')
             )
         except Exception:
             pass
@@ -339,13 +417,15 @@ def _reload_once():
         logger.error(f"[reload] Reload failed: {e}")
 
 
-def _notify_reload(changed, services):
+def _notify_reload(changed, services, stopped=()):
     """Send notification about config reload."""
     try:
         from utils.notifications import notify
         body = f'Reloaded {len(changed)} variable(s)'
         if services:
             body += f', restarted: {", ".join(sorted(services))}'
+        if stopped:
+            body += f', stopped: {", ".join(sorted(stopped))}'
         notify('startup', 'Config Reloaded', body)
     except Exception:
         pass
