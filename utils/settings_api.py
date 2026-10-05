@@ -32,7 +32,7 @@ ENV_SCHEMA = [
         'name': 'Zurg',
         'description': 'Core debrid service and WebDAV server',
         'fields': [
-            ('ZURG_ENABLED', 'Enable Zurg', 'boolean', True, 'Enable the Zurg WebDAV server'),
+            ('ZURG_ENABLED', 'Enable Zurg', 'boolean', True, 'Enable the Zurg WebDAV server. Takes effect when the container starts — restart it after changing this'),
             ('RD_API_KEY', 'Real-Debrid API Key', 'secret', False, 'API key from real-debrid.com/apitoken'),
             ('AD_API_KEY', 'AllDebrid API Key', 'secret', False, 'API key from alldebrid.com'),
             ('TORBOX_API_KEY', 'TorBox API Key', 'secret', False, 'API key from torbox.app. Powers cache probes, search-add, and the dual-debrid blackhole routing. For the WebDAV mount, also set TORBOX_WEBDAV_USER + TORBOX_WEBDAV_PASS (see the TorBox section).'),

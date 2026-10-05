@@ -48,7 +48,7 @@ Everything else has a sensible default or is opt-in.
 | Variable | Description | Default |
 |---|---|---|
 | `TZ` | [Timezone](http://en.wikipedia.org/wiki/List_of_tz_database_time_zones) | |
-| `ZURG_ENABLED` | Enable Zurg | `false` |
+| `ZURG_ENABLED` | Enable Zurg (automatic: on when a Real-Debrid or AllDebrid key is set). Takes effect at container start — changing it later needs a container restart | `false` |
 | `RD_API_KEY` | [Real-Debrid API key](https://real-debrid.com/apitoken) | |
 | `AD_API_KEY` | [AllDebrid API key](https://alldebrid.com/apikeys/). Public Zurg is Real-Debrid only — AllDebrid needs the sponsors-only nightly (`ZURG_VERSION=nightly` + `GITHUB_TOKEN`) | |
 | `TORBOX_API_KEY` | [TorBox API key](https://torbox.app/settings). Powers cache probes, search-add, and dual-debrid blackhole routing. For the WebDAV mount, see [TorBox co-debrid](#torbox-co-debrid-mount-plan-39). | |
