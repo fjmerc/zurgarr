@@ -391,7 +391,13 @@ def read_env_values():
     if os.path.exists(ENV_FILE):
         file_values = dotenv_values(ENV_FILE)
 
+    from utils import config_resolve
+    _resolved = config_resolve.current()
+
     def _read(key):
+        r = _resolved.get(key)
+        if r is not None and r.source == 'locked':
+            return os.environ.get(key, '')
         if key in file_values:
             return file_values[key] or ''
         return os.environ.get(key, '') or _ENV_DEFAULTS.get(key, '')
@@ -400,6 +406,25 @@ def read_env_values():
     for key in sorted(_ALL_KEYS):
         result[key] = _read(key)
     return result
+
+
+def get_env_sources():
+    """Provenance for every schema key: {'source', 'reason'} (see config_resolve)."""
+    from utils import config_resolve
+    resolved = config_resolve.current()
+    written = config_resolve.written()
+    out = {}
+    for key in sorted(_ALL_KEYS):
+        r = resolved.get(key)
+        if r is None:
+            raw = (os.environ.get(key) or '').strip()
+            if raw and written.get(key) != os.environ.get(key):
+                out[key] = {'source': 'locked', 'reason': 'set in docker-compose'}
+            else:
+                out[key] = {'source': 'unset', 'reason': None}
+        else:
+            out[key] = {'source': r.source, 'reason': r.reason}
+    return out
 
 
 def _sanitize_value(value):
@@ -461,10 +486,38 @@ def write_env_values(values):
             'warnings': [],
         }
 
-    # Merge with existing values (preserve keys not in the form submission)
-    # Lock to prevent races with _sync_plex_debrid_to_env
+    # Save only what the user actually set.  The page posts every field, so
+    # a posted value counts as explicit only when the key is already saved
+    # in the file or the value differs from what's currently shown.
+    # Locked (compose) and secret keys can't be changed from here.
     with _env_write_lock:
         existing = read_env_values()
+        file_values = dotenv_values(ENV_FILE) if os.path.exists(ENV_FILE) else {}
+        sources = get_env_sources()
+        # A locked/secret key left over in the file is dropped on the next
+        # save: it can't take effect, and keeping it would mislead readers.
+        explicit = {k: v for k, v in file_values.items()
+                    if k in _ALL_KEYS and v
+                    and sources.get(k, {}).get('source') not in ('locked', 'secret')}
+        locked_errors = []
+        for key, value in filtered.items():
+            src = sources.get(key, {}).get('source')
+            if src in ('locked', 'secret'):
+                if value and value != existing.get(key, ''):
+                    locked_errors.append(
+                        f'{key}: set in docker-compose — edit it there' if src == 'locked'
+                        else f'{key}: set via Docker secret — edit the secret file')
+                continue
+            if key in explicit:
+                if value:
+                    explicit[key] = value
+                else:
+                    del explicit[key]
+            elif value and value != existing.get(key, ''):
+                explicit[key] = value
+        if locked_errors:
+            return {'status': 'error', 'errors': locked_errors, 'warnings': []}
+
         merged = {**existing, **filtered}
 
         # Validate before writing
@@ -476,20 +529,15 @@ def write_env_values(values):
                 'warnings': validation['warnings'],
             }
 
-        # Write .env file atomically
+        # Write .env file atomically — explicit keys only
         try:
             with atomic_write(ENV_FILE) as f:
                 f.write('# Zurgarr configuration — managed by settings editor\n')
-                f.write('# Manual edits are preserved on next save\n\n')
+                f.write('# Only settings you changed are stored; everything else uses its default\n\n')
                 for cat in ENV_SCHEMA:
-                    cat_has_values = False
-                    lines = []
-                    for key, label, ftype, required, help_text in cat['fields']:
-                        val = merged.get(key, '')
-                        if val:
-                            cat_has_values = True
-                        lines.append(_format_env_line(key, val))
-                    if cat_has_values:
+                    lines = [_format_env_line(key, explicit[key])
+                             for key, *_ in cat['fields'] if key in explicit]
+                    if lines:
                         f.write(f'# --- {cat["name"]} ---\n')
                         for line in lines:
                             f.write(line + '\n')

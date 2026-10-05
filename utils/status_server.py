@@ -1819,6 +1819,14 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
             from utils.settings_api import read_env_values
             data = json.dumps(read_env_values())
             self._send_json_response(200, data)
+        elif self.path == '/api/settings/env/sources':
+            if not self.auth_credentials:
+                self._send_json_response(403, json.dumps({
+                    'error': 'Settings API requires STATUS_UI_AUTH to be configured'
+                }))
+                return
+            from utils.settings_api import get_env_sources
+            self._send_json_response(200, json.dumps(get_env_sources()))
         elif self.path == '/api/settings/plex-debrid':
             # Read plex_debrid settings — requires auth to be configured
             if not self.auth_credentials:

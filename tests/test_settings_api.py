@@ -1565,3 +1565,89 @@ class TestProwlarrSettings:
         assert 'PROWLARRAPIKEY' in base.__all__
         assert hasattr(base.config, 'PROWLARR_URL')
         assert hasattr(base.config, 'PROWLARRAPIKEY')
+
+
+class TestSourcesAndExplicitSave:
+
+    @pytest.fixture
+    def env_file(self, tmp_path, monkeypatch):
+        import utils.settings_api as sa
+        from utils import config_resolve
+        path = tmp_path / '.env'
+        path.write_text('')
+        monkeypatch.setattr(sa, 'ENV_FILE', str(path))
+        monkeypatch.setattr(config_resolve, '_WRITTEN', {})
+        monkeypatch.setattr(config_resolve, '_CURRENT', {})
+        for key in ('BLACKHOLE_DIR', 'NOTIFICATION_URL', 'RD_API_KEY'):
+            monkeypatch.delenv(key, raising=False)
+        config_resolve.apply(config_resolve.resolve(os.environ, {}))
+        monkeypatch.setattr('os.kill', lambda *a: None)          # no real SIGHUP
+        monkeypatch.setattr(sa, '_sync_env_to_plex_debrid', lambda *a: None)
+        return path
+
+    def _resolve_again(self, path):
+        from dotenv import dotenv_values
+        from utils import config_resolve
+        config_resolve.apply(config_resolve.resolve(
+            os.environ, dotenv_values(str(path)), frozenset(), config_resolve.written()))
+
+    def test_sources_cover_every_schema_key(self, env_file):
+        from utils.settings_api import get_env_sources, _ALL_KEYS
+        sources = get_env_sources()
+        assert set(sources) == set(_ALL_KEYS)
+        assert sources['BLACKHOLE_DIR'] == {'source': 'default', 'reason': None}
+
+    def test_unchanged_default_fields_not_written(self, env_file):
+        from utils.settings_api import read_env_values
+        values = read_env_values()                 # what the page would post
+        values['NOTIFICATION_URL'] = 'json://x'    # the only real edit
+        result = write_env_values(values)
+        assert result['status'] == 'saved'
+        text = env_file.read_text()
+        assert 'NOTIFICATION_URL=json://x' in text
+        assert 'BLACKHOLE_DIR' not in text         # default not frozen into the file
+
+    def test_clearing_a_set_key_removes_it_from_file(self, env_file):
+        env_file.write_text('BLACKHOLE_DIR=/custom\n')
+        self._resolve_again(env_file)
+        from utils.settings_api import read_env_values
+        values = read_env_values()
+        values['BLACKHOLE_DIR'] = ''
+        assert write_env_values(values)['status'] == 'saved'
+        assert 'BLACKHOLE_DIR' not in env_file.read_text()
+
+    def test_changing_a_set_key_back_to_default_keeps_it_explicit(self, env_file):
+        env_file.write_text('BLACKHOLE_DIR=/custom\n')
+        self._resolve_again(env_file)
+        from utils.settings_api import read_env_values
+        values = read_env_values()
+        values['BLACKHOLE_DIR'] = '/watch'
+        assert write_env_values(values)['status'] == 'saved'
+        assert 'BLACKHOLE_DIR=/watch' in env_file.read_text()
+
+    def test_change_to_locked_key_rejected(self, env_file, monkeypatch):
+        env_file.write_text('NOTIFICATION_URL=json://stale-file\n')
+        monkeypatch.setenv('NOTIFICATION_URL', 'json://compose')
+        self._resolve_again(env_file)
+        from utils.settings_api import read_env_values
+        values = read_env_values()
+        # The page must show the value actually in effect, not the file's.
+        assert values['NOTIFICATION_URL'] == 'json://compose'
+        values['NOTIFICATION_URL'] = 'json://ui'
+        result = write_env_values(values)
+        assert result['status'] == 'error'
+        assert any('NOTIFICATION_URL' in e and 'docker-compose' in e for e in result['errors'])
+        assert 'json://ui' not in env_file.read_text()
+
+    def test_save_to_secret_key_rejected(self, env_file, monkeypatch):
+        from dotenv import dotenv_values
+        from utils import config_resolve
+        config_resolve.apply(config_resolve.resolve(
+            os.environ, dotenv_values(str(env_file)), frozenset({'RD_API_KEY'}),
+            config_resolve.written()))
+        from utils.settings_api import read_env_values
+        values = read_env_values()
+        values['RD_API_KEY'] = 'typed-in-ui'
+        result = write_env_values(values)
+        assert result['status'] == 'error'
+        assert any('RD_API_KEY' in e and 'Docker secret' in e for e in result['errors'])
