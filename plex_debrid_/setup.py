@@ -74,12 +74,13 @@ def pd_setup():
     # meanwhile (applied by the reload) must not be overwritten here.
     from base import config as _cfg
     plex = None
+    waited_for = (_cfg.PLEXADD, _cfg.PLEXTOKEN)   # (a reload updates _cfg in place)
     if _cfg.PLEXUSER and not _cfg.JFAPIKEY:
         if not _cfg.PLEXTOKEN:
             raise MissingEnvironmentVariable("PLEX_TOKEN")   # fail now, not after a wait
         if not _cfg.PLEXADD:
             raise MissingEnvironmentVariable("PLEX_ADDRESS")
-        plex = _wait_for_plex(_cfg.PLEXADD, _cfg.PLEXTOKEN)
+        plex = _wait_for_plex(*waited_for)
         if plex is None:
             raise Exception(f"Plex server at {_cfg.PLEXADD} not reachable within 10 minutes — "
                             "plex_debrid not started (restart the container once Plex is up)")
@@ -89,14 +90,12 @@ def pd_setup():
     # All Plex I/O here, before the settings lock (Settings saves wait on it).
     library_section_ids = []
     if PLEXUSER and not JFAPIKEY and PLEXTOKEN and PLEXADD:
-        if plex is None or (_cfg.PLEXADD, _cfg.PLEXTOKEN) != (PLEXADD, PLEXTOKEN):
+        if plex is None or waited_for != (PLEXADD, PLEXTOKEN):
             plex = _wait_for_plex(PLEXADD, PLEXTOKEN, limit=60)   # changed meanwhile
         if plex is None:
             raise Exception(f"Plex server at {PLEXADD} is not reachable — plex_debrid not started")
         library_section_ids = [str(library.key) for library in plex.library.sections()]
         os.environ['PLEX_CONNECTED'] = 'True'
-        from utils import boot_layout
-        boot_layout.mark_plex_connected()   # for healthcheck.py
     logger.info("Configuring plex_debrid")
     settings_file = "./config/settings.json"
     ignored_file = "./config/ignored.txt"

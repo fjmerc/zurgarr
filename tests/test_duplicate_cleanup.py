@@ -53,3 +53,14 @@ def test_one_interval_rule_everywhere(monkeypatch):
     monkeypatch.setenv('AUTO_UPDATE_INTERVAL', '0.0001')
     assert dc.cleanup_interval() == 24 and dc.get_interval_seconds() == 24 * 3600
     assert Update.auto_update_interval(Update.__new__(Update)) == 24
+
+
+def test_interval_limits_and_warning(monkeypatch, caplog):
+    from utils import boot_layout
+    import utils.duplicate_cleanup as dc
+    assert boot_layout.interval_hours('1e308') == 24.0          # would overflow the scheduler
+    assert boot_layout.interval_hours('87600') == 87600.0       # 10 years is fine
+    monkeypatch.setattr(boot_layout, 'BOOTED', False)
+    monkeypatch.setenv('CLEANUP_INTERVAL', '24h')
+    assert dc.cleanup_interval() == 24
+    assert 'CLEANUP_INTERVAL' in caplog.text                    # told, not silently replaced

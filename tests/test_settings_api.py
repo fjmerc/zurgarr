@@ -1801,6 +1801,17 @@ class TestSourcesAndExplicitSave:
         _sync_plex_debrid_to_env({'Debug printing': 'true'})
         assert loads == [{'read_env_file': False}] and inval
 
+    def test_plex_debrid_tab_torbox_key_reaches_the_blackhole(self, env_file, monkeypatch):
+        # the sync applies settings in-process (no SIGHUP): blackhole
+        # dependencies changed there must still restart the blackhole
+        import utils.config_reload as cr
+        from utils.settings_api import _sync_plex_debrid_to_env
+        restarted = []
+        monkeypatch.setattr(cr, '_restart_services', lambda services, changed: restarted.append(set(services)))
+        monkeypatch.delenv('TORBOX_API_KEY', raising=False)
+        _sync_plex_debrid_to_env({'Torbox API Key': 'tb-new'})
+        assert restarted == [{'blackhole'}]
+
     @staticmethod
     def _as_page_posts(values):
         """Encode values the way the Settings page posts them: every

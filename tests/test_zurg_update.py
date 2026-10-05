@@ -305,3 +305,18 @@ def test_hook_script_refreshed_when_it_differs(tmp_path, monkeypatch):
     cfg.write_text('zurg: v1\n')
     zs.apply_plex_refresh_hook(str(cfg), str(dst), 'true', 'http://p', 't', '/m')
     assert dst.read_text() == 'new\n'
+
+
+def test_hook_marked_installed_only_after_it_was_written(tmp_path, monkeypatch):
+    from utils import boot_layout
+    from zurg import setup as zs
+    def boom(*a):
+        raise OSError('disk full')
+    monkeypatch.setattr(zs.shutil, 'copy', boom)
+    monkeypatch.setattr(zs, '_HOOK_SCRIPT_SRC', str(tmp_path / 'missing-src.py'))
+    cfg = tmp_path / 'config.yml'
+    cfg.write_text('zurg: v1\n')
+    import pytest
+    with pytest.raises(OSError):
+        zs.apply_plex_refresh_hook(str(cfg), str(tmp_path / 'p.py'), 'true', 'http://p', 't', '/m')
+    assert not boot_layout.started('plex_hook')

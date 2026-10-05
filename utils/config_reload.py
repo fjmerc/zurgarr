@@ -358,14 +358,19 @@ def _apply_service_restarts(services, changed):
     if 'blackhole' in services and not _proc_mod._shutting_down:
         try:
             from utils import blackhole
+            enabled = (os.environ.get('BLACKHOLE_ENABLED') or '').strip().lower() == 'true'
+            if blackhole._watcher is None and not enabled:
+                pass   # not used on this install: nothing to restart
             # setup() stops the running watcher itself (and won't start a
             # second one if it doesn't stop)
-            if blackhole.setup() is not None:
+            elif blackhole.setup() is not None:
                 done.add('blackhole')
                 logger.info("[reload] Blackhole watcher restarted")
+            elif not enabled:
+                logger.info("[reload] Blackhole watcher stopped (switched off)")
             else:
-                logger.warning("[reload] Blackhole watcher not running after the change "
-                               "(switched off, invalid settings, or the old one didn't stop)")
+                logger.warning("[reload] Blackhole watcher not restarted — invalid settings, or the "
+                               "old watcher didn't stop (see above)")
         except Exception as e:
             logger.error(f"[reload] Failed to restart blackhole: {e}")
     return done

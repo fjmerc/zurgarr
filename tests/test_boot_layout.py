@@ -100,12 +100,12 @@ class TestHealthcheckFollowsBoot:
         path = tmp_path / 'boot_layout.json'
         path.write_text(json.dumps({'zurg': False, 'instances': [], 'pd': False}))
         monkeypatch.setattr(boot_layout, 'PATH', str(path))
-        assert healthcheck._plex_debrid_expected(pd='true', connected=True) is False
+        assert healthcheck._plex_debrid_expected(pd='true', ready=True) is False
         path.write_text(json.dumps({'zurg': False, 'instances': [], 'pd': True}))
-        assert healthcheck._plex_debrid_expected(pd='true', connected=True) is True
-        assert healthcheck._plex_debrid_expected(pd='true', connected=False) is False
+        assert healthcheck._plex_debrid_expected(pd='true', ready=True) is True
+        assert healthcheck._plex_debrid_expected(pd='true', ready=False) is False
         # switched off at runtime: stopped at once, so not expected either
-        assert healthcheck._plex_debrid_expected(pd='false', connected=True) is False
+        assert healthcheck._plex_debrid_expected(pd='false', ready=True) is False
 
     def test_torbox_mount_and_nfs_mode_follow_the_record(self, tmp_path, monkeypatch):
         # Zurg off at boot → no TorBox mount was started, even with creds set
@@ -447,14 +447,26 @@ class TestWhatStartedIsRecorded:
         assert "mark_started('plex_debrid', False)" in main      # setup failed: not running
 
 
-class TestPlexConnectedMarker:
+class TestPlexDebridReadyMarker:
 
     def test_marker_set_cleared_and_read(self, tmp_path, monkeypatch):
-        # PLEX_CONNECTED lived only in the main process's environment: the
-        # healthcheck (a separate process) never saw it
-        monkeypatch.setattr(boot_layout, 'PLEX_CONNECTED_PATH', str(tmp_path / 'plex_connected'))
-        assert boot_layout.plex_connected() is False
-        boot_layout.mark_plex_connected()
-        assert boot_layout.plex_connected() is True
+        # one "plex_debrid is set up" marker for Plex and Jellyfin installs,
+        # written by main.py only after setup fully succeeded
+        monkeypatch.setattr(boot_layout, 'PD_READY_PATH', str(tmp_path / 'plex_debrid_ready'))
+        assert boot_layout.pd_ready() is False
+        boot_layout.mark_pd_ready()
+        assert boot_layout.pd_ready() is True
+        boot_layout.clear_pd_ready()
+        assert boot_layout.pd_ready() is False
+        boot_layout.mark_pd_ready()
         boot_layout.clear(str(tmp_path / 'nope.json'))
-        assert boot_layout.plex_connected() is False            # previous run's marker cleared
+        assert boot_layout.pd_ready() is False                 # previous run's marker cleared
+
+    def test_main_marks_ready_only_after_setup_succeeded(self):
+        import pathlib
+        main = pathlib.Path(__file__).resolve().parents[1].joinpath('main.py').read_text()
+        a, b = main.index('p.setup.pd_setup()'), main.index('boot_layout.mark_pd_ready()')
+        assert a < b < main.index('except Exception as e:', a)
+        assert 'boot_layout.clear_pd_ready()' in main
+        hc = pathlib.Path(__file__).resolve().parents[1].joinpath('healthcheck.py').read_text()
+        assert 'pd_ready()' in hc and 'JF_API_KEY' not in hc

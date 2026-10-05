@@ -35,8 +35,8 @@ ENV_SCHEMA = [
         'description': 'Core debrid service and WebDAV server',
         'fields': [
             ('ZURG_ENABLED', 'Enable Zurg', 'boolean', True, 'Enable the Zurg WebDAV server.'+_RESTART_HELP),
-            ('RD_API_KEY', 'Real-Debrid API Key', 'secret', False, 'API key from real-debrid.com/apitoken. Search, blackhole and plex_debrid use a new key right away; Zurg picks it up when the container starts — restart it after changing this.'),
-            ('AD_API_KEY', 'AllDebrid API Key', 'secret', False, 'API key from alldebrid.com. Search, blackhole and plex_debrid use a new key right away; Zurg picks it up when the container starts — restart it after changing this.'),
+            ('RD_API_KEY', 'Real-Debrid API Key', 'secret', False, 'API key from real-debrid.com/apitoken. Search and plex_debrid use a new key right away; Zurg (and the blackhole, which needs Zurg\'s mount) pick it up when the container starts — restart it after changing this.'),
+            ('AD_API_KEY', 'AllDebrid API Key', 'secret', False, 'API key from alldebrid.com. Search and plex_debrid use a new key right away; Zurg (and the blackhole, which needs Zurg\'s mount) pick it up when the container starts — restart it after changing this.'),
             ('TORBOX_API_KEY', 'TorBox API Key', 'secret', False, 'API key from torbox.app. Powers cache probes, search-add, and the dual-debrid blackhole routing. For the WebDAV mount, also set TORBOX_WEBDAV_USER + TORBOX_WEBDAV_PASS (see the TorBox section). Adding or removing it (with the WebDAV login set) starts or stops the TorBox mount when the container starts.'),
             ('ZURG_VERSION', 'Zurg Version', 'string', False, 'Pin to specific version (e.g., v0.9.2-hotfix.4)'),
             ('ZURG_UPDATE', 'Auto-Update Zurg', 'boolean', False, 'Check for Zurg updates on startup and every Auto-Update Interval. Switching it off applies right away; switching it on takes effect when the container starts.'),
@@ -1623,6 +1623,12 @@ def _sync_plex_debrid_to_env(values):
             setup_check._invalidate()   # e.g. a Zurg key changed: restart needed
         except Exception:
             pass
+        try:   # e.g. the TorBox key: the blackhole's routing uses it
+            from utils import config_reload
+            if set(changed) & config_reload.SERVICE_DEPENDENCIES['blackhole']:
+                config_reload._restart_services({'blackhole'}, set(changed))
+        except Exception as e:
+            logger.warning(f'[settings] Could not restart the blackhole after sync: {e}')
 
     logger.info(
         f'[settings] Synced {len(changed)} plex_debrid setting(s) back to .env: '

@@ -527,6 +527,7 @@ class TestZurgRcloneApplyAtStartup:
         monkeypatch.setattr(n, 'init', lambda: calls.append('notifications'))
         monkeypatch.setattr(bh, 'stop', lambda: calls.append('bh-stop'))
         monkeypatch.setattr(bh, 'setup', lambda: calls.append('bh-setup') or object())
+        monkeypatch.setenv('BLACKHOLE_ENABLED', 'true')
         boot_layout.STARTUP_COMPLETE.clear()
         try:
             monkeypatch.setattr('base.config.load', lambda **kw: None)
@@ -552,6 +553,7 @@ class TestZurgRcloneApplyAtStartup:
         monkeypatch.setattr(cr, '_drop_not_running', lambda s: set(s))
         monkeypatch.setattr(cr, '_restart_plex_debrid', lambda changed: (_ for _ in ()).throw(OSError('popen')))
         monkeypatch.setattr(bh, 'setup', lambda: calls.append('bh-setup') or object())
+        monkeypatch.setenv('BLACKHOLE_ENABLED', 'true')
         monkeypatch.setattr(cr, '_report_restarts', lambda services: events.append(sorted(services)))
         cr._deferred.update(services={'plex_debrid', 'blackhole'}, changed={'PLEX_USER'}, thread=None)
         cr._run_deferred()

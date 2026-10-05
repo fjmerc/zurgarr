@@ -147,9 +147,10 @@ def main():
                 pd_updater.auto_update('plex_debrid', False)
             else:
                 pd_updater.auto_update('plex_debrid', False)
+            boot_layout.mark_pd_ready()   # set up and started (for healthcheck.py)
         except Exception as e:
             boot_layout.mark_started('plex_debrid', False)   # not running
-            boot_layout.clear_plex_connected()               # healthcheck mustn't expect it
+            boot_layout.clear_pd_ready()                     # healthcheck mustn't expect it
             logger.error(f"Error in plex_debrid setup: {e}", exc_info=True)
 
     blackhole.setup()

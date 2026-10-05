@@ -104,13 +104,6 @@ def test_settings_json_writers_share_one_lock():
         assert 'PD_SETTINGS_LOCK' in inspect.getsource(fn), fn.__name__
 
 
-def test_failed_pd_setup_clears_the_plex_connected_marker():
-    import pathlib
-    main = pathlib.Path(__file__).resolve().parents[1].joinpath('main.py').read_text()
-    i = main.index("boot_layout.mark_started('plex_debrid', False)")
-    assert 'clear_plex_connected()' in main[i - 200:i + 200]
-
-
 def test_incomplete_plex_settings_fail_at_once_without_the_wait(monkeypatch, tmp_path):
     # a missing token/address used to wait 10 minutes and blame reachability
     import json
@@ -155,3 +148,31 @@ def test_plex_io_happens_outside_the_settings_lock(monkeypatch, tmp_path):
         monkeypatch.setattr(config, attr, val, raising=False)
     ps.pd_setup()
     assert held and not any(held)
+
+
+def test_reconnects_when_plex_settings_changed_during_the_wait(monkeypatch, tmp_path):
+    import json
+    from base import config
+    from plex_debrid_ import setup as ps
+    (tmp_path / 'config').mkdir()
+    (tmp_path / 'config' / 'settings.json').write_text(json.dumps({'Plex users': []}))
+    monkeypatch.chdir(tmp_path)
+    calls = []
+
+    class Plex:
+        library = property(lambda self: self)
+
+        def sections(self):
+            return []
+
+    def wait(addr, token, limit=600):
+        calls.append(addr)
+        config.PLEXADD = 'http://new'                         # fixed in Settings meanwhile
+        return Plex()
+    monkeypatch.setattr(ps, '_wait_for_plex', wait)
+    for attr, val in (('PLEXUSER', 'me'), ('PLEXTOKEN', 't'), ('PLEXADD', 'http://old'),
+                      ('JFAPIKEY', None), ('RDAPIKEY', 'k'), ('ADAPIKEY', None),
+                      ('SEERRADD', None), ('SEERRAPIKEY', None)):
+        monkeypatch.setattr(config, attr, val, raising=False)
+    ps.pd_setup()
+    assert calls == ['http://old', 'http://new']

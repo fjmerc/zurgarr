@@ -210,7 +210,8 @@ def _check_findings():
         out.append(_finding('pd-not-started', 'warn', 'PD_ENABLED',
                             "plex_debrid is switched on but didn't start when the container started "
                             "(the container log says why).",
-                            'Fix that setting, then restart the container.'))
+                            'Fix what the container log reports (or wait until Plex is reachable), '
+                            'then restart the container.'))
     pending = _restart_pending()
     if pending:
         out.append(_finding('restart-required', 'warn', pending[0],

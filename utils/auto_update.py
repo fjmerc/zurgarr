@@ -22,7 +22,15 @@ class Update(ProcessHandler):
 
     def auto_update_interval(self):
         from utils import boot_layout   # applies at container start (thread set up then)
-        return boot_layout.interval_hours(boot_layout.setting_at_start('AUTO_UPDATE_INTERVAL'))
+        raw = boot_layout.setting_at_start('AUTO_UPDATE_INTERVAL')
+        hours = boot_layout.interval_hours(raw)
+        try:
+            exact = float(raw) == hours
+        except (TypeError, ValueError):
+            exact = False
+        if raw and not exact and getattr(self, 'logger', None):
+            self.logger.warning(f"Invalid AUTO_UPDATE_INTERVAL '{raw}', using {hours:g} hours")
+        return hours
 
     def auto_update(self, process_name, enable_update):
         if enable_update:

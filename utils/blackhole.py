@@ -3282,6 +3282,28 @@ class BlackholeWatcher:
         from utils.debrid_routing import is_debrid_rejection
         return is_debrid_rejection(result_text)
 
+    @staticmethod
+    def _unstage_for_next_watcher(staged_path, file_path, filename):
+        """Move a rescue-staged file back to its watch path — exactly one
+        copy, never overwriting a fresh drop of the same name."""
+        try:
+            os.link(staged_path, file_path)
+        except FileExistsError:
+            logger.warning(f"[blackhole] {filename} was dropped again meanwhile; the original stays at "
+                           f"{staged_path} (moved to failed/ by the next watcher)")
+            return
+        except OSError as e:
+            logger.warning(f"[blackhole] Could not restore {filename} from rescue staging: {e}. "
+                           f"File preserved at {staged_path}")
+            return
+        try:
+            os.unlink(staged_path)
+        except OSError:
+            try:
+                os.unlink(file_path)   # keep one copy (the staged one, recovered at next start)
+            except OSError:
+                pass
+
     def _attempt_add_time_rescue(self, file_path, filename, info_hash,
                                  source_debrid, label, dispatch):
         """Plan 41 phase A — add-time cross-debrid rescue.
@@ -3433,13 +3455,14 @@ class BlackholeWatcher:
                 logger_prefix='blackhole',
             )
         except _WatcherStopping:
-            # stopping mid-rescue: put the file back for the next watcher
-            try:
-                os.link(staged_path, file_path)
-                os.unlink(staged_path)
-            except OSError:
-                pass   # stays staged (.rescue-…): recovered at the next start
+            # stopping mid-rescue (before the alt add): put the file back
+            self._unstage_for_next_watcher(staged_path, file_path, filename)
             raise
+        if not core.get('rescued') and core.get('reason') == 'stop_requested':
+            # stopping during the ready wait (the alt entry is already
+            # deleted): the file is for the next watcher, not failed/
+            self._unstage_for_next_watcher(staged_path, file_path, filename)
+            raise _WatcherStopping()
 
         if not core.get('rescued'):
             # Move the staged file back so the existing alt-release /
@@ -5455,6 +5478,13 @@ def _setup_locked():
                                f"restarts — not routing grabs to it yet")
                 del debrid_api_keys[name]
                 dropped.add(name)
+    if (boot_layout.BOOTED and 'torbox' in debrid_api_keys
+            and not boot_layout.debrid_key_at_start('TORBOX_API_KEY')):
+        # its mount starts only with the container
+        logger.warning("[blackhole] torbox has no mount until the container restarts — "
+                       "not routing grabs to it yet")
+        del debrid_api_keys['torbox']
+        dropped.add('torbox')
 
     if not debrid_api_keys:
         logger.error("[blackhole] No debrid API key found. Blackhole disabled.")

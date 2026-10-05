@@ -149,23 +149,26 @@ def torbox_mount_name():
 
 
 def debrid_key_at_start(key):
-    """Whether RD_API_KEY / AD_API_KEY was set when Zurg's mounts were set up
-    (decides their names: one instance → plain name, both → _RD/_AD)."""
+    """Whether a debrid key (RD_API_KEY / AD_API_KEY / TORBOX_API_KEY) was
+    set when the mounts were set up (decides Zurg's mount names: one
+    instance → plain name, both → _RD/_AD; and whether there's a TorBox
+    mount at all)."""
     if BOOTED:
         return bool(BOOT_VALUES.get(key))
     return bool((live_getter()(key) or '').strip())
 
 
 def interval_hours(value, default=24.0):
-    """An update/cleanup interval in hours: blank, invalid, non-finite or
-    under a minute → *default* (a 0 interval ran back to back)."""
+    """An update/cleanup interval in hours: blank, invalid, non-finite,
+    under a minute or over 10 years → *default* (a 0 interval ran back to
+    back)."""
     import math
     try:
         hours = float(value)
     except (TypeError, ValueError):
         return default
-    if not math.isfinite(hours) or hours * 60 < 1:
-        return default
+    if not math.isfinite(hours) or hours * 60 < 1 or hours > 24 * 365 * 10:
+        return default   # (a huge value overflowed the scheduler)
     return hours
 
 
@@ -215,37 +218,36 @@ def record(path=None):
         json.dump(data, f)
 
 
-PLEX_CONNECTED_PATH = '/healthcheck/plex_connected'
+PD_READY_PATH = '/healthcheck/plex_debrid_ready'
 
 
-def mark_plex_connected():
-    """plex_debrid reached Plex (for healthcheck.py — a separate process
-    that can't see the main process's environment)."""
+def mark_pd_ready():
+    """plex_debrid was set up and started (Plex or Jellyfin) — for
+    healthcheck.py, a separate process that can't see this one's state."""
     try:
         from utils.file_utils import atomic_write
-        with atomic_write(PLEX_CONNECTED_PATH) as f:
+        with atomic_write(PD_READY_PATH) as f:
             f.write('1')
     except OSError:
         pass
 
 
-def clear_plex_connected():
-    """plex_debrid isn't running after all (its setup failed later)."""
+def clear_pd_ready():
     try:
-        os.remove(PLEX_CONNECTED_PATH)
+        os.remove(PD_READY_PATH)
     except OSError:
         pass
 
 
-def plex_connected():
-    return os.path.exists(PLEX_CONNECTED_PATH)
+def pd_ready():
+    return os.path.exists(PD_READY_PATH)
 
 
 def clear(path=None):
-    """Remove the previous run's record and Plex-connected marker (the
+    """Remove the previous run's record and plex_debrid-ready marker (the
     container filesystem survives `docker restart`), so a failed record()
     can't leave a stale one."""
-    for p in (path or PATH, PLEX_CONNECTED_PATH):
+    for p in (path or PATH, PD_READY_PATH):
         try:
             os.remove(p)
         except OSError:

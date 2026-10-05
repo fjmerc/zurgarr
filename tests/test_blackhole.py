@@ -6133,6 +6133,7 @@ class TestFinalReviewFixes:
         import utils.config_reload as cr
         calls = []
         monkeypatch.setattr(cr, '_drop_not_running', lambda s: set(s))
+        monkeypatch.setenv('BLACKHOLE_ENABLED', 'true')
         monkeypatch.setattr(bh, 'stop', lambda: calls.append('stop') or True)
         monkeypatch.setattr(bh, 'setup', lambda: calls.append('setup') or None)   # off / wedged
         assert cr._apply_service_restarts({'blackhole'}, set()) == set()
@@ -6154,3 +6155,65 @@ class TestFinalReviewFixes:
     def test_routing_settings_restart_the_blackhole(self):
         from utils.config_reload import SERVICE_DEPENDENCIES
         assert {'BLACKHOLE_DEBRID_PRIMARY', 'BLACKHOLE_DEBRID_ROUTING', 'TORBOX_API_KEY'} <= SERVICE_DEPENDENCIES['blackhole']
+
+
+class TestLastFixes:
+
+    def _watcher_setup(self, monkeypatch, tmp_path, tb_at_start):
+        from unittest.mock import MagicMock
+        import utils.blackhole as bh
+        from base import config
+        from utils import boot_layout
+        monkeypatch.setattr(boot_layout, 'BOOTED', True)
+        monkeypatch.setattr(boot_layout, 'BOOT_LAYOUT',
+                            boot_layout.Layout(True, frozenset({'RD'}), 'z', False, '', '', False))
+        monkeypatch.setattr(boot_layout, 'BOOT_VALUES',
+                            dict(boot_layout.BOOT_VALUES, RD_API_KEY='rd', TORBOX_API_KEY='t' if tb_at_start else ''))
+        monkeypatch.setattr(config, 'RDAPIKEY', 'rd', raising=False)
+        monkeypatch.setattr(config, 'ADAPIKEY', None, raising=False)
+        monkeypatch.setenv('TORBOX_API_KEY', 't')
+        monkeypatch.setenv('BLACKHOLE_ENABLED', 'true')
+        monkeypatch.setenv('BLACKHOLE_DIR', str(tmp_path))
+        captured = {}
+        monkeypatch.setattr(bh, 'BlackholeWatcher',
+                            lambda *a, **k: captured.update(keys=k.get('debrid_api_keys')) or MagicMock())
+        monkeypatch.setattr(bh.threading, 'Thread', lambda *a, **k: MagicMock())
+        monkeypatch.setattr(bh, '_watcher', None)
+        monkeypatch.setattr(bh, '_watcher_thread', None)
+        bh.setup()
+        return captured
+
+    def test_torbox_key_added_after_start_waits_for_its_mount(self, monkeypatch, tmp_path):
+        assert set(self._watcher_setup(monkeypatch, tmp_path, False)['keys']) == {'realdebrid'}
+
+    def test_torbox_key_present_at_start_is_used(self, monkeypatch, tmp_path):
+        assert set(self._watcher_setup(monkeypatch, tmp_path, True)['keys']) == {'realdebrid', 'torbox'}
+
+    def test_rescue_stopped_during_the_ready_wait_returns_the_file(self, monkeypatch, tmp_path):
+        from unittest.mock import MagicMock
+        import utils.blackhole as bh
+        from utils import debrid_routing, debrid_client
+        w = bh.BlackholeWatcher(str(tmp_path), 'k', 'realdebrid', 5)
+        monkeypatch.setattr(w, '_api_key_for', lambda svc: 'k')
+        monkeypatch.setattr(debrid_routing, 'pick_alt_debrid', lambda src: 'torbox')
+        monkeypatch.setattr(debrid_client, 'get_debrid_client', lambda **k: (MagicMock(), None))
+        monkeypatch.setattr(debrid_routing, 'attempt_add_rescue',
+                            lambda *a, **k: {'rescued': False, 'reason': 'stop_requested'})
+        f = tmp_path / 'x.magnet'
+        f.write_text('magnet:?xt=urn:btih:abc')
+        import pytest
+        with pytest.raises(bh._WatcherStopping):
+            w._attempt_add_time_rescue(str(f), 'x.magnet', 'abc', 'realdebrid', None,
+                                       {'torbox': lambda *a, **k: (True, {})})
+        assert f.exists()
+
+    def test_no_blackhole_restart_or_warning_where_it_isnt_used(self, monkeypatch, caplog):
+        import utils.blackhole as bh
+        import utils.config_reload as cr
+        calls = []
+        monkeypatch.setattr(cr, '_drop_not_running', lambda s: set(s))
+        monkeypatch.setattr(bh, '_watcher', None)
+        monkeypatch.setenv('BLACKHOLE_ENABLED', 'false')
+        monkeypatch.setattr(bh, 'setup', lambda: calls.append('setup'))
+        assert cr._apply_service_restarts({'blackhole'}, {'TORBOX_API_KEY'}) == set()
+        assert calls == [] and 'not running' not in caplog.text

@@ -188,7 +188,15 @@ def cleanup_interval():
     """Cleanup interval in hours (boot_layout.interval_hours: blank, invalid
     or under a minute → 24).  Applies at container start (task registered then)."""
     from utils import boot_layout
-    return boot_layout.interval_hours(boot_layout.setting_at_start('CLEANUP_INTERVAL'))
+    raw = boot_layout.setting_at_start('CLEANUP_INTERVAL')
+    hours = boot_layout.interval_hours(raw)
+    try:
+        exact = float(raw) == hours
+    except (TypeError, ValueError):
+        exact = False
+    if raw and not exact:
+        logger.warning(f"Invalid CLEANUP_INTERVAL '{raw}', using {hours:g} hours")
+    return hours
 
 def start_cleanup():
     from base import config

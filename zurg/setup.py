@@ -59,8 +59,6 @@ def apply_plex_refresh_hook(config_file_path, refresh_file_path, plex_refresh, a
             want = False
     ours = str(config.get('on_library_update') or '') == _PLEX_HOOK
     if want:
-        from utils import boot_layout
-        boot_layout.mark_started('plex_hook')
         logger.info(f"Updating Plex Refresh in config file: {config_file_path}")
         config['on_library_update'] = _PLEX_HOOK
         # (the instance dirs are volumes: an older copy must be replaced)
@@ -77,6 +75,9 @@ def apply_plex_refresh_hook(config_file_path, refresh_file_path, plex_refresh, a
         return
     with atomic_write(config_file_path) as f:
         yaml.dump(config, f)
+    if want:
+        from utils import boot_layout
+        boot_layout.mark_started('plex_hook')   # (only once it's really in place)
 
 
 def instance_port(key_type, zurg_port, both):
