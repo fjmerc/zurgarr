@@ -202,13 +202,32 @@ def record(path=None):
         json.dump(data, f)
 
 
-def clear(path=None):
-    """Remove the previous run's record (the container filesystem survives
-    `docker restart`), so a failed record() can't leave a stale one."""
+PLEX_CONNECTED_PATH = '/healthcheck/plex_connected'
+
+
+def mark_plex_connected():
+    """plex_debrid reached Plex (for healthcheck.py — a separate process
+    that can't see the main process's environment)."""
     try:
-        os.remove(path or PATH)
+        with open(PLEX_CONNECTED_PATH, 'w') as f:
+            f.write('1')
     except OSError:
         pass
+
+
+def plex_connected():
+    return os.path.exists(PLEX_CONNECTED_PATH)
+
+
+def clear(path=None):
+    """Remove the previous run's record and Plex-connected marker (the
+    container filesystem survives `docker restart`), so a failed record()
+    can't leave a stale one."""
+    for p in (path or PATH, PLEX_CONNECTED_PATH):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
 
 
 def reset_markers(directory='/healthcheck'):

@@ -25,7 +25,8 @@ _STOCK_HOOK = 'sh plex_update.sh "$@"'   # zurg-public's config.yml default
 _HOOK_WARNED = False
 
 
-def apply_plex_refresh_hook(config_file_path, refresh_file_path, plex_refresh, addr, token, mount):
+def apply_plex_refresh_hook(config_file_path, refresh_file_path, plex_refresh, addr, token, mount,
+                            nfs=False):
     """Zurg's own Plex refresh (on_library_update → plex_refresh.py) for the
     content Zurg serves.  Added when PLEX_REFRESH is on and Plex is fully
     configured; otherwise our hook is replaced by Zurg's stock one (turning
@@ -40,6 +41,11 @@ def apply_plex_refresh_hook(config_file_path, refresh_file_path, plex_refresh, a
     with open(config_file_path) as f:
         config = yaml.load(f) or {}
     want = str(plex_refresh or '').strip().lower() == 'true'
+    if want and nfs:
+        # the hook waits for the content on the local mount; with
+        # `rclone serve nfs` nothing is mounted under /data
+        logger.info("Plex Refresh: Zurg's own refresh hook isn't used in NFS mode")
+        want = False
     if want:
         missing = [n for n, v in (('PLEX_ADDRESS', addr), ('PLEX_TOKEN', token),
                                   ('PLEX_MOUNT_DIR', mount)) if not v]
@@ -237,7 +243,8 @@ def zurg_setup():
             update_token(config_file_path, token)
             disable_zurg_rclone(config_file_path)
             apply_plex_refresh_hook(config_file_path, refresh_file_path,
-                                    PLEXREFRESH, PLEXADD, PLEXTOKEN, PLEXMOUNT)
+                                    PLEXREFRESH, PLEXADD, PLEXTOKEN, PLEXMOUNT,
+                                    nfs=str(NFSMOUNT or '').strip().lower() == 'true')
         except Exception as e:
             raise Exception(f"Error setting up Zurg instance for {key_type}: {e}")
 

@@ -247,3 +247,47 @@ def test_zurg_hook_keeps_the_plex_settings_it_started_with(z, monkeypatch):
     z.start_process('Zurg', '/zurg/RD')
     o = z._instance_handlers['RealDebrid'].env_overrides
     assert (o['PLEX_ADDRESS'], o['PLEX_TOKEN'], o['PLEX_MOUNT_DIR']) == ('http://plex', 't', '/media')
+
+
+def test_each_zurg_hook_gets_its_instances_mount_path(z, monkeypatch):
+    # with both instances the mounts are <name>_RD / <name>_AD: the hook
+    # waited on /data/<name> and never refreshed anything
+    from utils import boot_layout
+    monkeypatch.setattr(boot_layout, 'BOOTED', True)
+    monkeypatch.setattr(boot_layout, 'BOOT_LAYOUT',
+                        boot_layout.Layout(True, frozenset({'RD', 'AD'}), 'zurgarr', False, '', '', False))
+    monkeypatch.setattr(boot_layout, 'BOOT_RCLONE_MOUNT_NAME', 'zurgarr')
+    monkeypatch.setattr(zu.ProcessHandler, 'start_process', lambda self, *a, **k: None)
+    z.start_process('Zurg')
+    assert z._instance_handlers['RealDebrid'].env_overrides['ZURG_MOUNT_PATH'] == '/data/zurgarr_RD'
+    assert z._instance_handlers['AllDebrid'].env_overrides['ZURG_MOUNT_PATH'] == '/data/zurgarr_AD'
+
+
+def test_secret_plex_token_is_not_put_in_zurgs_environment(z, monkeypatch):
+    # the hook's base import reads the secret file itself
+    from utils import boot_layout, config_resolve
+    monkeypatch.setattr(boot_layout, 'BOOTED', True)
+    monkeypatch.setattr(boot_layout, 'BOOT_LAYOUT',
+                        boot_layout.Layout(True, frozenset({'RD'}), 'z', False, '', '', False))
+    monkeypatch.setattr(boot_layout, 'BOOT_VALUES', dict(boot_layout.BOOT_VALUES, PLEX_TOKEN='s3cret'))
+    monkeypatch.setattr(config_resolve, 'current',
+                        lambda: {'PLEX_TOKEN': config_resolve.Resolved('s3cret', 'secret', 'x')})
+    monkeypatch.setattr(zu.ProcessHandler, 'start_process', lambda self, *a, **k: None)
+    z.start_process('Zurg', '/zurg/RD')
+    assert 'PLEX_TOKEN' not in z._instance_handlers['RealDebrid'].env_overrides
+
+
+def test_no_refresh_hook_in_nfs_mode(tmp_path, monkeypatch):
+    # nothing is mounted under /data with `rclone serve nfs`
+    from zurg import setup as zs
+    monkeypatch.setattr(zs.shutil, 'copy', lambda *a: None)
+    cfg = tmp_path / 'config.yml'
+    cfg.write_text('zurg: v1\n')
+    zs.apply_plex_refresh_hook(str(cfg), str(tmp_path / 'p.py'), 'true', 'http://p', 't', '/m', nfs=True)
+    assert 'plex_refresh.py' not in cfg.read_text()
+
+
+def test_hook_script_uses_the_pinned_mount_path():
+    import pathlib
+    src = pathlib.Path(__file__).resolve().parents[1].joinpath('zurg', 'plex_refresh.py').read_text()
+    assert "ZURG_MOUNT_PATH" in src

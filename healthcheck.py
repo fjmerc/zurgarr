@@ -140,12 +140,13 @@ def _layout_facts(zurg, rd, ad, rclone_mn, torbox_mn, nfs, torbox_configured):
 
 
 def _plex_debrid_expected(pd, connected):
-    """Whether plex_debrid should be running: it was enabled at container
-    start (the boot record; it's set up only then — the live setting before
-    one exists) and Plex/Jellyfin is connected."""
+    """Whether plex_debrid should be running: enabled at container start
+    (the boot record — it's set up only then) AND still switched on
+    (switching it off stops it at once), and Plex/Jellyfin is connected."""
     from utils import boot_layout
     rec = boot_layout.load()
-    enabled = bool(rec.get('pd')) if rec is not None and 'pd' in rec else str(pd).lower() == 'true'
+    live = str(pd).lower() == 'true'
+    enabled = (bool(rec.get('pd')) and live) if rec is not None and 'pd' in rec else live
     return enabled and bool(connected)
 
 
@@ -183,8 +184,9 @@ def main():
 
         mount_type = "serve nfs" if facts['nfs'] else "mount"
 
+        from utils import boot_layout
         plex_debrid_should_run = _plex_debrid_expected(PLEXDEBRID, (
-            os.getenv('PLEX_CONNECTED', 'False') == 'True'
+            boot_layout.plex_connected()
             or bool(os.getenv('JF_API_KEY', '').strip())
         ))
 

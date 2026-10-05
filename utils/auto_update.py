@@ -26,9 +26,11 @@ class Update(ProcessHandler):
         if not val:
             return 24
         try:
-            return float(val)
+            hours = float(val)
         except (ValueError, TypeError):
             return 24
+        # <= 0 would make schedule run the check every second (or spin)
+        return hours if hours * 60 >= 1 else 24
 
     def auto_update(self, process_name, enable_update):
         if enable_update:

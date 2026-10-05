@@ -109,3 +109,18 @@ def snapshot_boot(monkeypatch):
         monkeypatch.setattr(boot_layout, 'BOOT_VALUES',
                             {k: boot_layout.startup_value(k) for k in boot_layout.SNAPSHOT_KEYS})
     return _snap
+
+
+@pytest.fixture(autouse=True)
+def _fresh_startup_record():
+    """What-started-at-boot record and once-only warnings start clean in
+    every test (module state otherwise leaks between tests)."""
+    from utils import boot_layout
+    import zurg.setup as zs
+    saved, warned = dict(boot_layout.STARTED), zs._HOOK_WARNED
+    boot_layout.STARTED.clear()
+    zs._HOOK_WARNED = False
+    yield
+    boot_layout.STARTED.clear()
+    boot_layout.STARTED.update(saved)
+    zs._HOOK_WARNED = warned

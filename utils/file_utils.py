@@ -2,9 +2,16 @@
 
 import os
 import stat
+import threading
 import tempfile
 from contextlib import contextmanager
 
+
+
+# plex_debrid's settings.json is read-modified-written by pd_setup and by the
+# Settings page (env sync, plex_debrid tab): one lock so neither overwrites
+# the other's change.
+PD_SETTINGS_LOCK = threading.RLock()
 
 @contextmanager
 def atomic_write(target_path, mode='w', encoding='utf-8', fsync=True):

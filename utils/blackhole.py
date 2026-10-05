@@ -47,6 +47,7 @@ from utils.api_metrics import tracked_request
 
 _watcher = None
 _watcher_thread = None
+_PENDING_FILE_LOCK = threading.RLock()
 _watcher_lock = threading.Lock()
 
 # Liveness ceiling for the healthcheck.  The loop also beats before each
@@ -258,7 +259,13 @@ _RATE_LIMIT_SLEEP_CHUNK = 300  # seconds — cap per-call sleep so a long
                                 # reset without wedging the worker thread.
 
 
-def _check_rate_limit(provider, *, _max_chunk=None):
+class _WatcherStopping(BaseException):
+    """The watcher is stopping (a restart): abandon the add in progress and
+    leave the file in the watch folder for the next watcher.  A
+    BaseException so the generic error handling (move to failed/) skips it."""
+
+
+def _check_rate_limit(provider, *, _max_chunk=None, stop_event=None):
     """Block until any active rate-limit window for *provider* expires.
 
     Cheap when no window is active (one lock acquire + dict lookup).
@@ -283,7 +290,11 @@ def _check_rate_limit(provider, *, _max_chunk=None):
                 f"sleeping up to {remaining:.1f}s before next add"
             )
             logged = True
-        time.sleep(wait)
+        if stop_event is not None:
+            if stop_event.wait(wait):
+                raise _WatcherStopping()
+        else:
+            time.sleep(wait)
         # If we slept the full remaining duration in one chunk we're done;
         # otherwise loop to wait the rest (re-reading ``until`` so a
         # manual reset can wake us up early).
@@ -1402,7 +1413,9 @@ class BlackholeWatcher:
 
         # Active monitor tracking (prevents duplicate monitors)
         self._active_monitors = set()
-        self._monitors_lock = threading.RLock()
+        # module-wide: a stopped watcher's monitor threads can still write the
+        # same pending_monitors.json as its replacement
+        self._monitors_lock = _PENDING_FILE_LOCK
 
         # Audit-driven re-search cooldown so a flaky indexer handing out
         # broken releases for the same (show, season) doesn't produce an
@@ -1559,7 +1572,12 @@ class BlackholeWatcher:
                 self._probe_cache[cache_key] = (now + self._PROBE_CACHE_TTL, outcome)
             return outcome
 
-        chosen = pick_debrid_for_grab(info_hash, cache_probe=_probe)
+        # Only the debrids this watcher serves (a key added since start may
+        # have no Zurg mount yet — see setup), with its primary.
+        kwargs = {}
+        if getattr(self, 'debrid_api_keys', None):
+            kwargs = {'configured': tuple(self.debrid_api_keys), 'primary': self.debrid_service}
+        chosen = pick_debrid_for_grab(info_hash, cache_probe=_probe, **kwargs)
         return chosen or self.debrid_service
 
     # ── Debrid submission methods ────────────────────────────────────
@@ -1571,7 +1589,7 @@ class BlackholeWatcher:
         with single-debrid callers; phase-2 multi-debrid callers pass the
         resolved per-debrid key explicitly via ``self._api_key_for('realdebrid')``.
         """
-        _check_rate_limit('realdebrid')
+        _check_rate_limit('realdebrid', stop_event=self._own_stop_event())
         api_key = api_key or self.debrid_api_key
         ext = os.path.splitext(file_path)[1].lower()
         headers = {'Authorization': f'Bearer {api_key}'}
@@ -1606,7 +1624,7 @@ class BlackholeWatcher:
 
     def _add_to_alldebrid(self, file_path, api_key=None):
         """Add a torrent/magnet to AllDebrid."""
-        _check_rate_limit('alldebrid')
+        _check_rate_limit('alldebrid', stop_event=self._own_stop_event())
         api_key = api_key or self.debrid_api_key
         ext = os.path.splitext(file_path)[1].lower()
         params = {'agent': 'zurgarr', 'apikey': api_key}
@@ -1632,7 +1650,7 @@ class BlackholeWatcher:
 
     def _add_to_torbox(self, file_path, api_key=None):
         """Add a torrent/magnet to TorBox."""
-        _check_rate_limit('torbox')
+        _check_rate_limit('torbox', stop_event=self._own_stop_event())
         api_key = api_key or self.debrid_api_key
         ext = os.path.splitext(file_path)[1].lower()
         headers = {'Authorization': f'Bearer {api_key}'}
@@ -5304,8 +5322,16 @@ class BlackholeWatcher:
             except OSError as e:
                 logger.warning(f"[blackhole] Could not recover {filename} from alt_pending: {e}")
 
+    def _own_stop_event(self):
+        """This watcher's stop event when called on its own thread (an add
+        it's doing can be abandoned on stop), else None."""
+        if threading.current_thread() is getattr(self, '_run_thread', None):
+            return self._stop_event
+        return None
+
     def run(self):
         """Main loop - scan at poll_interval."""
+        self._run_thread = threading.current_thread()
         logger.info(f"[blackhole] Watching {self.watch_dir} (poll: {self.poll_interval}s, service: {self.debrid_service})")
         # Register before startup recovery so a wedge in _recover_alt_pending
         # or _resume_pending_monitors is also visible to the healthcheck.
@@ -5336,6 +5362,9 @@ class BlackholeWatcher:
                 if self.symlink_enabled and (time.time() - self._last_cleanup) > 300:
                     self._last_cleanup = time.time()
                     self._cleanup_symlinks()
+            except _WatcherStopping:
+                logger.info("[blackhole] Stopping — the add in progress is left for the next watcher")
+                break
             except Exception as e:
                 logger.error(f"[blackhole] Scan error: {e}")
             self._stop_event.wait(self.poll_interval)
@@ -5362,7 +5391,8 @@ def setup():
     running one first (a reload and main's startup can both call this):
     two watchers would poll the same folder and double-add torrents."""
     with _watcher_lock:
-        _stop_locked()
+        if not _stop_locked():
+            return None   # the old watcher wouldn't stop: never run two
         return _setup_locked()
 
 
@@ -5405,12 +5435,14 @@ def _setup_locked():
     # AllDebrid key added since has no Zurg mount yet, so its grabs would be
     # looked for on the other instance's mount — use it after a restart.
     from utils import boot_layout
+    dropped = set()
     if boot_layout.BOOTED and boot_layout.BOOT_LAYOUT.zurg:
         for name, inst in (('realdebrid', 'RD'), ('alldebrid', 'AD')):
             if name in debrid_api_keys and inst not in boot_layout.BOOT_LAYOUT.instances:
                 logger.warning(f"[blackhole] {name} has no Zurg mount until the container "
                                f"restarts — not routing grabs to it yet")
                 del debrid_api_keys[name]
+                dropped.add(name)
 
     if not debrid_api_keys:
         logger.error("[blackhole] No debrid API key found. Blackhole disabled.")
@@ -5433,6 +5465,12 @@ def _setup_locked():
         return None
 
     debrid_service = resolve_primary() or next(iter(debrid_api_keys))
+    if debrid_service in dropped:
+        # its Zurg instance didn't start: use one this blackhole can serve
+        fallback = next(iter(debrid_api_keys))
+        logger.warning(f"[blackhole] Primary {debrid_service} has no Zurg mount until the container "
+                       f"restarts — using {fallback} meanwhile")
+        debrid_service = fallback
     if debrid_service not in debrid_api_keys:
         logger.error(
             f"[blackhole] Primary debrid {debrid_service!r} has no API key configured. "
@@ -5539,18 +5577,32 @@ def _setup_locked():
     return _watcher
 
 
+_STOP_WAIT_LIMIT = 600   # seconds — a watcher wedged longer than this is given up on
+
+
 def _stop_locked():
+    """Stop the watcher and wait for its thread to exit.  True when stopped
+    (or none ran); False when it didn't exit within _STOP_WAIT_LIMIT (or the
+    container is shutting down) — the caller then must not start another:
+    two watchers would poll the same folder and double-add torrents."""
     global _watcher, _watcher_thread
     if _watcher:
         _watcher.stop()
         if _watcher_thread is not None:
-            # Let it finish the file it's on (it stops before the next one);
-            # starting the replacement meanwhile would double-add torrents.
-            _watcher_thread.join(timeout=30)
+            # It stops before its next file, and a rate-limit wait is
+            # interrupted (_WatcherStopping) — so this is normally quick.
+            from utils import processes
+            deadline = time.monotonic() + _STOP_WAIT_LIMIT
+            _watcher_thread.join(timeout=min(30, _STOP_WAIT_LIMIT))
             while _watcher_thread.is_alive():
+                if processes._shutting_down or time.monotonic() >= deadline:
+                    logger.error("[blackhole] The previous watcher didn't stop — leaving the blackhole "
+                                 "stopped rather than running two (restart the container)")
+                    return False
                 logger.warning("[blackhole] Waiting for the previous watcher to finish its current file")
-                _watcher_thread.join(timeout=30)
+                _watcher_thread.join(timeout=min(30, max(0.01, deadline - time.monotonic())))
     _watcher = _watcher_thread = None
+    return True
 
 
 def stop():

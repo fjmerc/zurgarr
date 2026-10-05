@@ -102,8 +102,10 @@ class TestHealthcheckFollowsBoot:
         monkeypatch.setattr(boot_layout, 'PATH', str(path))
         assert healthcheck._plex_debrid_expected(pd='true', connected=True) is False
         path.write_text(json.dumps({'zurg': False, 'instances': [], 'pd': True}))
-        assert healthcheck._plex_debrid_expected(pd='false', connected=True) is True
+        assert healthcheck._plex_debrid_expected(pd='true', connected=True) is True
         assert healthcheck._plex_debrid_expected(pd='true', connected=False) is False
+        # switched off at runtime: stopped at once, so not expected either
+        assert healthcheck._plex_debrid_expected(pd='false', connected=True) is False
 
     def test_torbox_mount_and_nfs_mode_follow_the_record(self, tmp_path, monkeypatch):
         # Zurg off at boot → no TorBox mount was started, even with creds set
@@ -442,3 +444,17 @@ class TestWhatStartedIsRecorded:
         assert "mark_started('duplicate_cleanup')" in inspect.getsource(dc.setup)
         main = pathlib.Path(__file__).resolve().parents[1].joinpath('main.py').read_text()
         assert "mark_started('plex_debrid')" in main
+        assert "mark_started('plex_debrid', False)" in main      # setup failed: not running
+
+
+class TestPlexConnectedMarker:
+
+    def test_marker_set_cleared_and_read(self, tmp_path, monkeypatch):
+        # PLEX_CONNECTED lived only in the main process's environment: the
+        # healthcheck (a separate process) never saw it
+        monkeypatch.setattr(boot_layout, 'PLEX_CONNECTED_PATH', str(tmp_path / 'plex_connected'))
+        assert boot_layout.plex_connected() is False
+        boot_layout.mark_plex_connected()
+        assert boot_layout.plex_connected() is True
+        boot_layout.clear(str(tmp_path / 'nope.json'))
+        assert boot_layout.plex_connected() is False            # previous run's marker cleared

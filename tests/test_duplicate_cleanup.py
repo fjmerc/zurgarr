@@ -24,3 +24,17 @@ def test_intervals_are_the_startup_values(monkeypatch):
     monkeypatch.setenv('AUTO_UPDATE_INTERVAL', '1')
     assert dc.cleanup_interval() == 12
     assert Update.auto_update_interval(Update.__new__(Update)) == 6
+
+
+def test_zero_or_negative_intervals_are_clamped(monkeypatch):
+    # 0 made the update thread run every second (or spin in schedule), and
+    # cleanup register a 0s task
+    from utils import boot_layout
+    import utils.duplicate_cleanup as dc
+    from utils.auto_update import Update
+    monkeypatch.setattr(boot_layout, 'BOOTED', False)
+    for v in ('0', '-3'):
+        monkeypatch.setenv('CLEANUP_INTERVAL', v)
+        monkeypatch.setenv('AUTO_UPDATE_INTERVAL', v)
+        assert dc.cleanup_interval() == 24
+        assert Update.auto_update_interval(Update.__new__(Update)) == 24

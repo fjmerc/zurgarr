@@ -192,10 +192,14 @@ def cleanup_interval():
     if not raw:
         return 24
     try:
-        return float(raw)
+        hours = float(raw)
     except ValueError:
         logger.warning(f"Invalid CLEANUP_INTERVAL '{raw}', defaulting to 24 hours")
         return 24
+    if hours <= 0:   # a 0s task would run back to back
+        logger.warning(f"CLEANUP_INTERVAL must be above 0 ('{raw}'), defaulting to 24 hours")
+        return 24
+    return hours
 
 def start_cleanup():
     from base import config

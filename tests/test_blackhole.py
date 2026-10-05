@@ -6006,3 +6006,99 @@ class TestRoutesOnlyToStartedInstances:
         monkeypatch.setattr(bh, '_watcher_thread', None)
         bh.setup()
         assert set(captured['keys']) == {'realdebrid'}
+
+
+class TestRateLimitWaitIsInterruptible:
+
+    def test_stopping_watcher_leaves_a_rate_limited_add_for_the_next_one(self, tmp_path):
+        # the wait could last hours (TorBox cooldown); a restart must not hang
+        # behind it, and the file must stay in the watch folder (not failed/)
+        import threading
+        import time
+        import utils.blackhole as bh
+        stop = threading.Event()
+        with bh._rate_limit_lock:
+            bh._rate_limit_until['torbox'] = time.time() + 3600
+        try:
+            t0 = time.time()
+            threading.Timer(0.2, stop.set).start()
+            try:
+                bh._check_rate_limit('torbox', stop_event=stop)
+                raised = False
+            except bh._WatcherStopping:
+                raised = True
+            assert raised and time.time() - t0 < 5
+            assert not issubclass(bh._WatcherStopping, Exception)   # skips "move to failed/"
+        finally:
+            with bh._rate_limit_lock:
+                bh._rate_limit_until.pop('torbox', None)
+
+    def test_stop_gives_up_after_a_bound_and_never_starts_a_second_watcher(self, monkeypatch):
+        from unittest.mock import MagicMock
+        import utils.blackhole as bh
+        old, thread = MagicMock(), MagicMock()
+        thread.is_alive.return_value = True                     # wedged for good
+        monkeypatch.setattr(bh, '_STOP_WAIT_LIMIT', 0.05)
+        monkeypatch.setattr(bh, '_watcher', old)
+        monkeypatch.setattr(bh, '_watcher_thread', thread)
+        monkeypatch.setenv('BLACKHOLE_ENABLED', 'true')
+        started = []
+        monkeypatch.setattr(bh, '_setup_locked', lambda: started.append(1))
+        assert bh.setup() is None
+        assert started == []                                    # left stopped, not doubled
+
+
+class TestPrimaryFromUsableKeys:
+
+    def test_dropped_primary_falls_back_instead_of_disabling(self, monkeypatch, tmp_path):
+        # booted with AD only; RD added later (first in routing order) must
+        # not leave the blackhole switched off as "primary has no key"
+        from unittest.mock import MagicMock
+        import utils.blackhole as bh
+        from base import config
+        from utils import boot_layout
+        monkeypatch.setattr(boot_layout, 'BOOTED', True)
+        monkeypatch.setattr(boot_layout, 'BOOT_LAYOUT',
+                            boot_layout.Layout(True, frozenset({'AD'}), 'z', False, '', '', False))
+        monkeypatch.setattr(config, 'RDAPIKEY', 'rd', raising=False)
+        monkeypatch.setattr(config, 'ADAPIKEY', 'ad', raising=False)
+        monkeypatch.setenv('RD_API_KEY', 'rd')
+        monkeypatch.setenv('AD_API_KEY', 'ad')
+        monkeypatch.setenv('BLACKHOLE_ENABLED', 'true')
+        monkeypatch.setenv('BLACKHOLE_DIR', str(tmp_path))
+        captured = {}
+
+        def fake(*a, **k):
+            captured.update(service=a[2], keys=k.get('debrid_api_keys'))
+            return MagicMock()
+        monkeypatch.setattr(bh, 'BlackholeWatcher', fake)
+        monkeypatch.setattr(bh.threading, 'Thread', lambda *a, **k: MagicMock())
+        monkeypatch.setattr(bh, '_watcher', None)
+        monkeypatch.setattr(bh, '_watcher_thread', None)
+        assert bh.setup() is not None
+        assert captured['service'] == 'alldebrid' and set(captured['keys']) == {'alldebrid'}
+
+    def test_routing_only_picks_debrids_this_watcher_serves(self, monkeypatch):
+        import utils.blackhole as bh
+        from utils import debrid_routing
+        w = bh.BlackholeWatcher.__new__(bh.BlackholeWatcher)
+        w.debrid_api_keys = {'alldebrid': 'ad'}
+        w.debrid_service = 'alldebrid'
+        seen = {}
+
+        def fake_pick(h, **kw):
+            seen.update(kw)
+            return kw.get('primary')
+        monkeypatch.setattr(debrid_routing, 'pick_debrid_for_grab', fake_pick)
+        monkeypatch.setattr(w, '_ensure_probe_cache', lambda: None, raising=False)
+        assert w._route_grab('abc') == 'alldebrid'
+        assert seen['configured'] == ('alldebrid',) and seen['primary'] == 'alldebrid'
+
+
+def test_watchers_share_the_pending_monitors_lock(tmp_path):
+    # an old watcher's monitor thread can still update pending_monitors.json
+    # after a restart: per-watcher locks let the two overwrite each other
+    import utils.blackhole as bh
+    a = bh.BlackholeWatcher(str(tmp_path), 'k', 'realdebrid', 5)
+    b = bh.BlackholeWatcher(str(tmp_path), 'k', 'realdebrid', 5)
+    assert a._monitors_lock is b._monitors_lock

@@ -45,11 +45,24 @@ class ZurgUpdate(Update, ProcessHandler):
                     level = zurg_log_level()
                     handler.env_overrides = {'LOG_LEVEL': level or None}
                     # Its Plex-refresh hook keeps the Plex settings Zurg was
-                    # set up with (they apply at the next container start).
+                    # set up with (they apply at the next container start) and
+                    # waits on this instance's own mount.
                     from utils import boot_layout
                     if boot_layout.BOOTED:
+                        try:
+                            from utils import config_resolve
+                            secret = {k for k, r in config_resolve.current().items() if r.source == 'secret'}
+                        except Exception:
+                            secret = set()
                         for k in ('PLEX_ADDRESS', 'PLEX_TOKEN', 'PLEX_MOUNT_DIR'):
-                            handler.env_overrides[k] = boot_layout.BOOT_VALUES.get(k) or None
+                            if k not in secret:   # the hook reads a secret file itself
+                                handler.env_overrides[k] = boot_layout.BOOT_VALUES.get(k) or None
+                        names = boot_layout.zurg_mount_names(
+                            boot_layout.BOOT_RCLONE_MOUNT_NAME, 'RD' in boot_layout.BOOT_LAYOUT.instances,
+                            'AD' in boot_layout.BOOT_LAYOUT.instances)
+                        suffix = '_RD' if key_type == 'RealDebrid' else '_AD'
+                        mount = next((n for n in names if len(names) == 1 or n.endswith(suffix)), None)
+                        handler.env_overrides['ZURG_MOUNT_PATH'] = f'/data/{mount}' if mount else None
                 elif handler.process and handler.process.poll() is None:
                     # Still running (stop_process reaps what it kills, so this
                     # is a live process): a second Popen would clash with it.

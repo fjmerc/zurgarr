@@ -1644,6 +1644,12 @@ def _sync_env_to_plex_debrid(env_values):
     Only updates keys that actually changed.  Called from write_env_values()
     before the SIGHUP trigger.
     """
+    from utils.file_utils import PD_SETTINGS_LOCK
+    with PD_SETTINGS_LOCK:   # pd_setup read-modify-writes the same file
+        _sync_env_to_plex_debrid_locked(env_values)
+
+
+def _sync_env_to_plex_debrid_locked(env_values):
     if not os.path.exists(SETTINGS_JSON_FILE):
         return
 
@@ -1782,9 +1788,10 @@ def write_plex_debrid_values(values):
             'warnings': validation['warnings'],
         }
 
-    # Write settings.json atomically
+    # Write settings.json atomically (pd_setup read-modify-writes it too)
+    from utils.file_utils import PD_SETTINGS_LOCK
     try:
-        with atomic_write(SETTINGS_JSON_FILE) as f:
+        with PD_SETTINGS_LOCK, atomic_write(SETTINGS_JSON_FILE) as f:
             _json.dump(values, f, indent=4, ensure_ascii=False)
             f.write('\n')
     except Exception as e:

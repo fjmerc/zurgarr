@@ -148,6 +148,7 @@ def main():
             else:
                 pd_updater.auto_update('plex_debrid', False)
         except Exception as e:
+            boot_layout.mark_started('plex_debrid', False)   # not running
             logger.error(f"Error in plex_debrid setup: {e}", exc_info=True)
 
     blackhole.setup()

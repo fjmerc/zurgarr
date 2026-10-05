@@ -76,3 +76,29 @@ def test_each_update_thread_runs_only_its_own_job(monkeypatch):
     b._make_schedule('plex_debrid')
     assert len(a._scheduler.jobs) == 1 and len(b._scheduler.jobs) == 1
     assert a._scheduler is not b._scheduler and schedule.default_scheduler.jobs == []
+
+
+def test_plex_wait_is_bounded_and_stops_on_shutdown(monkeypatch):
+    # Plex down at boot used to stall startup forever (no blackhole, no
+    # scheduler, deferred restarts never ran)
+    import time
+    from plex_debrid_ import setup as ps
+    import utils.processes as procs
+    def down(*a, **k):
+        raise ConnectionError('refused')
+    monkeypatch.setattr(ps, 'PlexServer', down)
+    monkeypatch.setattr(ps.time, 'sleep', lambda s: None)
+    t = [0.0]
+    monkeypatch.setattr(ps.time, 'monotonic', lambda: t.__setitem__(0, t[0] + 30) or t[0])
+    assert ps._wait_for_plex('http://plex', 'tok', limit=600) is None       # gave up
+    monkeypatch.setattr(procs, '_shutting_down', True)
+    t[0] = 0.0
+    assert ps._wait_for_plex('http://plex', 'tok', limit=10 ** 9) is None   # shutdown: stops
+
+
+def test_settings_json_writers_share_one_lock():
+    import inspect
+    from plex_debrid_ import setup as ps
+    import utils.settings_api as sa
+    for fn in (ps.pd_setup, sa._sync_env_to_plex_debrid, sa.write_plex_debrid_values):
+        assert 'PD_SETTINGS_LOCK' in inspect.getsource(fn), fn.__name__

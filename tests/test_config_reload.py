@@ -369,7 +369,12 @@ class TestZurgRcloneApplyAtStartup:
     def started(self, monkeypatch):
         from utils import boot_layout
         monkeypatch.setattr(boot_layout, 'STARTED', {})
-        return lambda *names: [boot_layout.mark_started(n) for n in names]
+
+        def mark(*names):
+            boot_layout.STARTED.clear()
+            for n in names:
+                boot_layout.mark_started(n)
+        return mark
 
     def test_partly_live_settings_follow_what_started(self, boot, started, monkeypatch):
         cr = boot(DUPLICATE_CLEANUP='true', PLEX_ADDRESS='http://plex', PLEX_TOKEN='t',
@@ -377,6 +382,7 @@ class TestZurgRcloneApplyAtStartup:
         started('duplicate_cleanup', 'plex_hook')
         monkeypatch.setenv('DUPLICATE_CLEANUP', 'false')       # off applies at once
         assert cr.restart_pending() == []
+        monkeypatch.setenv('DUPLICATE_CLEANUP', 'true')
         monkeypatch.setenv('ZURG_UPDATE', 'true')              # the update thread starts at boot
         monkeypatch.setenv('CLEANUP_INTERVAL', '6')            # re-scheduling needs a restart
         monkeypatch.setenv('PLEX_MOUNT_DIR', '/plex')          # Zurg's hook got the old one
@@ -402,6 +408,11 @@ class TestZurgRcloneApplyAtStartup:
         monkeypatch.setenv('AUTO_UPDATE_INTERVAL', '6')        # no update thread running
         assert cr.restart_pending() == []
 
+    def test_plex_debrid_that_failed_to_start_isnt_called_changed(self, boot, started, monkeypatch):
+        cr = boot(PD_ENABLED='true', **self.RD_BOOT)
+        started()                                              # on at boot, setup failed
+        assert 'PD_ENABLED' not in cr.restart_pending()
+
     def test_plex_debrid_switched_on_needs_a_restart(self, boot, started, monkeypatch):
         cr = boot(**self.RD_BOOT)
         started()
@@ -409,7 +420,7 @@ class TestZurgRcloneApplyAtStartup:
         assert cr.restart_pending() == ['PD_ENABLED']
 
     def test_auto_update_interval_listed_when_an_update_thread_runs(self, boot, started, monkeypatch):
-        cr = boot(**self.RD_BOOT)
+        cr = boot(ZURG_UPDATE='true', **self.RD_BOOT)
         started('Zurg_update')
         monkeypatch.setenv('AUTO_UPDATE_INTERVAL', '6')
         assert cr.restart_pending() == ['AUTO_UPDATE_INTERVAL']
@@ -546,6 +557,51 @@ class TestZurgRcloneApplyAtStartup:
         cr._run_deferred()
         assert calls == ['bh-stop', 'bh-setup']                 # not skipped by the failure
         assert events == [['blackhole']]
+
+    def test_plex_debrid_switched_off_is_not_reported_as_restarted(self, boot, monkeypatch):
+        cr = boot(**self.RD_BOOT)
+        monkeypatch.setattr(cr, '_drop_not_running', lambda s: set(s))
+        monkeypatch.setattr(cr, '_restart_plex_debrid', lambda changed: False)   # stopped only
+        assert cr._apply_service_restarts({'plex_debrid'}, set()) == set()
+
+    def test_startup_pass_notification_has_its_own_text(self, boot, monkeypatch):
+        import utils.notifications as n
+        cr = boot(**self.RD_BOOT)
+        sent = []
+        monkeypatch.setattr(n, 'notify', lambda *a, **k: sent.append(a))
+        cr._report_restarts({'blackhole'})
+        assert sent and 'Reloaded 0' not in sent[0][2] and 'blackhole' in sent[0][2]
+
+    def test_conditional_rules_wait_for_the_end_of_startup(self, boot, started, monkeypatch):
+        # before main.py reaches plex_debrid/cleanup/update setup nothing is
+        # marked started yet — that's not "needs a restart"
+        from utils import boot_layout
+        cr = boot(PD_ENABLED='true', **self.RD_BOOT)
+        started()
+        monkeypatch.setenv('ZURG_UPDATE', 'true')
+        boot_layout.STARTUP_COMPLETE.clear()
+        try:
+            assert cr.restart_pending() == []
+        finally:
+            boot_layout.STARTUP_COMPLETE.set()
+
+    def test_pd_repo_change_named_when_it_was_only_read_at_boot(self, boot, started, monkeypatch):
+        cr = boot(PD_ENABLED='true', PD_REPO='a,b,main', **self.RD_BOOT)
+        started('plex_debrid')                                 # no update thread
+        monkeypatch.setenv('PD_REPO', 'c,d,main')
+        assert cr.restart_pending() == ['PD_REPO']
+        started('plex_debrid', 'plex_debrid_update')           # the thread reads it live
+        assert cr.restart_pending() == []
+
+    def test_intervals_compared_as_numbers_and_only_when_used(self, boot, started, monkeypatch):
+        cr = boot(DUPLICATE_CLEANUP='true', PLEX_ADDRESS='http://p', PLEX_TOKEN='t', **self.RD_BOOT)
+        started('duplicate_cleanup', 'Zurg_update')
+        monkeypatch.setenv('CLEANUP_INTERVAL', '24')           # '' meant 24 already
+        monkeypatch.setenv('AUTO_UPDATE_INTERVAL', '24.0')
+        assert cr.restart_pending() == []
+        monkeypatch.setenv('CLEANUP_INTERVAL', '6')
+        monkeypatch.setenv('DUPLICATE_CLEANUP', 'false')        # off now: interval moot
+        assert cr.restart_pending() == []
 
     def test_no_restarts_during_shutdown(self, boot, monkeypatch):
         import utils.blackhole as bh

@@ -13,7 +13,9 @@ from base import PLEXTOKEN, PLEXADD, PLEXMOUNT, RCLONEMN
 plex_url = PLEXADD.replace("'", "").replace('"', '')
 token = PLEXTOKEN.replace("'", "").replace('"', '')
 plex_mount = PLEXMOUNT.replace("'", "").replace('"', '')
-zurg_mount = f"/data/{RCLONEMN}"
+# This Zurg instance's mount (set per instance by zurgarr: <name>_RD /
+# <name>_AD when both run); the plain mount name otherwise.
+zurg_mount = os.environ.get('ZURG_MOUNT_PATH') or f"/data/{RCLONEMN}"
 zurg_timeout = 300  # 5 minutes in seconds for Zurg file availability
 plex_timeout = 60   # Maximum time to wait for Plex to process the refresh
 wait_increment = 1  # Time increment for each wait step

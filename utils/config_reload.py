@@ -128,7 +128,7 @@ def _zurg_auto():
 # `serve nfs` included)
 _FUSE_ONLY_KEYS = frozenset({'TORBOX_RCLONE_TPSLIMIT', 'TORBOX_RCLONE_TPSLIMIT_BURST'})
 # Every setting restart_pending can name (the save banner checks these).
-REPORTED_KEYS = _boot.SNAPSHOT_KEYS | {'TORBOX_API_KEY'}
+REPORTED_KEYS = _boot.SNAPSHOT_KEYS
 
 
 def restart_pending(get=None, auto=None):
@@ -162,18 +162,33 @@ def restart_pending(get=None, auto=None):
             keys.add('TORBOX_API_KEY')      # the key alone switched the TorBox mount
         if 'ZURG_ENABLED' in keys and len(keys) > 1 and (_zurg_auto() if auto is None else auto):
             keys.discard('ZURG_ENABLED')    # name what the user changed
+    if not _boot.STARTUP_COMPLETE.is_set():
+        # main.py hasn't reached (and marked) plex_debrid / cleanup / update
+        # setup yet: "not started" doesn't mean "needs a restart"
+        return sorted(keys)
+
+    def num(v):   # an interval in hours; blank / invalid / <= 0 → the default
+        try:
+            n = float(v)
+        except (TypeError, ValueError):
+            return 24.0
+        return n if n > 0 else 24.0
+
+    def interval_changed(k):
+        return num(now(k)) != num(start.get(k))
+
     if boot.zurg:
         # Zurg's Plex-refresh hook is written into its config at start (with
-        # the Plex address/token/mount it had then)
+        # the Plex address/token/mount it had then); never in NFS mode
         plex = ('PLEX_REFRESH', 'PLEX_ADDRESS', 'PLEX_TOKEN', 'PLEX_MOUNT_DIR')
-        hook_now = bool(now('PLEX_REFRESH') and all(now(k) for k in plex[1:]))
+        hook_now = bool(now('PLEX_REFRESH') and all(now(k) for k in plex[1:]) and not live.nfs)
         hook_then = _boot.started('plex_hook')
         if hook_now != hook_then or (hook_now and any(changed(k) for k in plex[1:])):
             keys |= {k for k in plex if changed(k)}
         # duplicate cleanup: switching off applies at once; on (or a new
         # interval) needs the start-up registration — when it would register
         if _boot.started('duplicate_cleanup'):
-            if changed('CLEANUP_INTERVAL'):
+            if now('DUPLICATE_CLEANUP') and interval_changed('CLEANUP_INTERVAL'):
                 keys.add('CLEANUP_INTERVAL')
         elif now('DUPLICATE_CLEANUP') and now('PLEX_ADDRESS') and now('PLEX_TOKEN'):
             keys.add('DUPLICATE_CLEANUP')
@@ -183,12 +198,16 @@ def restart_pending(get=None, auto=None):
                 and (not version or 'nightly' in version)):
             keys.add('ZURG_UPDATE')
     if _boot.started('plex_debrid'):
-        if not _boot.started('plex_debrid_update') and now('PD_UPDATE') and now('PD_REPO'):
-            keys.add('PD_UPDATE')
-    elif now('PD_ENABLED'):
+        if not _boot.started('plex_debrid_update'):
+            if now('PD_UPDATE') and now('PD_REPO'):
+                keys.add('PD_UPDATE')
+            if changed('PD_REPO'):
+                keys.add('PD_REPO')   # downloaded from only at start without the update thread
+    elif now('PD_ENABLED') and not start.get('PD_ENABLED'):
         keys.add('PD_ENABLED')        # plex_debrid is set up only at start
-    if ((_boot.started('Zurg_update') or _boot.started('plex_debrid_update'))
-            and changed('AUTO_UPDATE_INTERVAL')):
+    if (((_boot.started('Zurg_update') and now('ZURG_UPDATE'))
+         or (_boot.started('plex_debrid_update') and now('PD_UPDATE')))
+            and interval_changed('AUTO_UPDATE_INTERVAL')):
         keys.add('AUTO_UPDATE_INTERVAL')
     return sorted(keys)
 
@@ -270,9 +289,11 @@ def _refresh_setup_check():
 def _restart_plex_debrid(changed):
     """Stop, refresh config for, and restart plex_debrid.  Never interleaved
     with an auto-update restarting it (lifecycle_lock); processes are stopped
-    outside the registry lock (stopping waits for exit)."""
+    outside the registry lock (stopping waits for exit).  True when it was
+    started again."""
     import utils.processes as _proc_mod
     from utils.processes import _process_registry, _registry_lock, lifecycle_lock
+    started = False
     with lifecycle_lock:
         with _registry_lock:
             entries = [e for e in _process_registry if e['process_name'].lower() == 'plex_debrid']
@@ -300,11 +321,11 @@ def _restart_plex_debrid(changed):
 
         if (os.environ.get('PD_ENABLED') or '').strip().lower() != 'true':
             logger.info("[reload] plex_debrid switched off — stopped, not restarted")
-            return
+            return False
         for e in entries:
             if _proc_mod._shutting_down:
                 logger.info("[reload] Aborting restart — shutdown in progress")
-                return
+                return False
             h = e['handler']
             if h.process and h.process.poll() is None:
                 logger.warning("[reload] plex_debrid is still running after stop — not starting a second one")
@@ -313,6 +334,8 @@ def _restart_plex_debrid(changed):
                 continue
             logger.info("[reload] Starting plex_debrid")
             h.restart_process()
+            started = True
+    return started
 
 
 _DEFERRED_SERVICES = ('plex_debrid', 'blackhole')
@@ -332,8 +355,8 @@ def _apply_service_restarts(services, changed):
     done = set()
     if 'plex_debrid' in services:
         try:
-            _restart_plex_debrid(changed)
-            done.add('plex_debrid')
+            if _restart_plex_debrid(changed):
+                done.add('plex_debrid')
         except Exception as e:
             logger.error(f"[reload] Failed to restart plex_debrid: {e}")
     if 'blackhole' in services and not _proc_mod._shutting_down:
@@ -359,7 +382,12 @@ def _report_restarts(services):
                               f'Startup finished — restarted: {", ".join(service_labels(services))}')
     except Exception:
         pass
-    _notify_reload(set(), services)
+    try:
+        from utils.notifications import notify
+        notify('startup', 'Config Reloaded',
+               f'Startup finished — restarted: {", ".join(service_labels(services))}')
+    except Exception:
+        pass
 
 
 def _run_deferred():
