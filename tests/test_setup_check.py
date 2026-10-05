@@ -214,3 +214,32 @@ def test_shared_esc_escapes_quotes():
     out = subprocess.run(['node', '-e', fn + ';process.stdout.write(esc(`a"b\'c<`))'],
                          capture_output=True, text=True, check=True).stdout
     assert out == 'a&quot;b&#39;c&lt;'
+
+
+class TestValueAwareRedaction:
+    """Pattern-based redaction can be defeated by a value containing its own
+    quote characters (the validator interpolates raw values).  Every current
+    setting value is removed from validator messages regardless of syntax."""
+
+    @pytest.mark.parametrize('value', [
+        "x' leaked-secret-1",                  # closes the single-quote pair early
+        'pa"ss\' both-quotes-secret-2',         # both quote kinds
+        'discord://tok-secret-3@chan/abcdefghijklmnopqrstuvwxyz',  # long, truncated to 30 chars in messages
+    ])
+    def test_hostile_values_never_survive(self, clean, value):
+        clean.setenv('NOTIFICATION_URL', value)
+        raw = [f"NOTIFICATION_URL='{value}' is odd",
+               f"NOTIFICATION_URL contains '{value[:30]}...' which doesn't look valid"]
+        clean.setattr(sc, '_validator_messages', lambda: ([], raw))
+        text = ' '.join(f['message'] for f in sc.collect_findings())
+        for secret in ('leaked-secret-1', 'both-quotes-secret-2', 'tok-secret-3'):
+            assert secret not in text
+        assert 'NOTIFICATION_URL' in text
+
+
+def test_plain_values_keep_messages_readable(clean):
+    clean.setenv('PLEX_REFRESH', 'true')
+    msg = 'PLEX_REFRESH=true but PLEX_TOKEN is not set. Plex library refresh requires Plex API access.'
+    clean.setattr(sc, '_validator_messages', lambda: ([msg], []))
+    f = next(f for f in sc.collect_findings() if f['id'].startswith('validator:'))
+    assert f['message'] == msg

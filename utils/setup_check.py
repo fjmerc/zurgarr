@@ -37,12 +37,44 @@ def _finding(fid, level, key, message, fix=None, sig_inputs=()):
             'fix': fix, 'sig': _sig(fid, *sig_inputs)}
 
 
-def _redact(message):
-    """Blank every value in a validator message — quoted values and anything
+def _setting_values():
+    """Current values of every setting (env + Docker secrets), longest first.
+
+    Redaction removes these literally, so it doesn't depend on how the
+    validator quoted them (it interpolates raw values, and a value holding
+    its own quote character would defeat a quote-pairing regex)."""
+    from utils.config_resolve import SECRET_FILES
+    try:
+        from utils.settings_api import ENV_SCHEMA
+        typed = {k: t for cat in ENV_SCHEMA for k, _l, t, *_ in cat['fields']}
+    except Exception:
+        typed = {}
+    # Only values that can carry a credential: secrets, URLs (basic auth),
+    # sensitive-named keys.  Plain values (true, 8080, /data) stay readable.
+    keys = set(SECRET_FILES) | {'NOTIFICATION_URL'}
+    keys |= {k for k, t in typed.items() if t in ('secret', 'url')}
+    keys |= {k for k in typed if any(m in k for m in ('KEY', 'TOKEN', 'PASS', 'SECRET', 'AUTH'))}
+    values = set()
+    for key in keys:
+        for v in ((os.environ.get(key) or '').strip(),
+                  secret_or_env(key) if key in SECRET_FILES else ''):
+            if len(v) >= 3:
+                values.add(v)
+                if len(v) > 30:
+                    values.add(v[:30])   # NOTIFICATION_URL message quotes url[:30]
+    return sorted(values, key=len, reverse=True)
+
+
+def _redact(message, values=()):
+    """Blank every value in a validator message.  First every current setting
+    value literally (syntax-independent), then — as a backstop — quoted
+    values and anything
     URL-shaped.  URL settings (PLEX_ADDRESS, SEERR_ADDRESS, …) can embed
     basic-auth credentials without a "sensitive" name, and /api/status may
     be readable without a login.  The key name stays; the card's "Open
     setting" link leads to the value."""
+    for v in values:
+        message = message.replace(v, '…')
     message = re.sub(r'"[^"]*"', '"…"', message)   # repr() of values with an apostrophe
     message = re.sub(r"'[^']*'", "'…'", message)
     return re.sub(r'\b[a-zA-Z][a-zA-Z0-9+.-]*://\S+', '…', message)
@@ -79,9 +111,10 @@ def _validator_findings():
         return [_finding('validator-failed', 'warn', None,
                          "The configuration validator couldn't run — check the container log for details.")]
     out = []
+    values = _setting_values()
     for level, messages in (('error', errors), ('warn', warnings)):
         for raw in messages:
-            msg = _redact(raw)
+            msg = _redact(raw, values)
             m = re.match(r'([A-Z][A-Z0-9_]+)', msg)
             out.append(_finding('validator:' + _sig(msg), level, m.group(1) if m else None, msg))
     return out
