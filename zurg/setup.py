@@ -23,6 +23,7 @@ _PLEX_HOOK = (
 
 _STOCK_HOOK = 'sh plex_update.sh "$@"'   # zurg-public's config.yml default
 _HOOK_WARNED = False
+_HOOK_SCRIPT_SRC = '/zurg/plex_refresh.py'   # the image's copy (instance dirs get theirs)
 
 
 def apply_plex_refresh_hook(config_file_path, refresh_file_path, plex_refresh, addr, token, mount,
@@ -62,9 +63,12 @@ def apply_plex_refresh_hook(config_file_path, refresh_file_path, plex_refresh, a
         boot_layout.mark_started('plex_hook')
         logger.info(f"Updating Plex Refresh in config file: {config_file_path}")
         config['on_library_update'] = _PLEX_HOOK
-        if not os.path.exists(refresh_file_path):
-            logger.debug(f"Copying Plex Refresh script from base: /zurg/plex_refresh.py to {refresh_file_path}")
-            shutil.copy('/zurg/plex_refresh.py', refresh_file_path)
+        # (the instance dirs are volumes: an older copy must be replaced)
+        import filecmp
+        if (not os.path.exists(refresh_file_path)
+                or not filecmp.cmp(_HOOK_SCRIPT_SRC, refresh_file_path, shallow=False)):
+            logger.debug(f"Copying Plex Refresh script from base: {_HOOK_SCRIPT_SRC} to {refresh_file_path}")
+            shutil.copy(_HOOK_SCRIPT_SRC, refresh_file_path)
     elif ours:
         # back to Zurg's stock hook (replacing the value keeps the comments)
         logger.info(f"Removing Zurg's Plex Refresh hook from {config_file_path}")

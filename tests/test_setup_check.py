@@ -768,3 +768,14 @@ class TestRound7:
         # running until restart, so its mount still heals
         from utils import scheduled_tasks as st
         assert not hasattr(st, '_mount_should_run')
+
+
+def test_plex_debrid_that_did_not_start_is_flagged(clean, monkeypatch):
+    from utils import boot_layout
+    monkeypatch.setattr(boot_layout, 'BOOT_VALUES', dict(boot_layout.BOOT_VALUES, PD_ENABLED='true'))
+    clean.setenv('PD_ENABLED', 'true')
+    boot_layout.STARTED.clear()
+    boot_layout.mark_started('plex_debrid', False)
+    assert any(f['id'] == 'pd-not-started' for f in sc.collect_findings())
+    boot_layout.mark_started('plex_debrid')
+    assert not any(f['id'] == 'pd-not-started' for f in sc.collect_findings())

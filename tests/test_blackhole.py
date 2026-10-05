@@ -6102,3 +6102,55 @@ def test_watchers_share_the_pending_monitors_lock(tmp_path):
     a = bh.BlackholeWatcher(str(tmp_path), 'k', 'realdebrid', 5)
     b = bh.BlackholeWatcher(str(tmp_path), 'k', 'realdebrid', 5)
     assert a._monitors_lock is b._monitors_lock
+
+
+class TestFinalReviewFixes:
+
+    def test_stopped_rescue_add_returns_the_file_to_the_watch_folder(self, monkeypatch, tmp_path):
+        from unittest.mock import MagicMock
+        import utils.blackhole as bh
+        from utils import debrid_routing, debrid_client
+        w = bh.BlackholeWatcher(str(tmp_path), 'k', 'realdebrid', 5)
+        monkeypatch.setattr(w, '_api_key_for', lambda svc: 'k')
+        monkeypatch.setattr(debrid_routing, 'pick_alt_debrid', lambda src: 'torbox')
+        monkeypatch.setattr(debrid_client, 'get_debrid_client', lambda **k: (MagicMock(), None))
+
+        def stopping(*a, **k):
+            raise bh._WatcherStopping()
+        monkeypatch.setattr(debrid_routing, 'attempt_add_rescue', stopping)
+        f = tmp_path / 'x.magnet'
+        f.write_text('magnet:?xt=urn:btih:abc')
+        try:
+            w._attempt_add_time_rescue(str(f), 'x.magnet', 'abc', 'realdebrid', None,
+                                       {'torbox': lambda *a, **k: (True, {})})
+            raised = False
+        except bh._WatcherStopping:
+            raised = True
+        assert raised and f.exists()
+
+    def test_blackhole_restart_reported_only_when_it_happened(self, monkeypatch):
+        import utils.blackhole as bh
+        import utils.config_reload as cr
+        calls = []
+        monkeypatch.setattr(cr, '_drop_not_running', lambda s: set(s))
+        monkeypatch.setattr(bh, 'stop', lambda: calls.append('stop') or True)
+        monkeypatch.setattr(bh, 'setup', lambda: calls.append('setup') or None)   # off / wedged
+        assert cr._apply_service_restarts({'blackhole'}, set()) == set()
+        assert calls == ['setup']                               # setup() stops the old one itself
+
+    def test_primary_change_applies_to_routing_without_a_restart(self, monkeypatch):
+        import utils.blackhole as bh
+        from utils import debrid_routing
+        w = bh.BlackholeWatcher.__new__(bh.BlackholeWatcher)
+        w.debrid_api_keys = {'realdebrid': 'r', 'torbox': 't'}
+        w.debrid_service = 'realdebrid'
+        seen = {}
+        monkeypatch.setattr(debrid_routing, 'pick_debrid_for_grab', lambda h, **kw: seen.update(kw))
+        monkeypatch.setattr(debrid_routing, 'resolve_primary', lambda: 'torbox')
+        monkeypatch.setattr(w, '_ensure_probe_cache', lambda: None, raising=False)
+        w._route_grab('abc')
+        assert seen['primary'] == 'torbox'
+
+    def test_routing_settings_restart_the_blackhole(self):
+        from utils.config_reload import SERVICE_DEPENDENCIES
+        assert {'BLACKHOLE_DEBRID_PRIMARY', 'BLACKHOLE_DEBRID_ROUTING', 'TORBOX_API_KEY'} <= SERVICE_DEPENDENCIES['blackhole']

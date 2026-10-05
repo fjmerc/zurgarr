@@ -73,13 +73,30 @@ def pd_setup():
     # whole container start — and only then read the settings: a save made
     # meanwhile (applied by the reload) must not be overwritten here.
     from base import config as _cfg
+    plex = None
     if _cfg.PLEXUSER and not _cfg.JFAPIKEY:
-        if _wait_for_plex(_cfg.PLEXADD, _cfg.PLEXTOKEN) is None:
+        if not _cfg.PLEXTOKEN:
+            raise MissingEnvironmentVariable("PLEX_TOKEN")   # fail now, not after a wait
+        if not _cfg.PLEXADD:
+            raise MissingEnvironmentVariable("PLEX_ADDRESS")
+        plex = _wait_for_plex(_cfg.PLEXADD, _cfg.PLEXTOKEN)
+        if plex is None:
             raise Exception(f"Plex server at {_cfg.PLEXADD} not reachable within 10 minutes — "
                             "plex_debrid not started (restart the container once Plex is up)")
     # Current settings, not the ones imported at start.
     refresh_globals(globals())
     from utils.file_utils import atomic_write, PD_SETTINGS_LOCK
+    # All Plex I/O here, before the settings lock (Settings saves wait on it).
+    library_section_ids = []
+    if PLEXUSER and not JFAPIKEY and PLEXTOKEN and PLEXADD:
+        if plex is None or (_cfg.PLEXADD, _cfg.PLEXTOKEN) != (PLEXADD, PLEXTOKEN):
+            plex = _wait_for_plex(PLEXADD, PLEXTOKEN, limit=60)   # changed meanwhile
+        if plex is None:
+            raise Exception(f"Plex server at {PLEXADD} is not reachable — plex_debrid not started")
+        library_section_ids = [str(library.key) for library in plex.library.sections()]
+        os.environ['PLEX_CONNECTED'] = 'True'
+        from utils import boot_layout
+        boot_layout.mark_plex_connected()   # for healthcheck.py
     logger.info("Configuring plex_debrid")
     settings_file = "./config/settings.json"
     ignored_file = "./config/ignored.txt"
@@ -170,19 +187,9 @@ def pd_setup():
                     raise MissingEnvironmentVariable("PLEX_TOKEN")
                 if not PLEXADD:
                     raise MissingEnvironmentVariable("PLEX_ADDRESS")
-                plex = _wait_for_plex(PLEXADD, PLEXTOKEN, limit=60)   # (waited above already)
-                if plex is None:
-                    raise Exception(f"Plex server at {PLEXADD} is not reachable — plex_debrid not started")
-                os.environ['PLEX_CONNECTED'] = 'True'
-                from utils import boot_layout
-                boot_layout.mark_plex_connected()   # for healthcheck.py
                 if not any([PLEXUSER, PLEXTOKEN] == pair for pair in json_data["Plex users"]):
                     json_data["Plex users"].append([PLEXUSER, PLEXTOKEN])
                 json_data["Plex server address"] = PLEXADD
-                plex_url = PLEXADD  
-                plex_token = PLEXTOKEN
-                plex = PlexServer(plex_url, plex_token)
-                library_section_ids = [str(library.key) for library in plex.library.sections()]
                 json_data["Jellyfin API Key"] = ""
                 json_data["Jellyfin server address"] = "http://localhost:8096"
                 if not library_collection_service or "Jellyfin Libraries" in library_update_services:   

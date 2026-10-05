@@ -156,6 +156,19 @@ def debrid_key_at_start(key):
     return bool((live_getter()(key) or '').strip())
 
 
+def interval_hours(value, default=24.0):
+    """An update/cleanup interval in hours: blank, invalid, non-finite or
+    under a minute → *default* (a 0 interval ran back to back)."""
+    import math
+    try:
+        hours = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(hours) or hours * 60 < 1:
+        return default
+    return hours
+
+
 def setting_at_start(key):
     """A STARTUP_KEYS setting as Zurg/rclone were started with it (live
     before boot) — for code that builds their commands later, e.g. a mount
@@ -209,8 +222,17 @@ def mark_plex_connected():
     """plex_debrid reached Plex (for healthcheck.py — a separate process
     that can't see the main process's environment)."""
     try:
-        with open(PLEX_CONNECTED_PATH, 'w') as f:
+        from utils.file_utils import atomic_write
+        with atomic_write(PLEX_CONNECTED_PATH) as f:
             f.write('1')
+    except OSError:
+        pass
+
+
+def clear_plex_connected():
+    """plex_debrid isn't running after all (its setup failed later)."""
+    try:
+        os.remove(PLEX_CONNECTED_PATH)
     except OSError:
         pass
 

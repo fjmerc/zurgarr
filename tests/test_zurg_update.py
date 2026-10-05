@@ -291,3 +291,17 @@ def test_hook_script_uses_the_pinned_mount_path():
     import pathlib
     src = pathlib.Path(__file__).resolve().parents[1].joinpath('zurg', 'plex_refresh.py').read_text()
     assert "ZURG_MOUNT_PATH" in src
+
+
+def test_hook_script_refreshed_when_it_differs(tmp_path, monkeypatch):
+    # /zurg/RD and /zurg/AD are volumes: an old copy never got the fix
+    from zurg import setup as zs
+    src = tmp_path / 'src.py'
+    src.write_text('new\n')
+    dst = tmp_path / 'plex_refresh.py'
+    dst.write_text('old\n')
+    monkeypatch.setattr(zs, '_HOOK_SCRIPT_SRC', str(src))
+    cfg = tmp_path / 'config.yml'
+    cfg.write_text('zurg: v1\n')
+    zs.apply_plex_refresh_hook(str(cfg), str(dst), 'true', 'http://p', 't', '/m')
+    assert dst.read_text() == 'new\n'

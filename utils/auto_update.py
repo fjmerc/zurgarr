@@ -22,15 +22,7 @@ class Update(ProcessHandler):
 
     def auto_update_interval(self):
         from utils import boot_layout   # applies at container start (thread set up then)
-        val = boot_layout.setting_at_start('AUTO_UPDATE_INTERVAL')
-        if not val:
-            return 24
-        try:
-            hours = float(val)
-        except (ValueError, TypeError):
-            return 24
-        # <= 0 would make schedule run the check every second (or spin)
-        return hours if hours * 60 >= 1 else 24
+        return boot_layout.interval_hours(boot_layout.setting_at_start('AUTO_UPDATE_INTERVAL'))
 
     def auto_update(self, process_name, enable_update):
         if enable_update:

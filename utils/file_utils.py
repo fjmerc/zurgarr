@@ -9,8 +9,9 @@ from contextlib import contextmanager
 
 
 # plex_debrid's settings.json is read-modified-written by pd_setup and by the
-# Settings page (env sync, plex_debrid tab): one lock so neither overwrites
-# the other's change.
+# Settings page (env sync, plex_debrid tab): one lock so their writes never
+# interleave (a whole-file save from the plex_debrid tab still replaces the
+# file with what the page had loaded).
 PD_SETTINGS_LOCK = threading.RLock()
 
 @contextmanager

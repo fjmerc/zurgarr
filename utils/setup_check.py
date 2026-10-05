@@ -206,6 +206,11 @@ def _check_findings():
             out.append(_finding('gate:SEARCH_REQUIRE_CACHED', 'error', 'SEARCH_REQUIRE_CACHED',
                                 "Search → Require cached is on, so every add from search is refused (Real-Debrid/AllDebrid can't check their cache).",
                                 'Turn off Require cached for search.'))
+    if _plex_debrid_failed_to_start():
+        out.append(_finding('pd-not-started', 'warn', 'PD_ENABLED',
+                            "plex_debrid is switched on but didn't start when the container started "
+                            "(the container log says why).",
+                            'Fix that setting, then restart the container.'))
     pending = _restart_pending()
     if pending:
         out.append(_finding('restart-required', 'warn', pending[0],
@@ -242,6 +247,12 @@ def _recommendations():
                             "A completed folder is mounted, but the blackhole isn't creating symlinks for Sonarr/Radarr to import.",
                             'Turn on symlinks and set the symlink target base (the mount path as Sonarr/Radarr see it).'))
     return out
+
+
+def _plex_debrid_failed_to_start():
+    from utils import boot_layout
+    return (boot_layout.STARTUP_COMPLETE.is_set() and bool(boot_layout.BOOT_VALUES.get('PD_ENABLED'))
+            and not boot_layout.started('plex_debrid') and _on('PD_ENABLED'))
 
 
 def _restart_pending():

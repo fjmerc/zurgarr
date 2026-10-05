@@ -35,7 +35,8 @@ SERVICE_DEPENDENCIES = {
     },
     'blackhole': {
         'BLACKHOLE_ENABLED', 'BLACKHOLE_DIR', 'BLACKHOLE_POLL_INTERVAL',
-        'BLACKHOLE_DEBRID',
+        'BLACKHOLE_DEBRID', 'BLACKHOLE_DEBRID_PRIMARY', 'BLACKHOLE_DEBRID_ROUTING',
+        'TORBOX_API_KEY',
     },
     'notifications': {
         'NOTIFICATION_URL', 'NOTIFICATION_EVENTS', 'NOTIFICATION_LEVEL',
@@ -167,12 +168,7 @@ def restart_pending(get=None, auto=None):
         # setup yet: "not started" doesn't mean "needs a restart"
         return sorted(keys)
 
-    def num(v):   # an interval in hours; blank / invalid / <= 0 → the default
-        try:
-            n = float(v)
-        except (TypeError, ValueError):
-            return 24.0
-        return n if n > 0 else 24.0
+    num = _boot.interval_hours   # the same rule the update thread / cleanup use
 
     def interval_changed(k):
         return num(now(k)) != num(start.get(k))
@@ -362,10 +358,14 @@ def _apply_service_restarts(services, changed):
     if 'blackhole' in services and not _proc_mod._shutting_down:
         try:
             from utils import blackhole
-            blackhole.stop()
-            blackhole.setup()
-            done.add('blackhole')
-            logger.info("[reload] Blackhole watcher restarted")
+            # setup() stops the running watcher itself (and won't start a
+            # second one if it doesn't stop)
+            if blackhole.setup() is not None:
+                done.add('blackhole')
+                logger.info("[reload] Blackhole watcher restarted")
+            else:
+                logger.warning("[reload] Blackhole watcher not running after the change "
+                               "(switched off, invalid settings, or the old one didn't stop)")
         except Exception as e:
             logger.error(f"[reload] Failed to restart blackhole: {e}")
     return done

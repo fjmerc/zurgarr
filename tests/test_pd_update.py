@@ -102,3 +102,56 @@ def test_settings_json_writers_share_one_lock():
     import utils.settings_api as sa
     for fn in (ps.pd_setup, sa._sync_env_to_plex_debrid, sa.write_plex_debrid_values):
         assert 'PD_SETTINGS_LOCK' in inspect.getsource(fn), fn.__name__
+
+
+def test_failed_pd_setup_clears_the_plex_connected_marker():
+    import pathlib
+    main = pathlib.Path(__file__).resolve().parents[1].joinpath('main.py').read_text()
+    i = main.index("boot_layout.mark_started('plex_debrid', False)")
+    assert 'clear_plex_connected()' in main[i - 200:i + 200]
+
+
+def test_incomplete_plex_settings_fail_at_once_without_the_wait(monkeypatch, tmp_path):
+    # a missing token/address used to wait 10 minutes and blame reachability
+    import json
+    from base import config
+    from plex_debrid_ import setup as ps
+    (tmp_path / 'config').mkdir()
+    (tmp_path / 'config' / 'settings.json').write_text(json.dumps({'Plex users': []}))
+    monkeypatch.chdir(tmp_path)
+    waited = []
+    monkeypatch.setattr(ps, '_wait_for_plex', lambda *a, **k: waited.append(1))
+    for attr, val in (('PLEXUSER', 'me'), ('PLEXTOKEN', None), ('PLEXADD', 'http://p'),
+                      ('JFAPIKEY', None), ('RDAPIKEY', 'k')):
+        monkeypatch.setattr(config, attr, val, raising=False)
+    import pytest
+    with pytest.raises(Exception):
+        ps.pd_setup()
+    assert waited == []
+
+
+def test_plex_io_happens_outside_the_settings_lock(monkeypatch, tmp_path):
+    import json
+    from base import config
+    from plex_debrid_ import setup as ps
+    from utils import file_utils
+    (tmp_path / 'config').mkdir()
+    (tmp_path / 'config' / 'settings.json').write_text(json.dumps({'Plex users': []}))
+    monkeypatch.chdir(tmp_path)
+    held = []
+
+    class Plex:
+        def __init__(self, *a):
+            held.append(file_utils.PD_SETTINGS_LOCK._is_owned())
+            self.library = self
+
+        def sections(self):
+            held.append(file_utils.PD_SETTINGS_LOCK._is_owned())
+            return []
+    monkeypatch.setattr(ps, 'PlexServer', Plex)
+    for attr, val in (('PLEXUSER', 'me'), ('PLEXTOKEN', 't'), ('PLEXADD', 'http://p'),
+                      ('JFAPIKEY', None), ('RDAPIKEY', 'k'), ('ADAPIKEY', None),
+                      ('SEERRADD', None), ('SEERRAPIKEY', None)):
+        monkeypatch.setattr(config, attr, val, raising=False)
+    ps.pd_setup()
+    assert held and not any(held)

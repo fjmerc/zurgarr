@@ -38,3 +38,18 @@ def test_zero_or_negative_intervals_are_clamped(monkeypatch):
         monkeypatch.setenv('AUTO_UPDATE_INTERVAL', v)
         assert dc.cleanup_interval() == 24
         assert Update.auto_update_interval(Update.__new__(Update)) == 24
+
+
+def test_one_interval_rule_everywhere(monkeypatch):
+    from utils import boot_layout
+    import utils.duplicate_cleanup as dc
+    from utils.auto_update import Update
+    from utils.boot_layout import interval_hours
+    for v, want in (('0.0001', 24.0), ('nan', 24.0), ('inf', 24.0), ('-1', 24.0), ('', 24.0),
+                    ('x', 24.0), ('6', 6.0)):
+        assert interval_hours(v) == want, v
+    monkeypatch.setattr(boot_layout, 'BOOTED', False)
+    monkeypatch.setenv('CLEANUP_INTERVAL', 'inf')
+    monkeypatch.setenv('AUTO_UPDATE_INTERVAL', '0.0001')
+    assert dc.cleanup_interval() == 24 and dc.get_interval_seconds() == 24 * 3600
+    assert Update.auto_update_interval(Update.__new__(Update)) == 24

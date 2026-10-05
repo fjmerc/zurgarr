@@ -185,21 +185,10 @@ def setup():
         logger.error(e)
 
 def cleanup_interval():
-    """Cleanup interval in hours. Blank counts as unset (stock compose passes
-    CLEANUP_INTERVAL as ''); an unparseable value warns and uses 24."""
-    from utils import boot_layout   # applies at container start (task registered then)
-    raw = boot_layout.setting_at_start('CLEANUP_INTERVAL')
-    if not raw:
-        return 24
-    try:
-        hours = float(raw)
-    except ValueError:
-        logger.warning(f"Invalid CLEANUP_INTERVAL '{raw}', defaulting to 24 hours")
-        return 24
-    if hours <= 0:   # a 0s task would run back to back
-        logger.warning(f"CLEANUP_INTERVAL must be above 0 ('{raw}'), defaulting to 24 hours")
-        return 24
-    return hours
+    """Cleanup interval in hours (boot_layout.interval_hours: blank, invalid
+    or under a minute → 24).  Applies at container start (task registered then)."""
+    from utils import boot_layout
+    return boot_layout.interval_hours(boot_layout.setting_at_start('CLEANUP_INTERVAL'))
 
 def start_cleanup():
     from base import config

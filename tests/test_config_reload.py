@@ -304,7 +304,8 @@ class TestZurgRcloneApplyAtStartup:
         cr = boot(**self.RD_BOOT)
         from utils.boot_layout import STARTUP_KEYS
         for key in STARTUP_KEYS | {'TORBOX_API_KEY'}:
-            assert cr._services_to_restart({key}) <= {'plex_debrid'}, key
+            # (the TorBox key also feeds the blackhole's routing)
+            assert not cr._services_to_restart({key}) & {'zurg', 'rclone'}, key
         assert cr._services_to_restart({'RD_API_KEY'}) == {'plex_debrid'}   # its own config
 
     def test_changed_startup_settings_are_pending_and_revert_clears(self, boot, monkeypatch):
@@ -525,7 +526,7 @@ class TestZurgRcloneApplyAtStartup:
         calls = []
         monkeypatch.setattr(n, 'init', lambda: calls.append('notifications'))
         monkeypatch.setattr(bh, 'stop', lambda: calls.append('bh-stop'))
-        monkeypatch.setattr(bh, 'setup', lambda: calls.append('bh-setup'))
+        monkeypatch.setattr(bh, 'setup', lambda: calls.append('bh-setup') or object())
         boot_layout.STARTUP_COMPLETE.clear()
         try:
             monkeypatch.setattr('base.config.load', lambda **kw: None)
@@ -540,7 +541,7 @@ class TestZurgRcloneApplyAtStartup:
                 if 'bh-setup' in calls:
                     break
                 time.sleep(0.02)
-            assert calls == ['notifications', 'bh-stop', 'bh-setup']   # once, for both saves
+            assert calls == ['notifications', 'bh-setup']   # once, for both saves (setup stops the old one)
         finally:
             boot_layout.STARTUP_COMPLETE.set()
 
@@ -550,12 +551,11 @@ class TestZurgRcloneApplyAtStartup:
         calls, events = [], []
         monkeypatch.setattr(cr, '_drop_not_running', lambda s: set(s))
         monkeypatch.setattr(cr, '_restart_plex_debrid', lambda changed: (_ for _ in ()).throw(OSError('popen')))
-        monkeypatch.setattr(bh, 'stop', lambda: calls.append('bh-stop'))
-        monkeypatch.setattr(bh, 'setup', lambda: calls.append('bh-setup'))
+        monkeypatch.setattr(bh, 'setup', lambda: calls.append('bh-setup') or object())
         monkeypatch.setattr(cr, '_report_restarts', lambda services: events.append(sorted(services)))
         cr._deferred.update(services={'plex_debrid', 'blackhole'}, changed={'PLEX_USER'}, thread=None)
         cr._run_deferred()
-        assert calls == ['bh-stop', 'bh-setup']                 # not skipped by the failure
+        assert calls == ['bh-setup']                            # not skipped by the failure
         assert events == [['blackhole']]
 
     def test_plex_debrid_switched_off_is_not_reported_as_restarted(self, boot, monkeypatch):

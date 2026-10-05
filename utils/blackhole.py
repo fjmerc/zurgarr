@@ -1576,7 +1576,10 @@ class BlackholeWatcher:
         # have no Zurg mount yet — see setup), with its primary.
         kwargs = {}
         if getattr(self, 'debrid_api_keys', None):
-            kwargs = {'configured': tuple(self.debrid_api_keys), 'primary': self.debrid_service}
+            from utils.debrid_routing import resolve_primary
+            live = resolve_primary()   # a changed Primary Debrid applies at once
+            primary = live if live in self.debrid_api_keys else self.debrid_service
+            kwargs = {'configured': tuple(self.debrid_api_keys), 'primary': primary}
         chosen = pick_debrid_for_grab(info_hash, cache_probe=_probe, **kwargs)
         return chosen or self.debrid_service
 
@@ -3418,16 +3421,25 @@ class BlackholeWatcher:
         # the alt account (TB ``created_at`` / RD ``added`` predating this
         # probe), a rescue-failure delete would destroy their content.
         _rescue_probe_start = time.time()
-        core = attempt_add_rescue(
-            info_hash, source_debrid,
-            alt_debrid=alt,
-            alt_client=alt_client,
-            alt_add_fn=_add_via_handler,
-            ready_states=TB_READY_STATES,
-            stop_event=self._stop_event,
-            preexisting_check=make_preexisting_check(_rescue_probe_start),
-            logger_prefix='blackhole',
-        )
+        try:
+            core = attempt_add_rescue(
+                info_hash, source_debrid,
+                alt_debrid=alt,
+                alt_client=alt_client,
+                alt_add_fn=_add_via_handler,
+                ready_states=TB_READY_STATES,
+                stop_event=self._stop_event,
+                preexisting_check=make_preexisting_check(_rescue_probe_start),
+                logger_prefix='blackhole',
+            )
+        except _WatcherStopping:
+            # stopping mid-rescue: put the file back for the next watcher
+            try:
+                os.link(staged_path, file_path)
+                os.unlink(staged_path)
+            except OSError:
+                pass   # stays staged (.rescue-…): recovered at the next start
+            raise
 
         if not core.get('rescued'):
             # Move the staged file back so the existing alt-release /
@@ -5606,6 +5618,6 @@ def _stop_locked():
 
 
 def stop():
-    """Stop the blackhole watcher if running."""
+    """Stop the blackhole watcher if running.  False if it wouldn't stop."""
     with _watcher_lock:
-        _stop_locked()
+        return _stop_locked()
