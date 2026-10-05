@@ -17,6 +17,21 @@ Three options, any of them work:
    `STATUS_UI_AUTH`. Saves to `.env` and applies most changes without a
    restart (SIGHUP reload).
 
+### Which value wins
+
+Every setting resolves the same way, at startup and on every Settings save:
+
+1. **Docker secret** — for credentials (see [Docker secrets](#docker-secrets)).
+2. **docker-compose / `docker run -e`** — a value set on the container is a
+   locked override. The Settings page can't change it (edit compose instead).
+3. **`config/.env`** — what the Settings page saves. Only settings you
+   change are stored; clearing a field removes it.
+4. **Automatic** — e.g. `ZURG_ENABLED` turns on when a Real-Debrid or
+   AllDebrid key is set.
+5. **Default** — the value in the tables below.
+
+A blank value at any layer counts as "not set".
+
 ## Minimum required to start
 
 | Variable | Why |

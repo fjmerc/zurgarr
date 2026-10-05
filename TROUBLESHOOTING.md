@@ -22,6 +22,7 @@ isn't here, open a [GitHub issue](https://github.com/fjmerc/zurgarr/issues).
 - [Stuck ffprobe processes](#stuck-ffprobe-processes)
 - [Dashboard buttons fail with "cross-origin request rejected" behind a reverse proxy](#dashboard-buttons-fail-with-cross-origin-request-rejected-behind-a-reverse-proxy)
 - [I lost my config after a rebuild / restore from an old backup](#i-lost-my-config-after-a-rebuild--restore-from-an-old-backup)
+- [A setting I changed in the Settings page won't save ("set in docker-compose")](#a-setting-i-changed-in-the-settings-page-wont-save-set-in-docker-compose)
 - [Migrating from pd_zurg](#migrating-from-pd_zurg)
 
 ---
@@ -421,6 +422,14 @@ If the container isn't running, the archives are plain tar.gz files:
 
 Disable scheduled backups by setting `CONFIG_BACKUP_INTERVAL=0`. Manual
 download/restore in the Settings UI still works.
+
+## A setting I changed in the Settings page won't save ("set in docker-compose")
+
+The value is set on the container itself (in `docker-compose.yml` under
+`environment:`, or with `docker run -e`). Container values always win, so the
+Settings page refuses to change them rather than letting your edit silently
+revert on the next restart. Remove the line from your compose file (or set it
+there), then recreate the container: `docker compose up -d`.
 
 ## Migrating from pd_zurg
 
