@@ -203,6 +203,7 @@ textarea{min-height:120px;resize:vertical;font-family:monospace;font-size:.8em;l
    yellow highlight on the row; this is a small teal pill on the label. */
 .field-modified-chip{display:none;align-items:center;font-size:.68em;font-weight:600;color:var(--teal,#27aabc);background:rgba(39,170,188,.12);border:1px solid rgba(39,170,188,.35);border-radius:3px;padding:1px 5px;margin-left:5px;white-space:nowrap;vertical-align:middle;line-height:1.4}
 .field.is-nondefault .field-modified-chip{display:inline-flex}
+.deep-link-flash{outline:2px solid var(--blue);outline-offset:4px;border-radius:6px}
 .gated-fields{display:none}
 .gated-fields.open{display:block}
 .gate-note{font-size:.82em;color:var(--text2);padding:8px 0 2px}
@@ -850,11 +851,21 @@ function applyGate(key) {
 
 // /settings#KEY (from the Status page's Setup check): open the field's
 // section, reveal it if a gate or "Show advanced" hides it, then focus it.
-function openFieldFromHash() {
+async function openFieldFromHash() {
   const key = decodeURIComponent((location.hash || '').slice(1));
   if (!key || !/^[A-Z0-9_]+$/.test(key)) return;
   const row = document.getElementById('row-' + key);
   if (!row) return;
+  // A link from the Status page must land even if this page was left on
+  // the other tab or with a search / "only modified" filter active.
+  if (activeTabName() !== 'env') await switchTab('env');
+  const search = document.getElementById('search-env');
+  const modOnly = document.getElementById('modified-only-toggle');
+  if ((search && search.value) || (modOnly && modOnly.checked)) {
+    if (search) search.value = '';
+    if (modOnly) modOnly.checked = false;
+    filterSettings('env', '');
+  }
   const cat = row.closest('.category');
   if (cat) {
     const header = cat.querySelector('.cat-header'), body = cat.querySelector('.cat-body');
@@ -872,8 +883,8 @@ function openFieldFromHash() {
   row.scrollIntoView({block: 'center'});
   const input = document.getElementById('env-' + key);
   if (input && !input.disabled) input.focus({preventScroll: true});
-  row.classList.add('changed');
-  setTimeout(() => row.classList.remove('changed'), 2500);
+  row.classList.add('deep-link-flash');
+  setTimeout(() => row.classList.remove('deep-link-flash'), 2500);
 }
 window.addEventListener('hashchange', openFieldFromHash);
 

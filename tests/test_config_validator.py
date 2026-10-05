@@ -275,6 +275,15 @@ class TestConfigValidation:
         result = _validate_with_reload()
         assert any('NOTIFICATION_URL' in w for w in result.warnings)
 
+    def test_notification_url_warning_names_entry_not_value(self, clean_env, env_vars):
+        """Apprise URLs embed credentials: the warning (logged, and shown on the
+        Status page) must point at the entry by position, never quote it."""
+        env_vars(NOTIFICATION_URL="json://ok/x, mailto//bob:pa'ssSECRET@mail")
+        result = _validate_with_reload()
+        msg = next(w for w in result.warnings if w.startswith('NOTIFICATION_URL'))
+        assert 'SECRET' not in msg and 'bob' not in msg
+        assert 'entry 2' in msg
+
 
 class TestRunValidation:
 

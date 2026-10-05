@@ -681,7 +681,12 @@ def _setup_check_payload():
         from utils.setup_check import get_setup_check
         return get_setup_check()
     except Exception:
-        return {'findings': [], 'dismissed': 0}
+        logger.exception('[setup_check] Setup check unavailable')
+        # Never an empty list — the card would read "Setup OK".
+        return {'findings': [{'id': 'setup-check-failed', 'level': 'warn', 'key': None, 'label': None,
+                              'message': "The setup check couldn't run — check the container log for details.",
+                              'fix': None}],
+                'dismissed': 0, 'auth_configured': False}
 
 
 class StatusData:
@@ -907,12 +912,12 @@ __NAV_HTML__
 <main class="main-content">
 <h1 class="sr-only">Status</h1>
 <div id="sr-status" class="sr-only" aria-live="polite"></div>
-<div class="meta">Uptime: <span id="uptime"></span> <span class="freshness"><span class="pulse-dot" id="fetch-dot"></span><span id="freshness-text"></span></span></div>
+<div class="meta">Uptime: <span id="uptime"></span> <span class="freshness"><span class="pulse-dot" id="fetch-dot"></span><span id="freshness-text"></span></span> <span class="setup-ok" id="setup-ok"></span></div>
 <div class="meta" id="error-line" style="display:none;color:var(--red)">Errors: <span id="errors">0</span></div>
 <div id="banner" aria-live="polite"></div>
 <div class="grid full" id="setup-check-wrap" hidden>
   <div class="card">
-    <h2>Setup check</h2>
+    <h2 id="sc-title" tabindex="-1">Setup check</h2>
     <div id="setup-check"></div>
   </div>
 </div>
@@ -1266,8 +1271,7 @@ var _bannerDismissedSig=null;
 var _bannerRenderedSig=null;
 function _bannerSig(a){return a.map(function(x){return x.key+':'+x.level;}).join('|');}
 // href guard: only http(s), and percent-encode chars that could break out of
-// the double-quoted attribute. esc() alone escapes <>& but NOT quotes, and it
-// wouldn't block a javascript: scheme.
+// the double-quoted attribute. esc() wouldn't block a javascript: scheme.
 function _safeUrl(u){u=String(u==null?'':u);if(!/^https?:\\/\\//i.test(u))return '';return u.replace(/["'<>\\\\]/g,function(c){return '%'+c.charCodeAt(0).toString(16).toUpperCase();});}
 function renderBanners(alerts){
   var el=document.getElementById('banner');if(!el)return;
@@ -1292,32 +1296,56 @@ function renderBanners(alerts){
 }
 function dismissBanners(){_bannerDismissedSig=_bannerSig(_lastAlerts);_bannerRenderedSig=null;var el=document.getElementById('banner');if(el)el.innerHTML='';}
 
+var _scRenderedSig=null,_scAnnounced=null;
 function renderSetupCheck(sc){
-  var wrap=document.getElementById('setup-check-wrap'),el=document.getElementById('setup-check');
+  var wrap=document.getElementById('setup-check-wrap'),el=document.getElementById('setup-check'),okEl=document.getElementById('setup-ok');
   if(!wrap||!el)return;
-  wrap.hidden=false;
-  var f=(sc&&sc.findings)||[];
+  if(!sc){wrap.hidden=true;if(okEl)okEl.textContent='';_scRenderedSig=null;return;}
+  var f=sc.findings||[],d=sc.dismissed||0,auth=!!sc.auth_configured;
+  // Rebuild only when something changed: a rebuild on every poll would
+  // throw away keyboard focus inside the card.
+  var sig=JSON.stringify([f.map(function(x){return [x.id,x.level,x.key,x.label,x.message,x.fix];}),d,auth]);
+  if(sig===_scRenderedSig)return;
+  _scRenderedSig=sig;
+  var tips=d?d+' tip'+(d!==1?'s':'')+' dismissed':'';
+  var problems=f.filter(function(x){return x.level==='error';}).length,warns=f.filter(function(x){return x.level==='warn';}).length;
+  var say='Setup check: '+problems+' problem'+(problems!==1?'s':'')+', '+warns+' warning'+(warns!==1?'s':'');
+  if(_scAnnounced!==null&&_scAnnounced!==say){var sr=document.getElementById('sr-status');if(sr)sr.textContent=say;}
+  _scAnnounced=say;
   if(!f.length){
-    var d=(sc&&sc.dismissed)||0;
-    el.innerHTML='<div class="sc-ok">Setup OK'+(d?' — '+d+' dismissed recommendation'+(d!==1?'s':''):'')+'</div>';
-    setCardHealth('Setup check','card-ok');
+    // Nothing to act on: no card, just a quiet note in the meta line.
+    wrap.hidden=true;
+    if(okEl)okEl.textContent='Setup OK'+(tips?' · '+tips:'');
     return;
   }
-  var label={error:'Problem',warn:'Warning',recommend:'Tip'},h='';
+  if(okEl)okEl.textContent='';
+  wrap.hidden=false;
+  var label={error:'Problem',warn:'Warning',recommend:'Tip'},h='<ul class="sc-list" aria-labelledby="sc-title">';
   f.forEach(function(x){
-    h+='<div class="sc-item"><span class="sc-level '+esc(x.level)+'">'+esc(label[x.level]||x.level)+'</span><div class="sc-body"><div>'+esc(x.message)+'</div>'+
+    var name=x.label||x.key;
+    h+='<li class="sc-item"><span class="sc-level '+esc(x.level)+'">'+esc(label[x.level]||x.level)+'</span><div class="sc-body"><div>'+esc(x.message)+'</div>'+
       (x.fix?'<div class="sc-fix">'+esc(x.fix)+'</div>':'')+'<div class="sc-actions">'+
-      (x.key?'<a href="/settings#'+encodeURIComponent(x.key)+'">Open setting</a>':'')+
-      (x.level==='recommend'?'<button type="button" data-dismiss="'+esc(x.id)+'">Dismiss</button>':'')+
-      '</div></div></div>';
+      (x.key?'<a href="/settings#'+encodeURIComponent(x.key)+'">Open &ldquo;'+esc(name)+'&rdquo;</a>':'')+
+      (x.level==='recommend'&&auth?'<button type="button" data-dismiss="'+esc(x.id)+'">Dismiss tip</button>':'')+
+      '</div></div></li>';
   });
+  h+='</ul>'+(tips?'<div class="sc-footer">'+tips+'</div>':'');
   el.innerHTML=h;
   var worst=f[0].level;
-  setCardHealth('Setup check',worst==='error'?'card-crit':(worst==='warn'?'card-warn':'card-ok'));
+  // Tips alone aren't a health state — no coloured border for them.
+  setCardHealth('Setup check',worst==='error'?'card-crit':(worst==='warn'?'card-warn':''));
 }
 function dismissFinding(id){
+  var fail=function(msg){if(window.showToast)showToast(msg||'Could not dismiss the tip','error');};
   fetch('/api/setup-check/dismiss',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})})
-    .then(function(){update();}).catch(function(){});
+    .then(function(r){
+      if(r.ok){
+        if(window.showToast)showToast('Tip dismissed','success');
+        var t=document.getElementById('sc-title');if(t)t.focus();
+        _scRenderedSig=null;update();return;
+      }
+      return r.json().then(function(j){fail(j&&j.error);},function(){fail();});
+    }).catch(function(){fail();});
 }
 // One delegated listener: ids travel in data-dismiss, never inside an
 // inline onclick string (and _DASHBOARD_HTML is a non-raw Python string,
@@ -1560,15 +1588,19 @@ __WANTED_BADGE_JS__
 
 _DASHBOARD_EXTRA_CSS = """
 #setup-check-wrap[hidden]{display:none}
-.sc-ok{font-size:.85em;color:var(--text2)}
+.setup-ok{margin-left:10px;color:var(--text2)}
+.sc-list{list-style:none;margin:0;padding:0}
 .sc-item{display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-top:1px solid var(--border2)}
 .sc-item:first-child{border-top:0}
-.sc-level{font-size:.68em;font-weight:700;text-transform:uppercase;letter-spacing:.04em;border:1px solid currentColor;border-radius:3px;padding:1px 6px;margin-top:2px;white-space:nowrap}
+.sc-level{font-size:.75em;font-weight:700;text-transform:uppercase;letter-spacing:.04em;border:1px solid currentColor;border-radius:3px;padding:1px 6px;margin-top:2px;white-space:nowrap}
 .sc-level.error{color:var(--red)}.sc-level.warn{color:var(--yellow)}.sc-level.recommend{color:var(--teal)}
 .sc-body{flex:1;font-size:.88em}
 .sc-fix{color:var(--text2);margin-top:2px}
-.sc-actions{display:flex;gap:10px;margin-top:4px;font-size:.85em}
-.sc-actions a,.sc-actions button{color:var(--blue);background:none;border:0;padding:0;font:inherit;cursor:pointer;text-decoration:underline}
+.sc-actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+.sc-actions a,.sc-actions button{display:inline-flex;align-items:center;min-height:28px;padding:4px 10px;border:1px solid var(--border);border-radius:6px;background:none;color:var(--blue);font:inherit;font-size:.92em;cursor:pointer;text-decoration:none}
+.sc-actions a:hover,.sc-actions button:hover{border-color:var(--blue)}
+.sc-footer{font-size:.8em;color:var(--text2);padding-top:6px;border-top:1px solid var(--border2)}
+#sc-title:focus{outline:none}
 /* Library source colors. Single value per theme: darkened enough that the
    white in-bar labels clear WCAG AA (4.5:1) in both light and dark. */
 :root{--lib-local:#9333ea;--lib-cloud:#0e7490}
@@ -3453,7 +3485,8 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
                     self._send_json_response(400, json.dumps({'error': 'Request body too large'}))
                     return
                 values = json.loads(self.rfile.read(content_length).decode('utf-8'))
-                fid = (values.get('id') or '').strip() if isinstance(values, dict) else ''
+                fid = values.get('id') if isinstance(values, dict) else None
+                fid = fid.strip() if isinstance(fid, str) else ''
                 if not fid or len(fid) > 200:
                     self._send_json_response(400, json.dumps({'error': 'id required'}))
                     return

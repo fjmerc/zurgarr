@@ -67,7 +67,7 @@ def test_search_cache_gate_with_rd_is_an_error(clean):
 def test_locked_keys_produce_one_migration_recommendation(clean):
     clean.setattr(sc, '_locked_schema_keys', lambda: ['PD_ENABLED', 'ZURG_ENABLED'])
     f = next(f for f in sc.collect_findings() if f['id'] == 'locked-keys')
-    assert f['level'] == 'recommend' and '2 settings' in f['message']
+    assert f['level'] == 'recommend' and 'PD_ENABLED, ZURG_ENABLED are set' in f['message']
 
 
 @pytest.mark.parametrize('env,rec_id', [
@@ -102,7 +102,8 @@ def test_validator_messages_become_findings_with_keys(clean):
     findings = sc.collect_findings()
     err = next(f for f in findings if f['level'] == 'error')
     warn = next(f for f in findings if f['level'] == 'warn' and f['id'].startswith('validator:'))
-    assert err['key'] == 'PLEX_REFRESH' and warn['key'] == 'PD_ENABLED'
+    # the link targets the field to change, not the trigger
+    assert err['key'] == 'PLEX_TOKEN' and warn['key'] == 'ZURG_ENABLED'
 
 
 def test_sensitive_quoted_values_are_redacted(clean):
@@ -177,7 +178,8 @@ class TestDismissals:
             raise RuntimeError('x')
         monkeypatch.setattr(sc, 'collect_findings', boom)
         sc._invalidate()
-        assert sc.get_setup_check() == {'findings': [], 'dismissed': 0}
+        # a crash is reported, never shown as "Setup OK"
+        assert [f['id'] for f in sc.get_setup_check()['findings']] == ['setup-check-failed']
 
     def test_result_is_cached(self, store, monkeypatch):
         calls = []
@@ -263,3 +265,130 @@ class TestNoDetailWithoutLogin:
         clean.setattr(sc, '_validator_messages', lambda: ([], [raw]))
         f = next(f for f in sc.collect_findings() if f['id'].startswith('validator:'))
         assert 'resolves inside this container' in f['message'] and 'srv' not in f['message']
+
+
+class TestReviewFixes:
+
+    def test_login_without_colon_counts_as_no_login(self, clean):
+        # The server only enforces STATUS_UI_AUTH when it contains ':'
+        clean.setenv('STATUS_UI_AUTH', 'admin')
+        ids = {f['id'] for f in sc.collect_findings()}
+        assert 'no-auth' in ids
+        raw = "PLEX_ADDRESS='http://u:p@plex' is not a valid URL."
+        clean.setattr(sc, '_validator_messages', lambda: ([raw], []))
+        f = next(f for f in sc.collect_findings() if f['id'].startswith('validator:'))
+        assert 'not a valid URL' not in f['message']          # public → generic text
+
+    def test_notification_url_pieces_are_redacted(self, clean):
+        clean.setenv('NOTIFICATION_URL', "json://h/x, mailto//bob:pa'ssw0rdSECRET@gmail.com")
+        raw = "NOTIFICATION_URL contains 'mailto//bob:pa'ssw0rdSECRET@gm...' which doesn't look valid"
+        clean.setattr(sc, '_validator_messages', lambda: ([], [raw]))
+        text = ' '.join(f['message'] for f in sc.collect_findings())
+        assert 'SECRET' not in text and 'bob' not in text
+
+    def test_payload_has_no_sig_and_reports_auth(self, clean, tmp_path):
+        clean.setattr(sc, 'CONFIG_DIR', str(tmp_path))
+        clean.setenv('PD_ENABLED', 'true')
+        sc._invalidate()
+        payload = sc.get_setup_check()
+        assert payload['findings'] and all('sig' not in f for f in payload['findings'])
+        assert payload['auth_configured'] is True
+
+    def test_no_auth_fix_explains_env_var(self, clean):
+        clean.delenv('STATUS_UI_AUTH')
+        f = next(f for f in sc.collect_findings() if f['id'] == 'no-auth')
+        assert 'STATUS_UI_AUTH=' in f['fix'] and 'Essentials' not in f['fix']
+
+    def test_no_debrid_fix_without_login_points_at_env(self, clean):
+        clean.delenv('RD_API_KEY')
+        clean.delenv('STATUS_UI_AUTH')
+        f = next(f for f in sc.collect_findings() if f['id'] == 'no-debrid')
+        assert 'AllDebrid' in f['fix'] and 'RD_API_KEY' in f['fix']
+
+    def test_no_debrid_fix_with_login_points_at_settings(self, clean):
+        clean.delenv('RD_API_KEY')
+        f = next(f for f in sc.collect_findings() if f['id'] == 'no-debrid')
+        assert 'AllDebrid' in f['fix'] and 'Essentials' in f['fix']
+
+    def test_checker_crash_is_a_warning_not_ok(self, clean, tmp_path):
+        clean.setattr(sc, 'CONFIG_DIR', str(tmp_path))
+        def boom():
+            raise RuntimeError('x')
+        clean.setattr(sc, '_check_findings', boom)
+        sc._invalidate()
+        ids = [f['id'] for f in sc.get_setup_check()['findings']]
+        assert ids == ['setup-check-failed']
+
+    def test_search_gate_with_torbox_is_only_a_warning(self, clean):
+        clean.setenv('SEARCH_REQUIRE_CACHED', 'true')
+        clean.setenv('TORBOX_API_KEY', 'tb')
+        f = next(f for f in sc.collect_findings() if f['id'] == 'gate:SEARCH_REQUIRE_CACHED')
+        assert f['level'] == 'warn'
+        clean.delenv('TORBOX_API_KEY')
+        f = next(f for f in sc.collect_findings() if f['id'] == 'gate:SEARCH_REQUIRE_CACHED')
+        assert f['level'] == 'error'
+
+    @pytest.mark.parametrize('raw,target', [
+        ('PLEX_REFRESH=true but PLEX_TOKEN is not set. Plex library refresh requires Plex API access.', 'PLEX_TOKEN'),
+        ('BLACKHOLE_SYMLINK_ENABLED=true but BLACKHOLE_SYMLINK_TARGET_BASE is not set. This must be the mount path.', 'BLACKHOLE_SYMLINK_TARGET_BASE'),
+        ('TORBOX_API_KEY is set but TORBOX_WEBDAV_PASS is missing. TorBox WebDAV mount will be skipped.', 'TORBOX_WEBDAV_PASS'),
+        ('PD_ENABLED=true but ZURG_ENABLED is not true.', 'ZURG_ENABLED'),
+    ])
+    def test_validator_links_open_the_field_to_change(self, clean, raw, target):
+        clean.setattr(sc, '_validator_messages', lambda: ([raw], []))
+        f = next(f for f in sc.collect_findings() if f['id'].startswith('validator:'))
+        assert f['key'] == target
+
+    def test_no_debrid_supersedes_validator_key_complaints(self, clean):
+        clean.delenv('RD_API_KEY')
+        clean.setattr(sc, '_validator_messages', lambda: ([
+            'ZURG_ENABLED=true but neither RD_API_KEY nor AD_API_KEY is set. At least one debrid API key is required.',
+            'BLACKHOLE_ENABLED=true but no debrid API key found. Set RD_API_KEY, AD_API_KEY, or TORBOX_API_KEY.'], []))
+        assert [f['id'] for f in sc.collect_findings() if f['level'] == 'error'] == ['no-debrid']
+
+    def test_findings_carry_the_setting_label(self, clean):
+        clean.delenv('RD_API_KEY')
+        f = next(f for f in sc.collect_findings() if f['id'] == 'no-debrid')
+        assert f['label'] == 'Real-Debrid API Key'
+
+    def test_locked_keys_message_names_settings(self, clean):
+        clean.setattr(sc, '_locked_schema_keys', lambda: ['PD_ENABLED', 'PLEX_REFRESH', 'TZ', 'ZURG_ENABLED'])
+        f = next(f for f in sc.collect_findings() if f['id'] == 'locked-keys')
+        assert 'PD_ENABLED' in f['message'] and '2 more' in f['message'] and f['key'] == 'PD_ENABLED'
+        assert 'container environment' in f['message']
+
+    def test_dismiss_rejects_non_string_and_survives_unwritable_dir(self, clean, tmp_path):
+        clean.setenv('PD_ENABLED', 'true')
+        assert sc.dismiss(1) is False
+        ro = tmp_path / 'ro'
+        ro.mkdir()
+        ro.chmod(0o500)
+        try:
+            clean.setattr(sc, 'CONFIG_DIR', str(ro))
+            assert sc.dismiss('rec:PD_ENFORCE_CACHED_VERSIONS') is False
+        finally:
+            ro.chmod(0o700)
+
+    def test_cache_not_poisoned_by_invalidate_during_compute(self, clean, tmp_path):
+        clean.setattr(sc, 'CONFIG_DIR', str(tmp_path))
+        sc._invalidate()
+        calls = []
+
+        def collect():
+            calls.append(1)
+            if len(calls) == 1:
+                sc._invalidate()          # a dismiss lands mid-compute
+            return []
+        clean.setattr(sc, 'collect_findings', collect)
+        sc.get_setup_check()
+        sc.get_setup_check()
+        assert len(calls) == 2            # stale first result wasn't cached
+
+
+def test_status_payload_helper_never_reports_ok_on_crash(monkeypatch):
+    from utils import status_server
+    def boom():
+        raise RuntimeError('x')
+    monkeypatch.setattr(sc, 'get_setup_check', boom)
+    payload = status_server._setup_check_payload()
+    assert [f['id'] for f in payload['findings']] == ['setup-check-failed']

@@ -259,12 +259,14 @@ def validate_config():
     # --- Notification URL Validation ---
     notification_url = os.environ.get('NOTIFICATION_URL', '')
     if notification_url:
-        for url in notification_url.split(','):
+        for position, url in enumerate(notification_url.split(','), start=1):
             url = url.strip()
             if url and '://' not in url:
+                # By position, never by value: Apprise URLs embed credentials
+                # and this message is logged and shown on the Status page.
                 result.warn(
-                    f"NOTIFICATION_URL contains '{url[:30]}...' which doesn't "
-                    f"look like a valid Apprise URL (missing ://)"
+                    f"NOTIFICATION_URL entry {position} doesn't look like a "
+                    f"valid Apprise URL (missing ://)"
                 )
 
     # --- rclone Mount Name ---

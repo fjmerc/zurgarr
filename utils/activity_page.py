@@ -343,8 +343,7 @@ function stuckRowHtml(it,i,dismissed){
   h+='<td class="stuck-actions">';
   if(window._hasAuth){
     /* Buttons reference items by list index — item keys derive from
-       torrent filenames and must never land in an HTML attribute
-       (esc() does not escape quotes). */
+       torrent filenames and are kept out of HTML attributes. */
     if(dismissed){
       h+='<button class="btn btn-ghost btn-sm stuck-undismiss" data-i="'+i+'">Undismiss</button>';
     }else{
