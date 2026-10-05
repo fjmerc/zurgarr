@@ -182,57 +182,94 @@ class TestReloadEnvDoesNotClobberDockerCompose:
     """
 
     def test_docker_compose_vars_not_cleared(self, tmp_dir, monkeypatch):
-        """Vars only in docker-compose (not in .env) survive reload."""
+        """Vars set on the container (not in .env) are locked and survive reload."""
         import utils.config_reload as cr
+        from utils import config_resolve
+        monkeypatch.setattr(config_resolve, '_WRITTEN', {})
+        monkeypatch.setattr(config_resolve, '_CURRENT', {})
 
         env_file = os.path.join(tmp_dir, '.env')
         monkeypatch.setattr(cr, 'ENV_FILE', env_file)
-
-        # .env only has FOO
         with open(env_file, 'w') as f:
             f.write('FOO=bar\n')
-
-        # Simulate docker-compose var already in os.environ
         monkeypatch.setenv('BLACKHOLE_COMPLETED_DIR', '/completed')
         monkeypatch.setenv('RCLONE_VFS_CACHE_MODE', 'full')
-        monkeypatch.setenv('FOO', 'bar')
+        monkeypatch.delenv('FOO', raising=False)
 
-        # Initialize snapshot from current .env
-        monkeypatch.setattr(cr, '_last_env_keys', set(cr.dotenv_values(env_file).keys()))
+        cr._reload_env()                  # baseline: FOO written from the file
+        changed = cr._reload_env()        # nothing changed since
 
-        # Reload — .env still has FOO, docker-compose vars are NOT in .env
-        changed = cr._reload_env()
-
-        # Docker-compose vars must NOT be cleared
         assert os.environ['BLACKHOLE_COMPLETED_DIR'] == '/completed'
         assert os.environ['RCLONE_VFS_CACHE_MODE'] == 'full'
-        assert 'BLACKHOLE_COMPLETED_DIR' not in changed
-        assert 'RCLONE_VFS_CACHE_MODE' not in changed
-        # Unchanged .env var should not be reported as changed either
-        assert 'FOO' not in changed
+        assert os.environ['FOO'] == 'bar'
+        assert changed == set()
 
     def test_env_file_removal_detected(self, tmp_dir, monkeypatch):
-        """Vars removed from .env ARE cleared."""
+        """Vars removed from .env are reported and removed from the environ."""
         import utils.config_reload as cr
+        from utils import config_resolve
+        monkeypatch.setattr(config_resolve, '_WRITTEN', {})
+        monkeypatch.setattr(config_resolve, '_CURRENT', {})
 
         env_file = os.path.join(tmp_dir, '.env')
         monkeypatch.setattr(cr, 'ENV_FILE', env_file)
-
-        # .env has FOO and BAR
         with open(env_file, 'w') as f:
             f.write('FOO=bar\nBAR=baz\n')
-        monkeypatch.setenv('FOO', 'bar')
-        monkeypatch.setenv('BAR', 'baz')
+        monkeypatch.delenv('FOO', raising=False)
+        monkeypatch.delenv('BAR', raising=False)
+        cr._reload_env()                  # baseline: both written from the file
 
-        monkeypatch.setattr(cr, '_last_env_keys', set(cr.dotenv_values(env_file).keys()))
-
-        # Remove BAR from .env
         with open(env_file, 'w') as f:
             f.write('FOO=bar\n')
-
         changed = cr._reload_env()
 
-        assert os.environ.get('BAR') == ''
+        assert 'BAR' not in os.environ
         assert 'BAR' in changed
         assert os.environ['FOO'] == 'bar'
         assert 'FOO' not in changed
+
+
+class TestResolvedReload:
+
+    @pytest.fixture
+    def env_file(self, tmp_path, monkeypatch):
+        import utils.config_reload as cr_mod
+        from utils import config_resolve
+        path = tmp_path / '.env'
+        path.write_text('')
+        monkeypatch.setattr(cr_mod, 'ENV_FILE', str(path))
+        monkeypatch.setattr(config_resolve, '_WRITTEN', {})
+        monkeypatch.setattr(config_resolve, '_CURRENT', {})
+        for key in ('RD_API_KEY', 'AD_API_KEY', 'ZURG_ENABLED', 'NOTIFICATION_URL', 'BLACKHOLE_DIR'):
+            monkeypatch.delenv(key, raising=False)
+        # Baseline resolution, as startup would have produced.
+        config_resolve.apply(config_resolve.resolve(os.environ, {}))
+        return path
+
+    def test_derived_value_flip_is_reported(self, env_file):
+        from utils.config_reload import _reload_env
+        env_file.write_text('RD_API_KEY=abc\n')
+        changed = _reload_env()
+        assert {'RD_API_KEY', 'ZURG_ENABLED'} <= changed
+        assert os.environ['ZURG_ENABLED'] == 'true'
+
+    def test_removed_key_reverts_to_default_and_is_changed(self, env_file):
+        from utils.config_reload import _reload_env
+        env_file.write_text('BLACKHOLE_DIR=/custom\n')
+        _reload_env()
+        env_file.write_text('')
+        changed = _reload_env()
+        assert 'BLACKHOLE_DIR' in changed
+        assert os.environ['BLACKHOLE_DIR'] == '/watch'
+
+    def test_locked_key_ignores_file_edits(self, env_file, monkeypatch):
+        from utils.config_reload import _reload_env
+        monkeypatch.setenv('NOTIFICATION_URL', 'json://compose')
+        env_file.write_text('NOTIFICATION_URL=json://file\n')
+        changed = _reload_env()
+        assert 'NOTIFICATION_URL' not in changed
+        assert os.environ['NOTIFICATION_URL'] == 'json://compose'
+
+    def test_no_change_reports_nothing(self, env_file):
+        from utils.config_reload import _reload_env
+        assert _reload_env() == set()

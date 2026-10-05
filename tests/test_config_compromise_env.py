@@ -391,15 +391,18 @@ def test_config_reload_picks_up_toggle_changes(tmp_dir, monkeypatch):
     env_file = os.path.join(tmp_dir, '.env')
     monkeypatch.setattr(cr, 'ENV_FILE', env_file)
 
+    from utils import config_resolve
+    monkeypatch.setattr(config_resolve, '_WRITTEN', {})
+    monkeypatch.setattr(config_resolve, '_CURRENT', {})
     with open(env_file, 'w') as f:
         f.write('QUALITY_COMPROMISE_ENABLED=false\n')
         f.write('QUALITY_COMPROMISE_MAX_TIER_DROP=1\n')
         f.write('QUALITY_COMPROMISE_NOTIFY=true\n')
-    monkeypatch.setenv('QUALITY_COMPROMISE_ENABLED', 'false')
-    monkeypatch.setenv('QUALITY_COMPROMISE_MAX_TIER_DROP', '1')
-    monkeypatch.setenv('QUALITY_COMPROMISE_NOTIFY', 'true')
-    monkeypatch.setattr(cr, '_last_env_keys',
-                        set(cr.dotenv_values(env_file).keys()))
+    for key in ('QUALITY_COMPROMISE_ENABLED', 'QUALITY_COMPROMISE_MAX_TIER_DROP',
+                'QUALITY_COMPROMISE_NOTIFY'):
+        monkeypatch.delenv(key, raising=False)
+    # Baseline: values arrive from the file (as at startup), not the container.
+    cr._reload_env()
 
     # User toggles feature on + relaxes cap + silences Apprise.
     with open(env_file, 'w') as f:

@@ -79,46 +79,47 @@ SOFT_RELOAD = {
 
 
 # Snapshot of .env keys from the last load — used to detect removals.
-# Only keys that were previously IN the .env file should be cleared on
-# removal.  Keys set via docker-compose environment: (which are in
-# os.environ but NOT in .env) must never be touched.
-# Initialized from the current .env at import time so the first SIGHUP
-# can correctly detect removals.
-_last_env_keys = set(dotenv_values(ENV_FILE).keys()) if os.path.exists(ENV_FILE) else set()
+_SENSITIVE_MARKERS = ('KEY', 'TOKEN', 'PASS', 'SECRET', 'AUTH')
+_UNSET = None
 
 
 def _reload_env():
-    """Reload .env file and return set of changed variable names."""
-    global _last_env_keys
+    """Re-resolve settings from .env and return the keys whose value changed.
+
+    Re-resolves (utils/config_resolve) and reports keys whose effective
+    os.environ value changed, so derived values that flip because an input
+    changed are reported, values the resolver wrote are not mistaken for
+    edits, and locked (compose-set) keys are never touched.
+    """
+    from base import SECRETS_DIR
+    from utils import config_resolve
 
     if not os.path.exists(ENV_FILE):
         logger.warning(f"[reload] No .env file found at {ENV_FILE}")
         return set()
 
-    new_values = dotenv_values(ENV_FILE)
+    old = config_resolve.current()
+    new = config_resolve.resolve(
+        os.environ, dotenv_values(ENV_FILE),
+        config_resolve.present_secrets(SECRETS_DIR), config_resolve.written())
+
+    # Changed = the effective value services see moved.  Comparing the
+    # environ before/after apply (not old vs new resolution) means a locked
+    # key that merely enters the resolved set isn't reported, while derived
+    # values that flip because an input changed are.
+    keys = set(old) | set(new)
+    before = {k: os.environ.get(k, _UNSET) for k in keys}
+    config_resolve.apply(new)
     changed = set()
-
-    for key, new_val in new_values.items():
-        old_val = os.environ.get(key)
-        if old_val != new_val:
-            # Mask sensitive values in logs
-            if any(s in key.upper() for s in ('KEY', 'TOKEN', 'PASS', 'SECRET', 'AUTH')):
-                logger.info(f"[reload] {key} changed: *** -> ***")
-            else:
-                logger.info(f"[reload] {key} changed: '{old_val}' -> '{new_val}'")
-            os.environ[key] = new_val if new_val is not None else ''
-            changed.add(key)
-
-    # Detect keys removed from .env — only clear keys that were in the
-    # PREVIOUS .env snapshot, not keys from docker-compose or other sources.
-    for key in _last_env_keys:
-        if key not in new_values and os.environ.get(key, ''):
-            logger.info(f"[reload] {key} removed from .env")
-            os.environ[key] = ''
-            changed.add(key)
-
-    _last_env_keys = set(new_values.keys())
-
+    for key in keys:
+        old_val, new_val = before[key], os.environ.get(key, _UNSET)
+        if old_val == new_val:
+            continue
+        if any(s in key.upper() for s in _SENSITIVE_MARKERS):
+            logger.info(f"[reload] {key} changed: *** -> ***")
+        else:
+            logger.info(f"[reload] {key} changed: '{old_val}' -> '{new_val}'")
+        changed.add(key)
     return changed
 
 
