@@ -112,8 +112,19 @@ def test_sensitive_quoted_values_are_redacted(clean):
     assert 'tok123' not in f['message'] and "'…'" in f['message']
 
 
-def test_non_sensitive_quoted_values_are_kept():
-    assert "BLACKHOLE_DEBRID='foo'" in sc._redact("BLACKHOLE_DEBRID='foo' is not valid.")
+@pytest.mark.parametrize('raw,secret', [
+    # URL settings can embed basic-auth credentials and aren't "sensitive" by name
+    ("SEERR_ADDRESS='http://admin:hunter2@seerr:5055' is not a valid URL.", 'hunter2'),
+    ("PLEX_ADDRESS='https://user:pw9@plex' is not a valid URL.", 'pw9'),
+    ("BLACKHOLE_DEBRID='foo' is not valid.", 'foo'),
+    ("Something odd near http://u:secretpw@host/path happened", 'secretpw'),
+])
+def test_all_values_are_redacted_from_validator_messages(raw, secret):
+    # /api/status can be readable without a login; the card never needs the
+    # value itself — "Open setting" leads to the field.
+    out = sc._redact(raw)
+    assert secret not in out
+    assert out.split()[0].startswith(raw.split('=')[0].split()[0])   # key name kept
 
 
 def test_validator_crash_becomes_a_warning(clean):

@@ -5,7 +5,7 @@ Findings: {'id', 'level': error|warn|recommend, 'key', 'message', 'fix', 'sig'}
   recommend  — optional improvements; dismissible (see dismissals below)
 
 /api/status may be readable without a login, so findings never carry a
-credential: validator messages are redacted for sensitive keys.
+value: quoted and URL-shaped values in validator messages are redacted.
 """
 
 import hashlib
@@ -18,8 +18,6 @@ from utils.env import completed_dir_from_env, secret_or_env
 
 CONFIG_DIR = os.environ.get('CONFIG_DIR') or '/config'
 _LEVEL_ORDER = ('error', 'warn', 'recommend')
-_SENSITIVE_MARKERS = ('KEY', 'TOKEN', 'PASS', 'SECRET', 'AUTH')
-_ALWAYS_SENSITIVE = frozenset({'NOTIFICATION_URL'})
 
 
 def _on(key):
@@ -39,16 +37,14 @@ def _finding(fid, level, key, message, fix=None, sig_inputs=()):
             'fix': fix, 'sig': _sig(fid, *sig_inputs)}
 
 
-def _is_sensitive(key):
-    return key in _ALWAYS_SENSITIVE or any(m in key for m in _SENSITIVE_MARKERS)
-
-
 def _redact(message):
-    """Blank quoted values in a validator message when its key is sensitive."""
-    m = re.match(r'([A-Z][A-Z0-9_]+)', message)
-    if not m or not _is_sensitive(m.group(1)):
-        return message
-    return re.sub(r"'[^']*'", "'…'", message)
+    """Blank every value in a validator message — quoted values and anything
+    URL-shaped.  URL settings (PLEX_ADDRESS, SEERR_ADDRESS, …) can embed
+    basic-auth credentials without a "sensitive" name, and /api/status may
+    be readable without a login.  The key name stays; the card's "Open
+    setting" link leads to the value."""
+    message = re.sub(r"'[^']*'", "'…'", message)
+    return re.sub(r'\b[a-zA-Z][a-zA-Z0-9+.-]*://\S+', '…', message)
 
 
 # --- inputs (patched in tests) ---------------------------------------------
