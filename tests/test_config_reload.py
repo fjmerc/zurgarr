@@ -292,18 +292,55 @@ def test_notification_url_is_masked_in_reload_log(tmp_path, monkeypatch):
     assert not any('tok123' in m for m in logged)
 
 
-class TestZurgToggleOnReload:
+class TestZurgRestartRequired:
+    """Zurg and its mounts start only at container start, so a runtime
+    ZURG_ENABLED change leaves processes alone and flags a restart."""
 
-    def test_turning_zurg_off_stops_without_restart(self):
-        from utils.config_reload import _zurg_toggle_plan
-        stop_only, note = _zurg_toggle_plan({'ZURG_ENABLED'}, zurg_on=False, zurg_registered=True)
-        assert stop_only == {'zurg', 'rclone'} and note is None
+    def test_change_away_from_boot_value_flags_restart(self, monkeypatch):
+        import utils.config_reload as cr
+        monkeypatch.setattr(cr, '_BOOT_ZURG', True)
+        monkeypatch.setattr(cr, 'RESTART_REQUIRED', set())
+        monkeypatch.setenv('ZURG_ENABLED', 'false')
+        note = cr._zurg_restart_note({'ZURG_ENABLED'})
+        assert note and 'restart the container' in note.lower()
+        assert cr.RESTART_REQUIRED == {'ZURG_ENABLED'}
 
-    def test_turning_zurg_on_when_never_started_asks_for_restart(self):
-        from utils.config_reload import _zurg_toggle_plan
-        stop_only, note = _zurg_toggle_plan({'ZURG_ENABLED'}, zurg_on=True, zurg_registered=False)
-        assert stop_only == set() and 'restart the container' in note.lower()
+    def test_change_back_to_boot_value_clears_flag(self, monkeypatch):
+        import utils.config_reload as cr
+        monkeypatch.setattr(cr, '_BOOT_ZURG', True)
+        monkeypatch.setattr(cr, 'RESTART_REQUIRED', {'ZURG_ENABLED'})
+        monkeypatch.setenv('ZURG_ENABLED', 'true')
+        assert cr._zurg_restart_note({'ZURG_ENABLED'}) is None
+        assert cr.RESTART_REQUIRED == set()
 
-    def test_unrelated_change_is_untouched(self):
-        from utils.config_reload import _zurg_toggle_plan
-        assert _zurg_toggle_plan({'RD_API_KEY'}, zurg_on=True, zurg_registered=True) == (set(), None)
+    def test_unrelated_change_is_untouched(self, monkeypatch):
+        import utils.config_reload as cr
+        monkeypatch.setattr(cr, 'RESTART_REQUIRED', set())
+        assert cr._zurg_restart_note({'RD_API_KEY'}) is None
+
+    def test_reload_refreshes_the_setup_check(self, monkeypatch):
+        # a saved change shows up on the Setup check right away, not after
+        # its 15s cache (and the throttled Recheck) runs out
+        import utils.config_reload as cr
+        import utils.setup_check as sc
+        calls = []
+        monkeypatch.setattr(cr, '_reload_env', lambda: {'ZURG_ENABLED'})
+        monkeypatch.setattr(cr, '_BOOT_ZURG', True)
+        monkeypatch.setattr(cr, 'RESTART_REQUIRED', set())
+        monkeypatch.setenv('ZURG_ENABLED', 'false')
+        monkeypatch.setattr('base.config.load', lambda **kw: None)
+        monkeypatch.setattr(cr, '_notify_reload', lambda *a, **k: None)
+        monkeypatch.setattr(sc, '_invalidate', lambda: calls.append(1))
+        cr._reload_once()
+        assert calls
+
+    def test_zurg_toggle_alone_restarts_nothing_either_way(self, monkeypatch):
+        import utils.config_reload as cr
+        # away from or back to the boot value: the running processes are the
+        # boot ones either way, so nothing is restarted
+        assert cr._services_to_restart({'ZURG_ENABLED'}) == set()
+
+    def test_zurg_toggle_with_other_changes_keeps_their_restarts(self):
+        import utils.config_reload as cr
+        assert 'plex_debrid' in cr._services_to_restart(
+            {'ZURG_ENABLED'} | set(list(cr.SERVICE_DEPENDENCIES['plex_debrid'] - {'ZURG_ENABLED'})[:1]))

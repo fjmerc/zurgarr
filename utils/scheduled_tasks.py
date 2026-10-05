@@ -1199,13 +1199,14 @@ def _selfheal_enabled():
     return str(os.environ.get('MOUNT_SELFHEAL_ENABLED', 'true')).lower() == 'true'
 
 
-def _mount_should_run(mn):
-    """Whether mount *mn* should be up.  The Zurg-backed mounts follow Zurg
-    (turned off → stay down, never self-healed back); the TorBox WebDAV
-    mount doesn't depend on Zurg."""
-    if mn == ((os.environ.get('TORBOX_MOUNT_NAME') or '').strip() or 'torbox'):
-        return True
-    return _rclone_mount_expected()
+def _zurg_mount_registered():
+    """Whether a Zurg-backed rclone mount is running in this container
+    (it only starts at boot, so a runtime ZURG_ENABLED flip doesn't change it)."""
+    from utils.processes import _process_registry, _registry_lock
+    tb = (os.environ.get('TORBOX_MOUNT_NAME') or '').strip() or 'torbox'
+    with _registry_lock:
+        return any(e['process_name'].lower() == 'rclone' and e.get('key_type') != tb
+                   for e in _process_registry)
 
 
 def _mount_liveness_wanted():
@@ -1251,8 +1252,6 @@ def _maybe_selfheal_mount(mount_path, status, message):
 
     from utils.processes import restart_service, service_registered
     mn = os.path.basename(mount_path.rstrip('/'))
-    if not _mount_should_run(mn):
-        return   # e.g. Zurg turned off: its mount must stay down
     if not service_registered('rclone', key_type=mn):
         # Deliberately NOT latching the cooldown: nothing was attempted, so
         # the moment an rclone registers (startup ordering) the very next
@@ -1343,7 +1342,7 @@ def mount_liveness_probe():
 
     # Primary (RD/AD) — always checked.  This is the load-bearing mount;
     # an absent or unresponsive primary is always an error.
-    if _rclone_mount_expected():
+    if _rclone_mount_expected() or _zurg_mount_registered():
         primary_status, primary_msg, primary_items = _probe_mount(rclone_mount)
         if primary_status == 'absent':
             # Primary missing is a real error (existing behavior).
@@ -1351,7 +1350,7 @@ def mount_liveness_probe():
         _maybe_selfheal_mount(rclone_mount, primary_status, primary_msg)
     else:
         # Zurg off / no RD-AD key: no primary mount is expected.
-        primary_status, primary_msg, primary_items = 'success', 'Zurg is off — no Real-Debrid mount expected', 0
+        primary_status, primary_msg, primary_items = 'success', 'No Zurg mount expected (Zurg is off, or no Real-Debrid/AllDebrid key)', 0
 
     # Optional TB mount.  Gated on the same three env vars
     # ``rclone/rclone.py::_torbox_mount_configured`` checks, so we don't

@@ -9,6 +9,10 @@ class ZurgUpdate(Update, ProcessHandler):
     def __init__(self):
         Update.__init__(self)
         ProcessHandler.__init__(self, self.logger)
+        # One ProcessHandler per Zurg instance (RD / AD).  A single shared
+        # handler registered once, tracked only the last-started process, and
+        # a reload/update stopped one instance and orphaned the other.
+        self._instance_handlers = {}
 
     def terminate_zurg_instance(self, process_name, config_dir, key_type):
         regex_pattern = re.compile(rf'{re.escape(config_dir)}/zurg.*--preload', re.IGNORECASE)
@@ -44,10 +48,20 @@ class ZurgUpdate(Update, ProcessHandler):
             instances.append(("/zurg/AD", "AllDebrid"))
 
         for dir_to_check, key_type in instances:
+            if config_dir and dir_to_check != config_dir:
+                continue
             zurg_executable = os.path.join(dir_to_check, 'zurg')
             if os.path.exists(zurg_executable):
                 command = [zurg_executable]
-                super().start_process(process_name, dir_to_check, command, key_type, suppress_logging=suppress_logging)
+                handler = self._instance_handlers.get(key_type)
+                if handler is None:
+                    handler = self._instance_handlers[key_type] = ProcessHandler(self.logger)
+                handler.start_process(process_name, dir_to_check, command, key_type, suppress_logging=suppress_logging)
+
+    def _stop_instance(self, process_name, key_type):
+        handler = self._instance_handlers.get(key_type)
+        if handler is not None:
+            handler.stop_process(process_name, key_type)
                 
     def update_check(self, process_name):
         self.logger.info(f"Checking for available {process_name} updates")
@@ -102,11 +116,12 @@ class ZurgUpdate(Update, ProcessHandler):
                     instances.append(("/zurg/AD", "AllDebrid"))
                 zurg_presence = {d: os.path.exists(os.path.join(d, 'zurg')) for d, _ in instances}
 
+                updated = False
                 for dir_to_check, key_type in instances:
                     if zurg_presence.get(dir_to_check):
                         zurg_app_base = '/zurg/zurg'
                         zurg_executable_path = os.path.join(dir_to_check, 'zurg')
-                        self.stop_process(process_name, key_type)
+                        self._stop_instance(process_name, key_type)
                         # Atomic copy: the auto-update thread is a daemon, so a
                         # SIGTERM at interpreter exit can kill it mid-write.
                         # atomic_write stages to a temp file and only
@@ -117,7 +132,9 @@ class ZurgUpdate(Update, ProcessHandler):
                                 atomic_write(zurg_executable_path, mode='wb') as dst:
                             shutil.copyfileobj(src, dst)
                         self.start_process('Zurg', dir_to_check)
-                        return True
+                        updated = True   # every instance, not just the first
+                if updated:
+                    return True
 
         except Exception as e:
             self.logger.error(f"An error occurred in update_check for {process_name}: {e}")

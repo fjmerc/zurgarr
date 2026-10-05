@@ -351,7 +351,7 @@ def _is_sensitive(key):
 def get_env_schema():
     """Return the env var schema as a JSON-serializable structure."""
     from utils.settings_tiers import ESSENTIAL_GROUPS, GATES, UNGATED_KEYS, tier_for
-    from utils.config_resolve import RULES as _RULE_KEYS
+    from utils.config_resolve import RULES as _RULE_KEYS, SECRET_FILES
     categories = []
     for cat in ENV_SCHEMA:
         fields = []
@@ -366,6 +366,9 @@ def get_env_schema():
                 'tier': tier_for(key),
                 'ungated': key in UNGATED_KEYS,
                 'auto_capable': key in _RULE_KEYS,
+                # how zurgarr reaches your accounts/servers — "Reset all" keeps these
+                'connection': (_is_sensitive(key) or ftype in ('secret', 'url')
+                               or key in SECRET_FILES or key == 'TRAKT_CLIENT_ID'),
             }
             fields.append(field)
         categories.append({
@@ -531,7 +534,7 @@ def _bool_equivalent(a, b):
     is typed as — PD_LOGFILE is a text field holding a boolean)."""
     a = (a or '').strip().lower()
     b = (b or '').strip().lower()
-    if b not in ('true', 'false') and a not in ('true', 'false'):
+    if a not in ('', 'true', 'false') or b not in ('', 'true', 'false'):
         return False
     return (a == 'true') == (b == 'true')
 
@@ -618,7 +621,8 @@ def write_env_values(values):
         # so the admin couldn't undo it from the UI.
         auth_src = sources.get('STATUS_UI_AUTH', {}).get('source')
         if (auth_src == 'set' and ':' in (existing.get('STATUS_UI_AUTH') or '')
-                and ':' not in (explicit.get('STATUS_UI_AUTH') or '')):
+                and not (explicit.get('STATUS_UI_AUTH') or '').strip()):
+            # (a malformed new value is reported by validation below)
             return {'status': 'error', 'warnings': [], 'errors': [
                 'STATUS_UI_AUTH: removing the dashboard login would lock you out of Settings. '
                 'Enter a new username:password instead, or remove it from config/.env by hand.']}
@@ -649,7 +653,7 @@ def write_env_values(values):
         # Secret-backed keys show (and post) '' — syncing that would blank
         # the debrid key plex_debrid got from the secret.
         # Cleared keys sync their effective value (the default), not ''.
-        _sync_env_to_plex_debrid({k: (v if v != '' else _ENV_DEFAULTS.get(k, v))
+        _sync_env_to_plex_debrid({k: (v if v != '' else _RESOLVE_DEFAULTS.get(k, v))
                                   for k, v in merged.items()
                                   if sources.get(k, {}).get('source') != 'secret'})
     except Exception as e:
@@ -662,7 +666,7 @@ def write_env_values(values):
     try:
         changed = set()
         try:
-            from utils.config_reload import _determine_restarts
+            from utils.config_reload import _services_to_restart
             # Preview with a dry run of the same resolver the SIGHUP reload
             # uses, so the banner names only services that will really restart.
             from base import SECRETS_DIR
@@ -678,7 +682,11 @@ def write_env_values(values):
 
             changed = {k for k in set(current) | set(dry) if _eff(current, k) != _eff(dry, k)}
             if changed:
-                restarted = sorted(_determine_restarts(changed))
+                restarted = sorted(_services_to_restart(changed))
+            if 'ZURG_ENABLED' in changed:
+                validation['warnings'].append(
+                    'ZURG_ENABLED takes effect when you restart the container '
+                    '(Zurg and its mounts only start then).')
 
         except Exception as e:
             # Advisory only — a failed preview must never block the apply.
@@ -726,7 +734,8 @@ def _with_secret_placeholders(values):
     out = dict(values)
     for k in secret:
         if not out.get(k):
-            out[k] = '<docker-secret>'
+            # URL-shaped so format checks (PLEX_ADDRESS, …) pass too
+            out[k] = 'http://docker-secret' if k.endswith(('_ADDRESS', '_URL')) else 'docker-secret'
     return out
 
 
@@ -1432,7 +1441,9 @@ def _sync_plex_debrid_to_env(values):
             if r is not None and r.source in ('secret', 'locked'):
                 continue
             file_val = current.get(key)
-            old_val = file_val if file_val is not None else os.environ.get(key, '')
+            # A blank file line (older versions) means "not set": compare
+            # against the value actually in effect (e.g. SHOW_MENU's default).
+            old_val = file_val if (file_val or '').strip() else os.environ.get(key, '')
             if not _same_value(key, old_val, new_val) and not _bool_equivalent(old_val, new_val):
                 changed[key] = new_val
 

@@ -1308,10 +1308,10 @@ setInterval(_scTickChecked,5000);
 function recheckSetup(){
   fetch('/api/setup-check?fresh=1').then(function(r){if(!r.ok)throw new Error('http');return r.json();})
     .then(function(sc){
-      var before=_scRenderedSig;renderSetupCheck(sc);
+      var before=_scRenderedSig,ok=renderSetupCheck(sc)!==false;
       // Rebuilt? put focus back on the Recheck button the user pressed.
       if(_scRenderedSig!==before){var b=document.querySelector('[data-recheck]');if(b)b.focus();}
-      if(window.showToast)showToast('Setup checked','success');})
+      if(ok&&window.showToast)showToast('Setup checked','success');})
     .catch(function(){if(window.showToast)showToast('Could not run the setup check','error');});
 }
 function renderSetupCheck(sc){
@@ -1319,8 +1319,9 @@ function renderSetupCheck(sc){
   if(!wrap||!el)return;
   if(!sc){wrap.hidden=true;if(okEl)okEl.textContent='';_scRenderedSig=null;return;}
   // An in-flight /api/status poll can land after a fresh Recheck: never
-  // replace a newer result with an older one.
-  if(sc.checked_at&&sc.checked_at<_scLatest)return;
+  // replace a newer result with an older one (unless it is more than a
+  // minute older: the server clock was set back, take the new reality).
+  if(sc.checked_at&&sc.checked_at<_scLatest&&_scLatest-sc.checked_at<=60)return false;
   if(sc.checked_at)_scLatest=sc.checked_at;
   if(sc.server_now)_scSkew=Date.now()/1000-sc.server_now;
   var f=sc.findings||[],d=sc.dismissed||0,auth=!!sc.auth_configured;

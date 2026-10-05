@@ -1777,6 +1777,20 @@ class TestSourcesAndExplicitSave:
         assert result['status'] == 'saved'
         assert result['restarted'] == ['notifications']
 
+    def test_zurg_toggle_preview_restarts_nothing_and_says_restart_container(self, env_file, monkeypatch):
+        from utils.settings_api import read_env_values
+        from utils import config_resolve
+        monkeypatch.delenv('ZURG_ENABLED', raising=False)
+        monkeypatch.setenv('RD_API_KEY', 'k' * 20)          # Zurg is automatically on
+        config_resolve.apply(config_resolve.resolve(os.environ, {}))
+        values = self._as_page_posts(read_env_values())
+        values.pop('RD_API_KEY', None)
+        values['ZURG_ENABLED'] = 'false'
+        result = write_env_values(values)
+        assert result['status'] == 'saved', result
+        assert not {'zurg', 'rclone', 'plex_debrid'} & set(result['restarted'])
+        assert any("restart the container" in w.lower() for w in result["warnings"]), result
+
     def test_save_to_secret_key_rejected(self, env_file, monkeypatch):
         from dotenv import dotenv_values
         from utils import config_resolve
@@ -1861,6 +1875,35 @@ class TestSchemaEssentials:
         fields = {f['key']: f for c in schema['categories'] for f in c['fields']}
         assert fields['BLACKHOLE_LOCAL_LIBRARY_TV']['ungated'] is True
         assert fields['BLACKHOLE_DIR']['ungated'] is False
+
+    def test_schema_flags_connection_settings_kept_by_reset(self):
+        fields = {f['key']: f for c in get_env_schema()['categories'] for f in c['fields']}
+        # usernames, addresses and API ids survive "Reset all" — not just secrets
+        for k in ('PLEX_USER', 'PLEX_ADDRESS', 'SEERR_ADDRESS', 'ZURG_USER',
+                  'TORBOX_WEBDAV_USER', 'TRAKT_CLIENT_ID', 'RD_API_KEY', 'STATUS_UI_AUTH'):
+            if k in fields:
+                assert fields[k]['connection'] is True, k
+        assert fields['BLACKHOLE_DIR']['connection'] is False
+
+    def test_reset_js_keeps_connection_settings_and_reapplies_automatic(self):
+        from utils.settings_page import get_settings_html
+        from utils.settings_api import get_plex_debrid_schema
+        html = get_settings_html(get_env_schema(), get_plex_debrid_schema())
+        i = html.index('function applyResetToDefaults')
+        body = html[i:i + 2500]
+        assert 'f.connection' in body
+        assert 'useAutomatic(' in body
+        assert 'updateModifiedChips()' in body
+        assert 'connection settings' in html   # dialog text says what is kept
+
+    def test_skipped_rerender_shows_saved_value_for_cleared_fields(self):
+        from utils.settings_page import get_settings_html
+        from utils.settings_api import get_plex_debrid_schema
+        html = get_settings_html(get_env_schema(), get_plex_debrid_schema())
+        i = html.index("document.querySelectorAll('#tab-env [data-clear]').forEach(")
+        block = html[i - 900:i + 400]
+        assert 'syncClearedFrom(' in block
+        assert 'function syncClearedFrom' in html
 
 
 class TestPreviewNeverBlocksReload:

@@ -206,6 +206,15 @@ def _check_findings():
             out.append(_finding('gate:SEARCH_REQUIRE_CACHED', 'error', 'SEARCH_REQUIRE_CACHED',
                                 "Search → Require cached is on, so every add from search is refused (Real-Debrid/AllDebrid can't check their cache).",
                                 'Turn off Require cached for search.'))
+    try:
+        from utils.config_reload import RESTART_REQUIRED
+        pending = sorted(RESTART_REQUIRED)
+    except Exception:
+        pending = []
+    if pending:
+        out.append(_finding('restart-required', 'warn', pending[0],
+                            f"{_names(pending)} changed, but it only takes effect when the container starts.",
+                            'Restart the container to apply it.', sig_inputs=pending))
     locked = _locked_schema_keys()
     if locked:
         out.append(_finding('locked-keys', 'recommend', locked[0],
@@ -317,10 +326,15 @@ def get_setup_check(fresh=False):
             return _cache['value']
         gen = _cache['gen']
     try:
-        findings = collect_findings()
-        dismissed = _clear_resolved_dismissals(_load_dismissed())
-        shown = [f for f in findings if dismissed.get(f['id']) != f['sig']]
-        dismissed_count = len(findings) - len(shown)
+        for _attempt in range(3):
+            findings = collect_findings()
+            dismissed = _clear_resolved_dismissals(_load_dismissed())
+            shown = [f for f in findings if dismissed.get(f['id']) != f['sig']]
+            dismissed_count = len(findings) - len(shown)
+            with _lock:
+                if _cache['gen'] == gen:
+                    break
+                gen = _cache['gen']   # a dismiss landed mid-compute: redo, never return stale
     except Exception:
         _log().exception('[setup_check] Setup check failed')
         shown = [_finding('setup-check-failed', 'warn', None,

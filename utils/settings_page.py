@@ -938,6 +938,18 @@ function collectEnvData() {
   return data;
 }
 
+// After a save whose re-render was skipped (you were typing elsewhere):
+// a field that was cleared now holds its default / automatic value — show
+// that, so the form doesn't keep the old one and re-save it later.
+function syncClearedFrom(values) {
+  document.querySelectorAll('#tab-env [data-clear]').forEach(el => {
+    const v = values[el.dataset.key];
+    if (v === undefined) return;
+    if (el.dataset.type === 'boolean') el.checked = String(v).toLowerCase() === 'true';
+    else el.value = v;
+  });
+}
+
 // Drop a pending clear and put back the field's original note.
 function cancelClear(el) {
   delete el.dataset.clear;
@@ -973,12 +985,23 @@ function applyResetToDefaults(defaults) {
   Object.keys(envSources).forEach(k => { if (envSources[k].source === 'auto') preview[k] = envValues[k]; });
   renderEnvCategories(preview);
   document.querySelectorAll('#tab-env [data-key]').forEach(el => {
-    const f = _ENV_FIELD_BY_KEY[el.dataset.key] || {};
-    // Credentials (API keys, the dashboard login) are kept: a reset must
-    // never lock you out or disconnect your accounts.
-    if (f.sensitive || f.type === 'secret') { el.value = envValues[el.dataset.key] ?? el.value; return; }
-    if (!el.disabled && !el.readOnly) el.dataset.clear = '1';
+    const key = el.dataset.key;
+    const f = _ENV_FIELD_BY_KEY[key] || {};
+    // Connection settings (API keys, usernames, server addresses, the
+    // dashboard login) are kept: a reset must never lock you out or
+    // disconnect your accounts.
+    const keepCurrent = () => {
+      const v = envValues[key];
+      if (v !== undefined) { if (el.dataset.type === 'boolean') el.checked = String(v).toLowerCase() === 'true'; else el.value = v; }
+    };
+    if (f.connection) { keepCurrent(); return; }
+    if (el.disabled || el.readOnly) return;
+    // A setting you pinned that can be automatic goes back to automatic;
+    // its current value shows until the save works it out.
+    if (f.auto_capable && (envSources[key] || {}).source === 'set') { keepCurrent(); useAutomatic(key); return; }
+    el.dataset.clear = '1';
   });
+  updateModifiedChips();
   updateDirtyUI();
 }
 
@@ -1074,6 +1097,7 @@ async function envSave() {
           if (isPlainObject) {
             envValues = body;
             if (!userEditing) renderEnvCategories(envValues);
+            else syncClearedFrom(body);   // the re-render was skipped
           } else {
             envValues = renderedEnvData();
           }
@@ -1938,7 +1962,7 @@ function oauthCancel(service, fieldId) {
 async function envResetDefaults() {
   const ok = await inlineConfirm({
     title: 'Reset Zurgarr form to defaults?',
-    message: 'This clears every setting back to its default (API keys and the dashboard login are kept) — nothing is written to disk yet. You still need to click <strong>Save &amp; Apply</strong> afterwards to persist. Click Cancel to keep the current form values.',
+    message: 'This clears every setting back to its default (connection settings — API keys, usernames, server addresses and the dashboard login — are kept) — nothing is written to disk yet. You still need to click <strong>Save &amp; Apply</strong> afterwards to persist. Click Cancel to keep the current form values.',
     confirmText: 'Reset form',
     danger: true,
   });

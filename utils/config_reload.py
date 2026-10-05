@@ -111,75 +111,34 @@ def _reload_env():
     return set(changes)
 
 
-def _zurg_toggle_plan(changed, zurg_on, zurg_registered):
-    """How a SIGHUP should treat a ZURG_ENABLED flip.
+# Zurg and its rclone mounts only start at container start (main.py), so a
+# runtime ZURG_ENABLED change can't be applied by a reload: leave the
+# processes as they are and say a restart is needed.  Settings whose
+# effect needs a container restart are listed in RESTART_REQUIRED (the
+# Status page Setup check shows them).
+_BOOT_ZURG = (os.environ.get('ZURG_ENABLED') or '').strip().lower() == 'true'
+RESTART_REQUIRED = set()
 
-    Returns (stop_only, note): services to stop and NOT restart, and a note
-    to surface.  Zurg (and its rclone mount) only start at container boot,
-    so turning it on when it never started needs a container restart.
-    """
+
+def _services_to_restart(changed):
+    """Services a change restarts.  ZURG_ENABLED itself restarts nothing:
+    Zurg and its mounts start only with the container (see
+    _zurg_restart_note), whichever way it is flipped."""
+    return _determine_restarts(set(changed) - {'ZURG_ENABLED'})
+
+
+def _zurg_restart_note(changed):
+    """Note to surface when ZURG_ENABLED moved away from its boot value
+    (and record it), or None.  Moving back to the boot value clears it."""
     if 'ZURG_ENABLED' not in changed:
-        return set(), None
-    if not zurg_on:
-        return {'zurg', 'rclone'}, None
-    if not zurg_registered:
-        return set(), 'Zurg was turned on — restart the container to start Zurg and its mount.'
-    return set(), None
-
-
-def _tb_mount_name():
-    return (os.environ.get('TORBOX_MOUNT_NAME') or '').strip() or 'torbox'
-
-
-def _in_stop_only(entry, stop_only):
-    """Whether a registry entry belongs to a stop-only service.  Every rclone
-    mount registers as 'rclone' (told apart by key_type); the TorBox WebDAV
-    mount doesn't depend on Zurg, so a Zurg stop never touches it."""
-    name = entry['process_name'].lower()
-    if name not in stop_only:
-        return False
-    return not (name == 'rclone' and entry.get('key_type') == _tb_mount_name())
-
-
-def _disarm_stopped(entries, stop_only):
-    """Clear the auto-restart policy of every registered process in a
-    stop_only service — including ones already dead/in backoff, which the
-    stop loop skips, or the process monitor would relaunch them."""
-    for entry in entries:
-        if _in_stop_only(entry, stop_only):
-            entry['handler'].restart_policy = None
-
-
-def _clear_mount(mn):
-    """Best effort: remove a stopped rclone mount's FUSE leftovers and its
-    healthcheck marker, so probes and the healthcheck don't report it dead."""
-    try:
-        from rclone.rclone import _force_clear_stale_mount
-        _force_clear_stale_mount(f'/data/{mn}', logger)
-    except Exception as e:
-        logger.debug(f"[reload] Could not clear /data/{mn}: {e}")
-    try:
-        os.rmdir(f'/healthcheck/{mn}')
-    except OSError:
-        pass
-
-
-def _retire_stopped(registry, stop_only, clear=True):
-    """Remove intentionally-stopped entries from the process registry (so
-    the Processes card, healthcheck and self-heal treat them as off, not
-    dead) and clear their mounts.  Returns the removed entries."""
-    removed = [e for e in registry if _in_stop_only(e, stop_only)]
-    for e in removed:
-        registry.remove(e)
-    if clear:
-        for e in removed:
-            if e['process_name'].lower() == 'rclone' and e.get('key_type'):
-                _clear_mount(e['key_type'])
-    return removed
-
-
-def _restarted_services(services, stop_only):
-    return set(services) - set(stop_only)
+        return None
+    now = (os.environ.get('ZURG_ENABLED') or '').strip().lower() == 'true'
+    if now == _BOOT_ZURG:
+        RESTART_REQUIRED.discard('ZURG_ENABLED')
+        return None
+    RESTART_REQUIRED.add('ZURG_ENABLED')
+    return ('ZURG_ENABLED changed — restart the container to apply it '
+            '(Zurg and its mounts only start when the container starts).')
 
 
 def _determine_restarts(changed_vars):
@@ -256,34 +215,27 @@ def _reload_once():
             _notify_reload(changed, set())
             return
 
-        services = _determine_restarts(changed)
-        logger.info(f"[reload] Services to restart: {', '.join(sorted(services))}")
+        services = _services_to_restart(changed)
+        logger.info(f"[reload] Services to restart: {', '.join(sorted(services)) or 'none'}")
 
         # Handle process-based services
-        process_services = {'zurg', 'rclone', 'plex_debrid'} & services
-        from utils.processes import _process_registry, _registry_lock
-        with _registry_lock:
-            zurg_registered = any(e['process_name'].lower() == 'zurg' for e in _process_registry)
-        stop_only, zurg_note = _zurg_toggle_plan(
-            changed, os.environ.get('ZURG_ENABLED', '').strip().lower() == 'true', zurg_registered)
+        zurg_note = _zurg_restart_note(changed)
         if zurg_note:
             logger.warning(f"[reload] {zurg_note}")
-            process_services -= {'zurg', 'rclone'}
-            if not (changed & SERVICE_DEPENDENCIES['plex_debrid']):
-                process_services.discard('plex_debrid')   # only cascaded from ZURG_ENABLED
             try:
                 from utils.status_server import status_data
                 status_data.add_event('config_reload', zurg_note)
             except Exception:
                 pass
+        process_services = {'zurg', 'rclone', 'plex_debrid'} & services
         if process_services:
+            from utils.processes import _process_registry, _registry_lock
 
             # Stop affected services (reverse dependency order)
             stop_order = ['plex_debrid', 'rclone', 'zurg']
             start_entries = []
 
             with _registry_lock:
-                _disarm_stopped(_process_registry, stop_only)
                 for svc_name in stop_order:
                     if svc_name not in process_services:
                         continue
@@ -291,8 +243,6 @@ def _reload_once():
                         name = entry['process_name']
                         handler = entry['handler']
                         if name.lower() == svc_name.lower():
-                            if stop_only and name.lower() in stop_only and not _in_stop_only(entry, stop_only):
-                                continue   # TorBox mount: independent of Zurg, leave it running
                             if handler.process and handler.process.poll() is None:
                                 desc = f"{name} w/ {entry['key_type']}" if entry['key_type'] else name
                                 logger.info(f"[reload] Stopping {desc}")
@@ -300,20 +250,7 @@ def _reload_once():
                             start_entries.append(entry)
 
             # Re-run setup functions to regenerate config files before restart
-            if stop_only:
-                with _registry_lock:
-                    retired = _retire_stopped(_process_registry, stop_only, clear=False)
-                for e in retired:
-                    if e['process_name'].lower() == 'rclone' and e.get('key_type'):
-                        _clear_mount(e['key_type'])
-                try:
-                    from rclone import rclone as _rc
-                    for mn in list(_rc._pending_mounts):   # no deferred retries either
-                        if mn != _tb_mount_name():
-                            _rc._pending_mounts.pop(mn, None)
-                except Exception:
-                    pass
-            if 'zurg' in process_services and 'zurg' not in stop_only:
+            if 'zurg' in process_services:
                 try:
                     from zurg.setup import zurg_setup
                     logger.info("[reload] Regenerating zurg config")
@@ -321,7 +258,7 @@ def _reload_once():
                 except Exception as e:
                     logger.error(f"[reload] Failed to regenerate zurg config: {e}")
 
-            if 'rclone' in process_services and 'rclone' not in stop_only:
+            if 'rclone' in process_services:
                 try:
                     from rclone.rclone import regenerate_config
                     logger.info("[reload] Regenerating rclone config")
@@ -359,8 +296,6 @@ def _reload_once():
                 if svc_name not in process_services:
                     continue
                 for entry in start_entries:
-                    if _in_stop_only(entry, stop_only):
-                        continue   # Zurg was turned off — stay stopped
                     name = entry['process_name']
                     handler = entry['handler']
                     if name.lower() == svc_name.lower():
@@ -398,17 +333,20 @@ def _reload_once():
             except Exception as e:
                 logger.error(f"[reload] Failed to update Status UI auth/trusted origins: {e}")
 
+        # Show the new settings on the Setup check now, not after its cache expires
+        try:
+            from utils import setup_check
+            setup_check._invalidate()
+        except Exception:
+            pass
         logger.info("[reload] Config reload complete")
-        stopped = sorted(stop_only & services)
-        services = _restarted_services(services, stop_only)
-        _notify_reload(changed, services, stopped)
+        _notify_reload(changed, services)
 
         try:
             from utils.status_server import status_data
             status_data.add_event(
                 'config_reload',
                 f'Reloaded {len(changed)} var(s), restarted: {", ".join(sorted(services)) or "none"}'
-                + (f', stopped: {", ".join(stopped)}' if stopped else '')
             )
         except Exception:
             pass
@@ -417,15 +355,14 @@ def _reload_once():
         logger.error(f"[reload] Reload failed: {e}")
 
 
-def _notify_reload(changed, services, stopped=()):
+def _notify_reload(changed, services):
     """Send notification about config reload."""
     try:
         from utils.notifications import notify
         body = f'Reloaded {len(changed)} variable(s)'
         if services:
             body += f', restarted: {", ".join(sorted(services))}'
-        if stopped:
-            body += f', stopped: {", ".join(sorted(stopped))}'
+
         notify('startup', 'Config Reloaded', body)
     except Exception:
         pass

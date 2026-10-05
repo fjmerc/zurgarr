@@ -208,6 +208,17 @@ def test_pages_have_setup_check_hooks():
     assert 'function openFieldFromHash' in get_settings_html(get_env_schema(), {'categories': []})
 
 
+def test_recheck_toast_only_when_result_accepted_and_clock_step_back_allowed():
+    from utils.status_server import get_dashboard_html
+    dash = get_dashboard_html()
+    i = dash.index('function recheckSetup')
+    assert 'renderSetupCheck(sc)!==false' in dash[i:i + 700]
+    j = dash.index('function renderSetupCheck')
+    body = dash[j:j + 900]
+    # an older result is ignored (return false) unless the clock stepped back >60s
+    assert '_scLatest-sc.checked_at<=60' in body and 'return false' in body
+
+
 def test_shared_esc_escapes_quotes():
     import re, subprocess
     from utils import ui_common
@@ -525,28 +536,6 @@ class TestRound5:
         assert any('login' in e.lower() for e in result['errors'])
         assert 'STATUS_UI_AUTH=admin:pw' in env_file.read_text()
 
-    def test_selfheal_and_pending_retry_off_when_zurg_off(self, monkeypatch):
-        from utils import scheduled_tasks as st
-        monkeypatch.setenv('MOUNT_SELFHEAL_ENABLED', 'true')
-        monkeypatch.setenv('RD_API_KEY', 'k')
-        monkeypatch.setenv('RCLONE_MOUNT_NAME', 'zurgarr')
-        monkeypatch.setenv('ZURG_ENABLED', 'false')
-        assert st._mount_should_run('zurgarr') is False   # per mount now: TorBox still heals
-        monkeypatch.setenv('ZURG_ENABLED', 'true')
-        assert st._mount_should_run('zurgarr') is True
-
-    def test_stop_only_disarms_dead_processes(self):
-        from utils.config_reload import _disarm_stopped
-        class H:
-            restart_policy = object()
-            process = None
-        entries = [{'process_name': 'Zurg', 'handler': H()}, {'process_name': 'rclone', 'handler': H()},
-                   {'process_name': 'plex_debrid', 'handler': H()}]
-        _disarm_stopped(entries, {'zurg', 'rclone'})
-        assert entries[0]['handler'].restart_policy is None
-        assert entries[1]['handler'].restart_policy is None
-        assert entries[2]['handler'].restart_policy is not None
-
     def test_clear_resolved_keeps_concurrent_dismissal(self, clean, tmp_path):
         import json
         clean.setattr(sc, 'CONFIG_DIR', str(tmp_path))
@@ -573,29 +562,6 @@ class TestRound6:
                 {'process_name': 'rclone', 'key_type': 'torbox', 'handler': H()},
                 {'process_name': 'plex_debrid', 'key_type': None, 'handler': H()}]
 
-    def test_torbox_mount_is_not_part_of_the_zurg_stop(self, monkeypatch):
-        from utils import config_reload as cr
-        monkeypatch.setenv('TORBOX_MOUNT_NAME', 'torbox')
-        e = self._entries()
-        cr._disarm_stopped(e, {'zurg', 'rclone'})
-        assert e[0]['handler'].restart_policy is None and e[1]['handler'].restart_policy is None
-        assert e[2]['handler'].restart_policy is not None      # TorBox untouched
-        assert [x['key_type'] for x in e if cr._in_stop_only(x, {'zurg', 'rclone'})] == ['RealDebrid', 'zurgarr']
-
-    def test_stopped_zurg_entries_are_retired_from_the_registry(self, monkeypatch, tmp_path):
-        from utils import config_reload as cr
-        monkeypatch.setenv('TORBOX_MOUNT_NAME', 'torbox')
-        cleared = []
-        monkeypatch.setattr(cr, '_clear_mount', lambda mn: cleared.append(mn))
-        reg = self._entries()
-        cr._retire_stopped(reg, {'zurg', 'rclone'})
-        assert [(x['process_name'], x['key_type']) for x in reg] == [('rclone', 'torbox'), ('plex_debrid', None)]
-        assert cleared == ['zurgarr']
-
-    def test_restarted_services_exclude_stopped(self):
-        from utils.config_reload import _restarted_services
-        assert _restarted_services({'zurg', 'rclone', 'plex_debrid'}, {'zurg', 'rclone'}) == {'plex_debrid'}
-
     def test_mount_liveness_wanted_for_local_library_without_zurg(self, monkeypatch):
         from utils import scheduled_tasks as st
         monkeypatch.setenv('ZURG_ENABLED', 'false')
@@ -605,13 +571,6 @@ class TestRound6:
         assert st._mount_liveness_wanted() is False
         monkeypatch.setenv('BLACKHOLE_LOCAL_LIBRARY_TV', '/tv')
         assert st._mount_liveness_wanted() is True
-
-    def test_selfheal_per_mount(self, monkeypatch):
-        from utils import scheduled_tasks as st
-        monkeypatch.setenv('TORBOX_MOUNT_NAME', 'torbox')
-        monkeypatch.setenv('ZURG_ENABLED', 'false')
-        assert st._mount_should_run('zurgarr') is False
-        assert st._mount_should_run('torbox') is True
 
     def test_cleared_keys_sync_their_effective_value(self, tmp_path, monkeypatch):
         import utils.settings_api as sa
@@ -653,3 +612,97 @@ class TestRound6:
         from utils import config_resolve as cr
         cur, wr = cr.snapshot()
         assert isinstance(cur, dict) and isinstance(wr, dict)
+
+
+
+class TestRound7:
+
+    def test_secret_url_settings_validate(self, monkeypatch):
+        import utils.settings_api as sa
+        from utils import config_resolve
+        monkeypatch.setattr(config_resolve, '_WRITTEN', {})
+        monkeypatch.setattr(config_resolve, '_CURRENT', {})
+        config_resolve.resolve_and_apply({}, frozenset({'PLEX_ADDRESS', 'JF_ADDRESS', 'SEERR_ADDRESS'}), environ={})
+        assert sa.validate_env_values({'PLEX_ADDRESS': '', 'JF_ADDRESS': '', 'SEERR_ADDRESS': ''})['errors'] == []
+
+    def test_login_guard_only_on_empty_value(self, tmp_path, monkeypatch):
+        import utils.settings_api as sa
+        from utils import config_resolve
+        from dotenv import dotenv_values
+        path = tmp_path / '.env'
+        path.write_text('STATUS_UI_AUTH=admin:pw\n')
+        monkeypatch.setattr(sa, 'ENV_FILE', str(path))
+        monkeypatch.setattr(config_resolve, '_WRITTEN', {})
+        monkeypatch.setattr(config_resolve, '_CURRENT', {})
+        monkeypatch.delenv('STATUS_UI_AUTH', raising=False)
+        config_resolve.apply(config_resolve.resolve(os.environ, dotenv_values(str(path))))
+        monkeypatch.setattr('os.kill', lambda *a: None)
+        monkeypatch.setattr(sa, '_sync_env_to_plex_debrid', lambda *a: None)
+        values = sa.read_env_values()
+        values['STATUS_UI_AUTH'] = 'admin'          # typo, not removal → format error
+        result = sa.write_env_values(values)
+        assert result['status'] == 'error'
+        assert not any('lock you out' in e for e in result['errors'])
+        assert any('format' in e.lower() for e in result['errors'])
+
+    @pytest.mark.parametrize('a,b,eq', [('', 'false', True), ('false', 'info', False),
+                                        ('true', 'TRUE', True), ('x', 'y', False)])
+    def test_bool_equivalent_is_strict(self, a, b, eq):
+        from utils.settings_api import _bool_equivalent
+        assert _bool_equivalent(a, b) is eq
+
+    def test_blank_file_line_compares_as_effective_value(self, tmp_path, monkeypatch):
+        import utils.settings_api as sa
+        from utils import config_resolve
+        monkeypatch.setattr(config_resolve, '_WRITTEN', {})
+        monkeypatch.setattr(config_resolve, '_CURRENT', {})
+        monkeypatch.setenv('SHOW_MENU', 'true')            # resolver default in effect
+        env_file = tmp_path / '.env'
+        env_file.write_text('SHOW_MENU=\n')               # legacy blank line
+        monkeypatch.setattr(sa, 'ENV_FILE', str(env_file))
+        writes = []
+        monkeypatch.setattr(sa, '_write_env_file', lambda explicit: writes.append(dict(explicit)))
+        sa._sync_plex_debrid_to_env({'Show Menu on Startup': False})
+        assert writes and writes[0].get('SHOW_MENU') == 'false'
+
+    def test_restart_required_finding(self, clean, monkeypatch):
+        import utils.config_reload as cr
+        monkeypatch.setattr(cr, 'RESTART_REQUIRED', {'ZURG_ENABLED'})
+        f = next(f for f in sc.collect_findings() if f['id'] == 'restart-required')
+        assert f['level'] == 'warn' and f['key'] == 'ZURG_ENABLED'
+
+    def test_dismiss_mid_compute_recomputes_not_stale(self, clean, tmp_path):
+        clean.setattr(sc, 'CONFIG_DIR', str(tmp_path))
+        sc._invalidate()
+        calls = []
+        def collect():
+            calls.append(1)
+            if len(calls) == 1:
+                sc._invalidate()
+                return [{'id': 'rec:STALE', 'level': 'recommend', 'key': None, 'message': 'm', 'fix': None, 'sig': 's'}]
+            return []
+        clean.setattr(sc, 'collect_findings', collect)
+        assert sc.get_setup_check()['findings'] == []
+
+    def test_zurg_instances_get_their_own_handlers(self, monkeypatch, tmp_path):
+        from zurg import update as zu
+        from base import config
+        monkeypatch.setattr(config, 'RDAPIKEY', 'rd', raising=False)
+        monkeypatch.setattr(config, 'ADAPIKEY', 'ad', raising=False)
+        monkeypatch.setattr(zu.os.path, 'exists', lambda p: True)
+        started = []
+        monkeypatch.setattr(zu.ProcessHandler, 'start_process',
+                            lambda self, name, d, cmd, key_type=None, suppress_logging=False: started.append((id(self), key_type)))
+        z = zu.ZurgUpdate()
+        z.start_process('Zurg')
+        assert {k for _, k in started} == {'RealDebrid', 'AllDebrid'}
+        assert len({h for h, _ in started}) == 2           # separate handlers → separate registry entries
+        started.clear()
+        z.start_process('Zurg', '/zurg/AD')
+        assert [k for _, k in started] == ['AllDebrid']     # config_dir selects one instance
+
+    def test_selfheal_requires_registration_not_env(self, monkeypatch):
+        # heal follows what's running: Zurg flipped off at runtime keeps
+        # running until restart, so its mount still heals
+        from utils import scheduled_tasks as st
+        assert not hasattr(st, '_mount_should_run')
