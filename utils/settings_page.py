@@ -848,6 +848,35 @@ function applyGate(key) {
   document.querySelectorAll(`.gate-note[data-gate-note="${key}"]`).forEach(n => { n.hidden = open; });
 }
 
+// /settings#KEY (from the Status page's Setup check): open the field's
+// section, reveal it if a gate or "Show advanced" hides it, then focus it.
+function openFieldFromHash() {
+  const key = decodeURIComponent((location.hash || '').slice(1));
+  if (!key || !/^[A-Z0-9_]+$/.test(key)) return;
+  const row = document.getElementById('row-' + key);
+  if (!row) return;
+  const cat = row.closest('.category');
+  if (cat) {
+    const header = cat.querySelector('.cat-header'), body = cat.querySelector('.cat-body');
+    if (header) { header.classList.add('open'); header.setAttribute('aria-expanded', 'true'); }
+    if (body) body.classList.add('open');
+  }
+  const adv = row.closest('.advanced-fields');
+  if (adv && !adv.classList.contains('open')) {
+    adv.classList.add('open');
+    const t = adv.previousElementSibling;
+    if (t && t.classList.contains('advanced-toggle')) { t.textContent = 'Hide advanced settings'; t.setAttribute('aria-expanded', 'true'); }
+  }
+  const gated = row.closest('.gated-fields');
+  if (gated) gated.classList.add('open');
+  row.scrollIntoView({block: 'center'});
+  const input = document.getElementById('env-' + key);
+  if (input && !input.disabled) input.focus({preventScroll: true});
+  row.classList.add('changed');
+  setTimeout(() => row.classList.remove('changed'), 2500);
+}
+window.addEventListener('hashchange', openFieldFromHash);
+
 document.addEventListener('input', e => {
   const k = e.target && e.target.dataset ? e.target.dataset.key : null;
   if (k && _GATE_KEYS.has(k)) applyGate(k);
@@ -2479,6 +2508,7 @@ async function init() {
   await Promise.all([envFetch, defaultsFetch, pdFetch, refreshEnvSources()]);
   renderEnvCategories(envValues);
   renderPdCategories(pdValues);
+  openFieldFromHash();
 }
 
 init();

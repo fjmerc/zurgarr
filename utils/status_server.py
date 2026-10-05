@@ -910,6 +910,12 @@ __NAV_HTML__
 <div class="meta">Uptime: <span id="uptime"></span> <span class="freshness"><span class="pulse-dot" id="fetch-dot"></span><span id="freshness-text"></span></span></div>
 <div class="meta" id="error-line" style="display:none;color:var(--red)">Errors: <span id="errors">0</span></div>
 <div id="banner" aria-live="polite"></div>
+<div class="grid full" id="setup-check-wrap" hidden>
+  <div class="card">
+    <h2>Setup check</h2>
+    <div id="setup-check"></div>
+  </div>
+</div>
 <div class="grid full">
   <div class="card">
     <h2>Services</h2>
@@ -1286,6 +1292,40 @@ function renderBanners(alerts){
 }
 function dismissBanners(){_bannerDismissedSig=_bannerSig(_lastAlerts);_bannerRenderedSig=null;var el=document.getElementById('banner');if(el)el.innerHTML='';}
 
+function renderSetupCheck(sc){
+  var wrap=document.getElementById('setup-check-wrap'),el=document.getElementById('setup-check');
+  if(!wrap||!el)return;
+  wrap.hidden=false;
+  var f=(sc&&sc.findings)||[];
+  if(!f.length){
+    var d=(sc&&sc.dismissed)||0;
+    el.innerHTML='<div class="sc-ok">Setup OK'+(d?' — '+d+' dismissed recommendation'+(d!==1?'s':''):'')+'</div>';
+    setCardHealth('Setup check','card-ok');
+    return;
+  }
+  var label={error:'Problem',warn:'Warning',recommend:'Tip'},h='';
+  f.forEach(function(x){
+    h+='<div class="sc-item"><span class="sc-level '+esc(x.level)+'">'+esc(label[x.level]||x.level)+'</span><div class="sc-body"><div>'+esc(x.message)+'</div>'+
+      (x.fix?'<div class="sc-fix">'+esc(x.fix)+'</div>':'')+'<div class="sc-actions">'+
+      (x.key?'<a href="/settings#'+encodeURIComponent(x.key)+'">Open setting</a>':'')+
+      (x.level==='recommend'?'<button type="button" data-dismiss="'+esc(x.id)+'">Dismiss</button>':'')+
+      '</div></div></div>';
+  });
+  el.innerHTML=h;
+  var worst=f[0].level;
+  setCardHealth('Setup check',worst==='error'?'card-crit':(worst==='warn'?'card-warn':'card-ok'));
+}
+function dismissFinding(id){
+  fetch('/api/setup-check/dismiss',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})})
+    .then(function(){update();}).catch(function(){});
+}
+// One delegated listener: ids travel in data-dismiss, never inside an
+// inline onclick string (and _DASHBOARD_HTML is a non-raw Python string,
+// so backslash-escaped JS would be mangled).
+document.addEventListener('click',function(e){
+  var b=e.target&&e.target.closest?e.target.closest('[data-dismiss]'):null;
+  if(b)dismissFinding(b.getAttribute('data-dismiss'));
+});
 function update(){
   var _fd=document.getElementById('fetch-dot');if(_fd)_fd.className='pulse-dot fetching';
   fetch('/api/status').then(r=>r.json()).then(d=>{
@@ -1320,6 +1360,7 @@ function update(){
       }
     }
     renderBanners(alerts);
+    renderSetupCheck(d.setup_check);
 
     // Services
     document.getElementById('services').innerHTML=renderServices(d.services);
@@ -1518,6 +1559,16 @@ __WANTED_BADGE_JS__
 </html>'''
 
 _DASHBOARD_EXTRA_CSS = """
+#setup-check-wrap[hidden]{display:none}
+.sc-ok{font-size:.85em;color:var(--text2)}
+.sc-item{display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-top:1px solid var(--border2)}
+.sc-item:first-child{border-top:0}
+.sc-level{font-size:.68em;font-weight:700;text-transform:uppercase;letter-spacing:.04em;border:1px solid currentColor;border-radius:3px;padding:1px 6px;margin-top:2px;white-space:nowrap}
+.sc-level.error{color:var(--red)}.sc-level.warn{color:var(--yellow)}.sc-level.recommend{color:var(--teal)}
+.sc-body{flex:1;font-size:.88em}
+.sc-fix{color:var(--text2);margin-top:2px}
+.sc-actions{display:flex;gap:10px;margin-top:4px;font-size:.85em}
+.sc-actions a,.sc-actions button{color:var(--blue);background:none;border:0;padding:0;font:inherit;cursor:pointer;text-decoration:underline}
 /* Library source colors. Single value per theme: darkened enough that the
    white in-bar labels clear WCAG AA (4.5:1) in both light and dark. */
 :root{--lib-local:#9333ea;--lib-cloud:#0e7490}

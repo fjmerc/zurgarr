@@ -43,6 +43,7 @@ def _redact(message):
     basic-auth credentials without a "sensitive" name, and /api/status may
     be readable without a login.  The key name stays; the card's "Open
     setting" link leads to the value."""
+    message = re.sub(r'"[^"]*"', '"…"', message)   # repr() of values with an apostrophe
     message = re.sub(r"'[^']*'", "'…'", message)
     return re.sub(r'\b[a-zA-Z][a-zA-Z0-9+.-]*://\S+', '…', message)
 

@@ -377,7 +377,7 @@ TOAST_JS = r"""
 # ---------------------------------------------------------------------------
 
 SHARED_UTILS_JS = r"""
-function esc(s){var d=document.createElement('div');d.appendChild(document.createTextNode(String(s==null?'':s)));return d.innerHTML;}
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 function timeAgo(ts){
   var sec=Math.floor((Date.now()-new Date(ts).getTime())/1000);
   if(sec<60)return sec+'s ago';

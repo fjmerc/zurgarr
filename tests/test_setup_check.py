@@ -117,6 +117,8 @@ def test_sensitive_quoted_values_are_redacted(clean):
     ("SEERR_ADDRESS='http://admin:hunter2@seerr:5055' is not a valid URL.", 'hunter2'),
     ("PLEX_ADDRESS='https://user:pw9@plex' is not a valid URL.", 'pw9'),
     ("BLACKHOLE_DEBRID='foo' is not valid.", 'foo'),
+    # repr() switches to double quotes when the value contains an apostrophe
+    ('DUPLICATE_CLEANUP_KEEP="pa\'ss-word" is not valid.', 'ss-word'),
     ("Something odd near http://u:secretpw@host/path happened", 'secretpw'),
 ])
 def test_all_values_are_redacted_from_validator_messages(raw, secret):
@@ -191,3 +193,24 @@ def test_status_payload_includes_setup_check(monkeypatch):
     monkeypatch.setattr(sc, 'get_setup_check', lambda: {'findings': [], 'dismissed': 0})
     monkeypatch.setattr(status_server, 'check_services', lambda: [])
     assert status_server.status_data.to_dict()['setup_check'] == {'findings': [], 'dismissed': 0}
+
+
+def test_pages_have_setup_check_hooks():
+    from utils.status_server import get_dashboard_html
+    from utils.settings_page import get_settings_html
+    from utils.settings_api import get_env_schema
+    dash = get_dashboard_html()
+    for needle in ('id="setup-check"', 'function renderSetupCheck', '/api/setup-check/dismiss'):
+        assert needle in dash, needle
+    assert 'function openFieldFromHash' in get_settings_html(get_env_schema(), {'categories': []})
+
+
+def test_shared_esc_escapes_quotes():
+    import re, subprocess
+    from utils import ui_common
+    src = next(v for v in vars(ui_common).values()
+               if isinstance(v, str) and 'function esc(s)' in v)
+    fn = re.search(r'function esc\(s\)\{.*?\}(?=\s*(?:function|\n|$))', src, re.S).group(0)
+    out = subprocess.run(['node', '-e', fn + ';process.stdout.write(esc(`a"b\'c<`))'],
+                         capture_output=True, text=True, check=True).stdout
+    assert out == 'a&quot;b&#39;c&lt;'
