@@ -38,7 +38,7 @@ sys.path.insert(0, '/')
 import re
 
 from utils.blackhole import BlackholeWatcher, _is_safe_mount_name  # noqa: E402
-from utils.env import watch_dir_from_env  # noqa: E402
+from utils.env import env_or_default, watch_dir_from_env  # noqa: E402
 from utils.arr_client import RadarrClient, SonarrClient  # noqa: E402
 from utils.debrid_routing import TORBOX, mount_for_debrid  # noqa: E402
 from utils.library import parse_folder_name  # noqa: E402
@@ -54,7 +54,7 @@ def _discover_tb_mount() -> str | None:
     """Resolve the TorBox rclone mount path from env (same convention as
     ``BlackholeWatcher._mount_for``)."""
     rclonemn = os.environ.get('RCLONE_MOUNT_NAME') or ''
-    base = os.environ.get('BLACKHOLE_RCLONE_MOUNT', '/data').rstrip('/')
+    base = env_or_default('BLACKHOLE_RCLONE_MOUNT', '/data').rstrip('/')
     if rclonemn and os.path.basename(base) == rclonemn:
         parent = os.path.dirname(base)
         if parent:
@@ -116,7 +116,7 @@ def main() -> int:
         print(f'ERROR: TB mount not found at {tb_mount!r}', file=sys.stderr)
         return 1
 
-    completed_dir = os.environ.get('BLACKHOLE_COMPLETED_DIR', '/completed')
+    completed_dir = env_or_default('BLACKHOLE_COMPLETED_DIR', '/completed')
     if not os.path.isdir(completed_dir):
         print(f'ERROR: completed dir not found at {completed_dir!r}', file=sys.stderr)
         return 1
@@ -127,7 +127,7 @@ def main() -> int:
         'torbox',
         symlink_enabled=True,
         completed_dir=completed_dir,
-        rclone_mount=os.environ.get('BLACKHOLE_RCLONE_MOUNT', '/data'),
+        rclone_mount=env_or_default('BLACKHOLE_RCLONE_MOUNT', '/data'),
         symlink_target_base=os.environ.get('BLACKHOLE_SYMLINK_TARGET_BASE', ''),
     )
 

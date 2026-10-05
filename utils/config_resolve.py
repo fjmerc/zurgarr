@@ -14,6 +14,7 @@ stay import-light (os + dataclasses only): base/ imports it at startup.
 """
 
 import os
+import threading
 from dataclasses import dataclass
 
 SOURCES = ('locked', 'secret', 'set', 'auto', 'default', 'unset')
@@ -261,3 +262,23 @@ def current():
 
 def written():
     return dict(_WRITTEN)
+
+
+# Serializes resolve+apply across threads (startup, SIGHUP reload, the
+# plex_debrid settings sync).  Interleaved, one caller's resolve() can read
+# _WRITTEN before the other's apply() and mistake the fresh value for a
+# compose-set (locked) one.
+_LOCK = threading.Lock()
+
+
+def resolve_and_apply(file_env, secrets=frozenset(), environ=None):
+    """Resolve and apply atomically.  Returns {key: (old, new)} for keys
+    whose effective environ value changed (None = absent)."""
+    environ = os.environ if environ is None else environ
+    with _LOCK:
+        new = resolve(environ, file_env, secrets, dict(_WRITTEN))
+        keys = set(_CURRENT) | set(new)
+        before = {k: environ.get(k) for k in keys}
+        apply(new, environ)
+        return {k: (before[k], environ.get(k)) for k in keys
+                if before[k] != environ.get(k)}

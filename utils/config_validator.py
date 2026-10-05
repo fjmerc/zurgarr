@@ -8,7 +8,7 @@ is launched.
 import os
 import re
 from urllib.parse import urlparse
-from utils.env import secret_or_env
+from utils.env import env_or_default, secret_or_env
 from utils.logger import get_logger
 
 logger = get_logger()
@@ -95,7 +95,7 @@ def validate_config():
             "work).  Generate a WebDAV-only password in the TorBox dashboard "
             "(Settings → Integrations → WebDAV) to enable the mount."
         )
-    torbox_mount_name = os.environ.get('TORBOX_MOUNT_NAME', 'torbox')
+    torbox_mount_name = env_or_default('TORBOX_MOUNT_NAME', 'torbox')
     rclone_mount_name = os.environ.get('RCLONE_MOUNT_NAME', '')
     if torbox_key and torbox_mount_name == rclone_mount_name:
         result.error(

@@ -310,7 +310,9 @@ def get_logger(log_name='ZURGARR', log_dir='./log'):
     if log_level_env:
         log_level = log_level_env.upper()
         os.environ['LOG_LEVEL'] = log_level
-        os.environ['RCLONE_LOG_LEVEL'] = log_level
+        # rclone's level is derived per child in utils/env.child_env (an
+        # os.environ write here would make RCLONE_LOG_LEVEL look
+        # compose-locked to the settings resolver).
     else:
         log_level = 'INFO'
     numeric_level = getattr(logging, log_level, logging.INFO)

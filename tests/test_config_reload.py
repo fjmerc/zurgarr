@@ -273,3 +273,20 @@ class TestResolvedReload:
     def test_no_change_reports_nothing(self, env_file):
         from utils.config_reload import _reload_env
         assert _reload_env() == set()
+
+
+def test_notification_url_is_masked_in_reload_log(tmp_path, monkeypatch):
+    # Apprise URLs embed tokens (discord://token@id).
+    import utils.config_reload as cr_mod
+    from utils import config_resolve
+    monkeypatch.setattr(config_resolve, '_WRITTEN', {})
+    monkeypatch.setattr(config_resolve, '_CURRENT', {})
+    monkeypatch.delenv('NOTIFICATION_URL', raising=False)
+    path = tmp_path / '.env'
+    path.write_text('NOTIFICATION_URL=discord://tok123@id\n')
+    monkeypatch.setattr(cr_mod, 'ENV_FILE', str(path))
+    logged = []
+    monkeypatch.setattr(cr_mod.logger, 'info', lambda msg, *a: logged.append(msg))
+    cr_mod._reload_env()
+    assert any('NOTIFICATION_URL' in m for m in logged)
+    assert not any('tok123' in m for m in logged)

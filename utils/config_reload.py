@@ -80,6 +80,9 @@ SOFT_RELOAD = {
 
 # Snapshot of .env keys from the last load — used to detect removals.
 _SENSITIVE_MARKERS = ('KEY', 'TOKEN', 'PASS', 'SECRET', 'AUTH')
+# Credentials hidden in values that no marker catches (Apprise URLs embed
+# tokens, e.g. discord://token@id).
+_ALWAYS_MASKED = frozenset({'NOTIFICATION_URL'})
 _UNSET = None
 
 
@@ -98,29 +101,14 @@ def _reload_env():
         logger.warning(f"[reload] No .env file found at {ENV_FILE}")
         return set()
 
-    old = config_resolve.current()
-    new = config_resolve.resolve(
-        os.environ, dotenv_values(ENV_FILE),
-        config_resolve.present_secrets(SECRETS_DIR), config_resolve.written())
-
-    # Changed = the effective value services see moved.  Comparing the
-    # environ before/after apply (not old vs new resolution) means a locked
-    # key that merely enters the resolved set isn't reported, while derived
-    # values that flip because an input changed are.
-    keys = set(old) | set(new)
-    before = {k: os.environ.get(k, _UNSET) for k in keys}
-    config_resolve.apply(new)
-    changed = set()
-    for key in keys:
-        old_val, new_val = before[key], os.environ.get(key, _UNSET)
-        if old_val == new_val:
-            continue
-        if any(s in key.upper() for s in _SENSITIVE_MARKERS):
+    changes = config_resolve.resolve_and_apply(
+        dotenv_values(ENV_FILE), config_resolve.present_secrets(SECRETS_DIR))
+    for key, (old_val, new_val) in sorted(changes.items()):
+        if key in _ALWAYS_MASKED or any(s in key.upper() for s in _SENSITIVE_MARKERS):
             logger.info(f"[reload] {key} changed: *** -> ***")
         else:
             logger.info(f"[reload] {key} changed: '{old_val}' -> '{new_val}'")
-        changed.add(key)
-    return changed
+    return set(changes)
 
 
 def _determine_restarts(changed_vars):

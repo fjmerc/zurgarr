@@ -1341,6 +1341,26 @@ class TestSyncPlexDebridToEnv:
             _sync_plex_debrid_to_env(values)
             assert os.environ['SEERR_ADDRESS'] == 'http://new:5055'
 
+    def test_secret_and_locked_values_never_synced_into_env_file(self, tmp_path, monkeypatch):
+        # pd_setup copies secret credentials into settings.json; syncing them
+        # back would put the secret on disk (and into every config backup).
+        from utils import config_resolve
+        monkeypatch.setattr(config_resolve, '_WRITTEN', {})
+        monkeypatch.setattr(config_resolve, '_CURRENT', {})
+        monkeypatch.delenv('PLEX_TOKEN', raising=False)
+        monkeypatch.setenv('SEERR_ADDRESS', 'http://compose:5055')
+        env_file = self._make_env(tmp_path, '')
+        config_resolve.apply(config_resolve.resolve(
+            os.environ, {}, frozenset({'PLEX_TOKEN'})))
+        with patch('utils.settings_api.ENV_FILE', env_file):
+            _sync_plex_debrid_to_env({
+                'Plex users': [['someone', 'the-secret-token']],
+                'Overseerr Base URL': 'http://new:5055',
+            })
+        text = open(env_file).read()
+        assert 'the-secret-token' not in text
+        assert 'SEERR_ADDRESS' not in text
+
     def test_compose_locked_value_is_not_overridden(self, tmp_path, monkeypatch):
         from utils import config_resolve
         monkeypatch.setattr(config_resolve, '_WRITTEN', {})

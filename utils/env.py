@@ -41,8 +41,21 @@ def child_env():
             continue
     else:
         items = list(os.environ.copy().items())
-    return {k: v for k, v in items
-            if not (k.startswith('RCLONE_') and not v.strip())}
+    env = {k: v for k, v in items
+           if not (k.startswith('RCLONE_') and not v.strip())}
+    # rclone follows ZURGARR_LOG_LEVEL unless RCLONE_LOG_LEVEL is set.
+    # rclone's levels are DEBUG/INFO/NOTICE/ERROR — an unmapped value would
+    # make it exit on a parse error.
+    if 'RCLONE_LOG_LEVEL' not in env:
+        level = _RCLONE_LEVELS.get((env.get('ZURGARR_LOG_LEVEL') or '').strip().upper())
+        if level:
+            env['RCLONE_LOG_LEVEL'] = level
+    return env
+
+
+_RCLONE_LEVELS = {'DEBUG': 'DEBUG', 'INFO': 'INFO', 'NOTICE': 'NOTICE',
+                  'WARNING': 'NOTICE', 'WARN': 'NOTICE',
+                  'ERROR': 'ERROR', 'CRITICAL': 'ERROR'}
 
 
 def completed_dir_from_env():

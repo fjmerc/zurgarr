@@ -1326,8 +1326,16 @@ def _sync_plex_debrid_to_env(values):
         if os.path.exists(ENV_FILE):
             current = dotenv_values(ENV_FILE)
 
+        from utils import config_resolve
+        resolved = config_resolve.current()
         changed = {}
         for key, new_val in env_updates.items():
+            # Never write secret-backed values (pd_setup copies secrets into
+            # settings.json) or compose-locked ones (inert, and they'd
+            # masquerade as a UI edit) back into config/.env.
+            r = resolved.get(key)
+            if r is not None and r.source in ('secret', 'locked'):
+                continue
             file_val = current.get(key)
             old_val = file_val if file_val is not None else os.environ.get(key, '')
             if old_val != new_val:
@@ -1354,10 +1362,8 @@ def _sync_plex_debrid_to_env(values):
         # Re-resolve so in-process reads are consistent.  Writing os.environ
         # directly would make these look compose-locked to the resolver.
         from base import SECRETS_DIR
-        from utils import config_resolve
-        config_resolve.apply(config_resolve.resolve(
-            os.environ, dotenv_values(ENV_FILE),
-            config_resolve.present_secrets(SECRETS_DIR), config_resolve.written()))
+        config_resolve.resolve_and_apply(
+            dotenv_values(ENV_FILE), config_resolve.present_secrets(SECRETS_DIR))
 
     logger.info(
         f'[settings] Synced {len(changed)} plex_debrid setting(s) back to .env: '

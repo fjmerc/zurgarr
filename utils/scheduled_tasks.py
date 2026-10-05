@@ -10,7 +10,7 @@ import shutil
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from utils.env import secret_or_env
+from utils.env import env_or_default, secret_or_env
 from utils.logger import get_logger
 
 logger = get_logger()
@@ -424,7 +424,7 @@ def verify_symlinks():
     completed_dir = completed_dir_from_env()
     local_tv = os.environ.get('BLACKHOLE_LOCAL_LIBRARY_TV', '').strip()
     local_movies = os.environ.get('BLACKHOLE_LOCAL_LIBRARY_MOVIES', '').strip()
-    rclone_mount = os.path.realpath(os.environ.get('BLACKHOLE_RCLONE_MOUNT', '/data'))
+    rclone_mount = os.path.realpath(env_or_default('BLACKHOLE_RCLONE_MOUNT', '/data'))
     symlink_target = os.environ.get('BLACKHOLE_SYMLINK_TARGET_BASE', '').strip()
 
     # Per-debrid (symlink_target_base, rclone_mount) pairs so that a broken
@@ -1293,7 +1293,7 @@ def mount_liveness_probe():
     probed the RD mount, so a dead TB mount left the System page green
     while every TB grab silently timed out at 300s.
     """
-    rclone_mount = os.environ.get('BLACKHOLE_RCLONE_MOUNT', '/data')
+    rclone_mount = env_or_default('BLACKHOLE_RCLONE_MOUNT', '/data')
 
     # Deferred-start retry: a WebDAV endpoint unreachable during startup
     # (host crash-reboot → container up before network/DNS) makes setup()

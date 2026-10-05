@@ -5428,7 +5428,7 @@ def setup():
     # Symlink configuration
     symlink_enabled = os.environ.get('BLACKHOLE_SYMLINK_ENABLED', 'false').lower() == 'true'
     completed_dir = completed_dir_from_env()
-    rclone_mount = os.environ.get('BLACKHOLE_RCLONE_MOUNT', '/data')
+    rclone_mount = env_or_default('BLACKHOLE_RCLONE_MOUNT', '/data')
     # Auto-detect mount name subdirectory if not explicitly configured
     if rclone_mount == '/data' and os.environ.get('RCLONE_MOUNT_NAME'):
         mount_name = os.environ.get('RCLONE_MOUNT_NAME')

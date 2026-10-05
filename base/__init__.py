@@ -126,11 +126,8 @@ def load_env_file(path):
     from utils import config_resolve
     file_env = dotenv_values(path) if path and os.path.exists(path) else {}
     blank_before = {k for k, v in os.environ.items() if not v.strip()}
-    resolved = config_resolve.resolve(
-        os.environ, file_env, config_resolve.present_secrets(SECRETS_DIR),
-        config_resolve.written())
-    config_resolve.apply(resolved)
-    for key, r in resolved.items():
+    config_resolve.resolve_and_apply(file_env, config_resolve.present_secrets(SECRETS_DIR))
+    for key, r in config_resolve.current().items():
         if r.source == 'set' and key in blank_before and key not in ENV_FILE_FILLED_KEYS:
             ENV_FILE_FILLED_KEYS.append(key)
 
@@ -233,7 +230,7 @@ class Config:
         # Attr name matches env var name (with underscores) so the
         # _ENV_DEFAULTS drift guard in tests/test_settings_api.py
         # ::test_env_defaults_stays_in_sync_with_config can verify it.
-        self.TORBOX_MOUNT_NAME = os.getenv('TORBOX_MOUNT_NAME', 'torbox')
+        self.TORBOX_MOUNT_NAME = (os.getenv('TORBOX_MOUNT_NAME') or '').strip() or 'torbox'
         # Plan 41 phase D: TB rclone tpslimit knobs.  TB rate-limits
         # reads aggressively under concurrent Plex/Bazarr scans; default
         # 5 tps / 10-burst stays under the observed Essential-tier

@@ -52,8 +52,8 @@ Everything else has a sensible default or is opt-in.
 | `RD_API_KEY` | [Real-Debrid API key](https://real-debrid.com/apitoken) | |
 | `AD_API_KEY` | [AllDebrid API key](https://alldebrid.com/apikeys/). Public Zurg is Real-Debrid only — AllDebrid needs the sponsors-only nightly (`ZURG_VERSION=nightly` + `GITHUB_TOKEN`) | |
 | `TORBOX_API_KEY` | [TorBox API key](https://torbox.app/settings). Powers cache probes, search-add, and dual-debrid blackhole routing. For the WebDAV mount, see [TorBox co-debrid](#torbox-co-debrid-mount-plan-39). | |
-| `RCLONE_MOUNT_NAME` | Name for the rclone mount | |
-| `RCLONE_LOG_LEVEL` | [rclone log level](https://rclone.org/docs/#log-level-level). `OFF` to suppress | `NOTICE` |
+| `RCLONE_MOUNT_NAME` | Name for the rclone mount (under `/data`) | `zurgarr` |
+| `RCLONE_LOG_LEVEL` | [rclone log level](https://rclone.org/docs/#log-level-level). `OFF` to suppress. When unset, follows `ZURGARR_LOG_LEVEL` (WARNING → NOTICE, CRITICAL → ERROR) | `NOTICE` |
 | `RCLONE_DIR_CACHE_TIME` | [Directory cache duration](https://rclone.org/commands/rclone_mount/#vfs-directory-cache) | `10s` |
 | `RCLONE_CACHE_DIR` | [Cache directory](https://rclone.org/docs/#cache-dir-dir) | |
 | `RCLONE_VFS_CACHE_MODE` | [VFS cache mode](https://rclone.org/commands/rclone_mount/#vfs-file-caching) | `off` (FUSE) / `full` (NFS) |

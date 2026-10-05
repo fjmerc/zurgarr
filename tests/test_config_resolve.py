@@ -242,10 +242,7 @@ class TestNoRuntimeWritersOfSettings:
     compose-locked (UI edits refused, file ignored).  Route such writes
     through the resolver instead."""
 
-    # utils/logger.py deliberately mirrors ZURGARR_LOG_LEVEL into rclone's
-    # level; it wins at every get_logger() call regardless, so showing it
-    # as locked reflects reality.
-    _ALLOWED = {('utils/logger.py', 'RCLONE_LOG_LEVEL')}
+    _ALLOWED = set()
 
     def test_no_direct_environ_writes_of_schema_keys(self):
         from utils.settings_api import _ALL_KEYS
@@ -266,3 +263,67 @@ class TestNoRuntimeWritersOfSettings:
                             line = text.count('\n', 0, m.start()) + 1
                             offenders.append(f'{rel}:{line} {key}')
         assert not offenders, '\n'.join(offenders)
+
+
+class TestResolveAndApplyIsSerialized:
+
+    def test_concurrent_callers_wait_for_the_lock(self, monkeypatch):
+        # Reload (SIGHUP thread) and the plex_debrid sync (watcher/HTTP
+        # thread) both resolve+apply; interleaving them can make a key the
+        # other just wrote look compose-locked.
+        import threading
+        monkeypatch.setattr(cr, '_WRITTEN', {})
+        monkeypatch.setattr(cr, '_CURRENT', {})
+        env = {}
+        done = threading.Event()
+        cr._LOCK.acquire()
+        try:
+            t = threading.Thread(target=lambda: (cr.resolve_and_apply({}, frozenset(), env), done.set()))
+            t.start()
+            assert not done.wait(0.2)
+        finally:
+            cr._LOCK.release()
+        assert done.wait(2)
+
+    def test_returns_effective_changes(self, monkeypatch):
+        monkeypatch.setattr(cr, '_WRITTEN', {})
+        monkeypatch.setattr(cr, '_CURRENT', {})
+        env = {}
+        cr.resolve_and_apply({}, frozenset(), env)
+        changes = cr.resolve_and_apply({'BLACKHOLE_DIR': '/x'}, frozenset(), env)
+        assert changes == {'BLACKHOLE_DIR': ('/watch', '/x')}
+
+
+class TestComposeHandsSettingsToResolver:
+
+    def test_compose_supplies_no_defaults_except_status_ui(self):
+        # A `${X:-value}` in compose makes X compose-locked for every stock
+        # user: rules never fire (ZURG_ENABLED) and the UI can't edit it.
+        # STATUS_UI_ENABLED stays on for stock users (DEFAULTS keeps it off
+        # for docker run, see the security ruling); STATUS_UI_PORT also
+        # drives the compose port mapping.
+        with open(os.path.join(REPO, 'docker-compose.yml')) as f:
+            pinned = set(re.findall(r'- ([A-Z0-9_]+)=\$\{\1:-[^}]+\}', f.read()))
+        assert pinned == {'STATUS_UI_ENABLED', 'STATUS_UI_PORT'}
+
+
+class TestRcloneLogLevelFollowsZurgarrLevel:
+
+    def test_child_env_derives_rclone_level(self, monkeypatch):
+        from utils.env import child_env
+        monkeypatch.setenv('ZURGARR_LOG_LEVEL', 'warning')
+        monkeypatch.delenv('RCLONE_LOG_LEVEL', raising=False)
+        assert child_env()['RCLONE_LOG_LEVEL'] == 'NOTICE'   # rclone has no WARNING
+
+    def test_explicit_rclone_level_wins(self, monkeypatch):
+        from utils.env import child_env
+        monkeypatch.setenv('ZURGARR_LOG_LEVEL', 'DEBUG')
+        monkeypatch.setenv('RCLONE_LOG_LEVEL', 'ERROR')
+        assert child_env()['RCLONE_LOG_LEVEL'] == 'ERROR'
+
+    def test_get_logger_does_not_write_rclone_level(self, monkeypatch):
+        from utils.logger import get_logger
+        monkeypatch.setenv('ZURGARR_LOG_LEVEL', 'DEBUG')
+        monkeypatch.delenv('RCLONE_LOG_LEVEL', raising=False)
+        get_logger()
+        assert 'RCLONE_LOG_LEVEL' not in os.environ
