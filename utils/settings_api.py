@@ -331,103 +331,10 @@ _ALL_KEYS = {field[0] for cat in ENV_SCHEMA for field in cat['fields']}
 _SECRET_KEYS = {field[0] for cat in ENV_SCHEMA
                 for field in cat['fields'] if field[2] == 'secret'}
 
-# Env vars whose application default is non-empty (typically boolean toggles
-# that default to ON when unset). Used by read_env_values() and
-# get_env_defaults() to surface the real default in the UI — without this,
-# a true-default boolean would render as OFF when the var isn't in .env or
-# os.environ, even though the runtime behavior is ON. Values here MUST match
-# the corresponding defaults in base/__init__.py Config.__init__.
-_ENV_DEFAULTS = {
-    'BLOCKLIST_AUTO_ADD': 'true',
-    'ROUTING_AUTO_TAG_UNTAGGED': 'true',
-    # Gap-fill defaults ON — listed so the Settings UI boolean toggle renders
-    # as ON when the var isn't set in .env, matching runtime behavior in
-    # utils/library.py::gap_fill_enabled().
-    'GAP_FILL_ENABLED': 'true',
-    # ffprobe monitor defaults ON — matches utils/ffprobe_monitor.py::setup().
-    # Without this the UI toggle rendered OFF while the monitor ran.
-    'FFPROBE_MONITOR_ENABLED': 'true',
-    # Blackhole mount polling / symlink age — compose no longer supplies these
-    # (it passes them blank so UI saves survive restarts); match base Config.
-    'BLACKHOLE_MOUNT_POLL_TIMEOUT': '300',
-    'BLACKHOLE_MOUNT_POLL_INTERVAL': '10',
-    'BLACKHOLE_SYMLINK_MAX_AGE': '72',
-    # Wanted→TorBox recovery is on by default; matches
-    # utils/library.py::wanted_tb_recovery_enabled() and base/__init__.py Config.
-    'WANTED_TB_RECOVERY_ENABLED': 'true',
-    'WANTED_TB_RECOVERY_MAX_PER_SCAN': '2',
-    # RD leg — matches utils/library.py::wanted_rd_recovery_enabled()/_max_per_scan()
-    # and base/__init__.py Config.
-    'WANTED_RD_RECOVERY_ENABLED': 'true',
-    'WANTED_RD_RECOVERY_MAX_PER_SCAN': '4',
-    # Season-pack extension — matches
-    # utils/library.py::wanted_season_recovery_enabled() and base/__init__.py Config.
-    'WANTED_SEASON_RECOVERY_ENABLED': 'true',
-    # Debrid health detection is on by default; matches
-    # utils/debrid_health.py::_enabled() and base/__init__.py Config.
-    'DEBRID_HEALTH_ENABLED': 'true',
-    # Debrid quota/expiry dashboard defaults — match
-    # utils/debrid_quota.py::_enabled()/_warn_days() and base/__init__.py Config.
-    'DEBRID_QUOTA_ENABLED': 'true',
-    'DEBRID_EXPIRY_WARN_DAYS': '7',
-    # Tautulli watch-correlation defaults — match
-    # utils/library.py::wanted_deprioritize_unplayed_enabled(),
-    # utils/tautulli.py::history_days() and base/__init__.py Config.
-    'WANTED_DEPRIORITIZE_UNPLAYED': 'true',
-    'TAUTULLI_HISTORY_DAYS': '180',
-    # Seerr writeback is opt-in — matches
-    # utils/seerr_writeback.py::writeback_enabled() and base Config.
-    'SEERR_WRITEBACK_ENABLED': 'false',
-    # Mount self-heal defaults ON — matches
-    # utils/scheduled_tasks.py::_selfheal_enabled() and base/__init__.py Config.
-    'MOUNT_SELFHEAL_ENABLED': 'true',
-    # Quality compromise true-defaults — see Config.load() in base/__init__.py.
-    # Listed so the Settings UI renders the matching toggles as ON out of
-    # the box instead of misleading the user with an OFF toggle when the
-    # master switch is also off.
-    'QUALITY_COMPROMISE_ONLY_CACHED': 'true',
-    'QUALITY_COMPROMISE_NOTIFY': 'true',
-    # Debrid-account dedup gates default ON in base/__init__.py — the UI
-    # toggle would read as OFF without these entries, misleading users who
-    # rely on the protection without ever setting the var.
-    'SEARCH_DEDUP_ENABLED': 'true',
-    'BLACKHOLE_DEBRID_DEDUP_ENABLED': 'true',
-    # TorBox cached-alternative recovery defaults ON — matches the runtime
-    # fallback in blackhole.py::_tb_alt_recovery_enabled().  Listed so the
-    # Settings UI toggle renders ON when the var is unset.
-    'BLACKHOLE_TB_ALT_RECOVERY_ENABLED': 'true',
-    # Arr failed-download feedback defaults ON — matches the runtime
-    # fallback in blackhole.py::_arr_failed_feedback_enabled().
-    'BLACKHOLE_ARR_FAILED_FEEDBACK_ENABLED': 'true',
-    # Give-up cap true-defaults — match the live-os.environ fallbacks in
-    # library.py (force-grab), blackhole.py (TB-alt, arr feedback strikes).
-    # Listed so the UI shows the resolved value instead of an empty field
-    # while the help text claims "default: 12"/"default: 8".
-    'FORCE_GRAB_MAX_ATTEMPTS': '12',
-    'BLACKHOLE_TB_ALT_MAX_ATTEMPTS': '12',
-    'BLACKHOLE_ARR_FEEDBACK_MAX_STRIKES': '8',
-    # Config backup retention default matches base/__init__.py Config.load().
-    # Interval is omitted here because the scheduler's own default (86400s)
-    # applies when the env var is empty; surfacing a non-empty UI default
-    # would pin the value into .env on first save.
-    'CONFIG_BACKUP_RETENTION': '7',
-    # Plan 41 phase D: TB rclone tps defaults match the runtime fallback
-    # in rclone/rclone.py.  Listed here so the Settings UI shows the true
-    # default rather than an empty field that would suggest "no limit".
-    'TORBOX_RCLONE_TPSLIMIT': '5',
-    'TORBOX_RCLONE_TPSLIMIT_BURST': '3',
-    'TORBOX_RCLONE_DIR_CACHE_TIME': '2h',
-    'TORBOX_SCAN_TIMEOUT': '180',
-    # TorBox mount name default — matches base/__init__.py Config.load().
-    # Listed so the Settings UI shows 'torbox' as the resolved value when
-    # TORBOX_MOUNT_NAME isn't in .env, preventing an empty-looking field
-    # that would confuse the user about what mount path will be used.
-    'TORBOX_MOUNT_NAME': 'torbox',
-    # Notification digest default matches Config.load() in base/__init__.py
-    # (os.getenv('NOTIFICATION_DIGEST_TIME', '08:00')). Listed so the UI
-    # doesn't render an empty field while help text claims "default: 08:00".
-    'NOTIFICATION_DIGEST_TIME': '08:00',
-}
+# Display defaults for the Settings UI: a view of the single DEFAULTS table
+# (utils/config_resolve.py) restricted to keys the UI edits.
+from utils.config_resolve import DEFAULTS as _RESOLVE_DEFAULTS
+_ENV_DEFAULTS = {k: v for k, v in _RESOLVE_DEFAULTS.items() if k in _ALL_KEYS}
 
 # Sensitive key patterns — values should be masked in certain contexts
 _SENSITIVE_PATTERNS = {'KEY', 'TOKEN', 'PASS', 'SECRET', 'AUTH'}

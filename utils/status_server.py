@@ -3810,7 +3810,7 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
 
 def setup():
     """Start the status web UI server if enabled."""
-    enabled = os.environ.get('STATUS_UI_ENABLED', 'false').lower() == 'true'
+    enabled = os.environ.get('STATUS_UI_ENABLED', 'true').lower() == 'true'
     if not enabled:
         return
 

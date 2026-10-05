@@ -127,3 +127,63 @@ class TestDefaultsTable:
 
     def test_all_values_are_non_empty_strings(self):
         assert all(isinstance(v, str) and v.strip() for v in cr.DEFAULTS.values())
+
+
+import os
+import re
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Non-setting env vars that carry a literal default in code.
+_NOT_SETTINGS = {'PLEX_CONNECTED', 'CONFIG_DIR'}
+
+_LITERAL_PATTERNS = (
+    # os.environ.get('K', 'lit') / os.getenv('K', 'lit') / env_or_default('K', 'lit')
+    re.compile(r"""(?:os\.(?:environ\.get|getenv)|env_or_default)\(\s*['"]([A-Z][A-Z0-9_]+)['"]\s*,\s*['"]([^'"]+)['"]\s*\)(?!\s*\.strip\(\)\s*or)"""),
+    # os.environ.get('K', '').strip() or 'lit' / os.environ.get('K') or 'lit'
+    re.compile(r"""os\.(?:environ\.get|getenv)\(\s*['"]([A-Z][A-Z0-9_]+)['"](?:\s*,\s*['"]['"])?\s*\)(?:\.strip\(\))?\s*or\s*['"]([^'"]+)['"]"""),
+)
+
+
+def _code_literals():
+    found = {}
+    roots = ('utils', 'base', 'zurg', 'rclone', 'plex_debrid_')
+    files = [os.path.join(REPO, f) for f in os.listdir(REPO) if f.endswith('.py')]
+    for root in roots:
+        for dirpath, _, names in os.walk(os.path.join(REPO, root)):
+            files += [os.path.join(dirpath, n) for n in names if n.endswith('.py')]
+    for path in files:
+        if path.endswith(os.path.join('utils', 'config_resolve.py')):
+            continue
+        with open(path) as f:
+            text = f.read()
+        for pat in _LITERAL_PATTERNS:
+            for m in pat.finditer(text):
+                line = text.count('\n', 0, m.start()) + 1
+                found.setdefault(m.group(1), []).append(
+                    (m.group(2), f'{os.path.relpath(path, REPO)}:{line}'))
+    return found
+
+
+class TestDefaultsSync:
+
+    def test_code_literals_match_defaults(self):
+        mismatches = []
+        for key, sites in _code_literals().items():
+            if key in _NOT_SETTINGS:
+                continue
+            for literal, where in sites:
+                if key not in cr.DEFAULTS:
+                    mismatches.append(f'{where} {key}={literal!r} has no DEFAULTS entry')
+                elif literal != cr.DEFAULTS[key]:
+                    mismatches.append(f'{where} {key}={literal!r} != DEFAULTS {cr.DEFAULTS[key]!r}')
+        assert not mismatches, '\n'.join(mismatches)
+
+    def test_scheduler_intervals_match_defaults(self):
+        from utils.scheduled_tasks import _DEFAULTS as SCHED
+        for key, seconds in SCHED.items():
+            assert cr.DEFAULTS[key] == str(seconds), key
+
+    def test_settings_ui_defaults_are_a_view_of_defaults(self):
+        from utils.settings_api import _ENV_DEFAULTS, _ALL_KEYS
+        assert _ENV_DEFAULTS == {k: v for k, v in cr.DEFAULTS.items() if k in _ALL_KEYS}

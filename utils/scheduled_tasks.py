@@ -1523,7 +1523,7 @@ def register_all():
         )
 
     # Library Scan — only if status UI is enabled (scanner depends on it)
-    status_ui = os.environ.get('STATUS_UI_ENABLED', 'false').lower() == 'true'
+    status_ui = os.environ.get('STATUS_UI_ENABLED', 'true').lower() == 'true'
     if status_ui:
         scheduler.register(
             'library_scan',
