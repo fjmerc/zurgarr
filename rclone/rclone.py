@@ -5,6 +5,7 @@ from utils.notifications import notify
 from utils.network import wait_for_url
 from utils.file_utils import atomic_write
 from utils.env import child_env
+from utils import boot_layout
 
 logger = get_logger()
 
@@ -26,15 +27,14 @@ TORBOX_WEBDAV_URL = 'https://webdav.torbox.app/'
 # retry_pending_mounts() once the WebDAV comes back.
 #
 # Threading invariant: setup() runs on the main thread before the
-# scheduler is registered, and SIGHUP reload calls regenerate_config()
-# (not setup()) — so after startup, only the scheduler thread touches
-# these dicts.  If a future change re-runs setup() at runtime, add a lock.
+# scheduler is registered, and nothing re-runs it at runtime (rclone and
+# Zurg settings apply at container start — utils/config_reload) — so
+# after startup, only the scheduler thread touches these dicts.  If a
+# future change re-runs setup() at runtime, add a lock.
 #
-# Known limitation: the retry callables close over setup()-time state
-# (zurg ports, mount names, WebDAV credentials).  A SIGHUP that changes
-# ZURG_PORT or credentials while a mount is pending won't reach the
-# closure — the retry keeps probing the old endpoint and the mount needs
-# a container restart, same as before this feature existed.
+# The retry callables close over setup()-time state (zurg ports, mount
+# names, WebDAV credentials); that state can't change before the next
+# container start, so it stays valid.
 _pending_mounts = {}
 _pending_last_retry = {}
 _PENDING_RETRY_COOLDOWN = 600     # min seconds between retries per mount
@@ -363,9 +363,6 @@ def _write_rclone_config(rclone_config_path, mn_rd, mn_ad,
                          config_file_path_rd, config_file_path_ad):
     """Write rclone.config (backing up any existing file first).
 
-    Shared by setup() and regenerate_config() so the remote stanzas can't
-    drift between first start and SIGHUP regeneration.
-
     Returns (rd_port, ad_port, torbox_remote_written).
     """
     if os.path.exists(rclone_config_path):
@@ -381,8 +378,18 @@ def _write_rclone_config(rclone_config_path, mn_rd, mn_ad,
         if ADAPIKEY:
             ad_port = _write_zurg_remote(f, mn_ad, config_file_path_ad)
 
-        # TorBox co-debrid (plan 39).  Written only when fully configured.
-        if _torbox_mount_configured():
+        # TorBox co-debrid (plan 39).  Written only when fully configured,
+        # and never under a Zurg mount's name (rclone would merge the two
+        # sections and the Zurg mount could pick up TorBox's URL/login).
+        zurg_names = {mn for mn, key in ((mn_rd, RDAPIKEY), (mn_ad, ADAPIKEY)) if key}
+        if _torbox_mount_configured() and TORBOX_MOUNT_NAME in zurg_names:
+            logger.error(
+                f"[rclone] TORBOX_MOUNT_NAME ('{TORBOX_MOUNT_NAME}') "
+                f"collides with an existing Zurg mount.  TorBox mount "
+                f"will be skipped.  Set TORBOX_MOUNT_NAME to a unique "
+                f"value (default is 'torbox')."
+            )
+        elif _torbox_mount_configured():
             torbox_remote_written = _write_torbox_remote(f, TORBOX_MOUNT_NAME)
         elif TORBOXAPIKEY:
             logger.warning(
@@ -397,32 +404,19 @@ def _write_rclone_config(rclone_config_path, mn_rd, mn_ad,
     return rd_port, ad_port, torbox_remote_written
 
 
-def regenerate_config():
-    """Regenerate rclone.config from current config values.
-
-    Separated from setup() so config_reload can regenerate the config
-    file without re-launching processes.
-    """
-    refresh_globals(globals())
-
-    if not RCLONEMN:
-        raise Exception("Please set a name for the rclone mount")
-    if not RDAPIKEY and not ADAPIKEY:
-        raise Exception("Please set the API Key for the rclone mount")
-
-    if RDAPIKEY and ADAPIKEY:
-        mn_rd = f"{RCLONEMN}_RD"
-        mn_ad = f"{RCLONEMN}_AD"
-    else:
-        mn_rd = mn_ad = RCLONEMN
-
-    _write_rclone_config("/config/rclone.config", mn_rd, mn_ad,
-                         '/zurg/RD/config.yml', '/zurg/AD/config.yml')
-    logger.info("Regenerated rclone.config")
+def nfs_port_for(nfs_port, idx):
+    """NFS server port for the idx-th mount, or None (auto-assign).  With a
+    fixed NFS_PORT each further mount takes the next port — they can't share."""
+    if not str(nfs_port or '').strip():
+        return None
+    return int(nfs_port) + idx
 
 
 def setup():
     refresh_globals(globals())
+    # Settings read: config reloads may run from here on (they never touch
+    # rclone; later per-mount reads use the startup values).
+    boot_layout.mark_setup_captured()
     _rc_urls.clear()
     _pending_mounts.clear()
     _pending_last_retry.clear()
@@ -459,19 +453,10 @@ def setup():
         if ADAPIKEY:
             mount_names.append(RCLONEMN_AD)
         if torbox_remote_written:
-            # Collision check — TORBOX_MOUNT_NAME must not shadow an existing
-            # Zurg mount.  If it does, log loudly and skip — silently writing
-            # over /data/zurgarr/ with TorBox content would corrupt the
-            # symlink machinery's view of RD's catalogue.
-            if TORBOX_MOUNT_NAME in mount_names:
-                logger.error(
-                    f"[rclone] TORBOX_MOUNT_NAME ('{TORBOX_MOUNT_NAME}') "
-                    f"collides with an existing Zurg mount.  TorBox mount "
-                    f"will be skipped.  Set TORBOX_MOUNT_NAME to a unique "
-                    f"value (default is 'torbox')."
-                )
-            else:
-                mount_names.append(TORBOX_MOUNT_NAME)
+            # (_write_rclone_config already refused a name that collides
+            # with a Zurg mount — writing over /data/zurgarr/ with TorBox
+            # content would corrupt the symlink machinery's view of RD.)
+            mount_names.append(TORBOX_MOUNT_NAME)
 
         def _configure_mount(idx, mn, probe_timeout=None):
             logger.info(f"Configuring rclone for {mn}")
@@ -525,12 +510,14 @@ def setup():
             if mn == TORBOX_MOUNT_NAME and torbox_remote_written:
                 dir_cache_time = (TORBOX_RCLONE_DIR_CACHE_TIME or '').strip() or '2h'
             else:
-                dir_cache_time = (os.environ.get('RCLONE_DIR_CACHE_TIME') or '').strip() or '10s'
+                dir_cache_time = boot_layout.setting_at_start('RCLONE_DIR_CACHE_TIME') or '10s'
 
             if NFSMOUNT is not None and NFSMOUNT.lower() == "true":
-                port = NFSPORT if NFSPORT else find_available_port(8001, 8999)
+                port = nfs_port_for(NFSPORT, idx)
+                if port is None:
+                    port = find_available_port(8001, 8999)
                 logger.info(f"Setting up rclone NFS server for {mn} at 0.0.0.0:{port}")
-                vfs_cache_mode = (os.environ.get('RCLONE_VFS_CACHE_MODE') or '').strip() or 'full'
+                vfs_cache_mode = boot_layout.setting_at_start('RCLONE_VFS_CACHE_MODE') or 'full'
                 rclone_command = ["rclone", "serve", "nfs", f"{mn}:", "--config", "/config/rclone.config", "--addr", f"0.0.0.0:{port}", f"--vfs-cache-mode={vfs_cache_mode}", f"--dir-cache-time={dir_cache_time}"]
             else:
                 # poll-interval makes rclone actively diff the backend on a
@@ -538,7 +525,7 @@ def setup():
                 # that changed. Without it, rclone only ever re-reads when
                 # dir-cache-time expires or RC refresh is called, and the
                 # kernel dentry cache holds ghost entries in between.
-                poll_interval = (os.environ.get('RCLONE_POLL_INTERVAL') or '').strip() or '15s'
+                poll_interval = boot_layout.setting_at_start('RCLONE_POLL_INTERVAL') or '15s'
                 rclone_command = ["rclone", "mount", f"{mn}:", f"/data/{mn}", "--config", "/config/rclone.config", "--allow-other", f"--poll-interval={poll_interval}", f"--dir-cache-time={dir_cache_time}"]
 
             # Enable RC API so Zurgarr can refresh dir cache on demand.
@@ -548,11 +535,12 @@ def setup():
             rclone_command.extend(["--rc", f"--rc-addr=localhost:{rc_port}", "--rc-no-auth"])
 
             # Optional VFS cache flags — apply to both NFS and FUSE modes.
-            # Rclone also reads these natively from RCLONE_* env vars, but
-            # explicit flags ensure they take effect on restarts via SIGHUP.
+            # (rclone settings apply at container start: read as they were
+            # then — utils/boot_layout — so a mount that comes up later
+            # matches the others.)
             for env_key, flag in [('RCLONE_VFS_CACHE_MAX_SIZE', 'vfs-cache-max-size'),
                                   ('RCLONE_VFS_CACHE_MAX_AGE', 'vfs-cache-max-age')]:
-                val = (os.environ.get(env_key) or '').strip()
+                val = boot_layout.setting_at_start(env_key)
                 if val:
                     rclone_command.append(f'--{flag}={val}')
 
@@ -582,8 +570,8 @@ def setup():
             nfs_mode = NFSMOUNT is not None and NFSMOUNT.lower() == "true"
             if not nfs_mode:
                 if mn == TORBOX_MOUNT_NAME and torbox_remote_written:
-                    tps_raw = (os.environ.get('TORBOX_RCLONE_TPSLIMIT') or '5').strip()
-                    burst_raw = (os.environ.get('TORBOX_RCLONE_TPSLIMIT_BURST') or '3').strip()
+                    tps_raw = boot_layout.setting_at_start('TORBOX_RCLONE_TPSLIMIT') or '5'
+                    burst_raw = boot_layout.setting_at_start('TORBOX_RCLONE_TPSLIMIT_BURST') or '3'
                     try:
                         tps = int(tps_raw)
                         if tps > 0:

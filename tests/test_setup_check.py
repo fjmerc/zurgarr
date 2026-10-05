@@ -5,8 +5,6 @@ from unittest.mock import patch
 
 import pytest
 
-from utils.boot_layout import Layout
-
 from utils import setup_check as sc
 
 
@@ -658,28 +656,29 @@ class TestRound7:
         sa._sync_plex_debrid_to_env({'Show Menu on Startup': False})
         assert writes and writes[0].get('SHOW_MENU') == 'false'
 
-    def test_restart_required_finding(self, clean, monkeypatch):
+    def test_restart_required_finding(self, clean, monkeypatch, snapshot_boot):
         # computed from the live settings vs what started — however the
         # setting changed (reload, plex_debrid sync, failed reload)
-        import utils.config_reload as cr
         clean.setattr(sc, '_restart_pending', _REAL_RESTART_PENDING)
-        monkeypatch.setattr(cr, '_BOOT_LAYOUT', Layout(True, frozenset({'RD'}), 'zurgarr', False, '', '', False))
-        monkeypatch.setattr('utils.env.SECRETS_DIR', '/nonexistent-secrets')
-        monkeypatch.setattr(cr, '_FROZEN_PENDING', frozenset())
-        clean.setenv('RCLONE_MOUNT_NAME', 'zurgarr')
-        clean.setenv('NFS_ENABLED', 'false')
-        for k in ('TORBOX_WEBDAV_USER', 'TORBOX_WEBDAV_PASS', 'NFS_PORT', 'ZURG_ENABLED'):
+        from utils import boot_layout
+        for k in boot_layout.STARTUP_KEYS:
             clean.delenv(k, raising=False)
         clean.setenv('RD_API_KEY', 'k')
+        clean.setenv('ZURG_ENABLED', 'true')
+        clean.setenv('RCLONE_MOUNT_NAME', 'zurgarr')
+        snapshot_boot()
+        assert not any(f['id'] == 'restart-required' for f in sc.collect_findings())
         clean.setenv('ZURG_ENABLED', 'false')
         f = next(f for f in sc.collect_findings() if f['id'] == 'restart-required')
         assert f['level'] == 'warn' and f['key'] == 'ZURG_ENABLED'
         assert 'it only takes effect' in f['message']
         clean.setenv('ZURG_ENABLED', 'true')
-        monkeypatch.setattr(cr, '_FROZEN_PENDING', frozenset({'ZURG_LOG_LEVEL', 'ZURG_USER'}))
+        clean.setenv('ZURG_LOG_LEVEL', 'DEBUG')
+        clean.setenv('ZURG_USER', 'me')
         f = next(f for f in sc.collect_findings() if f['id'] == 'restart-required')
         assert 'they only take effect' in f['message']
-        monkeypatch.setattr(cr, '_FROZEN_PENDING', frozenset())
+        clean.delenv('ZURG_LOG_LEVEL')
+        clean.delenv('ZURG_USER')
         clean.setenv('AD_API_KEY', 'a')                   # a second instance added
         f = next(f for f in sc.collect_findings() if f['id'] == 'restart-required')
         assert f['key'] == 'AD_API_KEY'
@@ -699,9 +698,25 @@ class TestRound7:
                 sc._cache['value'], sc._cache['at'] = newer, 2000.0
             return []
         clean.setattr(sc, 'collect_findings', collect)
-        clean.setattr(sc.time, 'time', lambda: 1999.0)
+        clean.setattr(sc.time, 'monotonic', lambda: 1999.0)
         assert sc.get_setup_check()['checked_at'] == 2000.0
         assert sc._cache['value'] is newer
+
+    def test_cache_age_ignores_wall_clock_steps(self, clean, tmp_path):
+        # clock set back an hour: the cached result must still expire on time
+        import time as _t
+        clean.setattr(sc, 'CONFIG_DIR', str(tmp_path))
+        sc._invalidate()
+        calls = []
+        clean.setattr(sc, 'collect_findings', lambda: calls.append(1) or [])
+        base_mono = _t.monotonic()
+        clean.setattr(sc.time, 'monotonic', lambda: base_mono)
+        sc.get_setup_check()
+        real_time = _t.time()
+        clean.setattr(sc.time, 'time', lambda: real_time - 3600)       # stepped back
+        clean.setattr(sc.time, 'monotonic', lambda: base_mono + sc._CACHE_TTL + 1)
+        sc.get_setup_check()
+        assert len(calls) == 2
 
     def test_result_is_not_cached_when_every_attempt_was_invalidated(self, clean, tmp_path):
         clean.setattr(sc, 'CONFIG_DIR', str(tmp_path))

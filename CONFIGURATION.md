@@ -15,7 +15,10 @@ Three options, any of them work:
    you share across containers.
 3. **Web UI** at `http://your-host:8080/settings` after you've set
    `STATUS_UI_AUTH`. Saves to `.env` and applies most changes without a
-   restart (SIGHUP reload).
+   restart (SIGHUP reload). Zurg and rclone settings (debrid keys, Zurg
+   login/port/version/log level, every `RCLONE_*`, NFS, mount names, the
+   TorBox mount) take effect when the container starts — the Settings page
+   and the Status page's Setup check tell you when a restart is needed.
 
 ### Which value wins
 
@@ -48,7 +51,7 @@ Everything else has a sensible default or is opt-in.
 | Variable | Description | Default |
 |---|---|---|
 | `TZ` | [Timezone](http://en.wikipedia.org/wiki/List_of_tz_database_time_zones) | |
-| `ZURG_ENABLED` | Enable Zurg (automatic: on when a Real-Debrid or AllDebrid key is set). Takes effect at container start — changing it later, or adding/removing a Real-Debrid or AllDebrid key, needs a container restart (rotating a key doesn't) | `false` |
+| `ZURG_ENABLED` | Enable Zurg (automatic: on when a Real-Debrid or AllDebrid key is set). Takes effect at container start | `false` |
 | `RD_API_KEY` | [Real-Debrid API key](https://real-debrid.com/apitoken) | |
 | `AD_API_KEY` | [AllDebrid API key](https://alldebrid.com/apikeys/). Public Zurg is Real-Debrid only — AllDebrid needs the sponsors-only nightly (`ZURG_VERSION=nightly` + `GITHUB_TOKEN`) | |
 | `TORBOX_API_KEY` | [TorBox API key](https://torbox.app/settings). Powers cache probes, search-add, and dual-debrid blackhole routing. For the WebDAV mount, see [TorBox co-debrid](#torbox-co-debrid-mount-plan-39). | |
@@ -70,7 +73,7 @@ Everything else has a sensible default or is opt-in.
 | `ZURG_PASS` | WebDAV basic auth password | |
 | `ZURG_PORT` | WebDAV port. Set a fixed value if exposing to other machines. With both Real-Debrid and AllDebrid, AllDebrid uses this port + 1 | random |
 | `NFS_ENABLED` | Enable rclone NFS server (does NOT create a local mount — use FUSE if Plex is on the same host). Takes effect at container start. | `false` |
-| `NFS_PORT` | NFS server port. Takes effect at container start. | random |
+| `NFS_PORT` | NFS server port; with several mounts (RD + AD, TorBox) each further one uses the next port. Takes effect at container start. | random |
 
 ---
 
@@ -82,8 +85,7 @@ remote against `https://webdav.torbox.app/`. Setting `TORBOX_API_KEY` alone
 enables cache probes / search-add / blackhole routing. To get the WebDAV
 mount you need the two `TORBOX_WEBDAV_*` vars as well. The TorBox mount is
 started with the container, together with Zurg's mount (so Zurg must be on);
-adding or removing it later needs a container restart, while a changed WebDAV
-login applies right away (only the TorBox mount restarts).
+changes to its settings take effect at the next container start.
 
 | Variable | Description | Default |
 |---|---|---|

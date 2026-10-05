@@ -139,6 +139,25 @@ def _layout_facts(zurg, rd, ad, rclone_mn, torbox_mn, nfs, torbox_configured):
             'nfs': nfs_on, 'torbox_mount': torbox_mount}
 
 
+def _mounts_to_probe(facts, exists):
+    """Local FUSE mount paths to liveness-probe: the started mounts with a
+    /healthcheck marker.  None in NFS mode — `rclone serve nfs` serves the
+    remote over the network and mounts nothing under /data.  (The TorBox
+    mount talks to TorBox's own WebDAV, not Zurg, but main.py only starts
+    rclone — this mount included — when Zurg is on; facts reflect that.)"""
+    if facts['nfs']:
+        return []
+    names = []
+    if facts['zurg']:
+        if facts['rd']:
+            names.append(facts['rclone_rd'])
+        if facts['ad'] and facts['rclone_ad'] not in names:
+            names.append(facts['rclone_ad'])
+    if facts['torbox_mount']:
+        names.append(facts['torbox'])
+    return [f'/data/{n}' for n in names if exists(f'/healthcheck/{n}')]
+
+
 def main():
     try:
         error_messages = []
@@ -213,22 +232,7 @@ def main():
             return max(0.5, min(_MOUNT_PROBE_TIMEOUT_SEC,
                                 mount_probe_deadline - time.monotonic()))
 
-        if facts['zurg']:
-            if zurg_rd and os.path.exists(f'/healthcheck/{RCLONEMN_RD}'):
-                mp = f'/data/{RCLONEMN_RD}'
-                alive, why = _mount_alive(mp, _probe_budget())
-                if not alive:
-                    error_messages.append(f"Rclone mount {mp} is not active ({why}).")
-            if zurg_ad and os.path.exists(f'/healthcheck/{RCLONEMN_AD}'):
-                mp = f'/data/{RCLONEMN_AD}'
-                alive, why = _mount_alive(mp, _probe_budget())
-                if not alive:
-                    error_messages.append(f"Rclone mount {mp} is not active ({why}).")
-        # The TorBox mount talks to TorBox's own WebDAV (webdav.torbox.app),
-        # not Zurg, but main.py only starts rclone — this mount included —
-        # when Zurg is on; facts['torbox_mount'] reflects what was started.
-        if torbox_mount_configured and os.path.exists(f'/healthcheck/{TB_MOUNT}'):
-            mp = f'/data/{TB_MOUNT}'
+        for mp in _mounts_to_probe(facts, os.path.exists):
             alive, why = _mount_alive(mp, _probe_budget())
             if not alive:
                 error_messages.append(f"Rclone mount {mp} is not active ({why}).")

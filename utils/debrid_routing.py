@@ -159,15 +159,18 @@ def mount_for_debrid(debrid, rclone_mount_base='/data'):
 
     Returns ``None`` for an unknown debrid name.
     """
+    # The mounts that were started (utils/boot_layout): names and the RD/AD
+    # split only change at container start, whatever the settings say now.
+    from utils import boot_layout
     if debrid == TORBOX:
-        return os.path.join(rclone_mount_base, os.environ.get('TORBOX_MOUNT_NAME') or 'torbox')
+        return os.path.join(rclone_mount_base, boot_layout.torbox_mount_name())
 
-    rclonemn = os.environ.get('RCLONE_MOUNT_NAME') or ''
+    rclonemn = boot_layout.rclone_mount_name()
     if not rclonemn:
         return None
 
-    rd_key = bool(secret_or_env('RD_API_KEY'))
-    ad_key = bool(secret_or_env('AD_API_KEY'))
+    rd_key = boot_layout.debrid_key_at_start('RD_API_KEY')
+    ad_key = boot_layout.debrid_key_at_start('AD_API_KEY')
     if rd_key and ad_key:
         # Dual-Zurg layout — see rclone/rclone.py setup()
         if debrid == REALDEBRID:

@@ -2,7 +2,10 @@
 
 Reloads .env file, detects changed variables, and restarts
 only the affected services. Eliminates the need for full
-container restart on config changes.
+container restart on most config changes.  Zurg and rclone are the
+exception: they are set up only at container start, so their settings
+(utils/boot_layout.STARTUP_KEYS) are reported as needing a restart
+instead of being applied to running processes.
 
 Usage:
     docker kill -s HUP zurgarr
@@ -21,23 +24,8 @@ ENV_FILE = '/config/.env'
 
 # Which env vars affect which services
 SERVICE_DEPENDENCIES = {
-    # (Topology — Zurg on/off, which RD/AD instances, mount names, NFS mode,
-    # the TorBox mount — is fixed at container start: _LAYOUT_KEYS.)
-    'zurg': {
-        'RD_API_KEY', 'AD_API_KEY',
-        'ZURG_VERSION', 'ZURG_LOG_LEVEL', 'ZURG_USER', 'ZURG_PASS',
-        'ZURG_PORT',
-    },
-    'rclone': {
-        'RCLONE_LOG_LEVEL', 'RCLONE_CACHE_DIR',
-        'RCLONE_DIR_CACHE_TIME', 'RCLONE_VFS_CACHE_MODE',
-        'RCLONE_VFS_CACHE_MAX_SIZE', 'RCLONE_VFS_CACHE_MAX_AGE',
-        'RCLONE_VFS_READ_CHUNK_SIZE',
-        'RCLONE_VFS_READ_CHUNK_SIZE_LIMIT', 'RCLONE_BUFFER_SIZE',
-        'RCLONE_TRANSFERS',
-    },
-    # The TorBox mount alone (its WebDAV login); Zurg's mounts don't use it.
-    'rclone_torbox': {'TORBOX_WEBDAV_USER', 'TORBOX_WEBDAV_PASS'},
+    # (Zurg and rclone are not here: their settings apply at container
+    # start only — utils/boot_layout.STARTUP_KEYS.)
     'plex_debrid': {
         'PD_ENABLED', 'PLEX_USER', 'PLEX_TOKEN', 'PLEX_ADDRESS',
         'SHOW_MENU', 'SEERR_API_KEY', 'SEERR_ADDRESS',
@@ -118,24 +106,26 @@ def _reload_env():
     return set(changes)
 
 
-# Zurg and its rclone mounts only start at container start (main.py), and
-# their topology (utils/boot_layout.Layout) is fixed then.  While the live
-# settings describe a different topology, a reload must not restart Zurg or
-# rclone at all: zurg_setup would delete a running instance's directory and
-# regenerate_config would rename the remotes the running mounts use.  Those
-# processes are left alone and a container restart is flagged instead —
-# for the topology settings, and for Zurg/rclone settings changed meanwhile.
-_LAYOUT_KEYS = frozenset({
-    'ZURG_ENABLED', 'RD_API_KEY', 'AD_API_KEY', 'RCLONE_MOUNT_NAME',
-    'NFS_ENABLED', 'NFS_PORT', 'TORBOX_MOUNT_NAME', *_boot.TORBOX_KEYS})
-# Never restart anything themselves (only via topology / container start).
-_TOPOLOGY_ONLY = frozenset({'ZURG_ENABLED', 'RCLONE_MOUNT_NAME', 'NFS_ENABLED',
-                            'NFS_PORT', 'TORBOX_MOUNT_NAME'})
-_MOUNT_DEPS = frozenset(SERVICE_DEPENDENCIES['zurg'] | SERVICE_DEPENDENCIES['rclone']
-                        | SERVICE_DEPENDENCIES['rclone_torbox'])
-# Zurg/rclone settings a reload couldn't apply (topology had drifted);
-# replaced, never mutated (read from the HTTP threads).  Until restart.
-_FROZEN_PENDING = frozenset()
+# Zurg and rclone are set up only at container start (main.py).  Re-running
+# their setup under running processes rewrote config files and remote names
+# the processes still used (deleted instance dirs, renamed remotes,
+# half-applied logins, random port changes), so a reload never touches
+# them: a change to their settings is reported as needing a restart.
+# Stateless — compares the live settings with those in effect at startup —
+# so it is right however the change got in and clears when reverted.
+STARTUP_KEYS = _boot.STARTUP_KEYS
+_TORBOX_MOUNT_KEYS = frozenset({'TORBOX_MOUNT_NAME', 'TORBOX_WEBDAV_USER', 'TORBOX_WEBDAV_PASS'})
+
+# Reloads wait until Zurg/rclone have read their configuration at startup
+# (utils/boot_layout.SETUP_CAPTURED — set by rclone.setup, or main.py), so a
+# save during startup can't change what's being set up.  Not until rclone's
+# mounts are up: that can take minutes (a down WebDAV), and the dashboard
+# login etc. must stay editable meanwhile.
+_startup_done = _boot.SETUP_CAPTURED
+
+
+def mark_startup_complete():
+    _startup_done.set()
 
 
 def _zurg_auto():
@@ -144,72 +134,34 @@ def _zurg_auto():
     return r is not None and r.source == 'auto'
 
 
-def _layout_keys_changed(get=None, auto=None):
-    """Settings whose values moved the topology away from the boot one.
-    *get*: settings lookup (default live); *auto*: ZURG_ENABLED is automatic
-    (then the debrid keys that flipped it are named, not ZURG_ENABLED)."""
-    get = get or _boot.live_getter()
-    layout, boot = _zurg_layout(get), _BOOT_LAYOUT
-    if layout == boot:
-        return set()
-
-    def present(key):
-        return bool((get(key) or '').strip())
-    if layout.zurg != boot.zurg:
-        if _zurg_auto() if auto is None else auto:
-            keys = {f'{k}_API_KEY' for k in ('RD', 'AD')
-                    if present(f'{k}_API_KEY') != (k in boot.instances)}
-            if keys:
-                return keys
-        return {'ZURG_ENABLED'}
-    keys = {f'{k}_API_KEY' for k in layout.instances ^ boot.instances}
-    for field, key in (('rclone_mount', 'RCLONE_MOUNT_NAME'), ('nfs', 'NFS_ENABLED'),
-                       ('nfs_port', 'NFS_PORT')):
-        if getattr(layout, field) != getattr(boot, field):
-            keys.add(key)
-    if layout.torbox != boot.torbox:
-        missing = {k for k in _boot.TORBOX_KEYS if not present(k)}
-        keys |= missing or set(_boot.TORBOX_KEYS)
-    elif layout.torbox_mount != boot.torbox_mount:
-        keys.add('TORBOX_MOUNT_NAME')
-    return keys
-
-
-def _record_frozen(keys):
-    """Remember Zurg/rclone settings a reload left unapplied."""
-    global _FROZEN_PENDING
-    keys = frozenset(keys) & _MOUNT_DEPS
-    if keys:
-        _FROZEN_PENDING = _FROZEN_PENDING | keys
-
-
 def restart_pending(get=None, auto=None):
-    """Settings changed since the container started that only a restart
-    applies — sorted names."""
-    return sorted(_layout_keys_changed(get, auto) | _FROZEN_PENDING)
+    """Sorted names of settings that differ from the ones Zurg/rclone were
+    started with — only those that would change something after a restart.
+    *get*: settings lookup (default live); *auto*: ZURG_ENABLED is automatic
+    (then it isn't named next to the key that flipped it)."""
+    get = get or _boot.live_getter()
+    boot, live = _BOOT_LAYOUT, _zurg_layout(get)
+    if not (boot.zurg or live.zurg):
+        return []   # Zurg off then and now: none of this runs
+    keys = {k for k in STARTUP_KEYS if _boot.startup_value(k, get) != _boot.BOOT_VALUES.get(k, '')}
+    if not (boot.nfs or live.nfs):
+        keys.discard('NFS_PORT')
+    if not (boot.torbox or live.torbox):
+        keys -= _TORBOX_MOUNT_KEYS          # no TorBox mount then or now
+    if boot.torbox != live.torbox and not keys & {'TORBOX_WEBDAV_USER', 'TORBOX_WEBDAV_PASS'}:
+        keys.add('TORBOX_API_KEY')          # the key alone switched the TorBox mount
+    if 'ZURG_ENABLED' in keys and len(keys) > 1 and (_zurg_auto() if auto is None else auto):
+        keys.discard('ZURG_ENABLED')        # name what the user changed
+    return sorted(keys)
 
 
-def _frozen_by_drift(changed, layout=None):
-    """Zurg/rclone settings in *changed* that can't be applied because the
-    topology differs from the boot one (or Zurg didn't start)."""
-    layout = _zurg_layout() if layout is None else layout
-    if layout != _BOOT_LAYOUT or not _BOOT_LAYOUT.zurg:
-        return set(changed) & _MOUNT_DEPS
-    return set()
-
-
-def _services_to_restart(changed, layout=None):
-    """Services a change restarts.  Topology settings restart nothing; while
-    the topology differs from the boot one (or Zurg didn't start) no Zurg/
-    rclone setting does either (see above).  With it unchanged, rotations
-    apply.  *layout*: the new topology (default: the live one)."""
+def _services_to_restart(changed):
+    """Services a change restarts.  Zurg/rclone settings restart nothing (see
+    above); keys plex_debrid also uses still restart it."""
     changed = set(changed)
-    frozen = set(_TOPOLOGY_ONLY) | _frozen_by_drift(changed, layout)
-    if not _BOOT_LAYOUT.torbox:
-        frozen |= SERVICE_DEPENDENCIES['rclone_torbox']   # no TorBox mount running
-    services = _determine_restarts(changed - frozen)
+    services = _determine_restarts(changed - STARTUP_KEYS)
     if changed & SERVICE_DEPENDENCIES['plex_debrid']:
-        services.add('plex_debrid')   # the keys also feed plex_debrid's own config
+        services.add('plex_debrid')
     return services
 
 
@@ -219,33 +171,7 @@ def _drop_not_running(services):
     from utils.processes import _process_registry, _registry_lock
     with _registry_lock:
         running = {e['process_name'].lower() for e in _process_registry}
-    proc = {'zurg': 'zurg', 'rclone': 'rclone', 'plex_debrid': 'plex_debrid',
-            'rclone_torbox': 'rclone'}
-    return {s for s in services if s not in proc or proc[s] in running}
-
-
-def _restart_torbox_mount():
-    """Apply a new TorBox WebDAV login: rewrite rclone.config and restart
-    only the TorBox mount (Zurg's mounts don't use it).  Caller holds
-    lifecycle_lock."""
-    from utils.processes import _process_registry, _registry_lock
-    try:
-        from rclone.rclone import regenerate_config
-        regenerate_config()
-    except Exception as e:
-        logger.error(f"[reload] Failed to regenerate rclone config: {e}")
-        return
-    with _registry_lock:
-        entries = [e for e in _process_registry
-                   if e['process_name'].lower() == 'rclone'
-                   and getattr(e['handler'], 'no_dependencies', False) is True]
-        for e in entries:
-            if e['handler'].process and e['handler'].process.poll() is None:
-                logger.info(f"[reload] Stopping rclone w/ {e['key_type']}")
-                e['handler'].stop_process('rclone', e['key_type'])
-    for e in entries:
-        logger.info(f"[reload] Starting rclone w/ {e['key_type']}")
-        e['handler'].restart_process()
+    return {s for s in services if s != 'plex_debrid' or s in running}
 
 
 def restart_note(keys):
@@ -255,10 +181,9 @@ def restart_note(keys):
 
 
 def _zurg_restart_note(changed):
-    """The note to log for this reload — it touched the topology or left
-    Zurg/rclone settings unapplied — or None (unrelated, or moved back)."""
-    changed = set(changed)
-    if not (changed & _LAYOUT_KEYS or changed & _FROZEN_PENDING):
+    """The note to log when this reload changed settings that need a
+    container restart, or None."""
+    if not set(changed) & (STARTUP_KEYS | {'TORBOX_API_KEY'}):
         return None
     pending = restart_pending()
     return restart_note(pending) if pending else None
@@ -266,21 +191,7 @@ def _zurg_restart_note(changed):
 
 def _determine_restarts(changed_vars):
     """Given changed env var names, return services that need restart."""
-    services = set()
-
-    for service, deps in SERVICE_DEPENDENCIES.items():
-        if changed_vars & deps:
-            services.add(service)
-
-    # Dependency chain: rclone depends on zurg
-    if 'zurg' in services:
-        services.add('rclone')
-
-    # plex_debrid depends on rclone mounts
-    if 'rclone' in services:
-        services.add('plex_debrid')
-
-    return services
+    return {service for service, deps in SERVICE_DEPENDENCIES.items() if changed_vars & deps}
 
 
 _reload_lock = threading.Lock()
@@ -289,6 +200,7 @@ _reload_pending = threading.Event()
 
 def _do_reload():
     """Perform the actual reload work. Runs in a separate thread."""
+    _startup_done.wait()   # never while main.py is still setting things up
     if not _reload_lock.acquire(blocking=False):
         # The in-flight reload has likely already snapshotted os.environ,
         # so env changes behind this trigger would be lost if we just
@@ -316,6 +228,49 @@ def _refresh_setup_check():
         pass
 
 
+def _restart_plex_debrid(changed):
+    """Stop, refresh config for, and restart plex_debrid.  Never interleaved
+    with an auto-update restarting it (lifecycle_lock); processes are stopped
+    outside the registry lock (stopping waits for exit)."""
+    import utils.processes as _proc_mod
+    from utils.processes import _process_registry, _registry_lock, lifecycle_lock
+    with lifecycle_lock:
+        with _registry_lock:
+            entries = [e for e in _process_registry if e['process_name'].lower() == 'plex_debrid']
+        for e in entries:
+            h = e['handler']
+            if h.process and h.process.poll() is None:
+                logger.info("[reload] Stopping plex_debrid")
+                h.stop_process(e['process_name'], e['key_type'])
+
+        # Rewrite the plex_debrid Trakt .env if credentials changed
+        if changed & {'TRAKT_CLIENT_ID', 'TRAKT_CLIENT_SECRET'}:
+            try:
+                client_id = os.environ.get('TRAKT_CLIENT_ID', '')
+                client_secret = os.environ.get('TRAKT_CLIENT_SECRET', '')
+                if not (client_id and client_secret):
+                    client_id = '0183a05ad97098d87287fe46da4ae286f434f32e8e951caad4cc147c947d79a3'
+                    client_secret = '87109ed53fe1b4d6b0239e671f36cd2f17378384fa1ae09888a32643f83b7e6c'
+                from utils.file_utils import atomic_write
+                with atomic_write('./.env') as f:
+                    f.write(f'CLIENT_ID={client_id}\n')
+                    f.write(f'CLIENT_SECRET={client_secret}\n')
+                logger.info("[reload] Rewrote plex_debrid Trakt .env")
+            except Exception as e:
+                logger.error(f"[reload] Failed to rewrite Trakt .env: {e}")
+
+        for e in entries:
+            if _proc_mod._shutting_down:
+                logger.info("[reload] Aborting restart — shutdown in progress")
+                return
+            h = e['handler']
+            if h.process and h.process.poll() is None:
+                logger.warning("[reload] plex_debrid is still running after stop — not starting a second one")
+                continue
+            logger.info("[reload] Starting plex_debrid")
+            h.restart_process()
+
+
 def _reload_once():
     try:
         import utils.processes as _proc_mod
@@ -337,6 +292,15 @@ def _reload_once():
             logger.error(f"[reload] Failed to reload base config: {e}")
             return
 
+        note = _zurg_restart_note(changed)
+        if note:
+            logger.warning(f"[reload] {note}")
+            try:
+                from utils.status_server import status_data
+                status_data.add_event('config_reload', note)
+            except Exception:
+                pass
+
         # Determine what needs restarting
         soft_only = changed <= SOFT_RELOAD
         if soft_only:
@@ -348,101 +312,11 @@ def _reload_once():
             _notify_reload(changed, set())
             return
 
-        _record_frozen(_frozen_by_drift(changed))
         services = _drop_not_running(_services_to_restart(changed))
         logger.info(f"[reload] Services to restart: {', '.join(service_labels(services)) or 'none'}")
 
-        # Handle process-based services
-        zurg_note = _zurg_restart_note(changed)
-        if zurg_note:
-            logger.warning(f"[reload] {zurg_note}")
-            try:
-                from utils.status_server import status_data
-                status_data.add_event('config_reload', zurg_note)
-            except Exception:
-                pass
-        process_services = {'zurg', 'rclone', 'plex_debrid'} & services
-        from utils.processes import lifecycle_lock
-        # (never interleaved with a Zurg auto-update stopping/starting Zurg)
-        with lifecycle_lock:
-            if process_services:
-                from utils.processes import _process_registry, _registry_lock
-
-                # Stop affected services (reverse dependency order)
-                stop_order = ['plex_debrid', 'rclone', 'zurg']
-                start_entries = []
-
-                with _registry_lock:
-                    for svc_name in stop_order:
-                        if svc_name not in process_services:
-                            continue
-                        for entry in _process_registry:
-                            name = entry['process_name']
-                            handler = entry['handler']
-                            if name.lower() == svc_name.lower():
-                                if handler.process and handler.process.poll() is None:
-                                    desc = f"{name} w/ {entry['key_type']}" if entry['key_type'] else name
-                                    logger.info(f"[reload] Stopping {desc}")
-                                    handler.stop_process(name, entry['key_type'])
-                                start_entries.append(entry)
-
-                # Re-run setup functions to regenerate config files before restart
-                if 'zurg' in process_services:
-                    try:
-                        from zurg.setup import zurg_setup
-                        logger.info("[reload] Regenerating zurg config")
-                        zurg_setup()
-                    except Exception as e:
-                        logger.error(f"[reload] Failed to regenerate zurg config: {e}")
-
-                if 'rclone' in process_services:
-                    try:
-                        from rclone.rclone import regenerate_config
-                        logger.info("[reload] Regenerating rclone config")
-                        regenerate_config()
-                    except Exception as e:
-                        logger.error(f"[reload] Failed to regenerate rclone config: {e}")
-
-                # Rewrite the plex_debrid Trakt .env if credentials changed
-                if 'plex_debrid' in process_services and changed & {'TRAKT_CLIENT_ID', 'TRAKT_CLIENT_SECRET'}:
-                    try:
-                        client_id = os.environ.get('TRAKT_CLIENT_ID', '')
-                        client_secret = os.environ.get('TRAKT_CLIENT_SECRET', '')
-                        if not (client_id and client_secret):
-                            client_id = '0183a05ad97098d87287fe46da4ae286f434f32e8e951caad4cc147c947d79a3'
-                            client_secret = '87109ed53fe1b4d6b0239e671f36cd2f17378384fa1ae09888a32643f83b7e6c'
-                        from utils.file_utils import atomic_write
-                        env_path = './.env'
-                        with atomic_write(env_path) as f:
-                            f.write(f'CLIENT_ID={client_id}\n')
-                            f.write(f'CLIENT_SECRET={client_secret}\n')
-                        logger.info("[reload] Rewrote plex_debrid Trakt .env")
-                    except Exception as e:
-                        logger.error(f"[reload] Failed to rewrite Trakt .env: {e}")
-
-                # Re-check shutdown before starting new processes
-                if _proc_mod._shutting_down:
-                    logger.info("[reload] Aborting restart — shutdown in progress")
-                    return
-
-                # Start affected services (forward dependency order)
-                for svc_name in reversed(stop_order):
-                    if _proc_mod._shutting_down:
-                        logger.info("[reload] Aborting restart — shutdown in progress")
-                        return
-                    if svc_name not in process_services:
-                        continue
-                    for entry in start_entries:
-                        name = entry['process_name']
-                        handler = entry['handler']
-                        if name.lower() == svc_name.lower():
-                            desc = f"{name} w/ {entry['key_type']}" if entry['key_type'] else name
-                            logger.info(f"[reload] Starting {desc}")
-                            handler.restart_process()
-
-            # A full rclone restart above already applied it.
-            if 'rclone_torbox' in services and 'rclone' not in process_services:
-                _restart_torbox_mount()
+        if 'plex_debrid' in services:
+            _restart_plex_debrid(changed)
 
         # Handle non-process services
         if 'notifications' in services:
@@ -482,7 +356,7 @@ def _reload_once():
             from utils.status_server import status_data
             status_data.add_event(
                 'config_reload',
-                f'Reloaded {len(changed)} var(s), restarted: {", ".join(sorted(services)) or "none"}'
+                f'Reloaded {len(changed)} var(s), restarted: {", ".join(service_labels(services)) or "none"}'
             )
         except Exception:
             pass
@@ -491,12 +365,9 @@ def _reload_once():
         logger.error(f"[reload] Reload failed: {e}")
 
 
-_SERVICE_LABELS = {'rclone_torbox': 'TorBox mount'}
-
-
 def service_labels(services):
-    """Sorted, readable names for *services* (for messages)."""
-    return sorted(_SERVICE_LABELS.get(s, s) for s in services)
+    """Sorted names of *services* (for messages)."""
+    return sorted(services)
 
 
 def _notify_reload(changed, services):

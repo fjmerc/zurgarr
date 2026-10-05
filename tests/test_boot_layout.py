@@ -187,3 +187,110 @@ class TestZurgTileUsesRunningConfig:
     def test_missing_file_is_none(self, tmp_path):
         from utils.status_server import _zurg_running_config
         assert _zurg_running_config(str(tmp_path / 'nope.yml')) == (None, None, None)
+
+
+class TestMountNamesFollowStartup:
+
+    def test_live_until_booted_then_fixed(self, monkeypatch):
+        monkeypatch.setattr(boot_layout, 'BOOTED', False)
+        monkeypatch.setenv('RCLONE_MOUNT_NAME', 'live')
+        monkeypatch.setenv('TORBOX_MOUNT_NAME', 'tblive')
+        assert boot_layout.rclone_mount_name() == 'live'
+        assert boot_layout.torbox_mount_name() == 'tblive'
+        monkeypatch.setattr(boot_layout, 'BOOT_RCLONE_MOUNT_NAME', 'zurgarr')
+        monkeypatch.setattr(boot_layout, 'BOOT_TORBOX_MOUNT_NAME', 'torbox')
+        monkeypatch.setattr(boot_layout, 'BOOTED', True)
+        assert boot_layout.rclone_mount_name() == 'zurgarr'      # renamed later: still the running one
+        assert boot_layout.torbox_mount_name() == 'torbox'
+
+    def test_debrid_key_presence_and_torbox_mount_follow_startup(self, monkeypatch):
+        monkeypatch.setattr(boot_layout, 'BOOTED', True)
+        monkeypatch.setattr(boot_layout, 'BOOT_VALUES', {'RD_API_KEY': 'k', 'AD_API_KEY': 'a'})
+        monkeypatch.setattr(boot_layout, 'BOOT_LAYOUT', Layout(True, frozenset({'RD', 'AD'}), 'z', False, '', 'torbox', True))
+        monkeypatch.delenv('AD_API_KEY', raising=False)            # removed later
+        assert boot_layout.debrid_key_at_start('AD_API_KEY') is True
+        assert boot_layout.torbox_mount_started() is True
+
+    def test_mount_for_debrid_uses_the_mounts_that_started(self, monkeypatch):
+        from utils.debrid_routing import mount_for_debrid, REALDEBRID, TORBOX
+        monkeypatch.setattr(boot_layout, 'BOOTED', True)
+        monkeypatch.setattr(boot_layout, 'BOOT_RCLONE_MOUNT_NAME', 'zurgarr')
+        monkeypatch.setattr(boot_layout, 'BOOT_TORBOX_MOUNT_NAME', 'torbox')
+        monkeypatch.setattr(boot_layout, 'BOOT_VALUES', {'RD_API_KEY': 'k', 'AD_API_KEY': 'a'})
+        monkeypatch.setenv('RCLONE_MOUNT_NAME', 'renamed')
+        monkeypatch.setenv('TORBOX_MOUNT_NAME', 'renamed_tb')
+        monkeypatch.delenv('AD_API_KEY', raising=False)            # AD removed after start
+        assert mount_for_debrid(REALDEBRID, rclone_mount_base='/data') == '/data/zurgarr_RD'
+        assert mount_for_debrid(TORBOX, rclone_mount_base='/data') == '/data/torbox'
+
+    def test_main_marks_booted(self):
+        import pathlib
+        src = pathlib.Path(__file__).resolve().parents[1].joinpath('main.py').read_text()
+        assert 'boot_layout.mark_booted()' in src
+
+
+class TestHealthcheckMountProbes:
+
+    def _facts(self, **kw):
+        f = {'zurg': True, 'rd': True, 'ad': False, 'rclone_rd': 'z', 'rclone_ad': 'z',
+             'torbox': 'torbox', 'nfs': False, 'torbox_mount': True}
+        f.update(kw)
+        return f
+
+    def test_fuse_mounts_with_markers_are_probed(self):
+        import healthcheck
+        paths = healthcheck._mounts_to_probe(self._facts(), lambda p: True)
+        assert paths == ['/data/z', '/data/torbox']
+
+    def test_nfs_mode_has_no_local_mounts_to_probe(self):
+        # `rclone serve nfs` doesn't mount /data/<name>; probing it would
+        # mark the container unhealthy forever
+        import healthcheck
+        assert healthcheck._mounts_to_probe(self._facts(nfs=True), lambda p: True) == []
+
+    def test_mounts_without_a_marker_are_skipped(self):
+        import healthcheck
+        assert healthcheck._mounts_to_probe(self._facts(), lambda p: p.endswith('torbox')) == ['/data/torbox']
+
+
+class TestRcloneUsesStartupValues:
+
+    def test_children_get_rclone_settings_from_startup(self, monkeypatch):
+        # a crash-restart / self-heal of rclone after a settings change must
+        # not half-apply RCLONE_* (rclone reads them from its environment)
+        from utils.env import child_env
+        monkeypatch.setattr(boot_layout, 'BOOTED', True)
+        monkeypatch.setattr(boot_layout, 'BOOT_VALUES', dict(boot_layout.BOOT_VALUES,
+                                                             RCLONE_BUFFER_SIZE='32M', RCLONE_CACHE_DIR=''))
+        monkeypatch.setattr(boot_layout, 'BOOT_ZURGARR_LOG_LEVEL', 'INFO')
+        monkeypatch.setenv('RCLONE_BUFFER_SIZE', '64M')          # changed after start
+        monkeypatch.setenv('RCLONE_CACHE_DIR', '/new')           # set after start
+        monkeypatch.setenv('ZURGARR_LOG_LEVEL', 'DEBUG')
+        monkeypatch.delenv('RCLONE_LOG_LEVEL', raising=False)
+        env = child_env()
+        assert env['RCLONE_BUFFER_SIZE'] == '32M'
+        assert 'RCLONE_CACHE_DIR' not in env
+        assert env['RCLONE_LOG_LEVEL'] == 'INFO'                 # from the startup log level
+
+    def test_before_boot_children_get_the_live_values(self, monkeypatch):
+        from utils.env import child_env
+        monkeypatch.setattr(boot_layout, 'BOOTED', False)
+        monkeypatch.setenv('RCLONE_BUFFER_SIZE', '64M')
+        assert child_env()['RCLONE_BUFFER_SIZE'] == '64M'
+
+    def test_setting_at_start(self, monkeypatch):
+        monkeypatch.setattr(boot_layout, 'BOOTED', True)
+        monkeypatch.setattr(boot_layout, 'BOOT_VALUES', {'RCLONE_DIR_CACHE_TIME': '1m'})
+        monkeypatch.setenv('RCLONE_DIR_CACHE_TIME', '5m')
+        assert boot_layout.setting_at_start('RCLONE_DIR_CACHE_TIME') == '1m'
+        monkeypatch.setattr(boot_layout, 'BOOTED', False)
+        assert boot_layout.setting_at_start('RCLONE_DIR_CACHE_TIME') == '5m'
+
+    def test_tuning_keys_rclone_reads_are_startup_keys(self):
+        for k in ('RCLONE_POLL_INTERVAL', 'TORBOX_RCLONE_TPSLIMIT', 'TORBOX_RCLONE_TPSLIMIT_BURST'):
+            assert k in boot_layout.STARTUP_KEYS
+
+    def test_rclone_marks_its_config_captured(self):
+        import inspect
+        import rclone.rclone as mod
+        assert 'mark_setup_captured()' in inspect.getsource(mod.setup)

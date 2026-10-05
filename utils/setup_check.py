@@ -318,21 +318,24 @@ def _clear_resolved_dismissals(data):
 
 def get_setup_check(fresh=False):
     """Payload for /api/status: {'findings', 'dismissed', 'auth_configured'}.
-    Cached for 15s; never raises (a crash becomes a warning, never "OK")."""
-    now = time.time()
+    Cached for 15s; never raises (a crash becomes a warning, never "OK").
+    Cache ages use the monotonic clock (a wall-clock step can't freeze it);
+    checked_at is wall time, for display."""
+    mono = time.monotonic()
     if fresh:
         with _lock:
-            recent = _cache['value'] is not None and now - _cache['at'] < _FRESH_MIN_GAP
+            recent = _cache['value'] is not None and mono - _cache['at'] < _FRESH_MIN_GAP
         if not recent:   # throttled: /api/setup-check?fresh=1 can be public
             _invalidate()
     with _lock:
-        if _cache['value'] is not None and now - _cache['at'] < _CACHE_TTL:
+        if _cache['value'] is not None and mono - _cache['at'] < _CACHE_TTL:
             return _cache['value']
         gen = _cache['gen']
     current = False
+    now = time.time()
     try:
         for _attempt in range(3):
-            now = time.time()
+            mono, now = time.monotonic(), time.time()
             findings = collect_findings()
             dismissed = _clear_resolved_dismissals(_load_dismissed())
             shown = [f for f in findings if dismissed.get(f['id']) != f['sig']]
@@ -357,11 +360,11 @@ def get_setup_check(fresh=False):
     }
     with _lock:
         if current and _cache['gen'] == gen:   # only a result nothing invalidated
-            if _cache['value'] is not None and _cache['at'] > now:
+            if _cache['value'] is not None and _cache['at'] > mono:
                 # a concurrent request computed a newer one: keep and serve it
                 # (an older cached result would read as stale to the page)
                 return _cache['value']
-            _cache['at'], _cache['value'] = now, value
+            _cache['at'], _cache['value'] = mono, value
     return value
 
 

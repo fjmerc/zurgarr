@@ -34,9 +34,9 @@ ENV_SCHEMA = [
         'name': 'Zurg',
         'description': 'Core debrid service and WebDAV server',
         'fields': [
-            ('ZURG_ENABLED', 'Enable Zurg', 'boolean', True, 'Enable the Zurg WebDAV server. Takes effect when the container starts — restart it after changing this, or after adding/removing a Real-Debrid or AllDebrid key'),
-            ('RD_API_KEY', 'Real-Debrid API Key', 'secret', False, 'API key from real-debrid.com/apitoken. Adding or removing it (starting/stopping a Zurg instance) takes effect when the container starts; replacing it applies right away.'),
-            ('AD_API_KEY', 'AllDebrid API Key', 'secret', False, 'API key from alldebrid.com. Adding or removing it (starting/stopping a Zurg instance) takes effect when the container starts; replacing it applies right away.'),
+            ('ZURG_ENABLED', 'Enable Zurg', 'boolean', True, 'Enable the Zurg WebDAV server.'+_RESTART_HELP),
+            ('RD_API_KEY', 'Real-Debrid API Key', 'secret', False, 'API key from real-debrid.com/apitoken. Search, blackhole and plex_debrid use a new key right away; Zurg picks it up when the container starts — restart it after changing this.'),
+            ('AD_API_KEY', 'AllDebrid API Key', 'secret', False, 'API key from alldebrid.com. Search, blackhole and plex_debrid use a new key right away; Zurg picks it up when the container starts — restart it after changing this.'),
             ('TORBOX_API_KEY', 'TorBox API Key', 'secret', False, 'API key from torbox.app. Powers cache probes, search-add, and the dual-debrid blackhole routing. For the WebDAV mount, also set TORBOX_WEBDAV_USER + TORBOX_WEBDAV_PASS (see the TorBox section).'),
             ('ZURG_VERSION', 'Zurg Version', 'string', False, 'Pin to specific version (e.g., v0.9.2-hotfix.4)'),
             ('ZURG_UPDATE', 'Auto-Update Zurg', 'boolean', False, 'Check for Zurg updates on startup'),
@@ -53,7 +53,7 @@ ENV_SCHEMA = [
             ('RCLONE_MOUNT_NAME', 'Mount Name', 'string', True, 'Name for the rclone mount point under /data.'+_RESTART_HELP),
             ('RCLONE_LOG_LEVEL', 'Log Level', 'select:DEBUG,INFO,NOTICE,ERROR', False, 'rclone log verbosity'),
             ('NFS_ENABLED', 'Enable NFS', 'boolean', False, 'Use NFS server instead of FUSE mount.'+_RESTART_HELP),
-            ('NFS_PORT', 'NFS Port', 'number:1-65535', False, 'NFS server port.'+_RESTART_HELP),
+            ('NFS_PORT', 'NFS Port', 'number:1-65535', False, 'NFS server port. With several mounts, each further one uses the next port.'+_RESTART_HELP),
             ('RCLONE_CACHE_DIR', 'Cache Directory', 'string', False, 'Directory for VFS cache files'),
             ('RCLONE_DIR_CACHE_TIME', 'Dir Cache Time', 'string', False, 'How long to cache directory listings (e.g., 10s, 5m)'),
             ('RCLONE_VFS_READ_CHUNK_SIZE', 'VFS Read Chunk Size', 'string', False, 'Initial chunk size for streaming reads (e.g., 8M)'),
@@ -362,18 +362,56 @@ def _dry_resolve(explicit):
     try:
         from base import SECRETS_DIR
         from utils import config_resolve
-        return config_resolve.resolve(
-            os.environ, explicit, config_resolve.present_secrets(SECRETS_DIR),
-            config_resolve.written())
+        return config_resolve.dry_resolve(explicit, config_resolve.present_secrets(SECRETS_DIR))
     except Exception as e:
         logger.warning(f'[settings] Could not resolve the new settings: {e}')
         return None
+
+
+def _fixed_port_problems(values):
+    """Errors for fixed ports that can't all bind: Zurg's (AllDebrid takes
+    ZURG_PORT + 1 next to Real-Debrid), NFS (one port per mount from
+    NFS_PORT) and the dashboard's — out of range or shared."""
+    def on(key):
+        return str(values.get(key, '')).strip().lower() == 'true'
+
+    def num(key):
+        try:
+            return int(str(values.get(key, '')).strip())
+        except ValueError:
+            return None
+    rd, ad = bool(values.get('RD_API_KEY')), bool(values.get('AD_API_KEY'))
+    used = []   # (port, label)
+    zp = num('ZURG_PORT')
+    if on('ZURG_ENABLED') and zp is not None:
+        if rd:
+            used.append((zp, 'ZURG_PORT (Real-Debrid Zurg)'))
+        if ad:
+            used.append((zp + 1 if rd else zp, 'ZURG_PORT + 1 (AllDebrid Zurg)' if rd else 'ZURG_PORT (AllDebrid Zurg)'))
+    np_ = num('NFS_PORT')
+    if on('ZURG_ENABLED') and on('NFS_ENABLED') and np_ is not None:
+        mounts = int(rd) + int(ad) + int(all(values.get(k) for k in
+                                             ('TORBOX_API_KEY', 'TORBOX_WEBDAV_USER', 'TORBOX_WEBDAV_PASS')))
+        used += [(np_ + i, f'NFS_PORT{f" + {i}" if i else ""} (NFS mount {i + 1})') for i in range(mounts)]
+    sp = num('STATUS_UI_PORT')
+    if sp is not None:
+        used.append((sp, 'STATUS_UI_PORT'))
+    errors, seen = [], {}
+    for port, label in used:
+        if not 1 <= port <= 65535:
+            errors.append(f"{label.split(' ')[0]}: {label} would be port {port}, outside 1-65535.")
+        elif port in seen:
+            errors.append(f"{label.split(' ')[0]}: {label} and {seen[port]} would both use port {port}.")
+        else:
+            seen[port] = label
+    return errors
 
 
 def get_env_schema():
     """Return the env var schema as a JSON-serializable structure."""
     from utils.settings_tiers import ESSENTIAL_GROUPS, GATES, UNGATED_KEYS, tier_for
     from utils.config_resolve import RULES as _RULE_KEYS, SECRET_FILES
+    from utils.boot_layout import STARTUP_KEYS
     categories = []
     for cat in ENV_SCHEMA:
         fields = []
@@ -383,7 +421,9 @@ def get_env_schema():
                 'label': label,
                 'type': ftype,
                 'required': required,
-                'help': help_text,
+                # Zurg/rclone settings apply when the container starts
+                'help': (help_text if key not in STARTUP_KEYS or 'container starts' in help_text
+                         else help_text.rstrip().rstrip('.') + '.' + _RESTART_HELP),
                 'sensitive': _is_sensitive(key),
                 'tier': tier_for(key),
                 'ungated': key in UNGATED_KEYS,
@@ -431,8 +471,7 @@ def read_env_values():
     try:
         secrets = frozenset(config_resolve.present_secrets(SECRETS_DIR)) | {
             k for k, r in _current.items() if r.source == 'secret'}
-        _resolved = config_resolve.resolve(os.environ, file_values, secrets,
-                                           config_resolve.written())
+        _resolved = config_resolve.dry_resolve(file_values, secrets)
     except Exception as e:
         logger.warning(f'[settings] Could not resolve settings from the file: {e}')
         _resolved = _current
@@ -717,8 +756,8 @@ def write_env_values(values):
         changed = set()
         try:
             from utils.config_reload import (
-                SOFT_RELOAD, _LAYOUT_KEYS, _drop_not_running, _frozen_by_drift, service_labels,
-                _layout_keys_changed, _services_to_restart, _zurg_layout, restart_note)
+                SOFT_RELOAD, STARTUP_KEYS, _drop_not_running, service_labels,
+                _services_to_restart, restart_note, restart_pending)
             from utils.env import secret_or_env
             # Preview with a dry run of the same resolver the SIGHUP reload
             # uses, so the banner names only services that will really restart.
@@ -738,14 +777,12 @@ def write_env_values(values):
                 if r is None:
                     return os.environ.get(key)
                 return secret_or_env(key) if r.source == 'secret' else _eff(dry, key)
-            layout = _zurg_layout(_new)
             if changed and not changed <= SOFT_RELOAD:   # mirrors the reload
-                restarted = service_labels(_drop_not_running(_services_to_restart(changed, layout)))
+                restarted = service_labels(_drop_not_running(_services_to_restart(changed)))
             zr = dry.get('ZURG_ENABLED')
-            keys = _layout_keys_changed(_new, zr is not None and zr.source == 'auto')
-            frozen = _frozen_by_drift(changed, layout)
-            if (keys and changed & _LAYOUT_KEYS) or frozen:
-                validation['warnings'].append(restart_note(keys | frozen))
+            pending = restart_pending(_new, zr is not None and zr.source == 'auto')
+            if pending and changed & (STARTUP_KEYS | {'TORBOX_API_KEY'}):
+                validation['warnings'].append(restart_note(pending))
 
         except Exception as e:
             # Advisory only — a failed preview must never block the apply.
@@ -902,6 +939,8 @@ def validate_env_values(values):
                     warnings.append(f"{var}={n} is outside recommended range [{lo}-{hi}]")
             except ValueError:
                 errors.append(f"{var}='{val}' is not a valid integer")
+
+    errors.extend(_fixed_port_problems(values))
 
     # Quality compromise ratio — float in [0, 1].  Declared as 'string'
     # in the schema because the number:MIN-MAX renderer coerces to int,
@@ -1444,7 +1483,9 @@ def _sync_plex_debrid_to_env(values):
     """Sync plex_debrid settings back to .env so pd_setup() stays consistent.
 
     Only updates keys that actually changed.  Does NOT trigger SIGHUP
-    because the caller already handles the plex_debrid restart.
+    (except during startup) because the caller already handles the
+    plex_debrid restart; Zurg/rclone keys changed here (e.g. a debrid key)
+    show up on the Setup check as needing a container restart.
     """
     env_updates = {}
 
@@ -1525,11 +1566,26 @@ def _sync_plex_debrid_to_env(values):
             logger.error(f'[settings] Failed to sync plex_debrid settings to .env: {e}')
             return
 
-        # Re-resolve so in-process reads are consistent.  Writing os.environ
-        # directly would make these look compose-locked to the resolver.
-        from base import SECRETS_DIR
-        config_resolve.resolve_and_apply(
-            dotenv_values(ENV_FILE), config_resolve.present_secrets(SECRETS_DIR))
+        from utils import config_reload
+        if not config_reload._startup_done.is_set():
+            # Still starting up: don't change settings under Zurg/rclone
+            # being set up — the reload applies the file once startup is done.
+            os.kill(os.getpid(), signal.SIGHUP)
+        else:
+            # Re-resolve so in-process reads are consistent.  Writing os.environ
+            # directly would make these look compose-locked to the resolver.
+            from base import SECRETS_DIR, config
+            config_resolve.resolve_and_apply(
+                dotenv_values(ENV_FILE), config_resolve.present_secrets(SECRETS_DIR))
+            try:
+                config.load(read_env_file=False)   # module globals follow too
+            except Exception as e:
+                logger.warning(f'[settings] Could not refresh config after sync: {e}')
+            try:
+                from utils import setup_check
+                setup_check._invalidate()   # e.g. a Zurg key changed: restart needed
+            except Exception:
+                pass
 
     logger.info(
         f'[settings] Synced {len(changed)} plex_debrid setting(s) back to .env: '

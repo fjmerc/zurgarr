@@ -104,7 +104,8 @@ observe. Capabilities grouped by intent:
 **Observability & control**
 
 - Browser-based **status dashboard + Settings editor** with SIGHUP
-  reload — edit most env vars without restarting the container
+  reload — edit most env vars without restarting the container (Zurg and
+  rclone settings apply on the next container start; the UI says when)
 - **Activity history log** — every grab, compromise, symlink event, and
   debrid add, filterable by type and time
 - **Debrid quota & expiry dashboard** — per-provider account expiry,

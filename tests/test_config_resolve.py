@@ -337,3 +337,18 @@ def test_env_example_does_not_pin_resolver_owned_keys():
     with open(os.path.join(REPO, '.env.example')) as f:
         live = {m.group(1) for m in re.finditer(r'^([A-Z][A-Z0-9_]*)=', f.read(), re.M)}
     assert live <= {'RD_API_KEY', 'STATUS_UI_ENABLED', 'STATUS_UI_AUTH', 'TZ'}, live
+
+
+def test_dry_resolve_reads_environ_and_written_under_the_lock(monkeypatch):
+    # a concurrent resolve_and_apply between reading written() and os.environ
+    # made a value the resolver had just written look compose-locked
+    from utils import config_resolve
+    seen = []
+    real = config_resolve.resolve
+
+    def spy(environ, file_env, secrets=frozenset(), written=None):
+        seen.append(config_resolve._LOCK.locked())
+        return real(environ, file_env, secrets, written)
+    monkeypatch.setattr(config_resolve, 'resolve', spy)
+    config_resolve.dry_resolve({})
+    assert seen == [True]

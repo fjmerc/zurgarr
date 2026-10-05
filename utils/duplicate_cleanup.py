@@ -46,8 +46,8 @@ def _find_duplicates(duplicates, section_type, libtype):
     Each entry represents a Plex item with at least one copy on the rclone mount
     and at least one copy on local storage.
     """
-    from base import config
-    rclonemn = config.RCLONEMN
+    from utils import boot_layout
+    rclonemn = boot_layout.rclone_mount_name()   # the running mount's name
     results = []
 
     for item in duplicates:

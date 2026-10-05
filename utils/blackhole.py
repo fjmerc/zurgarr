@@ -1476,7 +1476,8 @@ class BlackholeWatcher:
         # ``/data/zurgarr/torbox`` — a phantom subdir under the RD
         # mount instead of its own top-level mount.
         base = self.rclone_mount.rstrip('/')
-        rclonemn = os.environ.get('RCLONE_MOUNT_NAME') or ''
+        from utils import boot_layout
+        rclonemn = boot_layout.rclone_mount_name()   # the running mount's name
         if rclonemn and os.path.basename(base) == rclonemn:
             parent = os.path.dirname(base)
             if parent:
@@ -5430,8 +5431,9 @@ def setup():
     completed_dir = completed_dir_from_env()
     rclone_mount = env_or_default('BLACKHOLE_RCLONE_MOUNT', '/data')
     # Auto-detect mount name subdirectory if not explicitly configured
-    if rclone_mount == '/data' and os.environ.get('RCLONE_MOUNT_NAME'):
-        mount_name = os.environ.get('RCLONE_MOUNT_NAME')
+    from utils import boot_layout
+    if rclone_mount == '/data' and boot_layout.rclone_mount_name():
+        mount_name = boot_layout.rclone_mount_name()   # the running mount's name
         candidate = os.path.join('/data', mount_name)
         if os.path.isdir(os.path.join(candidate, '__all__')) or os.path.isdir(os.path.join(candidate, 'shows')):
             rclone_mount = candidate

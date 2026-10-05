@@ -11,6 +11,7 @@ a separate process.
 
 import json
 import os
+import threading
 from collections import namedtuple
 
 PATH = '/healthcheck/boot_layout.json'
@@ -26,11 +27,19 @@ TORBOX_KEYS = ('TORBOX_API_KEY', 'TORBOX_WEBDAV_USER', 'TORBOX_WEBDAV_PASS')
 
 def live_getter():
     """Settings lookup: Docker secret first for credentials, else os.environ."""
+    from utils import env
     from utils.config_resolve import SECRET_FILES
-    from utils.env import secret_or_env
 
     def get(key):
-        return secret_or_env(key) if key in SECRET_FILES else os.environ.get(key)
+        if key in SECRET_FILES:   # same file names as the resolver (GITHUB_TOKEN is upper-case)
+            try:
+                with open(os.path.join(env.SECRETS_DIR, SECRET_FILES[key])) as f:
+                    value = f.read().strip()
+                if value:
+                    return value
+            except OSError:
+                pass
+        return os.environ.get(key)
     return get
 
 
@@ -52,9 +61,93 @@ def zurg_layout(get=None):
                   (val('TORBOX_MOUNT_NAME') or 'torbox') if torbox else '', torbox)
 
 
+# Settings Zurg and rclone read only when they're set up — at container
+# start.  A config reload never restarts Zurg or rclone (re-running their
+# setup at runtime rewrote config files under running processes and broke
+# mounts in many ways), so a change to any of these needs a restart.
+STARTUP_KEYS = frozenset({
+    'ZURG_ENABLED', 'RD_API_KEY', 'AD_API_KEY', 'ZURG_VERSION', 'ZURG_LOG_LEVEL',
+    'ZURG_USER', 'ZURG_PASS', 'ZURG_PORT', 'GITHUB_TOKEN',
+    'RCLONE_MOUNT_NAME', 'RCLONE_LOG_LEVEL', 'RCLONE_CACHE_DIR', 'RCLONE_DIR_CACHE_TIME',
+    'RCLONE_VFS_CACHE_MODE', 'RCLONE_VFS_CACHE_MAX_SIZE', 'RCLONE_VFS_CACHE_MAX_AGE',
+    'RCLONE_VFS_READ_CHUNK_SIZE', 'RCLONE_VFS_READ_CHUNK_SIZE_LIMIT', 'RCLONE_BUFFER_SIZE',
+    'RCLONE_TRANSFERS', 'RCLONE_POLL_INTERVAL', 'NFS_ENABLED', 'NFS_PORT',
+    'TORBOX_MOUNT_NAME', 'TORBOX_WEBDAV_USER', 'TORBOX_WEBDAV_PASS',
+    'TORBOX_RCLONE_TPSLIMIT', 'TORBOX_RCLONE_TPSLIMIT_BURST',
+})
+
+
+def startup_value(key, get=None):
+    """A STARTUP_KEYS setting, normalised for comparison."""
+    v = ((get or live_getter())(key) or '').strip()
+    return v.lower() if key in ('ZURG_ENABLED', 'NFS_ENABLED') else v
+
+
 BOOT_LAYOUT = zurg_layout()
+BOOT_VALUES = {k: startup_value(k) for k in STARTUP_KEYS}
+# rclone's log level follows ZURGARR_LOG_LEVEL unless RCLONE_LOG_LEVEL is set
+BOOT_ZURGARR_LOG_LEVEL = (os.environ.get('ZURGARR_LOG_LEVEL') or '').strip()
+
+# Set once Zurg/rclone have read their configuration at startup (by
+# rclone.setup, or main.py when no rclone starts): config reloads wait for
+# it, so a save during startup can't change what's being set up.
+SETUP_CAPTURED = threading.Event()
+
+
+def mark_setup_captured():
+    SETUP_CAPTURED.set()
 BOOT_RCLONE_MOUNT_NAME = (os.environ.get('RCLONE_MOUNT_NAME') or '').strip()
 BOOT_TORBOX_MOUNT_NAME = (os.environ.get('TORBOX_MOUNT_NAME') or '').strip() or 'torbox'
+
+
+# True once main.py has started Zurg/rclone: from then on the mount names and
+# debrid instances are the ones above, whatever the settings say now.
+# (Before that — tests, tools — the live settings are used.)
+BOOTED = False
+
+
+def mark_booted():
+    global BOOTED
+    BOOTED = True
+
+
+def rclone_mount_name():
+    """Zurg's mount name (the running one once booted)."""
+    if BOOTED:
+        return BOOT_RCLONE_MOUNT_NAME
+    return (os.environ.get('RCLONE_MOUNT_NAME') or '').strip()
+
+
+def torbox_mount_name():
+    """The TorBox mount's name (the running one once booted)."""
+    if BOOTED:
+        return BOOT_TORBOX_MOUNT_NAME
+    return (os.environ.get('TORBOX_MOUNT_NAME') or '').strip() or 'torbox'
+
+
+def debrid_key_at_start(key):
+    """Whether RD_API_KEY / AD_API_KEY was set when Zurg's mounts were set up
+    (decides their names: one instance → plain name, both → _RD/_AD)."""
+    if BOOTED:
+        return bool(BOOT_VALUES.get(key))
+    return bool((live_getter()(key) or '').strip())
+
+
+def setting_at_start(key):
+    """A STARTUP_KEYS setting as Zurg/rclone were started with it (live
+    before boot) — for code that builds their commands later, e.g. a mount
+    that comes up after startup."""
+    if BOOTED:
+        return BOOT_VALUES.get(key, '')
+    return (os.environ.get(key) or '').strip()
+
+
+def torbox_mount_started():
+    """Whether the TorBox mount was set up (live settings before boot)."""
+    if BOOTED:
+        return BOOT_LAYOUT.torbox
+    get = live_getter()
+    return all((get(k) or '').strip() for k in TORBOX_KEYS)
 
 
 def record(path=None):

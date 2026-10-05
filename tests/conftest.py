@@ -85,3 +85,27 @@ def _isolate_env_and_resolver():
     config_resolve._WRITTEN.clear()
     config_resolve._WRITTEN.update(saved_written)
     config_resolve._CURRENT = saved_current
+
+
+@pytest.fixture(autouse=True)
+def _startup_complete():
+    """Tests run as if main.py finished starting up (reloads not gated);
+    tests of the startup gate clear it themselves."""
+    from utils import config_reload
+    config_reload._startup_done.set()
+    yield
+    config_reload._startup_done.set()
+
+
+@pytest.fixture
+def snapshot_boot(monkeypatch):
+    """snapshot_boot() — treat the current settings as the ones Zurg/rclone
+    were started with (utils/boot_layout)."""
+    def _snap():
+        import utils.config_reload as cr
+        from utils import boot_layout
+        monkeypatch.setattr('utils.env.SECRETS_DIR', '/nonexistent-secrets')
+        monkeypatch.setattr(cr, '_BOOT_LAYOUT', boot_layout.zurg_layout())
+        monkeypatch.setattr(boot_layout, 'BOOT_VALUES',
+                            {k: boot_layout.startup_value(k) for k in boot_layout.STARTUP_KEYS})
+    return _snap

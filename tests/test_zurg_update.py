@@ -101,13 +101,14 @@ def test_no_dead_shared_handler_helper():
     assert not hasattr(zu.ZurgUpdate, 'terminate_zurg_instance')
 
 
-def test_start_does_not_skip_an_instance_we_just_stopped(z):
-    # stopped on purpose (policy None) but not reaped yet: still start it
+def test_start_never_doubles_a_process_that_is_still_alive(z):
+    # stop_process reaps the process; one still alive after it (stuck in the
+    # kernel) must not get a second copy on the same port, supervised or not
     h = _handler(alive=True)
     h.restart_policy = None
     z._instance_handlers = {'RealDebrid': h}
     z.start_process('Zurg', '/zurg/RD')
-    h.start_process.assert_called_once()
+    h.start_process.assert_not_called()
 
 
 def test_version_not_advanced_when_an_instance_kept_the_old_binary(z, monkeypatch):

@@ -239,3 +239,31 @@ class TestStopWaitsForExit:
         h.process.wait.side_effect = subprocess.TimeoutExpired('zurg', 5)
         h.subprocess_logger = None
         h.stop_process('Zurg')                             # logs, doesn't raise
+
+
+class TestRestartServiceLifecycle:
+
+    def test_restart_service_holds_the_lifecycle_lock(self, monkeypatch):
+        # never interleaved with a reload/auto-update stopping and starting the
+        # same process (that left an untracked duplicate)
+        import utils.processes as proc
+        h = MagicMock()
+        h.process.poll.return_value = 0
+        seen = []
+        h.restart_process.side_effect = lambda: seen.append(proc.lifecycle_lock._is_owned())
+        monkeypatch.setattr(proc, '_process_registry',
+                            [{'process_name': 'Zurg', 'key_type': 'RealDebrid', 'handler': h}])
+        assert proc.restart_service('Zurg') is True
+        assert seen == [True]
+
+    def test_restart_service_does_not_double_start_a_process_that_will_not_die(self, monkeypatch):
+        import subprocess
+        import utils.processes as proc
+        h = MagicMock()
+        h.process.poll.return_value = None                   # stuck (e.g. D state)
+        h.process.wait.side_effect = subprocess.TimeoutExpired('rclone', 5)
+        h.subprocess_logger = None
+        monkeypatch.setattr(proc, '_process_registry',
+                            [{'process_name': 'rclone', 'key_type': 'zurgarr', 'handler': h}])
+        proc.restart_service('rclone')                       # no exception
+        h.restart_process.assert_not_called()

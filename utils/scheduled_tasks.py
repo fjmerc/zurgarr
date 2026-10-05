@@ -453,8 +453,10 @@ def verify_symlinks():
     tb_mount_real = ''
     if tb_target:
         tb_target_real = os.path.realpath(tb_target) + '/'
-        # Resolve TB mount path from RCLONE_MOUNT_NAME parent + TORBOX_MOUNT_NAME.
-        rclonemn = os.environ.get('RCLONE_MOUNT_NAME') or ''
+        # Resolve TB mount path from RCLONE_MOUNT_NAME parent + TORBOX_MOUNT_NAME
+        # (the running mounts' names — utils/boot_layout).
+        from utils import boot_layout
+        rclonemn = boot_layout.rclone_mount_name()
         base = rclone_mount.rstrip('/')
         if rclonemn and os.path.basename(base) == rclonemn:
             parent = os.path.dirname(base)
@@ -1366,11 +1368,8 @@ def mount_liveness_probe():
     # change made ``BLACKHOLE_RCLONE_MOUNT`` point to ``/data/torbox``
     # (an unusual but valid config), the bare-discovery code would
     # probe the same mount twice.  Env-gate keeps the probe scoped.
-    tb_configured = bool(
-        secret_or_env('TORBOX_API_KEY')
-        and secret_or_env('TORBOX_WEBDAV_USER')
-        and secret_or_env('TORBOX_WEBDAV_PASS')
-    )
+    from utils import boot_layout
+    tb_configured = boot_layout.torbox_mount_started()   # set up at start, not now
     tb_mount_path = None
     tb_status, tb_msg, tb_items = None, None, 0
     if tb_configured:
@@ -1379,7 +1378,7 @@ def mount_liveness_probe():
             # ``mount_for_debrid`` needs the parent of the per-debrid mount-name
             # suffix — same convention as BlackholeWatcher._mount_for and
             # verify_symlinks.
-            rclonemn = os.environ.get('RCLONE_MOUNT_NAME') or ''
+            rclonemn = boot_layout.rclone_mount_name()
             base = rclone_mount.rstrip('/')
             if rclonemn and os.path.basename(base) == rclonemn:
                 parent = os.path.dirname(base)

@@ -29,9 +29,10 @@ class ZurgUpdate(Update, ProcessHandler):
                 handler = self._instance_handlers.get(key_type)
                 if handler is None:
                     handler = self._instance_handlers[key_type] = ProcessHandler(self.logger)
-                elif (handler.restart_policy is not None and handler.process
-                      and handler.process.poll() is None):
-                    continue   # running and supervised: a second Popen would orphan it
+                elif handler.process and handler.process.poll() is None:
+                    # Still running (stop_process reaps what it kills, so this
+                    # is a live process): a second Popen would clash with it.
+                    continue
                 handler.start_process(process_name, dir_to_check, command, key_type, suppress_logging=suppress_logging)
 
     _DIRS = {'RealDebrid': '/zurg/RD', 'AllDebrid': '/zurg/AD'}
@@ -57,6 +58,8 @@ class ZurgUpdate(Update, ProcessHandler):
             handler.stop_process(process_name, key_type)
                 
     def update_check(self, process_name):
+        # ZURG_VERSION / GITHUB_TOKEN as at container start, on purpose: like
+        # every Zurg setting they apply when the container restarts.
         self.logger.info(f"Checking for available {process_name} updates")
         
         try:

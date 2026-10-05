@@ -400,7 +400,8 @@ Settings page can't save you out of it: the save action is itself a
 blocked POST. Edit `STATUS_UI_TRUSTED_ORIGINS` directly in the `.env`
 file on the host, then reload without going through the UI: `docker
 kill -s HUP <container>` (the container picks up the new value via its
-`SIGHUP` handler — no restart needed).
+`SIGHUP` handler — no restart needed; Zurg/rclone settings are the
+exception and need a container restart).
 
 ## I lost my config after a rebuild / restore from an old backup
 

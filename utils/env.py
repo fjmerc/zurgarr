@@ -41,13 +41,23 @@ def child_env():
             continue
     else:
         items = list(os.environ.copy().items())
-    env = {k: v for k, v in items
+    env = dict(items)
+    zurgarr_level = env.get('ZURGARR_LOG_LEVEL')
+    from utils import boot_layout
+    if boot_layout.BOOTED:
+        # rclone settings apply at container start: a later restart of an
+        # rclone process (crash, self-heal) keeps the values it started with.
+        for k in boot_layout.STARTUP_KEYS:
+            if k.startswith('RCLONE_'):
+                env[k] = boot_layout.BOOT_VALUES.get(k, '')
+        zurgarr_level = boot_layout.BOOT_ZURGARR_LOG_LEVEL
+    env = {k: v for k, v in env.items()
            if not (k.startswith('RCLONE_') and not v.strip())}
     # rclone follows ZURGARR_LOG_LEVEL unless RCLONE_LOG_LEVEL is set.
     # rclone's levels are DEBUG/INFO/NOTICE/ERROR — an unmapped value would
     # make it exit on a parse error.
     if 'RCLONE_LOG_LEVEL' not in env:
-        level = _RCLONE_LEVELS.get((env.get('ZURGARR_LOG_LEVEL') or '').strip().upper())
+        level = _RCLONE_LEVELS.get((zurgarr_level or '').strip().upper())
         if level:
             env['RCLONE_LOG_LEVEL'] = level
     return env

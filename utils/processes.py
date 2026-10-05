@@ -391,40 +391,50 @@ def restart_service(service_name, key_type=None):
     logger = get_logger()
 
     restarted_any = False
-    with _registry_lock:
-        for entry in _process_registry:
-            name = entry['process_name']
-            handler = entry['handler']
-            key_type_entry = entry['key_type']
-            if key_type is not None and \
-                    (key_type_entry or '').lower() != key_type.lower():
-                continue
-            if name.lower() == service_name.lower():
-                desc = f"{name} w/ {key_type_entry}" if key_type_entry else name
+    # Never interleaved with a config reload / auto-update restarting it.
+    with lifecycle_lock:
+        with _registry_lock:
+            for entry in _process_registry:
+                name = entry['process_name']
+                handler = entry['handler']
+                key_type_entry = entry['key_type']
+                if key_type is not None and \
+                        (key_type_entry or '').lower() != key_type.lower():
+                    continue
+                if name.lower() == service_name.lower():
+                    desc = f"{name} w/ {key_type_entry}" if key_type_entry else name
 
-                # Terminate if running
-                if handler.process and handler.process.poll() is None:
-                    logger.info(f"[restart_service] Terminating {desc}")
-                    if handler.subprocess_logger:
-                        handler.subprocess_logger.stop_logging_stdout()
-                        handler.subprocess_logger.stop_monitoring_stderr()
-                        handler.subprocess_logger = None
-                    handler.process.terminate()
-                    try:
-                        handler.process.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        handler.process.kill()
-                        handler.process.wait(timeout=5)
+                    # Terminate if running
+                    if handler.process and handler.process.poll() is None:
+                        logger.info(f"[restart_service] Terminating {desc}")
+                        if handler.subprocess_logger:
+                            handler.subprocess_logger.stop_logging_stdout()
+                            handler.subprocess_logger.stop_monitoring_stderr()
+                            handler.subprocess_logger = None
+                        handler.process.terminate()
+                        try:
+                            handler.process.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            handler.process.kill()
+                            try:
+                                handler.process.wait(timeout=5)
+                            except subprocess.TimeoutExpired:
+                                pass
+                        if handler.process.poll() is None:
+                            # Still alive (stuck in the kernel): a second one
+                            # would clash with it and run unsupervised.
+                            logger.error(f"[restart_service] {desc} did not exit — not starting another")
+                            continue
 
-                # Reset restart counter for clean restart
-                handler._restart_count = 0
-                handler._first_restart_time = None
-                handler._exhausted_notified = False
+                    # Reset restart counter for clean restart
+                    handler._restart_count = 0
+                    handler._first_restart_time = None
+                    handler._exhausted_notified = False
 
-                # Re-launch
-                handler.restart_process()
-                logger.info(f"[restart_service] {desc} restarted successfully")
-                restarted_any = True
+                    # Re-launch
+                    handler.restart_process()
+                    logger.info(f"[restart_service] {desc} restarted successfully")
+                    restarted_any = True
 
     if not restarted_any:
         logger.warning(f"[restart_service] Process '{service_name}' not found in registry")

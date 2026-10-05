@@ -5,8 +5,6 @@ import os
 import re
 import tempfile
 import pytest
-
-from utils.boot_layout import Layout
 from unittest.mock import patch, MagicMock
 
 from utils.settings_api import (
@@ -430,6 +428,19 @@ class TestValidateEnvValues:
     def test_zurg_enabled_no_key(self):
         result = validate_env_values({'ZURG_ENABLED': 'true'})
         assert any('API key' in e for e in result['errors'])
+
+    def test_fixed_ports_must_not_clash_or_overflow(self):
+        base = {'ZURG_ENABLED': 'true', 'RD_API_KEY': 'k', 'AD_API_KEY': 'a', 'RCLONE_MOUNT_NAME': 'm'}
+        # AllDebrid takes ZURG_PORT + 1
+        errs = validate_env_values(dict(base, ZURG_PORT='65535'))['errors']
+        assert any('ZURG_PORT' in e and '65536' in e for e in errs), errs
+        errs = validate_env_values(dict(base, ZURG_PORT='8080', STATUS_UI_PORT='8081'))['errors']
+        assert any('8081' in e and 'STATUS_UI_PORT' in e for e in errs), errs
+        # NFS: one port per mount (RD, AD) from NFS_PORT
+        errs = validate_env_values(dict(base, NFS_ENABLED='true', NFS_PORT='9000', ZURG_PORT='9001'))['errors']
+        assert any('9001' in e for e in errs), errs
+        assert not validate_env_values(dict(base, ZURG_PORT='9100', NFS_ENABLED='true',
+                                            NFS_PORT='9200', STATUS_UI_PORT='8080'))['errors']
 
     def test_only_true_counts_as_on(self):
         # the app runs ZURG_ENABLED=yes as off — validation must agree
@@ -1725,6 +1736,30 @@ class TestSourcesAndExplicitSave:
         assert os.environ['PD_LOG_LEVEL'] == 'DEBUG'
         assert config_resolve.current()['PD_LOG_LEVEL'].source == 'set'
 
+    def test_plex_debrid_sync_refreshes_shared_config_and_setup_check(self, env_file, monkeypatch):
+        import utils.setup_check as sc
+        from utils.settings_api import _sync_plex_debrid_to_env
+        loads, inval = [], []
+        monkeypatch.setattr('base.config.load', lambda **kw: loads.append(kw))
+        monkeypatch.setattr(sc, '_invalidate', lambda: inval.append(1))
+        monkeypatch.delenv('PD_LOG_LEVEL', raising=False)
+        _sync_plex_debrid_to_env({'Debug printing': 'true'})
+        assert loads == [{'read_env_file': False}] and inval
+
+    def test_plex_debrid_sync_during_startup_defers_to_the_reload(self, env_file, monkeypatch):
+        # never change settings in-process while Zurg/rclone are being set up
+        import signal
+        from utils import config_reload
+        from utils.settings_api import _sync_plex_debrid_to_env
+        config_reload._startup_done.clear()
+        sent = []
+        monkeypatch.setattr('os.kill', lambda pid, sig: sent.append(sig))
+        monkeypatch.delenv('PD_LOG_LEVEL', raising=False)
+        _sync_plex_debrid_to_env({'Debug printing': 'true'})
+        assert 'PD_LOG_LEVEL=DEBUG' in env_file.read_text()
+        assert 'PD_LOG_LEVEL' not in os.environ
+        assert sent == [signal.SIGHUP]
+
     @staticmethod
     def _as_page_posts(values):
         """Encode values the way the Settings page posts them: every
@@ -1787,19 +1822,13 @@ class TestSourcesAndExplicitSave:
         assert result['status'] == 'saved'
         assert result['restarted'] == ['notifications']
 
-    def test_zurg_toggle_preview_restarts_nothing_and_says_restart_container(self, env_file, monkeypatch):
+    def test_zurg_toggle_preview_restarts_nothing_and_says_restart_container(self, env_file, monkeypatch, snapshot_boot):
         from utils.settings_api import read_env_values
         from utils import config_resolve
         monkeypatch.delenv('ZURG_ENABLED', raising=False)
         monkeypatch.setenv('RD_API_KEY', 'k' * 20)          # Zurg is automatically on
-        import utils.config_reload as cr
-        monkeypatch.setattr(cr, '_BOOT_LAYOUT', Layout(True, frozenset({'RD'}), 'zurgarr', False, '', '', False))
-        monkeypatch.setattr(cr, '_FROZEN_PENDING', frozenset())
-        monkeypatch.setenv('RCLONE_MOUNT_NAME', 'zurgarr')
-        monkeypatch.setenv('NFS_ENABLED', 'false')
-        for _k in ('TORBOX_API_KEY', 'TORBOX_WEBDAV_USER', 'TORBOX_WEBDAV_PASS', 'NFS_PORT'):
-            monkeypatch.delenv(_k, raising=False)
         config_resolve.apply(config_resolve.resolve(os.environ, {}))
+        snapshot_boot()
         values = self._as_page_posts(read_env_values())
         values.pop('RD_API_KEY', None)
         values['ZURG_ENABLED'] = 'false'
@@ -1808,20 +1837,31 @@ class TestSourcesAndExplicitSave:
         assert not {'zurg', 'rclone', 'plex_debrid'} & set(result['restarted'])
         assert any("restart the container" in w.lower() for w in result["warnings"]), result
 
-    def test_zurg_toggle_back_to_boot_value_has_no_restart_warning(self, env_file, monkeypatch):
-        import utils.config_reload as cr
+    def test_zurg_setting_change_preview_says_restart_container(self, env_file, monkeypatch, snapshot_boot):
+        from utils.settings_api import read_env_values
+        from utils import config_resolve
+        monkeypatch.delenv('ZURG_ENABLED', raising=False)
+        monkeypatch.delenv('ZURG_LOG_LEVEL', raising=False)
+        monkeypatch.setenv('RD_API_KEY', 'k' * 20)
+        config_resolve.apply(config_resolve.resolve(os.environ, {}))
+        snapshot_boot()
+        values = self._as_page_posts(read_env_values())
+        values.pop('RD_API_KEY', None)
+        values['ZURG_LOG_LEVEL'] = 'DEBUG'
+        result = write_env_values(values)
+        assert result['restarted'] == []
+        assert any('ZURG_LOG_LEVEL' in w and 'restart the container' in w for w in result['warnings']), result
+
+    def test_zurg_toggle_back_to_boot_value_has_no_restart_warning(self, env_file, monkeypatch, snapshot_boot):
         from utils.settings_api import read_env_values
         from utils import config_resolve
         monkeypatch.delenv('ZURG_ENABLED', raising=False)
         monkeypatch.setenv('RD_API_KEY', 'k' * 20)
-        env_file.write_text('ZURG_ENABLED=false\n')            # off now, but booted on
-        config_resolve.apply(config_resolve.resolve(os.environ, {'ZURG_ENABLED': 'false'}))
-        monkeypatch.setattr(cr, '_BOOT_LAYOUT', Layout(True, frozenset({'RD'}), 'zurgarr', False, '', '', False))
-        monkeypatch.setattr(cr, '_FROZEN_PENDING', frozenset())
-        monkeypatch.setenv('RCLONE_MOUNT_NAME', 'zurgarr')
-        monkeypatch.setenv('NFS_ENABLED', 'false')
-        for _k in ('TORBOX_API_KEY', 'TORBOX_WEBDAV_USER', 'TORBOX_WEBDAV_PASS', 'NFS_PORT'):
-            monkeypatch.delenv(_k, raising=False)
+        config_resolve.apply(config_resolve.resolve(os.environ, {}))
+        snapshot_boot()                                       # booted on (automatic)
+        env_file.write_text('ZURG_ENABLED=false\n')            # off now
+        config_resolve.apply(config_resolve.resolve(os.environ, {'ZURG_ENABLED': 'false'},
+                                                    frozenset(), config_resolve.written()))
         values = self._as_page_posts(read_env_values())
         values.pop('RD_API_KEY', None)
         values['ZURG_ENABLED'] = 'true'
@@ -2043,3 +2083,11 @@ class TestDerivedReasonAccuracy:
         monkeypatch.setenv('RD_API_KEY', 'k')
         monkeypatch.setenv('BLACKHOLE_SYMLINK_TARGET_BASE', '/mnt/debrid')
         assert 'BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX' not in _derived_reasons()
+
+
+def test_every_startup_only_setting_says_so_in_its_help():
+    from utils.boot_layout import STARTUP_KEYS
+    fields = {f['key']: f for c in get_env_schema()['categories'] for f in c['fields']}
+    missing = sorted(k for k in STARTUP_KEYS if k in fields
+                     and 'container starts' not in fields[k]['help'])
+    assert missing == []

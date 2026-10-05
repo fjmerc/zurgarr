@@ -1211,7 +1211,8 @@ def _count_show_content(show_path):
 
 
 def _discover_mount():
-    mount_name = os.environ.get('RCLONE_MOUNT_NAME', '').strip()
+    from utils import boot_layout
+    mount_name = boot_layout.rclone_mount_name()   # the running mount's name
     if mount_name:
         candidate = os.path.join('/data', mount_name)
         if os.path.isdir(candidate):
@@ -7628,8 +7629,8 @@ class LibraryScanner:
         collateral and trips WebDAV listing rate-limits.
         """
         from utils.rclone_rc import refresh_dir
-        from base import TORBOX_MOUNT_NAME
-        exclude = {TORBOX_MOUNT_NAME}
+        from utils import boot_layout
+        exclude = {boot_layout.torbox_mount_name()}
         refresh_dir('', recursive=False, exclude_mounts=exclude)
         try:
             with os.scandir(self._mount_path) as it:

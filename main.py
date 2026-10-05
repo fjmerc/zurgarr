@@ -87,6 +87,7 @@ def main():
     # `docker restart`.  Record what starts now (fixed until the next
     # container start) for healthcheck.py — see utils/boot_layout.
     from utils import boot_layout
+    boot_layout.mark_booted()   # mount names/instances are fixed from here
     boot_layout.clear()
     boot_layout.reset_markers()
     try:
@@ -133,19 +134,27 @@ def main():
             except Exception as e:
                 logger.error(f"Error in rclone/cleanup setup: {e}", exc_info=True)
 
+    # Zurg/rclone have read their settings (rclone.setup marks it itself;
+    # this covers no rclone at all): config reloads may run from here on.
+    from utils.config_reload import mark_startup_complete
+    mark_startup_complete()
+
     if str(PLEXDEBRID).lower() == 'true':
-        try:
-            p.setup.pd_setup()
-            pd_updater = p.update.PlexDebridUpdate()
-            if str(PDUPDATE).lower() == 'true' and PDREPO:
-                pd_updater.auto_update('plex_debrid', True)
-            elif PDREPO:
-                p.download.get_latest_release()
-                pd_updater.auto_update('plex_debrid', False)
-            else:
-                pd_updater.auto_update('plex_debrid', False)
-        except Exception as e:
-            logger.error(f"Error in plex_debrid setup: {e}", exc_info=True)
+        # (a settings reload restarting plex_debrid waits until it's set up)
+        from utils.processes import lifecycle_lock
+        with lifecycle_lock:
+            try:
+                p.setup.pd_setup()
+                pd_updater = p.update.PlexDebridUpdate()
+                if str(PDUPDATE).lower() == 'true' and PDREPO:
+                    pd_updater.auto_update('plex_debrid', True)
+                elif PDREPO:
+                    p.download.get_latest_release()
+                    pd_updater.auto_update('plex_debrid', False)
+                else:
+                    pd_updater.auto_update('plex_debrid', False)
+            except Exception as e:
+                logger.error(f"Error in plex_debrid setup: {e}", exc_info=True)
 
     blackhole.setup()
 

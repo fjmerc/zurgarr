@@ -281,6 +281,14 @@ def written():
 _LOCK = threading.Lock()
 
 
+def dry_resolve(file_env, secrets=frozenset()):
+    """What resolve_and_apply would produce, without applying it.  Reads the
+    environment and the resolver's memory under the lock, so a concurrent
+    apply can't make a value it just wrote look compose-locked."""
+    with _LOCK:
+        return resolve(dict(os.environ), file_env, secrets, dict(_WRITTEN))
+
+
 def resolve_and_apply(file_env, secrets=frozenset(), environ=None):
     """Resolve and apply atomically.  Returns {key: (old, new)} for keys
     whose effective environ value changed (None = absent)."""

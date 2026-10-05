@@ -749,3 +749,29 @@ class TestRetryPendingMounts:
         fake_now[0] += mod._PENDING_RETRY_COOLDOWN + 1
         mod.retry_pending_mounts()
         assert len(calls) == 2  # cooldown elapsed — retried again
+
+
+class TestPortsAndNames:
+
+    def test_fixed_nfs_port_gives_each_mount_its_own(self):
+        # every `rclone serve nfs` bound the one NFS_PORT: only the first started
+        import rclone.rclone as mod
+        assert mod.nfs_port_for('2049', 0) == 2049
+        assert mod.nfs_port_for('2049', 1) == 2050
+        assert mod.nfs_port_for(None, 0) is None          # auto-assigned
+
+    def test_torbox_remote_not_written_when_its_name_clashes(self, monkeypatch, tmp_path):
+        # two [zurgarr] sections: rclone merges them and the Zurg mount could
+        # get TorBox's URL and login
+        import rclone.rclone as mod
+        monkeypatch.setattr(mod, 'RDAPIKEY', 'k')
+        monkeypatch.setattr(mod, 'ADAPIKEY', None)
+        monkeypatch.setattr(mod, 'TORBOX_MOUNT_NAME', 'zurgarr')
+        monkeypatch.setattr(mod, '_write_zurg_remote', lambda f, mn, path: '9999')
+        monkeypatch.setattr(mod, '_torbox_mount_configured', lambda: True)
+        tb = MagicMock(return_value=True)
+        monkeypatch.setattr(mod, '_write_torbox_remote', tb)
+        out = mod._write_rclone_config(str(tmp_path / 'rclone.config'), 'zurgarr', 'zurgarr',
+                                       '/zurg/RD/config.yml', '/zurg/AD/config.yml')
+        tb.assert_not_called()
+        assert out == ('9999', None, False)

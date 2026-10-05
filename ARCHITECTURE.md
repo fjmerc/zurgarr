@@ -159,7 +159,7 @@ Developer reference for Zurgarr internals. Complements [CLAUDE.md](CLAUDE.md) (r
 |--------|---------|--------|
 | `SIGTERM` | `shutdown()` | Graceful shutdown (stop scheduler, LIFO process kill, unmount) |
 | `SIGINT` | `shutdown()` | Same as SIGTERM |
-| `SIGHUP` | `handle_sighup()` | Reload .env, diff changes, restart affected services |
+| `SIGHUP` | `handle_sighup()` | Reload .env, diff changes, restart affected services (never Zurg/rclone — they apply at container start) |
 | `SIGCHLD` | `SIG_IGN` | Auto-reap zombie children (no handler conflicts with Popen) |
 
 ### Authentication & Health
@@ -394,30 +394,35 @@ docker kill -s HUP zurgarr
   or: Settings editor "Save & Reload"
          │
          ▼
-handle_sighup() → spawns background thread
+handle_sighup() → spawns background thread (waits until main.py has
+finished starting up — utils/config_reload.mark_startup_complete)
          │
          ▼
 _reload_env()
-  ├─ Read /config/.env via dotenv_values()
-  ├─ Diff against current os.environ
-  ├─ Update os.environ with new values
-  └─ Detect removed keys
+  ├─ Re-resolve config/.env (utils/config_resolve) into os.environ
+  └─ Return the keys whose effective value changed
          │
          ▼
-_determine_restarts(changed_vars)
-  ├─ Check SERVICE_DEPENDENCIES map (which vars affect which services)
+_services_to_restart(changed)
   ├─ SOFT_RELOAD vars: only update in-memory values, no restart
-  │   (log levels, notification settings, cleanup toggles)
-  ├─ Dependency chain: zurg change → also restart rclone → also restart plex_debrid
-  └─ Return: set of services needing restart
+  ├─ SERVICE_DEPENDENCIES: plex_debrid, blackhole, notifications, status_ui
+  └─ Zurg/rclone settings (utils/boot_layout.STARTUP_KEYS) restart NOTHING:
+     Zurg and rclone are set up only at container start.  restart_pending()
+     compares the live settings with those in effect at startup
+     (boot_layout.BOOT_VALUES) and the save banner, reload log and Status
+     page Setup check say a container restart is needed.
          │
          ▼
-Restart affected services:
-  ├─ Stop order:  plex_debrid → rclone → zurg (reverse dependency)
-  ├─ Regenerate configs (zurg YAML, rclone config)
-  ├─ Start order: zurg → rclone → plex_debrid (forward dependency)
+Restart affected services (under processes.lifecycle_lock, shared with
+auto-updates and restart_service):
+  ├─ plex_debrid: stop (outside the registry lock), Trakt .env, start
   ├─ Non-process services: notifications.init(), blackhole.stop()/setup()
   └─ Notify: 'Config Reloaded' notification
+
+Mount paths used at runtime (blackhole, library, liveness, routing) come
+from boot_layout (rclone_mount_name(), torbox_mount_name(),
+debrid_key_at_start()) — the mounts that actually started — and
+/healthcheck/boot_layout.json gives the healthcheck the same facts.
 ```
 
 ### 4.5 Symlink Lifecycle
