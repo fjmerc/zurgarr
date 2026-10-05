@@ -243,3 +243,23 @@ def test_plain_values_keep_messages_readable(clean):
     clean.setattr(sc, '_validator_messages', lambda: ([msg], []))
     f = next(f for f in sc.collect_findings() if f['id'].startswith('validator:'))
     assert f['message'] == msg
+
+
+class TestNoDetailWithoutLogin:
+    """Without STATUS_UI_AUTH, /api/status is public: validator findings carry
+    no message text at all (the full detail stays in the container log)."""
+
+    def test_public_dashboard_gets_generic_validator_text(self, clean):
+        clean.delenv('STATUS_UI_AUTH')
+        raw = "BLACKHOLE_SYMLINK_TARGET_BASE='/srv/private/layout' resolves inside this container."
+        clean.setattr(sc, '_validator_messages', lambda: ([], [raw]))
+        f = next(f for f in sc.collect_findings() if f['id'].startswith('validator:'))
+        assert f['key'] == 'BLACKHOLE_SYMLINK_TARGET_BASE'
+        assert 'srv' not in f['message'] and 'resolves' not in f['message']
+        assert 'container log' in f['message']
+
+    def test_logged_in_dashboard_keeps_redacted_detail(self, clean):
+        raw = "BLACKHOLE_SYMLINK_TARGET_BASE='/srv/private/layout' resolves inside this container."
+        clean.setattr(sc, '_validator_messages', lambda: ([], [raw]))
+        f = next(f for f in sc.collect_findings() if f['id'].startswith('validator:'))
+        assert 'resolves inside this container' in f['message'] and 'srv' not in f['message']

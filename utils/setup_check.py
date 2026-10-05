@@ -112,11 +112,19 @@ def _validator_findings():
                          "The configuration validator couldn't run — check the container log for details.")]
     out = []
     values = _setting_values()
+    # Without a dashboard login /api/status is public: show no validator
+    # text at all (only which setting, and where the detail is).
+    public = not _val('STATUS_UI_AUTH')
     for level, messages in (('error', errors), ('warn', warnings)):
         for raw in messages:
             msg = _redact(raw, values)
             m = re.match(r'([A-Z][A-Z0-9_]+)', msg)
-            out.append(_finding('validator:' + _sig(msg), level, m.group(1) if m else None, msg))
+            key = m.group(1) if m else None
+            shown = msg
+            if public:
+                shown = (f'{key} needs attention' if key else 'A setting needs attention') + \
+                    ' — details are in the container log (set a dashboard login to see them here).'
+            out.append(_finding('validator:' + _sig(msg), level, key, shown))
     return out
 
 
