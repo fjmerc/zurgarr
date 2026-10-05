@@ -327,3 +327,13 @@ class TestRcloneLogLevelFollowsZurgarrLevel:
         monkeypatch.delenv('RCLONE_LOG_LEVEL', raising=False)
         get_logger()
         assert 'RCLONE_LOG_LEVEL' not in os.environ
+
+
+def test_env_example_does_not_pin_resolver_owned_keys():
+    # The Quick Start copies .env.example to the compose project .env, whose
+    # live values compose interpolates into the container — compose-locking
+    # them.  Only the UI switch + its login (DEFAULTS keeps the UI off) and
+    # the blank RD key placeholder may be live.
+    with open(os.path.join(REPO, '.env.example')) as f:
+        live = {m.group(1) for m in re.finditer(r'^([A-Z][A-Z0-9_]*)=', f.read(), re.M)}
+    assert live <= {'RD_API_KEY', 'STATUS_UI_ENABLED', 'STATUS_UI_AUTH', 'TZ'}, live
