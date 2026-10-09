@@ -2403,9 +2403,10 @@ class BlackholeWatcher:
 
         Handles both flat (``completed_dir/<release>``) and labeled
         (``completed_dir/<label>/<release>``) layouts via ``iter_release_dirs``.
-        Empty label dirs left behind after all their releases are cleaned up
-        are removed as well, but the top-level ``completed_dir`` itself is
-        never removed.
+        Label dirs (``completed_dir/<label>``) are never removed, even when
+        empty: Sonarr/Radarr's Torrent Blackhole client uses them as its
+        Watch Folder and fails every poll while it's missing.  Any label
+        present in the watch dir gets its completed-side dir (re)created here.
 
         Multi-debrid (plan 39 phase 2): symlinks for TB-routed grabs point
         at a different ``BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX`` and resolve
@@ -2420,6 +2421,8 @@ class BlackholeWatcher:
             return
         if not os.path.exists(self.completed_dir):
             return
+
+        self._ensure_label_dirs()
 
         now = time.time()
         max_age_secs = self.symlink_max_age * 3600
@@ -2470,8 +2473,6 @@ class BlackholeWatcher:
                 except OSError:
                     pass
 
-        cleaned_label_parents = set()
-
         for label, release_name, entry_path in iter_release_dirs(self.completed_dir):
             # Per-release beat: the walk resolves every symlink against the
             # FUSE mount — a slow-but-alive mount (429 backpressure) can
@@ -2518,20 +2519,35 @@ class BlackholeWatcher:
                     shutil.rmtree(entry_path, ignore_errors=True)
                     display = f"{label}/{release_name}" if label else release_name
                     logger.info(f"[blackhole] Cleaned up completed dir: {display}")
-                    if label:
-                        cleaned_label_parents.add(os.path.join(self.completed_dir, label))
                 except Exception as e:
                     logger.debug(f"[blackhole] Failed to clean up {entry_path}: {e}")
 
-        # Remove now-empty label dirs. The top-level completed_dir is never
-        # in cleaned_label_parents by construction.
-        for parent in cleaned_label_parents:
+    def _ensure_label_dirs(self):
+        """Create ``completed_dir/<label>`` for every label dir in the watch dir."""
+        try:
+            entries = os.listdir(self.watch_dir)
+        except OSError:
+            return
+        completed_real = os.path.realpath(self.completed_dir)
+        for entry in entries:
+            src = os.path.join(self.watch_dir, entry)
+            if not _is_valid_label(entry) or not os.path.isdir(src):
+                continue
+            if os.path.realpath(src) == completed_real:
+                continue
+            label_dir = os.path.join(self.completed_dir, entry)
+            if os.path.isdir(label_dir):
+                continue
             try:
-                if os.path.isdir(parent) and not os.listdir(parent):
-                    os.rmdir(parent)
-                    logger.debug(f"[blackhole] Removed empty label dir: {parent}")
-            except OSError:
-                pass
+                os.makedirs(label_dir, exist_ok=True)
+            except OSError as e:
+                logger.warning(f"[blackhole] Could not create label dir {label_dir}: {e}")
+                continue
+            logger.info(f"[blackhole] Recreated missing label dir: {label_dir}")
+            try:
+                os.chmod(label_dir, 0o777)
+            except OSError as e:
+                logger.warning(f"[blackhole] Could not chmod label dir {label_dir}: {e}")
 
     # ── Pending monitor persistence ──────────────────────────────────
 

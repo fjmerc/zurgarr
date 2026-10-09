@@ -4036,8 +4036,9 @@ class TestIterReleaseDirs:
 
 class TestCleanupSymlinksLabeled:
 
-    def test_removes_empty_label_dir_after_cleanup(self, tmp_dir):
-        """After every release under a label is removed, the label dir itself goes."""
+    def test_keeps_empty_label_dir_after_cleanup(self, tmp_dir):
+        """After every release under a label is removed, the label dir stays —
+        it's the arr's blackhole Watch Folder and the arr fails while it's missing."""
         completed = os.path.join(tmp_dir, 'completed')
         sonarr_dir = os.path.join(completed, 'sonarr')
         release_dir = os.path.join(sonarr_dir, 'Old.Release')
@@ -4052,10 +4053,26 @@ class TestCleanupSymlinksLabeled:
         watcher._cleanup_symlinks()
 
         assert not os.path.exists(release_dir)
-        # Empty label parent is also removed
-        assert not os.path.exists(sonarr_dir)
-        # Top-level completed_dir is preserved
+        assert os.path.isdir(sonarr_dir)
         assert os.path.isdir(completed)
+
+    def test_recreates_missing_label_dirs_from_watch_labels(self, tmp_dir):
+        completed = os.path.join(tmp_dir, 'completed')
+        os.makedirs(completed)
+        for label in ('sonarr', 'radarr', 'failed'):
+            os.makedirs(os.path.join(tmp_dir, label))
+
+        watcher = BlackholeWatcher(
+            tmp_dir, 'key', 'realdebrid',
+            symlink_enabled=True, completed_dir=completed,
+        )
+        watcher._cleanup_symlinks()
+
+        assert os.path.isdir(os.path.join(completed, 'sonarr'))
+        assert os.path.isdir(os.path.join(completed, 'radarr'))
+        # Reserved names and the completed dir itself are not labels
+        assert not os.path.exists(os.path.join(completed, 'failed'))
+        assert not os.path.exists(os.path.join(completed, 'completed'))
 
     def test_labeled_broken_symlink_removed(self, tmp_dir):
         completed = os.path.join(tmp_dir, 'completed')

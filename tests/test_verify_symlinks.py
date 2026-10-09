@@ -579,7 +579,7 @@ class TestVerifySymlinksLabeled:
 class TestHousekeepingEmptyDirSweep:
     """The empty-dir sweep in housekeeping must handle label subdirs."""
 
-    def test_removes_empty_label_dirs(self, tmp_dir, monkeypatch):
+    def test_keeps_empty_label_dirs(self, tmp_dir, monkeypatch):
         from utils.scheduled_tasks import housekeeping
         completed = os.path.join(tmp_dir, 'completed')
         sonarr = os.path.join(completed, 'sonarr')
@@ -592,11 +592,25 @@ class TestHousekeepingEmptyDirSweep:
 
         housekeeping()
 
-        # All empty dirs below completed_dir are removed
+        # Empty release dirs go; the label dir (the arr's Watch Folder) stays
         assert not os.path.exists(release)
-        assert not os.path.exists(sonarr)
+        assert os.path.isdir(sonarr)
         # Top-level completed_dir must be preserved
         assert os.path.isdir(completed)
+
+    def test_removes_empty_flat_release_dirs(self, tmp_dir, monkeypatch):
+        """Non-label top-level dirs (flat-mode releases) are still swept."""
+        from utils.scheduled_tasks import housekeeping
+        completed = os.path.join(tmp_dir, 'completed')
+        release = os.path.join(completed, 'Empty.Release.2020')
+        os.makedirs(release)
+
+        monkeypatch.setenv('BLACKHOLE_COMPLETED_DIR', completed)
+        monkeypatch.setenv('BLACKHOLE_DIR', os.path.join(tmp_dir, 'watch'))
+        os.makedirs(os.path.join(tmp_dir, 'watch'))
+
+        housekeeping()
+        assert not os.path.exists(release)
 
     def test_preserves_completed_root(self, tmp_dir, monkeypatch):
         """Regression guard: housekeeping must never remove completed_dir itself."""

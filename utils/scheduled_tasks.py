@@ -727,13 +727,18 @@ def housekeeping():
     # Under labeled mode, the tree is completed_dir/<label>/<release>/... so
     # we walk bottom-up and re-check emptiness at each level (os.walk's
     # `dirs` list goes stale once we remove children). The top-level
-    # completed_dir itself is never removed.
+    # completed_dir and its label dirs are never removed — the label dir is
+    # the arr's blackhole Watch Folder, and the arr fails while it's missing.
     from utils.env import completed_dir_from_env
+    from utils.blackhole import _is_valid_label
     completed_dir = completed_dir_from_env()
     try:
         if os.path.isdir(completed_dir):
             for root, _dirs, _files in os.walk(completed_dir, topdown=False):
                 if root == completed_dir:
+                    continue
+                if (os.path.dirname(root) == completed_dir
+                        and _is_valid_label(os.path.basename(root))):
                     continue
                 try:
                     if not os.listdir(root):
