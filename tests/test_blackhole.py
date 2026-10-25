@@ -942,14 +942,13 @@ class TestTorboxAddCooldownGate:
     """
 
     def setup_method(self):
+        import utils.blackhole as bh
         _rate_limit_until.clear()
         _tb_cooldown_cache['checked_at'] = 0.0
         _tb_cooldown_cache['seconds_until'] = 0.0
+        bh._tb_cooldown_state.update(strikes=0, last_strike=0.0)
 
-    def teardown_method(self):
-        _rate_limit_until.clear()
-        _tb_cooldown_cache['checked_at'] = 0.0
-        _tb_cooldown_cache['seconds_until'] = 0.0
+    teardown_method = setup_method
 
     def _make_watcher(self, tmp_dir, monkeypatch):
         monkeypatch.setattr('utils.blackhole.os.path.exists', lambda *_a, **_k: True)
@@ -1041,7 +1040,7 @@ class TestTorboxAddPauses:
         _rate_limit_until.clear()
         _tb_cooldown_cache['checked_at'] = 0.0
         _tb_cooldown_cache['seconds_until'] = 0.0
-        bh._tb_cooldown_strikes = 0
+        bh._tb_cooldown_state.update(strikes=0, last_strike=0.0)
 
     teardown_method = setup_method
 
@@ -1101,12 +1100,14 @@ class TestTorboxAddPauses:
         pauses = []
         for _ in range(4):
             resp.status_code, resp.text = 400, '{"error":"DOWNLOAD_SERVER_ERROR"}'
+            _rate_limit_until.clear()   # the previous pause has run out
             w._add_to_torbox(path)
             pauses.append(round(_rate_limit_until['torbox'] - time.time(), -1))
         assert pauses[0] == base and pauses[1] == 2 * base
         assert pauses[2] == 4 * base and pauses[3] <= 5000      # capped by the flag
         resp.status_code = 200
         resp.json.return_value = {'data': {'torrent_id': 1}}
+        _rate_limit_until.clear()
         assert w._add_to_torbox(path)[0] is True
         resp.status_code = 400
         w._add_to_torbox(path)
@@ -1139,18 +1140,77 @@ class TestTorboxAddPauses:
         assert w._defer_for_provider_pause('torbox', 'x.magnet') is True
         assert _rate_limit_remaining('realdebrid') == 0.0
 
-    def test_paused_torbox_defers_drop_without_adding_or_sleeping(self, tmp_dir, monkeypatch):
-        monkeypatch.setattr('utils.search._existing_hashes', lambda *a, **kw: set())
+    def _no_sleep_no_probe(self, monkeypatch):
+        def boom(*a, **k):
+            raise AssertionError('must not sleep or probe while TorBox is paused')
+        monkeypatch.setattr('utils.blackhole._check_rate_limit', boom)
+        monkeypatch.setattr('utils.search._existing_hashes', boom)
+        monkeypatch.setattr('utils.search.check_debrid_cache', boom)
+
+    def test_paused_torbox_defers_drop_without_adding_sleeping_or_probing(self, tmp_dir, monkeypatch):
+        monkeypatch.setenv('BLACKHOLE_REQUIRE_CACHED', 'true')
+        self._no_sleep_no_probe(monkeypatch)
         w = self._watcher(tmp_dir)
         added = []
         monkeypatch.setattr(w, '_add_to_torbox', lambda *a, **k: added.append(1) or (True, {}))
         _rate_limit_until['torbox'] = time.time() + 600
         path = self._magnet(tmp_dir)
-        start = time.time()
         w._process_file(path)
-        assert time.time() - start < 5
         assert not added
         assert os.path.exists(path)          # retried once the pause ends
+
+    def test_paused_add_returns_at_once_without_calling_torbox(self, tmp_dir, monkeypatch):
+        from utils.blackhole import _is_paused_result
+        self._no_sleep_no_probe(monkeypatch)
+        monkeypatch.setattr('utils.blackhole.tracked_request',
+                            lambda *a, **k: (_ for _ in ()).throw(AssertionError('called TorBox')))
+        _rate_limit_until['torbox'] = time.time() + 600
+        ok, msg = self._watcher(tmp_dir)._add_to_torbox(self._magnet(tmp_dir))
+        assert ok is False and _is_paused_result(msg)
+
+    def test_other_4xx_with_flag_set_is_not_a_cooldown_strike(self, tmp_dir, monkeypatch):
+        """The flag is pinned on this account: a bad .torrent must not pause
+        TorBox (one poison file would otherwise escalate pauses to a day)."""
+        import utils.blackhole as bh
+        self._post(monkeypatch, 400, '{"error":"BOZO_TORRENT"}')
+        monkeypatch.setattr('utils.blackhole.requests.get',
+                            lambda *a, **k: (_ for _ in ()).throw(AssertionError('probed')))
+        ok, msg = self._watcher(tmp_dir)._add_to_torbox(self._magnet(tmp_dir))
+        assert ok is False and 'BOZO_TORRENT' in msg
+        assert _rate_limit_until.get('torbox', 0) <= time.time()
+        assert bh._tb_cooldown_state['strikes'] == 0
+
+    def test_strike_streak_expires(self):
+        import utils.blackhole as bh
+        bh._tb_cooldown_state.update(strikes=5, last_strike=time.time() - bh._TB_STRIKE_RESET - 1)
+        assert bh._tb_cooldown_pause(86400) == bh._TB_COOLDOWN_PAUSE_MAX
+
+    def test_server_error_leaves_drop_in_watch_dir_without_retry_bump(self, tmp_dir, monkeypatch):
+        monkeypatch.setattr('utils.search._existing_hashes', lambda *a, **kw: set())
+        monkeypatch.setattr('utils.blackhole._check_rate_limit', lambda *a, **k: None)
+        self._post(monkeypatch, 502, 'Bad Gateway')
+        w = self._watcher(tmp_dir)
+        path = self._magnet(tmp_dir)
+        w._process_file(path)
+        assert os.path.exists(path)
+        assert not os.path.exists(os.path.join(tmp_dir, 'watch', 'failed'))
+
+    def test_tb_alt_pause_mid_attempt_keeps_drop_and_skips_arr_feedback(self, tmp_dir, monkeypatch):
+        """Call-site wiring: TB-alt returning None (paused) leaves the drop
+        and never reports the grab failed; False still fails it."""
+        monkeypatch.setenv('BLACKHOLE_REQUIRE_CACHED', 'true')
+        monkeypatch.setattr('utils.search._existing_hashes', lambda *a, **kw: set())
+        monkeypatch.setattr('utils.search.check_debrid_cache',
+                            lambda hashes, **k: {h: False for h in hashes})
+        for verdict, kept in ((None, True), (False, False)):
+            w = self._watcher(tmp_dir)
+            fed_back = []
+            monkeypatch.setattr(w, '_try_torbox_cached_alternative', lambda *a, **k: verdict)
+            monkeypatch.setattr(w, '_push_arr_failed_feedback', lambda *a, **k: fed_back.append(1))
+            path = self._magnet(tmp_dir)
+            w._process_file(path)
+            assert os.path.exists(path) is kept
+            assert bool(fed_back) is (not kept)
 
     def test_paused_torbox_does_not_hold_up_realdebrid(self, tmp_dir, monkeypatch):
         monkeypatch.setattr('utils.search._existing_hashes', lambda *a, **kw: set())
@@ -1161,6 +1221,54 @@ class TestTorboxAddPauses:
         _rate_limit_until['torbox'] = time.time() + 600
         w._process_file(self._magnet(tmp_dir))
         assert added == [1]
+
+    def test_rescue_skipped_while_alt_paused(self, tmp_dir, monkeypatch):
+        """The add-time cross-rescue (RD filter-block -> TorBox) must not
+        sleep the worker through a TorBox pause."""
+        import utils.debrid_routing as dr
+        import utils.debrid_client as dc
+        monkeypatch.setattr(dr, 'pick_alt_debrid', lambda src: 'torbox')
+        fake = type('C', (), {'configured': True})()
+        monkeypatch.setattr(dc, 'get_debrid_client', lambda service=None, api_key=None: (fake, service))
+        w = BlackholeWatcher(os.path.join(tmp_dir, 'watch'), 'rdkey', 'realdebrid',
+                             completed_dir=os.path.join(tmp_dir, 'completed'),
+                             debrid_api_keys={'realdebrid': 'rdkey', 'torbox': 'tbkey'})
+        called = []
+        _rate_limit_until['torbox'] = time.time() + 900
+        path = self._magnet(tmp_dir)
+        assert w._attempt_add_time_rescue(
+            path, os.path.basename(path), 'a' * 40, 'realdebrid', None,
+            {'torbox': lambda *a, **k: called.append(1) or (True, {})}) is False
+        assert not called and os.path.exists(path)
+
+    def test_alt_release_search_stops_on_pause_and_uses_routed_key(self, tmp_dir, monkeypatch):
+        from utils.blackhole import _PAUSED_RESULT
+        w = BlackholeWatcher(os.path.join(tmp_dir, 'watch'), 'rdkey', 'realdebrid',
+                             completed_dir=os.path.join(tmp_dir, 'completed'),
+                             debrid_api_keys={'realdebrid': 'rdkey', 'torbox': 'tbkey'})
+        orig = self._magnet(tmp_dir)
+        rels = [{'guid': 'magnet:?xt=urn:btih:' + c * 40, 'title': f'Alt {c}'} for c in 'bcd']
+        calls = []
+
+        def handler(path, api_key=None):
+            calls.append(api_key)
+            return False, f'{_PAUSED_RESULT}: TorBox adds paused for 600s'
+        assert w._try_releases(rels, handler, os.path.basename(orig), orig,
+                               debrid='torbox') is False
+        assert calls == ['tbkey']        # stopped at the first pause, routed key
+
+    def test_paused_alt_search_retries_instead_of_marking_exhausted(self, tmp_dir, monkeypatch):
+        from utils.blackhole import RetryMeta
+        w = self._watcher(tmp_dir)
+        monkeypatch.setattr(w, '_try_alt_movie', lambda *a, **k: False)
+        _rate_limit_until['torbox'] = time.time() + 600
+        staged = self._magnet(tmp_dir, 'Movie.2026.1080p.WEB.x264-GRP.magnet')
+        w._try_alternative_release(os.path.basename(staged), staged, lambda *a, **k: (False, ''),
+                                   debrid='torbox')
+        dest = os.path.join(tmp_dir, 'watch', 'failed', os.path.basename(staged))
+        assert os.path.exists(dest)
+        assert RetryMeta.is_alt_exhausted(dest) is False
+        assert RetryMeta.read(dest)[0] == 1
 
     def test_tb_alt_waits_instead_of_failing_the_grab(self, tmp_dir, monkeypatch):
         """With TorBox paused, an uncached drop that TB-alt would try to
@@ -1174,6 +1282,58 @@ class TestTorboxAddPauses:
         assert w._tb_alt_would_wait('x.magnet', '') is False
         _rate_limit_until.clear()
         assert w._tb_alt_would_wait('x.magnet', 'a' * 40) is False
+
+
+class TestRetryCountSurvivesRetries:
+    """The retry count follows a drop between failed/ and the watch dir.
+    Pre-fix ``_retry_failed`` deleted the sidecar on every retry, so the
+    count never passed 1, MAX_RETRIES was never reached and a failing drop
+    retried forever."""
+
+    def test_count_climbs_to_max_retries_then_stops(self, tmp_dir, monkeypatch):
+        from unittest.mock import MagicMock
+        from utils.blackhole import RetryMeta, MAX_RETRIES
+        _rate_limit_until.clear()
+        monkeypatch.setattr('utils.search._existing_hashes', lambda *a, **kw: set())
+        resp = MagicMock()
+        resp.status_code, resp.text = 400, '{"error":"INVALID_MAGNET"}'
+        monkeypatch.setattr('utils.blackhole.tracked_request', lambda *a, **kw: resp)
+        watch = os.path.join(tmp_dir, 'watch')
+        os.makedirs(watch)
+        w = BlackholeWatcher(watch, 'key', 'torbox', completed_dir=os.path.join(tmp_dir, 'c'))
+        name = 'Movie.2026.1080p.WEB.x264-GRP.magnet'
+        path = os.path.join(watch, name)
+        with open(path, 'w') as f:
+            f.write('magnet:?xt=urn:btih:' + 'a' * 40)
+        failed = os.path.join(watch, 'failed', name)
+        counts = []
+        for _ in range(MAX_RETRIES + 1):
+            if os.path.exists(path):
+                w._process_file(path)
+            counts.append(RetryMeta.read(failed)[0])
+            # make the backoff elapse, then let the retry pass run
+            data = RetryMeta._load_raw(failed)
+            data['last_attempt'] = 0
+            RetryMeta._save_raw(failed, data)
+            w._retry_failed()
+        assert counts == [1, 2, 3, 3]
+        assert os.path.exists(failed) and not os.path.exists(path)
+
+    def test_orphan_sidecar_swept_from_watch_dir(self, tmp_dir):
+        from utils.blackhole import RetryMeta
+        watch = os.path.join(tmp_dir, 'watch')
+        os.makedirs(os.path.join(watch, 'radarr'))
+        w = BlackholeWatcher(watch, 'key', 'torbox', completed_dir=os.path.join(tmp_dir, 'c'))
+        gone = os.path.join(watch, 'radarr', 'Gone.magnet')
+        kept = os.path.join(watch, 'radarr', 'Kept.magnet')
+        RetryMeta.write(gone, 2)
+        RetryMeta.write(kept, 2)
+        with open(kept, 'w') as f:
+            f.write('magnet:?xt=urn:btih:' + 'b' * 40)
+        os.utime(kept, (time.time(), time.time()))   # too fresh to process
+        w._scan()
+        assert not os.path.exists(RetryMeta.meta_path(gone))
+        assert os.path.exists(RetryMeta.meta_path(kept))
 
 
 class TestSymlinkConstants:
@@ -4787,7 +4947,7 @@ class TestAltReleaseProviderBinding:
         releases = [{'guid': 'magnet:?xt=urn:btih:' + 'd' * 40,
                      'title': 'Alt.Release.1080p'}]
         ok = watcher._try_releases(
-            releases, lambda path: (True, tb_result),
+            releases, lambda path, **_: (True, tb_result),
             'orig.magnet', orig_path, label=None, debrid='torbox',
         )
         assert ok is True
@@ -6026,6 +6186,26 @@ class TestTorboxAltLikeForLike:
         summary = [m for m in info if 'no like-for-like alternative' in m]
         assert len(summary) == 1 and f'{n_packs} same-tier rejected' in summary[0]
         assert ('not shown above' in summary[0]) is (n_packs > shown)
+
+    def test_paused_add_returns_none_and_keeps_file(self, tmp_dir, monkeypatch):
+        """TorBox pausing during TB-alt's own add is not a verdict on the
+        alternative: return None (caller retries later), keep the drop, and
+        don't burn the alternative or the give-up cap."""
+        from utils.blackhole import _PAUSED_RESULT
+        from utils import attempt_ledger
+        w = self._make_watcher(tmp_dir, symlink_enabled=True)
+        monkeypatch.setattr(w, '_resolve_arr_identity',
+                            lambda fn, label=None: ('tt16358384', 'series', 2, 5))
+        cand = [self._candidate(self.ALT, title='Tulsa.King.S02E05.1080p.WEB.h264-ETHEL')]
+        self._stub_search(monkeypatch, cand)
+        self._stub_cache(monkeypatch, {self.ALT: True})
+        monkeypatch.setattr(w, '_add_to_torbox',
+                            lambda *a, **k: (False, f'{_PAUSED_RESULT}: TorBox API error 502'))
+        fp = self._make_file(tmp_dir, self.EP_GRAB)
+        assert w._try_torbox_cached_alternative(
+            fp, self.EP_GRAB, self.REJECTED, 'realdebrid', label='sonarr') is None
+        assert os.path.exists(fp)
+        assert attempt_ledger.get('tbalt:tt16358384:s2e5') == 0
 
     def test_unparseable_codec_declines_before_search(self, tmp_dir, monkeypatch):
         w = self._make_watcher(tmp_dir)

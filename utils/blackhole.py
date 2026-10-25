@@ -149,20 +149,52 @@ _tb_cooldown_cache = {'checked_at': 0.0, 'seconds_until': 0.0}
 # succeeding (it is advisory), so a create that fails while it is set — e.g.
 # during a TorBox API outage — must not gate TB adds for the flag's full
 # remaining time: that wedged every TorBox-routed grab for ~23h (2026-10-25).
-# Pause briefly, doubling per consecutive cooldown-flagged failure (capped
-# at the flag's remaining time): when enforcement is real, each create during
-# it may re-arm the 24h penalty, so retries must back off fast; when it isn't,
-# adds resume within the first pause.  Any successful add resets the streak.
+# Pause briefly, doubling per consecutive cooldown-shaped failure (400
+# DOWNLOAD_SERVER_ERROR with the flag set; capped at the flag's remaining
+# time): when enforcement is real, each create during it may re-arm the 24h
+# penalty, so retries must back off fast; when it isn't, adds resume within
+# the first pause.  A successful add, or _TB_STRIKE_RESET without a strike,
+# resets the streak.  Guarded by _rate_limit_lock.
 _TB_COOLDOWN_PAUSE_MAX = 900  # seconds — first pause
-_tb_cooldown_strikes = 0      # consecutive failed adds with the flag set
+_TB_STRIKE_RESET = 6 * 3600   # seconds
+_tb_cooldown_state = {'strikes': 0, 'last_strike': 0.0}
 # createtorrent timeout / connection error / 5xx: the TB API is struggling,
 # and a timed-out create may have landed anyway — pause TB adds rather than
 # re-creating the same drop on every scan (which feeds the abuse system).
 _TB_ERROR_PAUSE = 300  # seconds
-# Longest rate-limit window the serial worker waits out inline.  Longer
-# windows defer the drop (left in the watch dir) so grabs routed to other
-# providers keep moving instead of queueing behind one sleeping add.
-_RATE_LIMIT_MAX_INLINE_WAIT = _RATE_LIMIT_BACKOFF
+# Longest rate-limit window an add waits out inline (a 429 marks exactly
+# _RATE_LIMIT_BACKOFF, which must stay <= this).  A longer window makes the
+# add return a "paused" result at once instead of sleeping — the serial
+# worker must never sit through a TorBox pause, or every grab queues behind
+# it and the worker heartbeat goes stale.  Paused drops stay in the watch dir.
+_RATE_LIMIT_MAX_INLINE_WAIT = 60  # seconds
+_PAUSED_RESULT = 'adds paused'    # prefix of an add result that means "retry later"
+
+
+def _is_paused_result(result):
+    """True for an add result meaning the provider is paused (retry later),
+    not that it rejected the torrent."""
+    return isinstance(result, str) and result.startswith(_PAUSED_RESULT)
+
+
+def _tb_cooldown_pause(flag_remaining):
+    """Next pause after a cooldown-shaped TorBox add failure (and record the
+    strike): doubles per consecutive strike, capped at the flag's remaining
+    time; the streak expires after _TB_STRIKE_RESET without a strike."""
+    now = time.time()
+    with _rate_limit_lock:
+        st = _tb_cooldown_state
+        if now - st['last_strike'] > _TB_STRIKE_RESET:
+            st['strikes'] = 0
+        pause = min(flag_remaining, _TB_COOLDOWN_PAUSE_MAX * 2 ** min(st['strikes'], 10))
+        st['strikes'] += 1
+        st['last_strike'] = now
+    return pause
+
+
+def _tb_reset_cooldown_strikes():
+    with _rate_limit_lock:
+        _tb_cooldown_state['strikes'] = 0
 
 # Coalesced root re-list.  Phase 2 of ``_process_torrent`` kicks rclone to
 # re-list the mount root via RC ``vfs/refresh`` so a freshly-cached torrent
@@ -1313,6 +1345,20 @@ class RetryMeta:
                 )
 
     @staticmethod
+    def carry(src_path, dst_path):
+        """Move *src_path*'s sidecar (if any) to *dst_path* — the retry count
+        and tier_state follow the file between watch dir and failed/.
+        Without it every retry restarted at zero, so MAX_RETRIES was never
+        reached and a failing drop retried forever."""
+        with _retry_meta_lock:
+            src = RetryMeta.meta_path(src_path)
+            try:
+                if os.path.exists(src):
+                    os.replace(src, RetryMeta.meta_path(dst_path))
+            except OSError as e:
+                logger.warning(f"[blackhole] Could not carry retry meta for {src_path}: {e}")
+
+    @staticmethod
     def remove(file_path):
         """Clean up sidecar meta file."""
         with _retry_meta_lock:
@@ -1591,6 +1637,9 @@ class BlackholeWatcher:
         # _TB_ALT_DEDUP_TTL.  Mirrored into attempt_ledger (``tbaltdedup:``
         # keys) so the TTL survives a container restart.
         self._tb_alt_recent_grabs = {}  # {(imdb_id, scope_tag): epoch}
+        # Provider pause windows already announced at INFO (_defer_for_provider_pause).
+        self._pause_announced = {}  # {provider: until_epoch}
+        self._pause_announced_lock = threading.Lock()
         self._tb_alt_grabs_lock = threading.Lock()
         # Persistent give-up cap: after this many cached-alternative grabs for
         # one (imdb_id, scope) across scans/restarts, stop re-grabbing (each
@@ -1815,7 +1864,16 @@ class BlackholeWatcher:
         return False, response.text[:200]
 
     def _add_to_torbox(self, file_path, api_key=None):
-        """Add a torrent/magnet to TorBox."""
+        """Add a torrent/magnet to TorBox.
+
+        Returns ``(False, '<_PAUSED_RESULT> ...')`` — never sleeping — while
+        TorBox adds are paused longer than ``_RATE_LIMIT_MAX_INLINE_WAIT``,
+        and when this add itself pauses them (5xx, cooldown); callers treat
+        that as "retry later", not as a rejection of the torrent.
+        """
+        remaining = _rate_limit_remaining('torbox')
+        if remaining > _RATE_LIMIT_MAX_INLINE_WAIT:
+            return False, f'{_PAUSED_RESULT}: TorBox adds paused for {remaining:.0f}s'
         _check_rate_limit('torbox', stop_event=self._own_stop_event())
         api_key = api_key or self.debrid_api_key
         ext = os.path.splitext(file_path)[1].lower()
@@ -1838,35 +1896,36 @@ class BlackholeWatcher:
             _mark_rate_limited('torbox', seconds=_TB_ERROR_PAUSE)
             raise
 
-        global _tb_cooldown_strikes
         if response.status_code in (200, 201):
-            _tb_cooldown_strikes = 0
+            _tb_reset_cooldown_strikes()
             return True, response.json()
         if _is_rate_limit_response(response):
             _mark_rate_limited('torbox')
             return False, 'rate limit exceeded'
         if response.status_code >= 500:
             _mark_rate_limited('torbox', seconds=_TB_ERROR_PAUSE)
-            return False, (f'TorBox API error {response.status_code} — pausing '
-                           f'TorBox adds for {_TB_ERROR_PAUSE}s')
+            return False, (f'{_PAUSED_RESULT}: TorBox API error {response.status_code} '
+                           f'— pausing TorBox adds for {_TB_ERROR_PAUSE}s')
         # TB does not surface its account-level cooldown via 429 — instead
         # it returns HTTP 400 ``DOWNLOAD_SERVER_ERROR`` while ``cooldown_until``
-        # on /user/me is set.  Probe the cooldown so a failed add during it
-        # pauses TB adds rather than retrying createtorrent on every scan —
-        # but only for _TB_COOLDOWN_PAUSE_MAX, not the flag's remaining
-        # time: the flag is advisory (adds usually succeed while it's set).
-        cooldown_seconds = _check_torbox_cooldown(api_key)
-        if cooldown_seconds > 0:
-            pause = min(cooldown_seconds,
-                        _TB_COOLDOWN_PAUSE_MAX * 2 ** min(_tb_cooldown_strikes, 10))
-            _tb_cooldown_strikes += 1
-            _mark_rate_limited('torbox', seconds=pause)
-            return False, (
-                f'TorBox add failed with account cooldown flag set '
-                f'({int(cooldown_seconds)}s left) — pausing TorBox adds '
-                f'for {int(pause)}s'
-            )
-        return False, response.text[:200]
+        # on /user/me is set.  Only that shape probes the cooldown: the flag
+        # is pinned on this account, so treating every 4xx (a bad .torrent,
+        # an invalid magnet) as a cooldown strike would let one poison file
+        # escalate TB pauses toward a day.  The pause is short and escalates
+        # (see _tb_cooldown_pause), never the flag's full remaining time —
+        # the flag is advisory (adds usually succeed while it's set).
+        body = response.text or ''
+        if response.status_code == 400 and 'DOWNLOAD_SERVER_ERROR' in body:
+            cooldown_seconds = _check_torbox_cooldown(api_key)
+            if cooldown_seconds > 0:
+                pause = _tb_cooldown_pause(cooldown_seconds)
+                _mark_rate_limited('torbox', seconds=pause)
+                return False, (
+                    f'{_PAUSED_RESULT}: TorBox add failed with account cooldown '
+                    f'flag set ({int(cooldown_seconds)}s left) — pausing TorBox '
+                    f'adds for {int(pause)}s'
+                )
+        return False, body[:200]
 
     # ── Torrent ID extraction ────────────────────────────────────────
 
@@ -3649,6 +3708,10 @@ class BlackholeWatcher:
         alt_handler = dispatch.get(alt)
         if not alt_handler:
             return False
+        if _rate_limit_remaining(alt) > _RATE_LIMIT_MAX_INLINE_WAIT:
+            logger.info(f"[blackhole] rescue: {alt} adds paused; skipping cross-rescue "
+                        f"for {filename} (the failed/ retry tries again)")
+            return False
 
         # Stage the file BEFORE the rescue wait_ready loop (see method
         # docstring).  Unique name keeps us out of alt-release staging's
@@ -3909,7 +3972,27 @@ class BlackholeWatcher:
         except Exception as e:
             logger.error(f"[blackhole] Error during alternative release search: {e}")
 
-        if not alt_ok and os.path.exists(file_path):
+        paused = (not alt_ok and _rate_limit_remaining(debrid or self.debrid_service)
+                  > _RATE_LIMIT_MAX_INLINE_WAIT)
+        if paused and os.path.exists(file_path):
+            # The provider paused mid-search (5xx / cooldown): the
+            # alternatives weren't rejected, so don't mark them exhausted —
+            # a plain failed/ entry retries the whole search later.
+            error_dir = self._failed_dir(label)
+            os.makedirs(error_dir, exist_ok=True)
+            dest = os.path.join(error_dir, filename)
+            if os.path.exists(dest):
+                base, fext = os.path.splitext(filename)
+                dest = os.path.join(error_dir, f"{base}_{int(time.time())}{fext}")
+            try:
+                os.rename(file_path, dest)
+                retries, _ = RetryMeta.read(dest)
+                RetryMeta.write(dest, retries + 1)
+                logger.info(f"[blackhole] Alt-release search for {filename} paused with "
+                            f"{debrid or self.debrid_service}; retrying from failed/ later")
+            except OSError as e:
+                logger.warning(f"[blackhole] Could not move {filename} to failed/: {e}")
+        elif not alt_ok and os.path.exists(file_path):
             # No alternative worked — move to failed/ and mark alts exhausted
             # so retries don't repeat the same alt-release search
             error_dir = self._failed_dir(label)
@@ -4024,16 +4107,20 @@ class BlackholeWatcher:
         if remaining <= _RATE_LIMIT_MAX_INLINE_WAIT:
             return False
         until = int(time.time() + remaining)
-        announced = getattr(self, '_pause_announced', None)
-        if announced is None:
-            announced = self._pause_announced = {}
-        if announced.get(provider) != until:
-            announced[provider] = until
+        with self._pause_announced_lock:
+            first = self._pause_announced.get(provider) != until
+            self._pause_announced[provider] = until
+        if first:
             logger.info(f"[blackhole] {provider} adds paused for {remaining:.0f}s — "
                         f"{provider}-bound drops wait in the watch dir; other "
                         f"providers keep going")
         logger.debug(f"[blackhole] Deferring {filename}: {provider} adds paused "
                      f"for {remaining:.0f}s")
+        try:
+            from utils.metrics import metrics
+            metrics.inc('blackhole_processed', {'status': 'deferred_provider_paused'})
+        except Exception:
+            pass
         return True
 
     def _tb_alt_would_wait(self, filename, info_hash):
@@ -4214,7 +4301,9 @@ class BlackholeWatcher:
         the original watch-dir file has already been removed and the caller
         must NOT delete again.  False → caller falls through to its
         existing failed-grab handling (arr failed-feedback + delete).
-        Never raises; any failure degrades to that.
+        None → TorBox adds paused mid-attempt; the caller leaves the drop in
+        the watch dir for a retry.  Never raises; any failure degrades to
+        False.
         """
         if not self._tb_alt_recovery_enabled():
             return False
@@ -4425,6 +4514,14 @@ class BlackholeWatcher:
                 pass
 
         if not success:
+            if (_is_paused_result(result)
+                    or _rate_limit_remaining('torbox') > _RATE_LIMIT_MAX_INLINE_WAIT):
+                # TorBox paused (this add's 5xx/timeout/cooldown, or another
+                # caller's): not a verdict on the alternative — the caller
+                # leaves the drop for a retry instead of failing it to the arr.
+                logger.info(f"[blackhole] TB-alt: TorBox adds paused; deferring "
+                            f"{filename}: {str(result)[:100]}")
+                return None
             logger.info(f"[blackhole] TB-alt: TorBox rejected cached alternative for "
                         f"{filename}: {str(result)[:100]}")
             return False
@@ -4861,7 +4958,8 @@ class BlackholeWatcher:
         try:
             with os.fdopen(tmp_fd, 'w') as f:
                 f.write(magnet)
-            success, result = debrid_handler(tmp_path)
+            success, result = debrid_handler(
+                tmp_path, **({'api_key': self._api_key_for(debrid)} if debrid else {}))
         except Exception as e:
             logger.warning(f"[blackhole] Compromise submit errored: {e}")
         finally:
@@ -4976,7 +5074,10 @@ class BlackholeWatcher:
             try:
                 with os.fdopen(tmp_fd, 'w') as f:
                     f.write(guid)
-                success, result = debrid_handler(tmp_path)
+                # The routed provider's key — the handler's default is the
+                # primary's, which a non-primary provider rejects (401).
+                success, result = debrid_handler(
+                    tmp_path, **({'api_key': self._api_key_for(debrid)} if debrid else {}))
                 if success:
                     logger.info(f"[blackhole] Alternative release accepted: {alt_title[:60]}")
                     # Clean up original file
@@ -4994,6 +5095,10 @@ class BlackholeWatcher:
                         _notify('download_complete', 'Blackhole: Alt Release Found',
                                 f'Original rejected, using: {alt_title[:60]}')
                     return True
+                elif _is_paused_result(result):
+                    logger.info(f"[blackhole] {debrid or self.debrid_service} paused; "
+                                f"stopping alternative search: {result}")
+                    break
                 else:
                     logger.debug(f"[blackhole] Alternative also rejected: {alt_title[:60]}: {str(result)[:100]}")
             except Exception as e:
@@ -5063,10 +5168,6 @@ class BlackholeWatcher:
         ``watch_dir`` containing the file, or None for flat-mode files.
         """
         filename = os.path.basename(file_path)
-        if label:
-            logger.info(f"[blackhole] Processing: {filename} [label={label}]")
-        else:
-            logger.info(f"[blackhole] Processing: {filename}")
 
         # Check local library before submitting to debrid
         if self._check_local_library(filename):
@@ -5114,6 +5215,15 @@ class BlackholeWatcher:
         # monitor, symlink) so a TB-routed grab never touches RD state.
         debrid = self._route_grab(info_hash)
         api_key = self._api_key_for(debrid)
+        # Paused provider: wait in the watch dir BEFORE the dedup / cache
+        # probes, so a paused drop doesn't re-query a struggling API on
+        # every scan (re-checked below if a cross-probe re-routes to TB).
+        if self._defer_for_provider_pause(debrid, filename):
+            return
+        if label:
+            logger.info(f"[blackhole] Processing: {filename} [label={label}]")
+        else:
+            logger.info(f"[blackhole] Processing: {filename}")
 
         # Debrid-account dedup — skip hashes already on the debrid account.
         # Without this, Sonarr/Radarr re-grabs of the same release after a
@@ -5207,8 +5317,9 @@ class BlackholeWatcher:
                     # an abundantly-cached title silently falls to "Wanted".
                     if self._tb_alt_would_wait(filename, info_hash):
                         return
-                    if self._try_torbox_cached_alternative(file_path, filename, info_hash, debrid, label=label):
-                        return
+                    if self._try_torbox_cached_alternative(
+                            file_path, filename, info_hash, debrid, label=label) is not False:
+                        return  # recovered, or TorBox paused — retried next scan
                     # No cached alternative either — before the silent
                     # delete, tell the arr the grab failed so it blocklists
                     # this release and searches for a different one.
@@ -5258,8 +5369,9 @@ class BlackholeWatcher:
                         # before deleting.
                         if self._tb_alt_would_wait(filename, info_hash):
                             return
-                        if self._try_torbox_cached_alternative(file_path, filename, info_hash, debrid, label=label):
-                            return
+                        if self._try_torbox_cached_alternative(
+                                file_path, filename, info_hash, debrid, label=label) is not False:
+                            return  # recovered, or TorBox paused — retried next scan
                         self._push_arr_failed_feedback(filename, info_hash, debrid, label=label)
                         logger.info(
                             f"[blackhole] Skipping uncached (cross-confirmed via TB): "
@@ -5432,6 +5544,10 @@ class BlackholeWatcher:
                     else:
                         _notify('download_complete', 'Blackhole: Torrent Added',
                                 f'{filename} added to {debrid}')
+            elif _is_paused_result(result):
+                # Not a rejection: the provider paused itself (5xx, cooldown).
+                # Leave the drop for the next scan — no failed/, no retry bump.
+                logger.warning(f"[blackhole] Deferring {filename} on {debrid}: {result}")
             else:
                 logger.error(f"[blackhole] Failed to add {filename}: {result}")
 
@@ -5482,6 +5598,7 @@ class BlackholeWatcher:
                     base, fext = os.path.splitext(filename)
                     dest = os.path.join(error_dir, f"{base}_{int(time.time())}{fext}")
                 os.rename(file_path, dest)
+                RetryMeta.carry(file_path, dest)
                 try:
                     from utils.metrics import metrics
                     metrics.inc('blackhole_processed', {'status': 'failed'})
@@ -5577,10 +5694,12 @@ class BlackholeWatcher:
                 )
                 continue
             try:
-                RetryMeta.remove(file_path)
                 os.rename(file_path, retry_path)
             except OSError as e:
                 logger.error(f"[blackhole] Failed to move {filename} for retry: {e}")
+            else:
+                # Keep the count: the next failure carries it back to failed/.
+                RetryMeta.carry(file_path, retry_path)
 
     def _scan(self):
         """Scan watch directory for new files.
@@ -5643,6 +5762,13 @@ class BlackholeWatcher:
         """Shared pre-processing: skip in-flight writes, dispatch on extension."""
         if self._stop_event.is_set():
             return   # stopping: a replacement watcher takes over (never both)
+        if filename.endswith('.meta'):
+            # Retry sidecar carried back with a retried drop (RetryMeta.carry);
+            # drop it once that drop has left the watch dir (added/removed),
+            # so a later re-drop of the same name starts at zero.
+            if not os.path.exists(file_path[:-len('.meta')]):
+                RetryMeta.remove(file_path[:-len('.meta')])
+            return
         try:
             if now - os.path.getmtime(file_path) < 2.0:
                 return
