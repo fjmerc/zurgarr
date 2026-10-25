@@ -145,6 +145,19 @@ class TestCodec:
         q = parse_quality("Movie (2023).mkv")
         assert q['codec'] is None
 
+    def test_space_separated_h264(self):
+        # Sonarr magnet names turn dots into spaces: "H.264" -> "H 264".
+        q = parse_quality("Tulsa King S02E05 Tilting at Windmills 1080p AMZN WEB-DL DDP5 1 H 264-NTb.magnet")
+        assert q['codec'] == 'x264'
+
+    def test_space_separated_h265(self):
+        q = parse_quality("Breaking Bad S02E01 Seven Thirty-Seven 2160p NF WEB-DL DDP5 1 H 265-XEBEC")
+        assert q['codec'] == 'x265'
+
+    def test_dash_separated_h265(self):
+        q = parse_quality("Show S01E01 1080p WEB H-265")
+        assert q['codec'] == 'x265'
+
     def test_x_dot_265(self):
         q = parse_quality("Show.S01E01.x.265.mkv")
         assert q['codec'] == 'x265'

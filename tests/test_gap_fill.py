@@ -548,6 +548,25 @@ class TestForceGrabCap:
         assert self.ledger.get('tbalt:tt123:s1') == 0
         assert self.ledger.get('tbalt:tt123:s2') == 1
 
+    def test_resolution_resets_per_episode_tbalt_ledger(self, scanner):
+        """Blackhole keys episode-grab TB-alt counters per episode set
+        (``s1e1``, ``s1e1e2``).  Resolving S01E01 clears every key whose set
+        includes E01 and leaves other episodes' strikes alone."""
+        self.ledger.bump('tbalt:tt123:s1e1')
+        self.ledger.bump('tbalt:tt123:s1e1e2')
+        self.ledger.bump('tbalt:tt123:s1e10')
+        self.ledger.bump('tbalt:tt123:s1e2')
+        lp.set_pending('foo', [{'season': 1, 'episode': 1}], 'to-debrid')
+        shows = [{
+            'title': 'Foo', 'year': None, 'imdb_id': 'tt123',
+            'season_data': [{'number': 1, 'episodes': [{'number': 1, 'source': 'debrid'}]}],
+        }]
+        scanner._clear_resolved_pending(shows, [])
+        assert self.ledger.get('tbalt:tt123:s1e1') == 0
+        assert self.ledger.get('tbalt:tt123:s1e1e2') == 0
+        assert self.ledger.get('tbalt:tt123:s1e10') == 1
+        assert self.ledger.get('tbalt:tt123:s1e2') == 1
+
     def test_movie_resolution_resets_tbalt_snone(self, scanner):
         """Movie pendings carry season 0, but blackhole keys movie tbalt
         entries as sNone (parse_release_name returns season=None) — a movie

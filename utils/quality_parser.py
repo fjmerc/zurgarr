@@ -32,9 +32,11 @@ _SOURCE_PATTERNS = [
 ]
 
 # -- Codec patterns -----------------------------------------------------
+# H.264/H.265 also appear space- or dash-separated ("DDP5 1 H 264-NTb") in
+# Sonarr/Radarr magnet names and Torrentio titles, where dots became spaces.
 _CODEC_PATTERNS = [
-    (re.compile(r'(?<![a-zA-Z\d])(?:x\.?265|[Hh]\.?265|HEVC)(?![a-zA-Z\d])', re.IGNORECASE), 'x265'),
-    (re.compile(r'(?<![a-zA-Z\d])(?:x\.?264|[Hh]\.?264|AVC)(?![a-zA-Z\d])', re.IGNORECASE), 'x264'),
+    (re.compile(r'(?<![a-zA-Z\d])(?:x\.?265|[Hh][\s.\-]?265|HEVC)(?![a-zA-Z\d])', re.IGNORECASE), 'x265'),
+    (re.compile(r'(?<![a-zA-Z\d])(?:x\.?264|[Hh][\s.\-]?264|AVC)(?![a-zA-Z\d])', re.IGNORECASE), 'x264'),
     (re.compile(r'(?<![a-zA-Z\d])AV1(?![a-zA-Z\d])', re.IGNORECASE), 'AV1'),
 ]
 

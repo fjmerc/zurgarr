@@ -158,3 +158,23 @@ class TestCompletenessAudit:
         hist.log_event.assert_called()
         # No blocklist add because hash is empty
         bl.add.assert_not_called()
+
+
+class TestParseEpisodesShapes:
+    """Release-name shapes _parse_episodes must read correctly — TB-alt's
+    like-for-like scope match and file filter depend on it."""
+
+    @pytest.mark.parametrize('name,expected', [
+        ('Show.S02E05.1080p.WEB.x264-GRP', {5}),
+        ('Show.S02.E05.1080p.WEB.x264-GRP', {5}),
+        ('Show S2 E5 1080p', {5}),
+        ('Show.S01E04E05.1080p', {4, 5}),
+        ('Show.S01E04-E06.1080p', {4, 5, 6}),
+        ('Show.S02E01-S02E04.1080p', {1, 2, 3, 4}),
+        ('Show.S02E05-720p.mkv', {5}),
+        ('Show.S02E05-1080i.mkv', {5}),
+        ('Show.S02.1080p.WEB.x264-GRP', set()),
+    ])
+    def test_shapes(self, name, expected):
+        from utils.blackhole import _parse_episodes
+        assert _parse_episodes(name) == expected

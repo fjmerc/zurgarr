@@ -25,6 +25,7 @@ from utils.file_utils import atomic_write
 from utils.logger import get_logger
 from utils import attempt_ledger
 from utils import heartbeat
+from utils.quality_parser import parse_quality as parse_release_quality
 
 logger = get_logger()
 
@@ -70,16 +71,15 @@ MAX_RETRIES = 3
 _TB_ALT_MAX_PROBES = 12
 
 # Suppress redundant cached-alternative recovery grabs for the same
-# (imdb_id, season) within this window.  When a whole season is
-# uncached-but-Wanted, the arr drops every episode's .magnet at once; without
-# this guard each episode independently grabs a cached alternative and — before
-# the first pack lands (~300s) and gets symlinked — siblings pick *different*
-# season packs, grabbing 3+ full-season packs for one season and multiplying the
-# rclone VFS download load into a TorBox 429 storm.  One cached pack recovers the
-# whole season, so the first grab wins and the rest defer.  Sized to cover the
-# grab→land→hourly-scan→symlink window; after content lands, the local-dedup
-# check skips re-drops anyway, and a still-missing episode self-heals via the
-# arr re-drop once this expires.
+# (imdb_id, scope) within this window — scope being the exact episode set for
+# an episode grab, the season for a season-pack grab (see _scope_tag).  TB-alt
+# only accepts like-for-like alternatives (an episode grab never takes a
+# season pack — a pack the arr didn't grab gets its import rejected), so each
+# episode recovers on its own; the guard stops a re-dropped .magnet for the
+# same scope from grabbing a second alternative before the first lands and
+# gets symlinked.  Sized to cover the grab→land→hourly-scan→symlink window;
+# after content lands, the local-dedup check skips re-drops anyway, and a
+# still-missing scope self-heals via the arr re-drop once this expires.
 _TB_ALT_DEDUP_TTL = 21600  # 6 hours
 
 # Plan 41 phase A — rescue-staging filename layout.  When the add-time
@@ -564,11 +564,18 @@ def _parse_episodes(filename):
     """Extract episode numbers from a release filename.
 
     Returns a set of episode ints, or empty set for season packs.
-    Handles S01E04, S01E04E05, S01E04-E06, etc.
+    Handles S01E04, S01.E04, S01E04E05, S01E04-E06, S01E04-S01E06, etc.
+    A dash followed by a resolution (``S01E04-720p``) is not a range.
     """
     name = re.sub(r'\.(torrent|magnet)$', '', filename, flags=re.IGNORECASE)
-    # Match S01E04, S01E04E05, S01E04-E06, etc.
-    m = re.search(r'S\d+(E\d+(?:[E\-]E?\d+)*)', name, re.IGNORECASE)
+    # Same-season range written with both season markers: S01E04-S01E06
+    m = re.search(r'S(\d+)[.\s_-]?E(\d+)\s*[-–]\s*S(\d+)[.\s_-]?E(\d+)', name, re.IGNORECASE)
+    if m and int(m.group(1)) == int(m.group(3)):
+        lo, hi = int(m.group(2)), int(m.group(4))
+        if lo <= hi and (hi - lo) < 100:
+            return set(range(lo, hi + 1))
+    # Match S01E04, S01.E04, S01E04E05, S01E04-E06, etc.
+    m = re.search(r'S\d+[.\s_-]?(E\d+(?:[E\-]E?\d+(?!\d)(?![pi](?![a-z])))*)', name, re.IGNORECASE)
     if not m:
         return set()
     ep_str = m.group(1)
@@ -935,7 +942,7 @@ def _extract_file_season(filepath):
         return int(m.group(1))
 
     # Fallback: Sxx without Exx (e.g., S03.Special.mkv) — must not re-match SxxExx
-    m = re.search(r'[Ss](\d{1,2})(?=[.\s\-_]|$)(?![Ee]\d)', filename)
+    m = re.search(r'(?<![A-Za-z])[Ss](\d{1,2})(?=[.\s\-_]|$)(?![Ee]\d)', filename)
     if m:
         return int(m.group(1))
 
@@ -949,6 +956,128 @@ def _extract_file_season(filepath):
             return int(m.group(1))
 
     return None
+
+
+# Multi-movie packs (Torrentio lists them under each member's IMDb id).
+_MOVIE_COLLECTION_RE = re.compile(
+    r'(?<![a-z])(?:trilogy|duology|tetralogy|quadrilogy|pentalogy|hexalogy|anthology'
+    r'|collection|complete[\s._-]saga|box[\s._-]?set|\d+[\s._-]?(?:movies|films))(?![a-z])'
+    r'|(?<!\d)(?:19|20)\d{2}\s*[-–]\s*(?:19|20)\d{2}(?!\d)',
+    re.IGNORECASE)
+
+
+def _release_scope(name, is_tv=None):
+    """Classify what a release covers, for TB-alt like-for-like matching.
+
+    Returns ``(kind, season, episodes)`` where *kind* is ``'movie'``,
+    ``'episode'`` (*episodes* = the frozenset of episode ints),
+    ``'season'`` (single-season pack), ``'multi'`` (multi/cross-season or
+    complete-series pack), ``'collection'`` (multi-movie pack) or ``None``
+    (TV with no parseable season).
+    *is_tv* overrides the parsed media type — the original grab's
+    blackhole label is authoritative; alternatives pass None.
+    """
+    base = re.sub(r'\.(torrent|magnet)$', '', name or '', flags=re.IGNORECASE)
+    if _is_multi_season_pack(base)[0]:
+        return 'multi', None, frozenset()
+    _name, season, parsed_tv = parse_release_name(base)
+    if not (parsed_tv if is_tv is None else is_tv):
+        if _MOVIE_COLLECTION_RE.search(base):
+            return 'collection', None, frozenset()
+        return 'movie', None, frozenset()
+    if season is None:
+        return None, None, frozenset()
+    eps = frozenset(_parse_episodes(base))
+    return ('episode' if eps else 'season'), season, eps
+
+
+def _scope_label(scope):
+    """Human-readable form of a ``_release_scope`` tuple for log lines."""
+    kind, season, eps = scope
+    if kind == 'episode':
+        return f"S{season:02d}" + ''.join(f"E{e:02d}" for e in sorted(eps))
+    if kind == 'season':
+        return f"S{season:02d} season pack"
+    if kind == 'multi':
+        return 'multi-season pack'
+    if kind == 'collection':
+        return 'movie collection'
+    if kind == 'movie':
+        return 'movie'
+    return 'no season/episode marker'
+
+
+def _scope_tag(scope):
+    """attempt_ledger key segment for a TB-alt scope: ``s2`` for a season
+    pack, ``s2e5`` (``s2e5e6`` multi-episode) for an episode grab, ``sNone``
+    for a movie.  Pack and movie tags keep the pre-episode-scoping
+    ``s{season}`` form so existing ledger entries stay valid."""
+    kind, season, eps = scope
+    if kind == 'episode':
+        return f"s{season}e" + 'e'.join(str(e) for e in sorted(eps))
+    return f"s{season}"
+
+
+def _tb_alt_reject_reason(want_scope, want_codec, alt_title):
+    """Why a TB-alt candidate is not like-for-like with the original grab,
+    or None if it is.  Same scope (episode set / season / movie) and the
+    same codec family — Sonarr/Radarr profiles routinely score H.264 and
+    x265 very differently, so a codec swap gets the import rejected."""
+    got_scope = _release_scope(alt_title)
+    if got_scope != want_scope:
+        return f"{_scope_label(got_scope)}, wanted {_scope_label(want_scope)}"
+    got_codec = parse_release_quality(alt_title).get('codec')
+    if got_codec != want_codec:
+        return f"codec {got_codec or 'unknown'}, wanted {want_codec}"
+    return None
+
+
+def _in_file_scope(rel, file_scope):
+    """True unless media file *rel* positively parses to a season or
+    episode outside *file_scope* (``{'season': int, 'episodes': [int] |
+    None}``).  Unparseable files are kept — dropping them could leave a
+    correctly-scoped release with nothing to import."""
+    season = _extract_file_season(rel)
+    if season is not None and season != file_scope.get('season'):
+        return False
+    wanted = file_scope.get('episodes')
+    if wanted:
+        eps = _parse_episodes(os.path.basename(rel))
+        if eps and not eps <= set(wanted):
+            return False
+    return True
+
+
+def _file_scope_for(scope):
+    """``_create_symlinks`` file scope for a ``_release_scope`` tuple:
+    the season (+ episode list for an episode grab), or None for a movie
+    or anything that isn't a single season."""
+    kind, season, eps = scope
+    if kind not in ('episode', 'season'):
+        return None
+    return {'season': season, 'episodes': sorted(eps) or None}
+
+
+def _label_is_tv(label):
+    """Authoritative movie-vs-TV for a blackhole label (None = unlabelled,
+    let the release name decide)."""
+    return {'sonarr': True, 'radarr': False}.get((label or '').lower())
+
+
+def _valid_file_scope(file_scope):
+    """Normalise a persisted ``file_scope`` (pending_monitors.json is
+    trust-boundary state); returns None for anything malformed."""
+    if not isinstance(file_scope, dict):
+        return None
+    season = file_scope.get('season')
+    episodes = file_scope.get('episodes')
+    if not isinstance(season, int) or isinstance(season, bool):
+        return None
+    if episodes is not None:
+        if not (isinstance(episodes, list) and episodes
+                and all(isinstance(e, int) and not isinstance(e, bool) for e in episodes)):
+            return None
+    return {'season': season, 'episodes': episodes}
 
 
 def _build_season_release_name(original_name, season_num):
@@ -1425,16 +1554,19 @@ class BlackholeWatcher:
         self._AUDIT_RETRIGGER_COOLDOWN = 7200  # 2 hours
         self._AUDIT_RETRIGGER_MAX_PER_WINDOW = 3  # caps retries within window
 
-        # Dedup for TorBox cached-alternative recovery: one grabbed pack
-        # recovers a whole season, so the first grab for an (imdb_id, season)
-        # suppresses sibling episode grabs within _TB_ALT_DEDUP_TTL.
-        # Mirrored into attempt_ledger (``tbaltdedup:`` keys) so the TTL
-        # survives a container restart mid-backfill.
-        self._tb_alt_recent_grabs = {}  # {(imdb_id, season): epoch}
+        # Dedup for TorBox cached-alternative recovery: a grab for an
+        # (imdb_id, scope_tag) — exact episode set or season pack, see
+        # _scope_tag — suppresses re-grabs of that scope within
+        # _TB_ALT_DEDUP_TTL.  Mirrored into attempt_ledger (``tbaltdedup:``
+        # keys) so the TTL survives a container restart.
+        self._tb_alt_recent_grabs = {}  # {(imdb_id, scope_tag): epoch}
         self._tb_alt_grabs_lock = threading.Lock()
         # Persistent give-up cap: after this many cached-alternative grabs for
-        # one (imdb_id, season) across scans/restarts, stop re-grabbing (each
-        # grab re-arms TorBox's abuse cooldown). Survives restart via the
+        # one (imdb_id, scope) across scans/restarts, stop re-grabbing (each
+        # grab re-arms TorBox's abuse cooldown).  Episode grabs count per
+        # episode — each needs its own like-for-like grab now that season
+        # packs aren't accepted for them — so a fully-uncached season can
+        # cost up to episodes x this many TorBox creates over its lifetime. Survives restart via the
         # attempt_ledger; the in-memory dedup above only bounds a single burst.
         try:
             self._tb_alt_max_attempts = int(os.environ.get('BLACKHOLE_TB_ALT_MAX_ATTEMPTS', '12'))
@@ -2037,7 +2169,7 @@ class BlackholeWatcher:
         return base
 
     def _create_symlinks(self, release_name, category, mount_path, label=None, debrid=None,
-                         display_name=None):
+                         display_name=None, file_scope=None):
         """Create symlinks in the completed directory for media files.
 
         Symlink targets use the per-debrid base resolved via
@@ -2059,6 +2191,14 @@ class BlackholeWatcher:
         arr can parse the import, while symlink TARGETS keep the real mount
         folder name so they still resolve.
 
+        *file_scope* (``{'season': int, 'episodes': [int] | None}``, TB-alt
+        grabs only) restricts the links to media files of that season /
+        episode set (``_in_file_scope``), and names the completed dir after
+        *display_name* — the release the arr actually grabbed — so a
+        substituted payload is imported as the grab it replaces, never as
+        a pack the arr didn't ask for.  Multi-season splitting is skipped:
+        a scope is a single season.
+
         Returns the number of symlinks created.
         """
         debrid = debrid or self.debrid_service
@@ -2066,18 +2206,20 @@ class BlackholeWatcher:
             logger.error(f"[blackhole] Refusing symlink creation for unsafe release_name: {release_name!r}")
             return 0
 
-        # Obfuscated payload: name the completed dir after the real release.
+        # Obfuscated or TB-alt-substituted payload: name the completed dir
+        # after the real (grabbed) release.
         link_name = release_name
         if (display_name and display_name != release_name
-                and is_obfuscated_name(release_name)
+                and (file_scope or is_obfuscated_name(release_name))
                 and _is_safe_mount_name(display_name)):
-            logger.info(f"[blackhole] Obfuscated payload {release_name!r}: "
+            kind = 'Substituted' if file_scope else 'Obfuscated'
+            logger.info(f"[blackhole] {kind} payload {release_name!r}: "
                         f"naming completed symlinks {display_name!r}")
             link_name = display_name
 
         is_multi, _, _ = _is_multi_season_pack(link_name)
 
-        if is_multi:
+        if is_multi and not file_scope:
             # Season detection + dir naming key off link_name (the human name);
             # symlink targets still resolve against the real mount folder.
             split_count = self._create_split_season_symlinks(
@@ -2097,7 +2239,6 @@ class BlackholeWatcher:
         if not completed_release_dir.startswith(completed_real + os.sep) and completed_release_dir != completed_real:
             logger.error(f"[blackhole] Refusing path-traversal release dir: {completed_release_dir}")
             return 0
-        os.makedirs(completed_release_dir, exist_ok=True)
         symlink_target_base = self._symlink_target_base_for(debrid)
         count = 0
 
@@ -2110,6 +2251,33 @@ class BlackholeWatcher:
                 if 'sample' in f.lower():
                     continue
                 media_rels.append(os.path.relpath(os.path.join(root, f), mount_path))
+
+        if file_scope:
+            in_scope = [rel for rel in media_rels if _in_file_scope(rel, file_scope)]
+            if len(in_scope) != len(media_rels):
+                logger.info(f"[blackhole] {release_name}: linking {len(in_scope)} of "
+                            f"{len(media_rels)} media file(s) matching the requested "
+                            f"season/episode(s)")
+            media_rels = in_scope
+        # Created only when there is something to link: an empty release dir
+        # in the arr's watch folder is a "download" it can never import.
+        if not media_rels:
+            return 0
+        os.makedirs(completed_release_dir, exist_ok=True)
+        if link_name != release_name and file_scope:
+            # Named after the grab, so an earlier substitute for the same
+            # grab may have linked here too — drop its links, or the arr
+            # sees two copies of the episode.
+            own_prefix = os.path.join(symlink_target_base, category, release_name) + os.sep
+            for root, _dirs, files in os.walk(completed_release_dir):
+                for f in files:
+                    p = os.path.join(root, f)
+                    try:
+                        if os.path.islink(p) and not os.readlink(p).startswith(own_prefix):
+                            os.remove(p)
+                            logger.info(f"[blackhole] Removed stale substitute symlink {p}")
+                    except OSError as e:
+                        logger.warning(f"[blackhole] Could not remove stale symlink {p}: {e}")
 
         # Single obfuscated media file: rename the link basename too, so the
         # arr's file-level parse sees the release name instead of hex junk.
@@ -2569,7 +2737,8 @@ class BlackholeWatcher:
         except (IOError, OSError) as e:
             logger.debug(f"[blackhole] Could not write pending monitors: {e}")
 
-    def _add_pending(self, torrent_id, filename, label=None, compromise=None, debrid=None):
+    def _add_pending(self, torrent_id, filename, label=None, compromise=None, debrid=None,
+                     file_scope=None):
         """Add a torrent to the pending monitors file.
 
         *compromise* is an optional dict annotating this grab as a
@@ -2584,6 +2753,10 @@ class BlackholeWatcher:
         debrid for legacy callers; multi-debrid grabs pass it explicitly.
         Legacy on-disk entries without a ``debrid`` key load as
         ``realdebrid`` (the only pre-plan-39 option for new grabs).
+
+        *file_scope* (TB-alt grabs only) restricts symlink creation to one
+        season / episode set — see ``_create_symlinks``.  Entries without
+        it symlink every media file, as before.
         """
         with self._monitors_lock:
             entries = self._load_pending()
@@ -2606,6 +2779,8 @@ class BlackholeWatcher:
                 entry['grabbed_tier'] = compromise.get('grabbed_tier')
                 entry['compromise_reason'] = compromise.get('reason')
                 entry['compromise_strategy'] = compromise.get('strategy')
+            if file_scope:
+                entry['file_scope'] = file_scope
             entries.append(entry)
             self._save_pending(entries)
 
@@ -2619,7 +2794,8 @@ class BlackholeWatcher:
 
     # ── Monitor orchestration ────────────────────────────────────────
 
-    def _start_monitor(self, torrent_id, filename, label=None, compromise=None, debrid=None):
+    def _start_monitor(self, torrent_id, filename, label=None, compromise=None, debrid=None,
+                       file_scope=None):
         """Spawn a background thread to monitor a torrent and create symlinks.
 
         *compromise* is an optional dict forwarded to ``_add_pending`` so
@@ -2629,6 +2805,9 @@ class BlackholeWatcher:
         *debrid* (plan 39 phase 2) binds the monitor thread to a specific
         provider for its lifetime.  Defaults to the instance debrid for
         single-debrid setups + legacy callers.
+
+        *file_scope* is forwarded to ``_add_pending`` (persisted for resume)
+        and ``_create_symlinks``.
         """
         debrid = debrid or self.debrid_service
         with self._monitors_lock:
@@ -2637,10 +2816,12 @@ class BlackholeWatcher:
                 return
             self._active_monitors.add(torrent_id)
 
-        self._add_pending(torrent_id, filename, label=label, compromise=compromise, debrid=debrid)
+        self._add_pending(torrent_id, filename, label=label, compromise=compromise, debrid=debrid,
+                          file_scope=file_scope)
         t = threading.Thread(
             target=self._monitor_and_symlink,
             args=(torrent_id, filename, label, debrid),
+            kwargs={'file_scope': file_scope},
             daemon=True,
         )
         t.start()
@@ -2726,7 +2907,7 @@ class BlackholeWatcher:
             return False
         return True
 
-    def _monitor_and_symlink(self, torrent_id, filename, label=None, debrid=None):
+    def _monitor_and_symlink(self, torrent_id, filename, label=None, debrid=None, file_scope=None):
         """Background thread: poll debrid status, wait for mount, create symlinks.
 
         This method runs in its own thread and must not block the main scan loop.
@@ -2736,6 +2917,8 @@ class BlackholeWatcher:
         its lifetime — used by every status check, info extraction, and
         symlink-creation call below.  Defaults to the instance debrid for
         single-debrid setups and legacy callers.
+
+        *file_scope* (TB-alt grabs) is passed to ``_create_symlinks``.
         """
         debrid = debrid or self.debrid_service
         api_key = self._api_key_for(debrid)
@@ -3053,7 +3236,8 @@ class BlackholeWatcher:
         # Phase 3: Create symlinks
         try:
             count = self._create_symlinks(matched_name, category, mount_path, label=label, debrid=debrid,
-                                          display_name=os.path.splitext(filename)[0])
+                                          display_name=os.path.splitext(filename)[0],
+                                          file_scope=file_scope)
             if count > 0:
                 logger.info(f"[blackhole] Created {count} symlink(s) for {release_name}")
                 if _history:
@@ -3088,6 +3272,15 @@ class BlackholeWatcher:
                     pass
             else:
                 logger.warning(f"[blackhole] No media files found to symlink for {release_name}")
+                if file_scope:
+                    # A TB-alt payload without the requested episode(s): the
+                    # audit blocklists it and re-searches what's missing, so
+                    # the grab fails visibly instead of vanishing.
+                    try:
+                        self._audit_release_completeness(filename, release_name, mount_path,
+                                                         info, debrid=debrid)
+                    except Exception as e:
+                        logger.debug(f"[blackhole] Completeness audit error for {release_name}: {e}")
         except Exception as e:
             logger.error(f"[blackhole] Error creating symlinks for {release_name}: {e}")
             try:
@@ -3141,8 +3334,27 @@ class BlackholeWatcher:
                         f"{torrent_id!r}: {entry_debrid!r}"
                     )
                     entry_debrid = self.debrid_service
+                # TB-alt symlink scope; absent on every other entry → None.
+                # A present-but-invalid scope must not fail open into
+                # linking the whole payload: rebuild it from the grab's own
+                # name, and skip the entry if even that can't scope it.
+                file_scope = entry.get('file_scope')
+                if file_scope is not None:
+                    file_scope = _valid_file_scope(file_scope)
+                    if file_scope is None:
+                        file_scope = _file_scope_for(
+                            _release_scope(filename, is_tv=_label_is_tv(label)))
+                        logger.warning(
+                            f"[blackhole] Invalid file_scope on pending entry "
+                            f"{torrent_id!r}: {entry.get('file_scope')!r} — "
+                            f"{'rebuilt from filename' if file_scope else 'not resuming'}"
+                        )
+                        if file_scope is None:
+                            self._remove_pending(torrent_id)
+                            continue
                 if torrent_id:
-                    self._start_monitor(torrent_id, filename, label=label, debrid=entry_debrid)
+                    self._start_monitor(torrent_id, filename, label=label, debrid=entry_debrid,
+                                        file_scope=file_scope)
             except Exception as e:
                 logger.warning(f"[blackhole] Skipping bad pending entry {entry!r}: {e}")
 
@@ -3915,14 +4127,20 @@ class BlackholeWatcher:
         debrid, and — for the cross-confirmed path — also on TorBox), but
         OTHER releases of the same title may be cached on TorBox.  Rather
         than let the title fall back to "Wanted", search Torrentio for
-        same-title releases, keep only those TorBox has cached AT THE SAME
-        quality tier the arr already approved, grab the best one on TorBox,
-        and start a TB-routed symlink monitor.
+        same-title releases, keep only like-for-like ones — the SAME quality
+        tier the arr already approved, the same scope (episode set, season
+        pack, or movie) and the same codec family — that TorBox has cached,
+        grab the best one on TorBox, and start a TB-routed symlink monitor
+        scoped to the requested episode(s).  An alternative the arr didn't
+        grab only imports if the arr would have accepted it, so a season
+        pack for an episode grab, or x265 for an H.264 grab, is rejected
+        (logged as ``TB-alt: rejected <alt> (<reason>)``).
 
         Returns True iff a cached alternative was grabbed — in which case
         the original watch-dir file has already been removed and the caller
         must NOT delete again.  False → caller falls through to its
-        existing delete.  Never raises; any failure degrades to delete.
+        existing failed-grab handling (arr failed-feedback + delete).
+        Never raises; any failure degrades to that.
         """
         if not self._tb_alt_recovery_enabled():
             return False
@@ -3949,35 +4167,56 @@ class BlackholeWatcher:
                 logger.debug(f"[blackhole] TB-alt: unparseable tier for {filename}; skipping")
                 return False
 
+            # Like-for-like targets.  The label (when set) is authoritative
+            # for movie-vs-TV, as in _resolve_arr_identity.  A multi-season
+            # grab or a TV name without a season can't be matched to a
+            # single scope, and an unparseable codec can't be matched to a
+            # codec family — decline rather than risk an import the arr
+            # rejects.
+            want_scope = _release_scope(filename, is_tv=_label_is_tv(label))
+            if want_scope[0] not in ('movie', 'episode', 'season'):
+                logger.info(f"[blackhole] TB-alt: {filename} is a "
+                            f"{_scope_label(want_scope)} grab; no like-for-like "
+                            f"match possible, skipping")
+                return False
+            want_codec = parse_release_quality(filename).get('codec')
+            if not want_codec:
+                logger.info(f"[blackhole] TB-alt: unparseable codec for {filename}; "
+                            f"can't match the codec family, skipping")
+                return False
+            scope_tag = _scope_tag(want_scope)
+            # Symlink only the requested season/episode(s) out of whatever
+            # lands — defence in depth behind the scope match below.
+            file_scope = _file_scope_for(want_scope)
+
             imdb_id, media_type, season, episode = self._resolve_arr_identity(
                 filename, label=label)
             if not imdb_id:
                 logger.debug(f"[blackhole] TB-alt: no IMDb id for {filename}; skipping")
                 return False
 
-            # One cached pack recovers the whole season — if a sibling episode
-            # already grabbed an alternative for this (imdb_id, season), skip
-            # the redundant search/probe/grab that would pull another pack and
-            # multiply the rclone VFS load.  Checked before the Torrentio search
-            # so we also spare the TorBox cache-probe API calls.
-            dedup_key = (imdb_id, season)
+            # If this exact scope already grabbed an alternative within the
+            # TTL (a re-dropped .magnet), skip the redundant search/probe/grab.
+            # Checked before the Torrentio search so we also spare the TorBox
+            # cache-probe API calls.
+            dedup_key = (imdb_id, scope_tag)
             if self._tb_alt_recently_grabbed(dedup_key):
                 logger.info(f"[blackhole] TB-alt: already recovered "
-                            f"{imdb_id} (season={season}) within TTL; "
+                            f"{imdb_id} ({_scope_label(want_scope)}) within TTL; "
                             f"skipping redundant grab for {filename}")
                 return False
 
             # Persistent give-up cap: a never-completing title would otherwise
             # be re-grabbed every time its .magnet re-drops, re-arming TorBox's
             # abuse cooldown indefinitely. After _tb_alt_max_attempts grabs for
-            # this (imdb_id, season), decline so the caller deletes and the title
+            # this (imdb_id, scope), decline so the caller deletes and the title
             # falls back to Wanted instead of churning TorBox.
-            ledger_key = f"tbalt:{imdb_id}:s{season}"
+            ledger_key = f"tbalt:{imdb_id}:{scope_tag}"
             if attempt_ledger.get(ledger_key) >= self._tb_alt_max_attempts:
                 logger.info(f"[blackhole] TB-alt: give-up cap "
                             f"({self._tb_alt_max_attempts}) reached for "
-                            f"{imdb_id} (season={season}); declining grab for "
-                            f"{filename}, falling back to Wanted")
+                            f"{imdb_id} ({_scope_label(want_scope)}); declining "
+                            f"grab for {filename}, falling back to Wanted")
                 return False
 
             results = search_torrentio(
@@ -4023,17 +4262,33 @@ class BlackholeWatcher:
                 if _blocklist and _blocklist.is_blocked(h):
                     return False
                 return attempt_ledger.get(
-                    self._tb_alt_tried_ledger_key(imdb_id, season, h)) == 0
+                    self._tb_alt_tried_ledger_key(imdb_id, scope_tag, h)) == 0
 
-            candidates = [r for r in results
-                          if _eligible_hash((r.get('info_hash') or '').lower())
-                          and (r.get('quality') or {}).get('label') == target_tier
-                          and release_matches_title(r.get('title') or '',
-                                                    approved_title,
-                                                    media_year=approved_year)]
+            # Like-for-like gate runs BEFORE the probe slice too, so season
+            # packs and codec swaps can't eat cache-probe budget.
+            candidates = []
+            n_rejected = 0
+            for r in results:
+                alt_title = r.get('title') or ''
+                if not (_eligible_hash((r.get('info_hash') or '').lower())
+                        and (r.get('quality') or {}).get('label') == target_tier
+                        and release_matches_title(alt_title, approved_title,
+                                                  media_year=approved_year)):
+                    continue
+                reason = _tb_alt_reject_reason(want_scope, want_codec, alt_title)
+                if reason:
+                    n_rejected += 1
+                    logger.info(f"[blackhole] TB-alt: rejected {alt_title[:120]} ({reason})")
+                    continue
+                candidates.append(r)
             if not candidates:
-                logger.debug(f"[blackhole] TB-alt: no same-tier "
-                             f"({target_tier}) alternative for {filename}")
+                if n_rejected:
+                    logger.info(f"[blackhole] TB-alt: no like-for-like alternative "
+                                f"for {filename} ({n_rejected} same-tier "
+                                f"rejected); failing the grab")
+                else:
+                    logger.debug(f"[blackhole] TB-alt: no same-tier "
+                                 f"({target_tier}) alternative for {filename}")
                 return False
             candidates.sort(key=lambda r: -(r.get('seeds') or 0))
             probe = candidates[:_TB_ALT_MAX_PROBES]
@@ -4105,7 +4360,8 @@ class BlackholeWatcher:
                              f"{filename}; not claiming recovery")
                 return False
             try:
-                self._start_monitor(torrent_id, filename, label=label, debrid='torbox')
+                self._start_monitor(torrent_id, filename, label=label, debrid='torbox',
+                                    file_scope=file_scope)
             except Exception as e:
                 logger.error(f"[blackhole] TB-alt: failed to start monitor for "
                              f"{filename}; not claiming recovery: {e}")
@@ -4118,7 +4374,7 @@ class BlackholeWatcher:
             remember_added_hash('torbox', alt_hash)
         except ImportError:
             pass
-        # Suppress sibling-episode grabs for this season for _TB_ALT_DEDUP_TTL.
+        # Suppress re-grabs for this exact scope for _TB_ALT_DEDUP_TTL.
         # dedup_key is always bound here: the only way to reach this line is to
         # fall through the candidate-resolution try block (whose except returns
         # False), and dedup_key is assigned before any code that can do so.
@@ -4126,11 +4382,11 @@ class BlackholeWatcher:
         attempt_ledger.bump(ledger_key)
         # Recorded at grab time, not at import-failure time: success means
         # the arr imports and stops hunting, so the only way this (imdb,
-        # season) re-enters the recovery is if this grab failed — and every
+        # scope) re-enters the recovery is if this grab failed — and every
         # failure mode (mislabeled payload, no symlink, handoff limbo,
         # monitor death) funnels back here without needing its own
         # report-back hook.
-        attempt_ledger.bump(self._tb_alt_tried_ledger_key(imdb_id, season, alt_hash))
+        attempt_ledger.bump(self._tb_alt_tried_ledger_key(imdb_id, scope_tag, alt_hash))
         try:
             os.remove(file_path)
         except OSError as e:
@@ -4169,42 +4425,43 @@ class BlackholeWatcher:
         return True
 
     @staticmethod
-    def _tb_alt_tried_ledger_key(imdb_id, season, alt_hash):
+    def _tb_alt_tried_ledger_key(imdb_id, scope_tag, alt_hash):
         """attempt_ledger key marking a specific cached alternative as
-        already grabbed for this (imdb_id, season).
+        already grabbed for this (imdb_id, scope).
 
         Distinct ``tbalttried:`` family — per-hash memory, unlike the
-        ``tbalt:`` give-up counter (per-season count) and ``tbaltdedup:``
-        (per-season TTL).  Season-scoped to match those families' identity
-        and so mislabeled uploads sharing a hash across titles can't
-        cross-poison.  Movies key as ``sNone`` — same silent convention as
-        the peer families.  Hash is stored lowercase (Torrentio convention).
+        ``tbalt:`` give-up counter (per-scope count) and ``tbaltdedup:``
+        (per-scope TTL).  Scoped like those families (``_scope_tag``:
+        ``s2`` season pack, ``s2e5`` episode, ``sNone`` movie) so
+        mislabeled uploads sharing a hash across titles can't
+        cross-poison.  Hash is stored lowercase (Torrentio convention).
         Entries decay with the ledger's 30-idle-day prune, giving an
         abandoned title a fresh chance if it ever flows back through.
         """
-        return f"tbalttried:{imdb_id}:s{season}:{(alt_hash or '').lower()}"
+        return f"tbalttried:{imdb_id}:{scope_tag}:{(alt_hash or '').lower()}"
 
     @staticmethod
     def _tb_alt_dedup_ledger_key(key):
-        """attempt_ledger key for a (imdb_id, season) sibling-grab dedup entry.
+        """attempt_ledger key for an (imdb_id, scope_tag) re-grab dedup entry.
 
         Distinct ``tbaltdedup:`` family so it can't collide with the
-        ``tbalt:`` give-up counters, which share the same (imdb, season)
+        ``tbalt:`` give-up counters, which share the same (imdb, scope)
         identity but different semantics (TTL'd dedup vs. capped count).
         """
-        imdb_id, season = key
-        return f"tbaltdedup:{imdb_id}:s{season}"
+        imdb_id, scope_tag = key
+        return f"tbaltdedup:{imdb_id}:{scope_tag}"
 
     def _tb_alt_recently_grabbed(self, key):
-        """True if a cached alternative was grabbed for this (imdb_id, season)
-        within _TB_ALT_DEDUP_TTL.  Prunes expired entries opportunistically so
-        the dict stays bounded over a long-running process.
+        """True if a cached alternative was grabbed for this (imdb_id,
+        scope_tag) within _TB_ALT_DEDUP_TTL.  Prunes expired entries
+        opportunistically so the dict stays bounded over a long-running
+        process.
 
         The in-memory dict is the fast path; the attempt_ledger mirror makes
         the answer restart-survivable — without it, a container restart
-        mid-backfill re-enables sibling season-pack grabs, and each redundant
-        TB create is exactly the volume event that arms TB Essential's ~24h
-        abuse cooldown."""
+        right after a grab re-enables a duplicate grab for a re-dropped
+        .magnet, and each redundant TB create is exactly the volume event
+        that arms TB Essential's ~24h abuse cooldown."""
         now = time.time()
         with self._tb_alt_grabs_lock:
             expired = [k for k, ts in self._tb_alt_recent_grabs.items()
@@ -4219,7 +4476,7 @@ class BlackholeWatcher:
 
     def _remember_tb_alt_grab(self, key):
         """Record that a cached alternative was grabbed for this (imdb_id,
-        season) so sibling-episode grabs in the same burst are suppressed —
+        scope_tag) so a re-drop of the same scope is suppressed —
         including across a container restart (ledger mirror)."""
         with self._tb_alt_grabs_lock:
             self._tb_alt_recent_grabs[key] = time.time()

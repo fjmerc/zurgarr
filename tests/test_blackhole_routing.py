@@ -157,7 +157,7 @@ class TestPendingMonitorsDebridField:
         captured = []
         monkeypatch.setattr(
             watcher, '_start_monitor',
-            lambda tid, fn, label=None, debrid=None: captured.append((tid, debrid)),
+            lambda tid, fn, label=None, debrid=None, **_: captured.append((tid, debrid)),
         )
         watcher._resume_pending_monitors()
         assert captured == [('tlegacy', 'realdebrid')]
@@ -173,7 +173,7 @@ class TestPendingMonitorsDebridField:
         captured = []
         monkeypatch.setattr(
             watcher, '_start_monitor',
-            lambda tid, fn, label=None, debrid=None: captured.append((tid, debrid)),
+            lambda tid, fn, label=None, debrid=None, **_: captured.append((tid, debrid)),
         )
         watcher._resume_pending_monitors()
         assert captured == [('tb1', 'torbox')]
@@ -192,7 +192,7 @@ class TestPendingMonitorsDebridField:
         captured = []
         monkeypatch.setattr(
             watcher, '_start_monitor',
-            lambda tid, fn, label=None, debrid=None: captured.append((tid, debrid)),
+            lambda tid, fn, label=None, debrid=None, **_: captured.append((tid, debrid)),
         )
         watcher._resume_pending_monitors()
         assert captured == [('t_bad', 'realdebrid')]  # sanitized to default

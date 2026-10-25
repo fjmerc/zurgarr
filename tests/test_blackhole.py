@@ -5247,11 +5247,13 @@ class TestTorboxCachedAlternative:
                             lambda *a, **k: (True, {'data': {'torrent_id': 777}}))
         started = []
         monkeypatch.setattr(w, '_start_monitor',
-                            lambda tid, fn, label=None, debrid=None: started.append((tid, debrid)))
+                            lambda tid, fn, label=None, debrid=None, file_scope=None:
+                            started.append((tid, debrid, file_scope)))
         fp = self._make_file(tmp_dir, 'Sing.2.1080p.WEB.x264-CYBER.mkv.magnet')
         assert w._try_torbox_cached_alternative(
             fp, os.path.basename(fp), self.REJECTED, 'realdebrid') is True
-        assert started == [('777', 'torbox')]
+        # Movies carry no file scope — every media file is linked.
+        assert started == [('777', 'torbox', None)]
         assert not os.path.exists(fp)
 
     def test_symlink_mode_no_torrent_id_declines_and_keeps_file(self, tmp_dir, monkeypatch):
@@ -5276,17 +5278,15 @@ class TestTorboxCachedAlternative:
         assert not started
         assert os.path.exists(fp)
 
-    def test_dedup_suppresses_second_grab_for_same_season(self, tmp_dir, monkeypatch):
-        """One cached pack recovers a whole season: after the first episode of
-        a season grabs an alternative, a sibling episode is skipped before any
-        search/probe/grab — this is what stops 3+ packs landing for one season
-        and overdriving the rclone VFS into a TorBox 429 storm."""
+    def test_dedup_suppresses_regrab_of_same_episode(self, tmp_dir, monkeypatch):
+        """After an episode grabs an alternative, a re-drop of the SAME
+        episode within the TTL is skipped before any search/probe/grab."""
         monkeypatch.setenv('BLACKHOLE_TB_ALT_RECOVERY_ENABLED', 'true')
         w = self._make_watcher(tmp_dir)
         monkeypatch.setattr(w, '_resolve_arr_identity',
                             lambda fn, label=None: ('tt999', 'series', 2, 1))
         self._stub_search(monkeypatch, [self._candidate(
-            self.CACHED_ALT, title='Show.S02.1080p.WEB.x264-GRP')])
+            self.CACHED_ALT, title='Show.S02E01.1080p.WEB.x264-OTHER')])
         self._stub_cache(monkeypatch, {self.CACHED_ALT: True})
         adds = []
         monkeypatch.setattr(w, '_add_to_torbox',
@@ -5295,46 +5295,80 @@ class TestTorboxCachedAlternative:
         assert w._try_torbox_cached_alternative(
             fp1, os.path.basename(fp1), self.REJECTED, 'realdebrid') is True
         assert len(adds) == 1
-        # Sibling episode of the SAME season: suppressed, file kept, no 2nd add.
-        fp2 = self._make_file(tmp_dir, 'Show.S02E02.1080p.WEB.x264-GRP.mkv.magnet')
+        # Same episode re-dropped: suppressed, file kept, no 2nd add.
+        fp2 = self._make_file(tmp_dir, 'Show.S02E01.1080p.WEB.x264-GRP.mkv.magnet')
         assert w._try_torbox_cached_alternative(
             fp2, os.path.basename(fp2), self.REJECTED, 'realdebrid') is False
         assert len(adds) == 1
         assert os.path.exists(fp2)
 
+    def test_dedup_does_not_suppress_a_sibling_episode(self, tmp_dir, monkeypatch):
+        """The dedup key is (imdb_id, episode scope): with season packs no
+        longer accepted for an episode grab, each episode must recover on
+        its own — E01's grab must not block E02."""
+        monkeypatch.setenv('BLACKHOLE_TB_ALT_RECOVERY_ENABLED', 'true')
+        w = self._make_watcher(tmp_dir)
+        ident = {'episode': 1}
+        monkeypatch.setattr(w, '_resolve_arr_identity',
+                            lambda fn, label=None: ('tt999', 'series', 2, ident['episode']))
+        alt_e2 = 'c' * 40
+        self._stub_search(monkeypatch, [
+            self._candidate(self.CACHED_ALT, title='Show.S02E01.1080p.WEB.x264-OTHER'),
+            self._candidate(alt_e2, title='Show.S02E02.1080p.WEB.x264-OTHER'),
+        ])
+        self._stub_cache(monkeypatch, {self.CACHED_ALT: True, alt_e2: True})
+        added = []
+
+        def fake_add(path, api_key=None):
+            with open(path) as f:
+                added.append(f.read())
+            return True, {}
+        monkeypatch.setattr(w, '_add_to_torbox', fake_add)
+        fp1 = self._make_file(tmp_dir, 'Show.S02E01.1080p.WEB.x264-GRP.mkv.magnet')
+        assert w._try_torbox_cached_alternative(
+            fp1, os.path.basename(fp1), self.REJECTED, 'realdebrid') is True
+        ident['episode'] = 2
+        fp2 = self._make_file(tmp_dir, 'Show.S02E02.1080p.WEB.x264-GRP.mkv.magnet')
+        assert w._try_torbox_cached_alternative(
+            fp2, os.path.basename(fp2), self.REJECTED, 'realdebrid') is True
+        assert len(added) == 2
+        assert self.CACHED_ALT in added[0] and alt_e2 in added[1]
+
     def test_dedup_does_not_suppress_a_different_season(self, tmp_dir, monkeypatch):
-        """The dedup key is (imdb_id, season) — a grab for S02 must not block
-        recovery of S03."""
+        """A season-pack grab for S02 must not block recovery of S03."""
         monkeypatch.setenv('BLACKHOLE_TB_ALT_RECOVERY_ENABLED', 'true')
         w = self._make_watcher(tmp_dir)
         ident = {'season': 2}
         monkeypatch.setattr(w, '_resolve_arr_identity',
-                            lambda fn, label=None: ('tt999', 'series', ident['season'], 1))
-        self._stub_search(monkeypatch, [self._candidate(
-            self.CACHED_ALT, title='Show.S02.1080p.WEB.x264-GRP')])
-        self._stub_cache(monkeypatch, {self.CACHED_ALT: True})
+                            lambda fn, label=None: ('tt999', 'series', ident['season'], None))
+        alt_s3 = 'c' * 40
+        self._stub_search(monkeypatch, [
+            self._candidate(self.CACHED_ALT, title='Show.S02.1080p.WEB.x264-OTHER'),
+            self._candidate(alt_s3, title='Show.S03.1080p.WEB.x264-OTHER'),
+        ])
+        self._stub_cache(monkeypatch, {self.CACHED_ALT: True, alt_s3: True})
         adds = []
         monkeypatch.setattr(w, '_add_to_torbox',
                             lambda *a, **k: adds.append(1) or (True, {}))
-        fp1 = self._make_file(tmp_dir, 'Show.S02E01.1080p.WEB.x264-GRP.mkv.magnet')
+        fp1 = self._make_file(tmp_dir, 'Show.S02.1080p.WEB.x264-GRP.magnet')
         assert w._try_torbox_cached_alternative(
             fp1, os.path.basename(fp1), self.REJECTED, 'realdebrid') is True
         ident['season'] = 3
-        fp2 = self._make_file(tmp_dir, 'Show.S03E01.1080p.WEB.x264-GRP.mkv.magnet')
+        fp2 = self._make_file(tmp_dir, 'Show.S03.1080p.WEB.x264-GRP.magnet')
         assert w._try_torbox_cached_alternative(
             fp2, os.path.basename(fp2), self.REJECTED, 'realdebrid') is True
         assert len(adds) == 2
 
     def test_dedup_not_set_when_grab_fails(self, tmp_dir, monkeypatch):
         """The guard records only on a committed grab — a failed first attempt
-        (no cached alt) must not poison the season so a later sibling can still
+        (no cached alt) must not poison the episode, so a re-drop can still
         recover once an alternative becomes cached."""
         monkeypatch.setenv('BLACKHOLE_TB_ALT_RECOVERY_ENABLED', 'true')
         w = self._make_watcher(tmp_dir)
         monkeypatch.setattr(w, '_resolve_arr_identity',
                             lambda fn, label=None: ('tt999', 'series', 2, 1))
         self._stub_search(monkeypatch, [self._candidate(
-            self.CACHED_ALT, title='Show.S02.1080p.WEB.x264-GRP')])
+            self.CACHED_ALT, title='Show.S02E01.1080p.WEB.x264-OTHER')])
         cache = {self.CACHED_ALT: False}  # uncached on first attempt
         import utils.search as search
         monkeypatch.setattr(search, 'check_debrid_cache',
@@ -5347,12 +5381,11 @@ class TestTorboxCachedAlternative:
         assert w._try_torbox_cached_alternative(
             fp1, os.path.basename(fp1), self.REJECTED, 'realdebrid') is False
         assert not adds
-        # Now the alternative is cached — the season was NOT poisoned, so a
-        # sibling episode recovers normally.
+        # Now the alternative is cached — the episode was NOT poisoned, so the
+        # re-drop recovers normally.
         cache[self.CACHED_ALT] = True
-        fp2 = self._make_file(tmp_dir, 'Show.S02E02.1080p.WEB.x264-GRP.mkv.magnet')
         assert w._try_torbox_cached_alternative(
-            fp2, os.path.basename(fp2), self.REJECTED, 'realdebrid') is True
+            fp1, os.path.basename(fp1), self.REJECTED, 'realdebrid') is True
         assert len(adds) == 1
 
 
@@ -5376,10 +5409,27 @@ class TestTorboxAltGiveUpCap(TestTorboxCachedAlternative):
         monkeypatch.setattr(w, '_resolve_arr_identity',
                             lambda fn, label=None: ('tt777', 'series', 2, 1))
         self._stub_search(monkeypatch, [self._candidate(
-            self.CACHED_ALT, title='Show.S02.1080p.WEB.x264-GRP')])
+            self.CACHED_ALT, title='Show.S02E01.1080p.WEB.x264-OTHER')])
         self._stub_cache(monkeypatch, {self.CACHED_ALT: True})
         monkeypatch.setattr(w, '_add_to_torbox', lambda *a, **k: (True, {}))
         fp = self._make_file(tmp_dir, 'Show.S02E01.1080p.WEB.x264-GRP.mkv.magnet')
+        assert w._try_torbox_cached_alternative(
+            fp, os.path.basename(fp), self.REJECTED, 'realdebrid') is True
+        # Episode grabs count per episode, so a long season can't exhaust
+        # one shared cap.
+        assert self.ledger.get('tbalt:tt777:s2e1') == 1
+        assert self.ledger.get('tbalt:tt777:s2') == 0
+
+    def test_season_pack_grab_bumps_season_ledger_key(self, tmp_dir, monkeypatch):
+        monkeypatch.setenv('BLACKHOLE_TB_ALT_RECOVERY_ENABLED', 'true')
+        w = self._make_watcher(tmp_dir)
+        monkeypatch.setattr(w, '_resolve_arr_identity',
+                            lambda fn, label=None: ('tt777', 'series', 2, None))
+        self._stub_search(monkeypatch, [self._candidate(
+            self.CACHED_ALT, title='Show.S02.1080p.WEB.x264-OTHER')])
+        self._stub_cache(monkeypatch, {self.CACHED_ALT: True})
+        monkeypatch.setattr(w, '_add_to_torbox', lambda *a, **k: (True, {}))
+        fp = self._make_file(tmp_dir, 'Show.S02.1080p.WEB.x264-GRP.magnet')
         assert w._try_torbox_cached_alternative(
             fp, os.path.basename(fp), self.REJECTED, 'realdebrid') is True
         assert self.ledger.get('tbalt:tt777:s2') == 1
@@ -5389,11 +5439,11 @@ class TestTorboxAltGiveUpCap(TestTorboxCachedAlternative):
         w = self._make_watcher(tmp_dir)
         w._tb_alt_max_attempts = 2
         for _ in range(2):
-            self.ledger.bump('tbalt:tt777:s2')
+            self.ledger.bump('tbalt:tt777:s2e3')
         monkeypatch.setattr(w, '_resolve_arr_identity',
-                            lambda fn, label=None: ('tt777', 'series', 2, 1))
+                            lambda fn, label=None: ('tt777', 'series', 2, 3))
         self._stub_search(monkeypatch, [self._candidate(
-            self.CACHED_ALT, title='Show.S02.1080p.WEB.x264-GRP')])
+            self.CACHED_ALT, title='Show.S02E03.1080p.WEB.x264-OTHER')])
         self._stub_cache(monkeypatch, {self.CACHED_ALT: True})
         adds = []
         monkeypatch.setattr(w, '_add_to_torbox',
@@ -5437,32 +5487,33 @@ class TestTorboxAltGiveUpCap(TestTorboxCachedAlternative):
         assert len(adds) == 2
 
     def test_sibling_dedup_survives_restart(self, tmp_dir):
-        """The 6h sibling-grab suppression must survive a container restart.
+        """The 6h re-grab suppression must survive a container restart.
 
-        Pre-fix it lived only in an in-memory dict, so a restart
-        mid-backfill re-enabled sibling season-pack grabs — each redundant
-        TB create being the volume event that arms TB Essential's cooldown.
+        Pre-fix it lived only in an in-memory dict, so a restart re-enabled
+        duplicate grabs — each redundant TB create being the volume event
+        that arms TB Essential's cooldown.
         """
         import importlib
         from utils import attempt_ledger
         w = self._make_watcher(tmp_dir)
-        w._remember_tb_alt_grab(('tt777', 2))
+        w._remember_tb_alt_grab(('tt777', 's2e1'))
 
         # "Restart": reload the ledger from the same file, fresh watcher
         # (empty in-memory dedup dict).
         importlib.reload(attempt_ledger)
         attempt_ledger.init(config_dir=tmp_dir)
         w2 = self._make_watcher(tmp_dir)
-        assert w2._tb_alt_recently_grabbed(('tt777', 2)) is True
-        assert w2._tb_alt_recently_grabbed(('tt777', 3)) is False
-        assert w2._tb_alt_recently_grabbed(('tt888', 2)) is False
+        assert w2._tb_alt_recently_grabbed(('tt777', 's2e1')) is True
+        assert w2._tb_alt_recently_grabbed(('tt777', 's2e2')) is False
+        assert w2._tb_alt_recently_grabbed(('tt777', 's3e1')) is False
+        assert w2._tb_alt_recently_grabbed(('tt888', 's2e1')) is False
 
     def test_sibling_dedup_ledger_entry_expires(self, tmp_dir):
         """A ledger-mirrored dedup entry older than the TTL does not suppress."""
         from datetime import datetime, timezone, timedelta
         from utils.blackhole import _TB_ALT_DEDUP_TTL
         w = self._make_watcher(tmp_dir)
-        key = ('tt777', 2)
+        key = ('tt777', 's2')
         w._remember_tb_alt_grab(key)
         with w._tb_alt_grabs_lock:
             w._tb_alt_recent_grabs.clear()  # drop the in-memory fast path
@@ -5518,13 +5569,13 @@ class TestTorboxAltRetryLoopBreaker(TestTorboxCachedAlternative):
         monkeypatch.setattr(w, '_resolve_arr_identity',
                             lambda fn, label=None: ('tt777', 'series', 2, 1))
         self._stub_search(monkeypatch, [self._candidate(
-            self.CACHED_ALT, title='Show.S02.1080p.WEB.x264-GRP')])
+            self.CACHED_ALT, title='Show.S02E01.1080p.WEB.x264-OTHER')])
         self._stub_cache(monkeypatch, {self.CACHED_ALT: True})
         monkeypatch.setattr(w, '_add_to_torbox', lambda *a, **k: (True, {}))
         fp = self._make_file(tmp_dir, 'Show.S02E01.1080p.WEB.x264-GRP.mkv.magnet')
         assert w._try_torbox_cached_alternative(
             fp, os.path.basename(fp), self.REJECTED, 'realdebrid') is True
-        assert self.ledger.get(f'tbalttried:tt777:s2:{self.CACHED_ALT}') == 1
+        assert self.ledger.get(f'tbalttried:tt777:s2e1:{self.CACHED_ALT}') == 1
 
     def test_tried_alt_not_regrabbed_next_cycle(self, tmp_dir, monkeypatch):
         """Second recovery cycle for the same (imdb, season) — i.e. the first
@@ -5537,9 +5588,9 @@ class TestTorboxAltRetryLoopBreaker(TestTorboxCachedAlternative):
         alt_b = 'c' * 40
         self._stub_search(monkeypatch, [
             self._candidate(self.CACHED_ALT, seeds=50,
-                            title='Show.S02.1080p.WEB.x264-GRP'),
+                            title='Show.S02E01.1080p.WEB.x264-ALT'),
             self._candidate(alt_b, seeds=5,
-                            title='Show.S02.1080p.WEB.x264-OTHER'),
+                            title='Show.S02E01.1080p.WEB.x264-OTHER'),
         ])
         self._stub_cache(monkeypatch,
                          {self.CACHED_ALT: True, alt_b: True})
@@ -5578,16 +5629,20 @@ class TestTorboxAltRetryLoopBreaker(TestTorboxCachedAlternative):
         assert len(added) == 2
         assert os.path.exists(fp3)
 
-    def test_tried_hash_is_season_scoped(self, tmp_dir, monkeypatch):
-        """A pack tried for S02 must not be barred for S03 of the same show
-        (and vice versa) — the key is (imdb, season, hash)."""
+    def test_tried_hash_is_scope_scoped(self, tmp_dir, monkeypatch):
+        """A hash tried for S02E01 must not be barred for S03E01 of the
+        same show (and vice versa) — the key is (imdb, scope, hash)."""
         monkeypatch.setenv('BLACKHOLE_TB_ALT_RECOVERY_ENABLED', 'true')
         w = self._make_watcher(tmp_dir)
         ident = {'season': 2}
         monkeypatch.setattr(w, '_resolve_arr_identity',
                             lambda fn, label=None: ('tt777', 'series', ident['season'], 1))
-        self._stub_search(monkeypatch, [self._candidate(
-            self.CACHED_ALT, title='Show.1080p.WEB.x264-GRP')])
+        # One hash, listed under both episodes (Torrentio mislabels happen);
+        # the scope match picks the right listing per cycle.
+        self._stub_search(monkeypatch, [
+            self._candidate(self.CACHED_ALT, title='Show.S02E01.1080p.WEB.x264-OTHER'),
+            self._candidate(self.CACHED_ALT, title='Show.S03E01.1080p.WEB.x264-OTHER'),
+        ])
         self._stub_cache(monkeypatch, {self.CACHED_ALT: True})
         adds = []
         monkeypatch.setattr(w, '_add_to_torbox',
@@ -5600,6 +5655,405 @@ class TestTorboxAltRetryLoopBreaker(TestTorboxCachedAlternative):
         assert w._try_torbox_cached_alternative(
             fp2, os.path.basename(fp2), self.REJECTED, 'realdebrid') is True
         assert len(adds) == 2
+
+
+class TestTorboxAltLikeForLike:
+    """TB-alt only accepts an alternative the arr would have accepted in
+    place of its grab: same scope (episode set / season / movie) and same
+    codec family.  Regression for 2026-10-25: an H.264 single-episode grab
+    of Tulsa King S02E05 was "recovered" with an x265 S02 season pack,
+    every episode symlinked, and Sonarr rejected the import forever."""
+
+    REJECTED = TestTorboxCachedAlternative.REJECTED
+    ALT = 'b' * 40
+    PACK = 'c' * 40
+
+    EP_GRAB = 'Tulsa King S02E05 Tilting at Windmills 1080p AMZN WEB-DL DDP5 1 H 264-NTb.magnet'
+    PACK_GRAB = 'Tulsa.King.S02.1080p.AMZN.WEB-DL.DDP5.1.H.264-NTb.magnet'
+
+    _make_watcher = TestTorboxCachedAlternative._make_watcher
+    _make_file = TestTorboxCachedAlternative._make_file
+    _stub_search = TestTorboxCachedAlternative._stub_search
+    _stub_cache = TestTorboxCachedAlternative._stub_cache
+    _candidate = TestTorboxCachedAlternative._candidate
+
+    @pytest.fixture(autouse=True)
+    def _ledger(self, tmp_dir, monkeypatch):
+        import importlib
+        from utils import attempt_ledger
+        importlib.reload(attempt_ledger)
+        attempt_ledger.init(config_dir=tmp_dir)
+        monkeypatch.setenv('BLACKHOLE_TB_ALT_RECOVERY_ENABLED', 'true')
+        yield
+
+    def _run(self, tmp_dir, monkeypatch, grab, ident, candidates, label='sonarr'):
+        """Drive one TB-alt attempt in symlink mode; every candidate is
+        TorBox-cached.  Returns (result, added_hashes, monitor_calls, path)."""
+        w = self._make_watcher(tmp_dir, symlink_enabled=True)
+        monkeypatch.setattr(w, '_resolve_arr_identity', lambda fn, label=None: ident)
+        self._stub_search(monkeypatch, candidates)
+        self._stub_cache(monkeypatch, {c['info_hash']: True for c in candidates})
+        added = []
+
+        def fake_add(path, api_key=None):
+            with open(path) as f:
+                added.append(f.read().rsplit(':', 1)[-1])
+            return True, {'data': {'torrent_id': 4242}}
+        monkeypatch.setattr(w, '_add_to_torbox', fake_add)
+        started = []
+        monkeypatch.setattr(w, '_start_monitor',
+                            lambda tid, fn, label=None, debrid=None, file_scope=None:
+                            started.append(file_scope))
+        fp = self._make_file(tmp_dir, grab)
+        result = w._try_torbox_cached_alternative(
+            fp, grab, self.REJECTED, 'realdebrid', label=label)
+        return result, added, started, fp
+
+    def test_episode_grab_rejects_season_pack_alt(self, tmp_dir, monkeypatch, caplog):
+        caplog.set_level('INFO')
+        result, added, started, fp = self._run(
+            tmp_dir, monkeypatch, self.EP_GRAB, ('tt16358384', 'series', 2, 5),
+            [self._candidate(self.PACK, seeds=90,
+                             title='Tulsa.King.S02.COMPLETE.1080p.AMZN.WEBRip.H.264-PGW')])
+        assert result is False          # caller fails the grab (arr feedback + delete)
+        assert not added and not started
+        assert os.path.exists(fp)
+        assert ('TB-alt: rejected Tulsa.King.S02.COMPLETE.1080p.AMZN.WEBRip.H.264-PGW '
+                '(S02 season pack, wanted S02E05)') in caplog.text
+
+    def test_h264_grab_rejects_x265_alt(self, tmp_dir, monkeypatch, caplog):
+        caplog.set_level('INFO')
+        grab = 'Tulsa.King.S01E04.Visitation.Place.1080p.AMZN.WEBRip.DDP5.1.x264-NTb[rartv].magnet'
+        result, added, started, fp = self._run(
+            tmp_dir, monkeypatch, grab, ('tt16358384', 'series', 1, 4),
+            [self._candidate(self.ALT,
+                             title='Tulsa.King.S01E04.1080p.AMZN.WEBRip.x265-PGW')])
+        assert result is False
+        assert not added
+        assert os.path.exists(fp)
+        assert 'TB-alt: rejected Tulsa.King.S01E04.1080p.AMZN.WEBRip.x265-PGW ' \
+               '(codec x265, wanted x264)' in caplog.text
+
+    def test_x265_grab_rejects_h264_alt(self, tmp_dir, monkeypatch):
+        grab = 'Show.S01E04.1080p.WEB.x265-GRP.magnet'
+        result, added, _, _ = self._run(
+            tmp_dir, monkeypatch, grab, ('tt1', 'series', 1, 4),
+            [self._candidate(self.ALT, title='Show.S01E04.1080p.WEB.H.264-OTHER')])
+        assert result is False and not added
+
+    def test_matching_single_episode_alt_accepted(self, tmp_dir, monkeypatch):
+        result, added, started, fp = self._run(
+            tmp_dir, monkeypatch, self.EP_GRAB, ('tt16358384', 'series', 2, 5),
+            [self._candidate(self.ALT,
+                             title='Tulsa King S02E05 1080p AMZN WEB-DL DDP5 1 H 264-FLUX')])
+        assert result is True
+        assert added == [self.ALT]
+        # Monitor links only the requested episode out of whatever lands.
+        assert started == [{'season': 2, 'episodes': [5]}]
+        assert not os.path.exists(fp)
+
+    def test_episode_grab_picks_matching_episode_over_better_seeded_pack(
+            self, tmp_dir, monkeypatch):
+        result, added, _, _ = self._run(
+            tmp_dir, monkeypatch, self.EP_GRAB, ('tt16358384', 'series', 2, 5),
+            [self._candidate(self.PACK, seeds=500,
+                             title='Tulsa.King.S02.COMPLETE.1080p.AMZN.WEBRip.x264-PGW'),
+             self._candidate(self.ALT, seeds=3,
+                             title='Tulsa.King.S02E05.1080p.WEB.h264-ETHEL')])
+        assert result is True
+        assert added == [self.ALT]
+
+    def test_episode_grab_rejects_other_episode_and_multi_episode(self, tmp_dir, monkeypatch,
+                                                                   caplog):
+        caplog.set_level('INFO')
+        result, added, _, _ = self._run(
+            tmp_dir, monkeypatch, self.EP_GRAB, ('tt16358384', 'series', 2, 5),
+            [self._candidate(self.ALT, title='Tulsa.King.S02E06.1080p.WEB.h264-ETHEL'),
+             self._candidate(self.PACK, title='Tulsa.King.S02E05E06.1080p.WEB.h264-ETHEL'),
+             self._candidate('d' * 40, title='Tulsa.King.S01E05.1080p.WEB.h264-ETHEL')])
+        assert result is False and not added
+        assert '(S02E06, wanted S02E05)' in caplog.text
+        assert '(S02E05E06, wanted S02E05)' in caplog.text
+        assert '(S01E05, wanted S02E05)' in caplog.text
+
+    def test_season_grab_accepts_pack_alt(self, tmp_dir, monkeypatch):
+        result, added, started, fp = self._run(
+            tmp_dir, monkeypatch, self.PACK_GRAB, ('tt16358384', 'series', 2, None),
+            [self._candidate(self.PACK,
+                             title='Tulsa.King.S02.COMPLETE.1080p.AMZN.WEBRip.x264-PGW')])
+        assert result is True
+        assert added == [self.PACK]
+        assert started == [{'season': 2, 'episodes': None}]
+        assert not os.path.exists(fp)
+
+    def test_season_grab_rejects_episode_other_season_and_multi_season(
+            self, tmp_dir, monkeypatch, caplog):
+        caplog.set_level('INFO')
+        result, added, _, _ = self._run(
+            tmp_dir, monkeypatch, self.PACK_GRAB, ('tt16358384', 'series', 2, None),
+            [self._candidate(self.ALT, title='Tulsa.King.S02E05.1080p.WEB.h264-ETHEL'),
+             self._candidate(self.PACK, title='Tulsa.King.S01.1080p.WEB.h264-ETHEL'),
+             self._candidate('d' * 40, title='Tulsa.King.S01-S02.1080p.WEB.h264-ETHEL')])
+        assert result is False and not added
+        assert '(S02E05, wanted S02 season pack)' in caplog.text
+        assert '(S01 season pack, wanted S02 season pack)' in caplog.text
+        assert '(multi-season pack, wanted S02 season pack)' in caplog.text
+
+    def test_movie_grab_rejects_tv_shaped_alt_and_accepts_movie(self, tmp_dir, monkeypatch):
+        grab = 'Sing.2.2021.1080p.WEB.x264-CYBER.magnet'
+        result, added, started, _ = self._run(
+            tmp_dir, monkeypatch, grab, ('tt6467266', 'movie', None, None),
+            [self._candidate(self.PACK, seeds=99, title='Sing.2.S01.1080p.WEB.x264-JUNK'),
+             self._candidate(self.ALT, seeds=1, title='Sing.2.2021.1080p.BluRay.x264-OTHER')],
+            label='radarr')
+        assert result is True
+        assert added == [self.ALT]
+        assert started == [None]
+
+    def test_dotted_episode_grab_rejects_season_pack(self, tmp_dir, monkeypatch):
+        """"S02.E05" is an episode grab, not a season grab — it must not
+        accept (and link every episode of) a season pack."""
+        result, added, _, _ = self._run(
+            tmp_dir, monkeypatch, 'Show.Name.S02.E05.1080p.WEB.H264-GRP.magnet',
+            ('tt1', 'series', 2, 5),
+            [self._candidate(self.PACK, title='Show.Name.S02.1080p.WEB.H264-PACK')])
+        assert result is False and not added
+
+    def test_dotted_episode_alt_accepted(self, tmp_dir, monkeypatch):
+        result, added, started, _ = self._run(
+            tmp_dir, monkeypatch, self.EP_GRAB, ('tt16358384', 'series', 2, 5),
+            [self._candidate(self.ALT, title='Tulsa.King.S02.E05.1080p.WEB.H264-OTHER')])
+        assert result is True and added == [self.ALT]
+        assert started == [{'season': 2, 'episodes': [5]}]
+
+    @pytest.mark.parametrize('title', [
+        'The Matrix Trilogy 1999-2003 1080p BluRay x264-GRP',
+        'The.Matrix.Collection.1080p.BluRay.x264-GRP',
+        'The Matrix 1999-2003 1080p BluRay x264-GRP',
+    ])
+    def test_movie_grab_rejects_collection_pack(self, tmp_dir, monkeypatch, title):
+        result, added, _, _ = self._run(
+            tmp_dir, monkeypatch, 'The.Matrix.1999.1080p.BluRay.x264-GRP.magnet',
+            ('tt0133093', 'movie', None, None),
+            [self._candidate(self.PACK, title=title)], label='radarr')
+        assert result is False and not added
+
+    def test_unparseable_codec_declines_before_search(self, tmp_dir, monkeypatch):
+        w = self._make_watcher(tmp_dir)
+        monkeypatch.setattr(w, '_resolve_arr_identity',
+                            lambda fn, label=None: ('tt1', 'series', 2, 5))
+        import utils.search as search
+        searched = []
+        monkeypatch.setattr(search, 'search_torrentio',
+                            lambda *a, **k: searched.append(1) or [])
+        fp = self._make_file(tmp_dir, 'Show.S02E05.1080p.WEB-DL.DDP5.1-GRP.magnet')
+        assert w._try_torbox_cached_alternative(
+            fp, os.path.basename(fp), self.REJECTED, 'realdebrid') is False
+        assert not searched
+        assert os.path.exists(fp)
+
+    def test_multi_season_grab_declines_before_search(self, tmp_dir, monkeypatch):
+        w = self._make_watcher(tmp_dir)
+        monkeypatch.setattr(w, '_resolve_arr_identity',
+                            lambda fn, label=None: ('tt1', 'series', 1, None))
+        import utils.search as search
+        searched = []
+        monkeypatch.setattr(search, 'search_torrentio',
+                            lambda *a, **k: searched.append(1) or [])
+        fp = self._make_file(tmp_dir, 'Show.S01-S03.1080p.WEB.x264-GRP.magnet')
+        assert w._try_torbox_cached_alternative(
+            fp, os.path.basename(fp), self.REJECTED, 'realdebrid', label='sonarr') is False
+        assert not searched
+
+
+class TestTbAltFileScope:
+    """Symlink creation for a TB-alt grab links only the requested
+    season/episode(s), names the completed dir after the arr's own grab,
+    and the scope survives a restart via pending_monitors.json."""
+
+    def _make_watcher(self, tmp_dir):
+        completed = os.path.join(tmp_dir, 'completed')
+        mount = os.path.join(tmp_dir, 'mount')
+        os.makedirs(completed)
+        os.makedirs(mount)
+        w = BlackholeWatcher(
+            os.path.join(tmp_dir, 'watch'), 'key', 'torbox',
+            symlink_enabled=True, completed_dir=completed, rclone_mount=mount,
+            symlink_target_base='/mnt/debrid',
+        )
+        return w, completed, mount
+
+    def _payload(self, mount, release, files):
+        d = os.path.join(mount, 'shows', release)
+        for name in files:
+            path = os.path.join(d, name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, 'w') as f:
+                f.write('data')
+        return d
+
+    def test_episode_scope_links_only_requested_episode(self, tmp_dir):
+        w, completed, mount = self._make_watcher(tmp_dir)
+        release = 'Tulsa.King.S02.1080p.WEB.h264-GRP'
+        d = self._payload(mount, release, [
+            'Tulsa.King.S02E04.1080p.WEB.h264-GRP.mkv',
+            'Tulsa.King.S02E05.1080p.WEB.h264-GRP.mkv',
+            'Tulsa.King.S02E06.1080p.WEB.h264-GRP.mkv',
+        ])
+        grab = 'Tulsa King S02E05 Tilting at Windmills 1080p AMZN WEB-DL DDP5 1 H 264-NTb'
+        count = w._create_symlinks(release, 'shows', d, label='sonarr', debrid='torbox',
+                                   display_name=grab,
+                                   file_scope={'season': 2, 'episodes': [5]})
+        assert count == 1
+        # Named after the release Sonarr grabbed, never the pack.
+        out = os.path.join(completed, 'sonarr', grab)
+        assert os.listdir(out) == ['Tulsa.King.S02E05.1080p.WEB.h264-GRP.mkv']
+        assert not os.path.exists(os.path.join(completed, 'sonarr', release))
+        # Target still resolves against the real mount folder.
+        assert os.readlink(os.path.join(out, 'Tulsa.King.S02E05.1080p.WEB.h264-GRP.mkv')) \
+            .endswith(f'/shows/{release}/Tulsa.King.S02E05.1080p.WEB.h264-GRP.mkv')
+
+    def test_season_scope_drops_other_seasons_keeps_unparseable(self, tmp_dir):
+        w, completed, mount = self._make_watcher(tmp_dir)
+        release = 'Show.S02.1080p.WEB.h264-GRP'
+        d = self._payload(mount, release, [
+            'Show.S02E01.mkv', 'Show.S02E02.mkv', 'Show.S01E09.mkv', 'Bonus.Feature.mkv',
+        ])
+        count = w._create_symlinks(release, 'shows', d, label='sonarr', debrid='torbox',
+                                   display_name='Show.S02.1080p.WEB.h264-NTb',
+                                   file_scope={'season': 2, 'episodes': None})
+        assert count == 3
+        out = os.path.join(completed, 'sonarr', 'Show.S02.1080p.WEB.h264-NTb')
+        assert sorted(os.listdir(out)) == ['Bonus.Feature.mkv', 'Show.S02E01.mkv',
+                                           'Show.S02E02.mkv']
+
+    def test_scope_matching_nothing_creates_no_dir(self, tmp_dir):
+        """An empty release dir in the arr's watch folder is a download it
+        can never import — none is created when nothing is in scope."""
+        w, completed, mount = self._make_watcher(tmp_dir)
+        release = 'Show.S02E05.1080p.WEB.h264-GRP'
+        d = self._payload(mount, release, ['Show.S02E06.mkv'])
+        assert w._create_symlinks(release, 'shows', d, label='sonarr',
+                                  display_name='Show.S02E05.1080p.WEB.h264-NTb',
+                                  file_scope={'season': 2, 'episodes': [5]}) == 0
+        out = os.path.join(completed, 'sonarr')
+        assert not os.path.isdir(out) or os.listdir(out) == []
+
+    @pytest.mark.parametrize('rel,keep', [
+        ('Show.S02E05.mkv', True),
+        ('Show.S02E05E06.mkv', False),          # carries an episode not asked for
+        ('Show.S03E05.mkv', False),             # other season, same episode number
+        ('Season 2/Show - 05.mkv', True),       # season from the parent dir, no SxxExx
+        ('Season 3/Show - 05.mkv', False),
+        ('Show - 05.mkv', True),                # unparseable: kept
+    ])
+    def test_in_file_scope_episode(self, rel, keep):
+        from utils.blackhole import _in_file_scope
+        assert _in_file_scope(rel, {'season': 2, 'episodes': [5]}) is keep
+
+    @pytest.mark.parametrize('rel,keep', [
+        ('Show.S02E05-720p.mkv', True),        # "-720p" is not an episode range
+        ('Show - 05 [DTS5.1].mkv', True),      # "S5." inside DTS5.1 is not a season
+        ('Show.S02.E05.mkv', True),
+        ('Show.S02.E06.mkv', False),
+    ])
+    def test_in_file_scope_odd_names(self, rel, keep):
+        from utils.blackhole import _in_file_scope
+        assert _in_file_scope(rel, {'season': 2, 'episodes': [5]}) is keep
+
+    def test_second_substitute_replaces_first_in_grab_named_dir(self, tmp_dir):
+        """Both substitutes for one grab link into the dir named after it;
+        the second must replace the first's links, never sit beside them."""
+        w, completed, mount = self._make_watcher(tmp_dir)
+        grab = 'Show.S02E05.1080p.WEB.h264-NTb'
+        scope = {'season': 2, 'episodes': [5]}
+        d1 = self._payload(mount, 'Alt1.S02E05', ['Alt1.S02E05.mkv'])
+        assert w._create_symlinks('Alt1.S02E05', 'shows', d1, label='sonarr',
+                                  display_name=grab, file_scope=scope) == 1
+        d2 = self._payload(mount, 'Alt2.S02E05', ['Alt2.S02E05.mkv'])
+        assert w._create_symlinks('Alt2.S02E05', 'shows', d2, label='sonarr',
+                                  display_name=grab, file_scope=scope) == 1
+        assert os.listdir(os.path.join(completed, 'sonarr', grab)) == ['Alt2.S02E05.mkv']
+
+    def test_multi_episode_scope_keeps_each_requested_episode(self):
+        from utils.blackhole import _in_file_scope
+        scope = {'season': 2, 'episodes': [5, 6]}
+        assert _in_file_scope('Show.S02E05.mkv', scope)
+        assert _in_file_scope('Show.S02E05E06.mkv', scope)
+        assert not _in_file_scope('Show.S02E07.mkv', scope)
+
+    def test_monitor_passes_scope_to_symlinks_and_audits_zero_link(self, tmp_dir, monkeypatch):
+        """The monitor threads the scope into _create_symlinks; a scoped
+        grab that links nothing runs the completeness audit (blocklist +
+        re-search of the missing episode) instead of vanishing silently."""
+        import utils.blackhole as bh
+        w, _, mount = self._make_watcher(tmp_dir)
+        monkeypatch.setattr(bh, '_history', None)
+        monkeypatch.setattr(bh, '_notify', None)
+        monkeypatch.setattr(bh, '_coalesced_root_refresh', lambda *a, **k: None)
+        monkeypatch.setattr(w, '_check_torbox_status', lambda tid, api_key=None: ('cached', {}))
+        monkeypatch.setattr(w, '_is_torrent_ready', lambda status, debrid=None: True)
+        monkeypatch.setattr(w, '_extract_release_name', lambda info, debrid=None: 'Alt.S02E05')
+        monkeypatch.setattr(w, '_has_usable_media_files', lambda info, debrid=None: True)
+        monkeypatch.setattr(w, '_extract_filenames_from_info', lambda info, debrid=None: [])
+        monkeypatch.setattr(w, '_find_on_mount',
+                            lambda name, debrid=None, file_names=None:
+                            (os.path.join(mount, 'shows', name), 'shows', name))
+        removed = []
+        monkeypatch.setattr(w, '_remove_pending', lambda tid: removed.append(tid))
+        seen, audits = [], []
+        monkeypatch.setattr(w, '_create_symlinks',
+                            lambda *a, file_scope=None, **k: seen.append(file_scope) or 0)
+        monkeypatch.setattr(w, '_audit_release_completeness',
+                            lambda *a, **k: audits.append(a[0]))
+        scope = {'season': 2, 'episodes': [5]}
+        w._monitor_and_symlink('t1', 'Show.S02E05.x264.magnet', 'sonarr', 'torbox',
+                               file_scope=scope)
+        assert seen == [scope]
+        assert audits == ['Show.S02E05.x264.magnet']
+        assert removed == ['t1']
+        # Unscoped zero-link keeps the old behaviour: no audit.
+        w._monitor_and_symlink('t2', 'Show.S02E05.x264.magnet', 'sonarr', 'torbox')
+        assert seen[-1] is None and len(audits) == 1
+
+    def test_no_scope_links_everything_unchanged(self, tmp_dir):
+        w, completed, mount = self._make_watcher(tmp_dir)
+        release = 'Show.S02.1080p.WEB.h264-GRP'
+        d = self._payload(mount, release, ['Show.S02E01.mkv', 'Show.S02E02.mkv'])
+        assert w._create_symlinks(release, 'shows', d, label='sonarr',
+                                  display_name='Something.Else') == 2
+        assert os.path.isdir(os.path.join(completed, 'sonarr', release))
+
+    def test_file_scope_persisted_and_resumed(self, tmp_dir, monkeypatch):
+        w, _, _ = self._make_watcher(tmp_dir)
+        monkeypatch.setattr(w, '_monitor_and_symlink', lambda *a, **k: None)
+        w._start_monitor('t1', 'Show.S02E05.x264.magnet', label='sonarr', debrid='torbox',
+                         file_scope={'season': 2, 'episodes': [5]})
+        w._start_monitor('t2', 'Movie.2020.x264.magnet', label='radarr', debrid='torbox')
+        entries = {e['torrent_id']: e for e in w._load_pending()}
+        assert entries['t1']['file_scope'] == {'season': 2, 'episodes': [5]}
+        assert 'file_scope' not in entries['t2']
+
+        w2, _, _ = self._make_watcher(os.path.join(tmp_dir, 'b'))
+        w2._pending_file = w._pending_file
+        entries = w2._load_pending()
+        # A corrupt scope must not fail open into linking the whole payload:
+        # rebuilt from the grab's name when possible, otherwise not resumed.
+        entries.append({'torrent_id': 't3', 'filename': 'Show.S03E07.1080p.x264.magnet',
+                        'debrid': 'torbox', 'label': 'sonarr',
+                        'file_scope': {'season': '2; rm', 'episodes': 'all'}})
+        entries.append({'torrent_id': 't4', 'filename': 'x.magnet', 'debrid': 'torbox',
+                        'label': 'sonarr', 'file_scope': ['bogus']})
+        w2._save_pending(entries)
+        resumed = {}
+        monkeypatch.setattr(w2, '_start_monitor',
+                            lambda tid, fn, label=None, debrid=None, file_scope=None:
+                            resumed.__setitem__(tid, file_scope))
+        w2._resume_pending_monitors()
+        assert resumed == {'t1': {'season': 2, 'episodes': [5]}, 't2': None,
+                           't3': {'season': 3, 'episodes': [7]}}
+        # The unrecoverable entry is dropped, not re-skipped every restart.
+        assert 't4' not in {e['torrent_id'] for e in w2._load_pending()}
 
 
 class TestArrFailedFeedback:

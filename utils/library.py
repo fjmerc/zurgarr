@@ -6334,10 +6334,13 @@ class LibraryScanner:
                 # `tbalt:` give-up counters (blackhole TB-alt recovery) —
                 # blackhole keys movies as `sNone` (parse_release_name returns
                 # season=None for movies), so season-0 resolutions clear that
-                # form too.
+                # form too.  Episode grabs key per episode set (`s2e5`,
+                # `s2e5e6` — blackhole `_scope_tag`); clear any whose set
+                # includes a resolved episode.
                 if direction in ('to-debrid', 'debrid-unavailable'):
                     attempt_ledger.reset(f"fg:{norm_title}")
                     imdb = imdb_map.get(norm_title)
+                    ledger_keys = list(attempt_ledger.snapshot()) if imdb else []
                     for ep in resolved:
                         sn = ep.get('season', 0)
                         attempt_ledger.reset(f"fg:{norm_title}:s{sn}")
@@ -6345,6 +6348,11 @@ class LibraryScanner:
                             attempt_ledger.reset(f"tbalt:{imdb}:s{sn}")
                             if not sn:
                                 attempt_ledger.reset(f"tbalt:{imdb}:sNone")
+                            ep_prefix = f"tbalt:{imdb}:s{sn}e"
+                            for k in ledger_keys:
+                                if (k.startswith(ep_prefix)
+                                        and str(ep.get('episode')) in k[len(ep_prefix):].split('e')):
+                                    attempt_ledger.reset(k)
 
     def _escalate_stuck_pending(self):
         """Mark to-debrid entries as debrid-unavailable after threshold days.
