@@ -171,10 +171,22 @@ _RATE_LIMIT_MAX_INLINE_WAIT = 60  # seconds
 _PAUSED_RESULT = 'adds paused'    # prefix of an add result that means "retry later"
 
 
+_TRANSIENT_RESULT = 'temporary failure'  # prefix: provider 5xx (RD/AD) — retry later
+
+
 def _is_paused_result(result):
     """True for an add result meaning the provider is paused (retry later),
     not that it rejected the torrent."""
     return isinstance(result, str) and result.startswith(_PAUSED_RESULT)
+
+
+def _is_retry_later(result):
+    """True for any add result that says nothing about the torrent itself —
+    a pause, a 429 or a provider 5xx — so it must not count toward
+    MAX_RETRIES (an outage would otherwise permanently fail every drop that
+    arrived during it) nor mark alternatives exhausted."""
+    return (_is_paused_result(result) or result == 'rate limit exceeded'
+            or (isinstance(result, str) and result.startswith(_TRANSIENT_RESULT)))
 
 
 def _tb_cooldown_pause(flag_remaining):
@@ -1835,6 +1847,8 @@ class BlackholeWatcher:
         if _is_rate_limit_response(response):
             _mark_rate_limited('realdebrid')
             return False, 'rate limit exceeded'
+        if response.status_code >= 500:
+            return False, f'{_TRANSIENT_RESULT}: Real-Debrid HTTP {response.status_code}'
         return False, response.text[:200]
 
     def _add_to_alldebrid(self, file_path, api_key=None):
@@ -1861,6 +1875,8 @@ class BlackholeWatcher:
         if _is_rate_limit_response(response):
             _mark_rate_limited('alldebrid')
             return False, 'rate limit exceeded'
+        if response.status_code >= 500:
+            return False, f'{_TRANSIENT_RESULT}: AllDebrid HTTP {response.status_code}'
         return False, response.text[:200]
 
     def _add_to_torbox(self, file_path, api_key=None):
@@ -3649,9 +3665,12 @@ class BlackholeWatcher:
         would have, but pointing at the alt provider.
 
         Returns ``True`` when rescued (caller should ``return``).
-        Returns ``False`` on any failure mode — file is left at
-        ``file_path`` for the existing alt-release / failed/ fallback
-        paths.
+        Returns ``None`` when the alt is paused (before or during the add)
+        — not a verdict on the hash; the caller parks the file for a plain
+        retry instead of falling through to an alt-release search that
+        would mark it exhausted.  Returns ``False`` on any other failure
+        mode — file is left at ``file_path`` for the existing alt-release /
+        failed/ fallback paths.
 
         File handling — the rescue stages ``file_path`` to a
         uniquely-named entry under ``.alt_pending/`` BEFORE entering the
@@ -3709,9 +3728,9 @@ class BlackholeWatcher:
         if not alt_handler:
             return False
         if _rate_limit_remaining(alt) > _RATE_LIMIT_MAX_INLINE_WAIT:
-            logger.info(f"[blackhole] rescue: {alt} adds paused; skipping cross-rescue "
-                        f"for {filename} (the failed/ retry tries again)")
-            return False
+            logger.info(f"[blackhole] rescue: {alt} adds paused; parking {filename} "
+                        f"to retry the rescue later")
+            return None
 
         # Stage the file BEFORE the rescue wait_ready loop (see method
         # docstring).  Unique name keeps us out of alt-release staging's
@@ -3846,6 +3865,11 @@ class BlackholeWatcher:
             # re-grab attempt on each Sonarr/Radarr retry cycle until
             # ``_FILTER_BLOCK_KEYWORDS`` is updated.
             alt_result = add_response.get('result')
+            if (_is_retry_later(alt_result)
+                    or _rate_limit_remaining(alt) > _RATE_LIMIT_MAX_INLINE_WAIT):
+                logger.info(f"[blackhole] rescue: {alt} paused during the add for "
+                            f"{filename}; parking to retry the rescue later")
+                return None
             if (core.get('reason') == 'add_failed'
                     and not add_response.get('extract_failed')
                     and classify_add_failure(alt_result) == 'filter_block'
@@ -3976,22 +4000,12 @@ class BlackholeWatcher:
                   > _RATE_LIMIT_MAX_INLINE_WAIT)
         if paused and os.path.exists(file_path):
             # The provider paused mid-search (5xx / cooldown): the
-            # alternatives weren't rejected, so don't mark them exhausted —
-            # a plain failed/ entry retries the whole search later.
-            error_dir = self._failed_dir(label)
-            os.makedirs(error_dir, exist_ok=True)
-            dest = os.path.join(error_dir, filename)
-            if os.path.exists(dest):
-                base, fext = os.path.splitext(filename)
-                dest = os.path.join(error_dir, f"{base}_{int(time.time())}{fext}")
-            try:
-                os.rename(file_path, dest)
-                retries, _ = RetryMeta.read(dest)
-                RetryMeta.write(dest, retries + 1)
-                logger.info(f"[blackhole] Alt-release search for {filename} paused with "
-                            f"{debrid or self.debrid_service}; retrying from failed/ later")
-            except OSError as e:
-                logger.warning(f"[blackhole] Could not move {filename} to failed/: {e}")
+            # alternatives weren't rejected, so don't mark them exhausted
+            # or count the attempt — a plain failed/ entry retries the whole
+            # search later.
+            logger.info(f"[blackhole] Alt-release search for {filename} paused with "
+                        f"{debrid or self.debrid_service}; retrying from failed/ later")
+            self._park_for_retry(file_path, filename, label)
         elif not alt_ok and os.path.exists(file_path):
             # No alternative worked — move to failed/ and mark alts exhausted
             # so retries don't repeat the same alt-release search
@@ -4002,15 +4016,19 @@ class BlackholeWatcher:
                 base, fext = os.path.splitext(filename)
                 dest = os.path.join(error_dir, f"{base}_{int(time.time())}{fext}")
             rename_ok = False
+            # Sidecar first (carried from staging, then marked) so
+            # _retry_failed on the worker never sees the file without it.
+            # Mark alt-exhausted via the centralised helper so any
+            # tier_state already seeded on this sidecar is preserved
+            # (the old raw-write form clobbered the whole file and
+            # would wipe the dwell timer on every alt-exhaustion).
+            RetryMeta.carry(file_path, dest)
+            RetryMeta.mark_alt_exhausted(dest)
             try:
                 os.rename(file_path, dest)
                 rename_ok = True
-                # Mark alt-exhausted via the centralised helper so any
-                # tier_state already seeded on this sidecar is preserved
-                # (the old raw-write form clobbered the whole file and
-                # would wipe the dwell timer on every alt-exhaustion).
-                RetryMeta.mark_alt_exhausted(dest)
             except OSError as e:
+                RetryMeta.carry(dest, file_path)
                 logger.warning(f"[blackhole] Could not move {filename} to failed/: {e}")
 
             # Notify user — all alternatives exhausted, manual intervention needed
@@ -4122,6 +4140,26 @@ class BlackholeWatcher:
         except Exception:
             pass
         return True
+
+    def _park_for_retry(self, file_path, filename, label):
+        """Move a drop to failed/ for a later retry WITHOUT counting it
+        toward MAX_RETRIES (the failure said nothing about the torrent).
+        The sidecar is written before the file lands so ``_retry_failed``
+        never sees it without its backoff timestamp."""
+        error_dir = self._failed_dir(label)
+        os.makedirs(error_dir, exist_ok=True)
+        dest = os.path.join(error_dir, filename)
+        if os.path.exists(dest):
+            base, fext = os.path.splitext(filename)
+            dest = os.path.join(error_dir, f"{base}_{int(time.time())}{fext}")
+        RetryMeta.carry(file_path, dest)
+        retries, _ = RetryMeta.read(dest)
+        RetryMeta.write(dest, retries)          # refresh last_attempt only
+        try:
+            os.rename(file_path, dest)
+        except OSError as e:
+            RetryMeta.carry(dest, file_path)
+            logger.warning(f"[blackhole] Could not park {filename} in failed/: {e}")
 
     def _tb_alt_would_wait(self, filename, info_hash):
         """True when TB-alt recovery would run for this drop but TorBox adds
@@ -4514,7 +4552,7 @@ class BlackholeWatcher:
                 pass
 
         if not success:
-            if (_is_paused_result(result)
+            if (_is_retry_later(result)
                     or _rate_limit_remaining('torbox') > _RATE_LIMIT_MAX_INLINE_WAIT):
                 # TorBox paused (this add's 5xx/timeout/cooldown, or another
                 # caller's): not a verdict on the alternative — the caller
@@ -5085,6 +5123,7 @@ class BlackholeWatcher:
                         os.remove(orig_path)
                     except OSError as e:
                         logger.warning(f"[blackhole] Could not remove original after alt-retry: {e}")
+                    RetryMeta.remove(orig_path)  # carried in at staging; nothing left to retry
                     # Start symlink monitoring
                     if self.symlink_enabled:
                         torrent_id = self._extract_torrent_id(result, debrid=debrid)
@@ -5548,6 +5587,12 @@ class BlackholeWatcher:
                 # Not a rejection: the provider paused itself (5xx, cooldown).
                 # Leave the drop for the next scan — no failed/, no retry bump.
                 logger.warning(f"[blackhole] Deferring {filename} on {debrid}: {result}")
+            elif _is_retry_later(result):
+                # 429 / RD-AD 5xx: retry on the failed/ schedule without
+                # counting it — an outage is no verdict on the torrent.
+                logger.warning(f"[blackhole] Temporary failure adding {filename} to "
+                               f"{debrid}: {result} — retrying later")
+                self._park_for_retry(file_path, filename, label)
             else:
                 logger.error(f"[blackhole] Failed to add {filename}: {result}")
 
@@ -5558,12 +5603,18 @@ class BlackholeWatcher:
                 # the same media.  They chain: cross-rescue first (cheap,
                 # hit-cached only), falls through to alt-release on miss.
                 from utils.debrid_routing import classify_add_failure
-                if (classify_add_failure(result) == 'filter_block'
-                        and info_hash
-                        and self._attempt_add_time_rescue(
-                            file_path, filename, info_hash, debrid, label, dispatch,
-                        )):
-                    return
+                if classify_add_failure(result) == 'filter_block' and info_hash:
+                    rescued = self._attempt_add_time_rescue(
+                        file_path, filename, info_hash, debrid, label, dispatch,
+                    )
+                    if rescued:
+                        return
+                    if rescued is None:
+                        # Rescue target paused: retry the same-hash rescue
+                        # later — an alt-release search on this debrid would
+                        # hit the same filter and mark the file exhausted.
+                        self._park_for_retry(file_path, filename, label)
+                        return
 
                 # On debrid rejection (infringing/blocked), try alternative release
                 # in a background thread to avoid blocking the scan loop.
@@ -5576,6 +5627,7 @@ class BlackholeWatcher:
                     staged_path = os.path.join(staging_dir, filename)
                     try:
                         os.rename(file_path, staged_path)
+                        RetryMeta.carry(file_path, staged_path)
                     except OSError as e:
                         logger.warning(
                             f"[blackhole] Could not stage {filename} for alt-retry: {e}. "
@@ -5813,6 +5865,8 @@ class BlackholeWatcher:
             return
 
         for label, src, filename in stranded:
+            if filename.endswith('.meta'):
+                continue  # a payload's retry sidecar — carried with it below
             # Strip the ``.rescue-<uuid8>-`` prefix the rescue path adds
             # before staging (plan 41 phase A).  Without this restore,
             # Sonarr/Radarr's blackhole-import would not recognise the
@@ -5828,6 +5882,7 @@ class BlackholeWatcher:
                 dest = os.path.join(error_dir, f"{base}_{int(time.time())}{fext}")
             try:
                 os.rename(src, dest)
+                RetryMeta.carry(src, dest)
                 is_rescue_orphan = recovered_filename != filename
                 if not is_rescue_orphan:
                     # Alt-release staging: the original hash is debrid-blocked

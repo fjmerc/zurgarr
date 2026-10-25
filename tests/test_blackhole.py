@@ -1238,7 +1238,7 @@ class TestTorboxAddPauses:
         path = self._magnet(tmp_dir)
         assert w._attempt_add_time_rescue(
             path, os.path.basename(path), 'a' * 40, 'realdebrid', None,
-            {'torbox': lambda *a, **k: called.append(1) or (True, {})}) is False
+            {'torbox': lambda *a, **k: called.append(1) or (True, {})}) is None
         assert not called and os.path.exists(path)
 
     def test_alt_release_search_stops_on_pause_and_uses_routed_key(self, tmp_dir, monkeypatch):
@@ -1268,7 +1268,69 @@ class TestTorboxAddPauses:
         dest = os.path.join(tmp_dir, 'watch', 'failed', os.path.basename(staged))
         assert os.path.exists(dest)
         assert RetryMeta.is_alt_exhausted(dest) is False
-        assert RetryMeta.read(dest)[0] == 1
+        retries, last = RetryMeta.read(dest)
+        assert retries == 0 and last > 0      # not counted, but backed off
+
+    def test_filter_block_with_torbox_paused_parks_for_rescue_retry(self, tmp_dir, monkeypatch):
+        """RD filter-blocks the hash while TorBox (the rescue target) is
+        paused: park in failed/ for a later same-hash rescue — never the
+        RD-only alt-release search that would mark it exhausted forever."""
+        from utils.blackhole import RetryMeta
+        monkeypatch.setattr('utils.search._existing_hashes', lambda *a, **kw: set())
+        w = BlackholeWatcher(os.path.join(tmp_dir, 'watch'), 'rdkey', 'realdebrid',
+                             completed_dir=os.path.join(tmp_dir, 'completed'),
+                             debrid_api_keys={'realdebrid': 'rdkey', 'torbox': 'tbkey'})
+        monkeypatch.setattr(w, '_route_grab', lambda h: 'realdebrid')
+        monkeypatch.setattr(w, '_add_to_realdebrid', lambda *a, **k: (
+            False, '{"error": "infringing_file", "error_code": 35}'))
+        monkeypatch.setattr(w, '_attempt_add_time_rescue', lambda *a, **k: None)
+        alt_threads = []
+        monkeypatch.setattr(w, '_try_alternative_release', lambda *a, **k: alt_threads.append(1))
+        path = self._magnet(tmp_dir)
+        w._process_file(path)
+        dest = os.path.join(tmp_dir, 'watch', 'failed', os.path.basename(path))
+        assert os.path.exists(dest) and not alt_threads
+        assert RetryMeta.is_alt_exhausted(dest) is False
+        assert RetryMeta.read(dest)[0] == 0
+
+    @pytest.mark.parametrize('result', ['rate limit exceeded',
+                                        'temporary failure: Real-Debrid HTTP 503'])
+    def test_transient_failure_retries_without_counting(self, tmp_dir, monkeypatch, result):
+        from utils.blackhole import RetryMeta
+        monkeypatch.setattr('utils.search._existing_hashes', lambda *a, **kw: set())
+        w = BlackholeWatcher(os.path.join(tmp_dir, 'watch'), 'rdkey', 'realdebrid',
+                             completed_dir=os.path.join(tmp_dir, 'completed'))
+        monkeypatch.setattr(w, '_add_to_realdebrid', lambda *a, **k: (False, result))
+        path = self._magnet(tmp_dir)
+        w._process_file(path)
+        dest = os.path.join(tmp_dir, 'watch', 'failed', os.path.basename(path))
+        retries, last = RetryMeta.read(dest)
+        assert os.path.exists(dest) and retries == 0 and last > 0
+
+    def test_realdebrid_5xx_is_a_temporary_failure(self, tmp_dir, monkeypatch):
+        from unittest.mock import MagicMock
+        from utils.blackhole import _is_retry_later
+        resp = MagicMock()
+        resp.status_code, resp.text = 503, 'Service Unavailable'
+        monkeypatch.setattr('utils.blackhole.tracked_request', lambda *a, **kw: resp)
+        monkeypatch.setattr('utils.blackhole._check_rate_limit', lambda *a, **k: None)
+        w = BlackholeWatcher(os.path.join(tmp_dir, 'watch'), 'rdkey', 'realdebrid')
+        ok, msg = w._add_to_realdebrid(self._magnet(tmp_dir))
+        assert ok is False and _is_retry_later(msg)
+
+    def test_alt_pending_recovery_skips_sidecars_and_carries_them(self, tmp_dir):
+        from utils.blackhole import RetryMeta
+        watch = os.path.join(tmp_dir, 'watch')
+        staging = os.path.join(watch, '.alt_pending', 'radarr')
+        os.makedirs(staging)
+        staged = os.path.join(staging, 'Movie.magnet')
+        with open(staged, 'w') as f:
+            f.write('magnet:?xt=urn:btih:' + 'a' * 40)
+        RetryMeta.write(staged, 2)
+        w = BlackholeWatcher(watch, 'key', 'torbox', completed_dir=os.path.join(tmp_dir, 'c'))
+        w._recover_alt_pending()
+        failed = os.path.join(watch, 'failed', 'radarr')
+        assert sorted(os.listdir(failed)) == ['Movie.magnet', 'Movie.magnet.meta']
 
     def test_tb_alt_waits_instead_of_failing_the_grab(self, tmp_dir, monkeypatch):
         """With TorBox paused, an uncached drop that TB-alt would try to
@@ -5537,13 +5599,16 @@ class TestTorboxCachedAlternative:
                             lambda fn, label=None: ('tt1234567', 'movie', None, None))
         self._stub_search(monkeypatch, [self._candidate(self.CACHED_ALT)])
         self._stub_cache(monkeypatch, {self.CACHED_ALT: True})
-        monkeypatch.setattr(w, '_add_to_torbox',
-                            lambda *a, **k: (False, 'rate limit exceeded'))
-        fp = self._make_file(tmp_dir, 'Sing.2.1080p.WEB.x264-CYBER.mkv.magnet')
-        assert w._try_torbox_cached_alternative(
-            fp, os.path.basename(fp), self.REJECTED, 'realdebrid') is False
-        # Add failed -> leave the file for the caller's normal handling.
-        assert os.path.exists(fp)
+        # A rate limit is no verdict on the alternative: None (caller keeps
+        # the drop for a retry); a real rejection is False (caller fails it).
+        for result, verdict in (('rate limit exceeded', None),
+                                ('{"error":"INVALID_MAGNET"}', False)):
+            monkeypatch.setattr(w, '_add_to_torbox', lambda *a, _r=result, **k: (False, _r))
+            fp = self._make_file(tmp_dir, 'Sing.2.1080p.WEB.x264-CYBER.mkv.magnet')
+            assert w._try_torbox_cached_alternative(
+                fp, os.path.basename(fp), self.REJECTED, 'realdebrid') is verdict
+            # Add failed -> leave the file for the caller's normal handling.
+            assert os.path.exists(fp)
 
     def test_symlink_mode_starts_monitor_and_removes_file(self, tmp_dir, monkeypatch):
         monkeypatch.setenv('BLACKHOLE_TB_ALT_RECOVERY_ENABLED', 'true')
