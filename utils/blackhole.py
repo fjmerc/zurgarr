@@ -70,6 +70,11 @@ MAX_RETRIES = 3
 # first even when a popular title returns far more streams than this.
 _TB_ALT_MAX_PROBES = 12
 
+# "TB-alt: rejected <alt> (<reason>)" lines logged at INFO per recovery
+# attempt; further rejections go to DEBUG and are counted in one summary
+# line.  An episode search can return dozens of same-tier season packs.
+_TB_ALT_REJECT_LOG_MAX = 5
+
 # Suppress redundant cached-alternative recovery grabs for the same
 # (imdb_id, scope) within this window — scope being the exact episode set for
 # an episode grab, the season for a season-pack grab (see _scope_tag).  TB-alt
@@ -4219,8 +4224,14 @@ class BlackholeWatcher:
                             f"grab for {filename}, falling back to Wanted")
                 return False
 
+            # A season-pack grab has no episode, and Torrentio's bare series
+            # query mixes every season (hundreds of streams, other seasons
+            # first).  Asking for the season's first episode returns exactly
+            # the releases that contain it — that season's packs among them;
+            # the scope match below drops the single episodes.
+            search_episode = 1 if want_scope[0] == 'season' else episode
             results = search_torrentio(
-                imdb_id, media_type=media_type, season=season, episode=episode,
+                imdb_id, media_type=media_type, season=season, episode=search_episode,
             )
             if not results:
                 return False
@@ -4278,14 +4289,20 @@ class BlackholeWatcher:
                 reason = _tb_alt_reject_reason(want_scope, want_codec, alt_title)
                 if reason:
                     n_rejected += 1
-                    logger.info(f"[blackhole] TB-alt: rejected {alt_title[:120]} ({reason})")
+                    log = logger.info if n_rejected <= _TB_ALT_REJECT_LOG_MAX else logger.debug
+                    log(f"[blackhole] TB-alt: rejected {alt_title[:120]} ({reason})")
                     continue
                 candidates.append(r)
+            n_hidden = n_rejected - _TB_ALT_REJECT_LOG_MAX
+            if candidates and n_hidden > 0:
+                logger.info(f"[blackhole] TB-alt: {n_hidden} more same-tier alternative(s) "
+                            f"rejected for {filename} (details at DEBUG)")
             if not candidates:
                 if n_rejected:
+                    hidden = f", {n_hidden} not shown above" if n_hidden > 0 else ''
                     logger.info(f"[blackhole] TB-alt: no like-for-like alternative "
                                 f"for {filename} ({n_rejected} same-tier "
-                                f"rejected); failing the grab")
+                                f"rejected{hidden}); failing the grab")
                 else:
                     logger.debug(f"[blackhole] TB-alt: no same-tier "
                                  f"({target_tier}) alternative for {filename}")

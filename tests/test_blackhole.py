@@ -5838,6 +5838,46 @@ class TestTorboxAltLikeForLike:
             [self._candidate(self.PACK, title=title)], label='radarr')
         assert result is False and not added
 
+    @pytest.mark.parametrize('grab,ident,want_episode', [
+        # Season grab: ask Torrentio for the season's first episode, not the
+        # bare series list that mixes every season.
+        (PACK_GRAB, ('tt16358384', 'series', 2, None), 1),
+        (EP_GRAB, ('tt16358384', 'series', 2, 5), 5),
+    ])
+    def test_search_targets_the_grabbed_season(self, tmp_dir, monkeypatch,
+                                               grab, ident, want_episode):
+        w = self._make_watcher(tmp_dir)
+        monkeypatch.setattr(w, '_resolve_arr_identity', lambda fn, label=None: ident)
+        import utils.search as search
+        calls = []
+        monkeypatch.setattr(search, 'search_torrentio',
+                            lambda *a, **k: calls.append(k) or [])
+        fp = self._make_file(tmp_dir, grab)
+        w._try_torbox_cached_alternative(fp, grab, self.REJECTED, 'realdebrid',
+                                         label='sonarr')
+        assert calls == [{'media_type': 'series', 'season': 2,
+                          'episode': want_episode}]
+
+    @pytest.mark.parametrize('n_packs,shown', [(3, 3), (8, 5)])
+    def test_rejection_lines_capped_at_info(self, tmp_dir, monkeypatch, caplog,
+                                            n_packs, shown):
+        """The first few rejections are logged at INFO, the rest at DEBUG
+        and counted in the summary line, so one drop can't flood the log."""
+        from utils.blackhole import _TB_ALT_REJECT_LOG_MAX
+        assert _TB_ALT_REJECT_LOG_MAX == 5
+        caplog.set_level('INFO', logger='ZURGARR')
+        packs = [self._candidate(f'{i:x}' * 40 if i < 10 else 'e' * 40,
+                                 title=f'Tulsa.King.S02.1080p.WEB.H264-GRP{i}')
+                 for i in range(1, n_packs + 1)]
+        result, added, _, _ = self._run(
+            tmp_dir, monkeypatch, self.EP_GRAB, ('tt16358384', 'series', 2, 5), packs)
+        assert result is False and not added
+        info = [r.getMessage() for r in caplog.records if r.levelname == 'INFO']
+        assert sum('TB-alt: rejected' in m for m in info) == shown
+        summary = [m for m in info if 'no like-for-like alternative' in m]
+        assert len(summary) == 1 and f'{n_packs} same-tier rejected' in summary[0]
+        assert ('not shown above' in summary[0]) is (n_packs > shown)
+
     def test_unparseable_codec_declines_before_search(self, tmp_dir, monkeypatch):
         w = self._make_watcher(tmp_dir)
         monkeypatch.setattr(w, '_resolve_arr_identity',
