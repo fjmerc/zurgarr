@@ -1254,8 +1254,31 @@ class TestTorboxAddPauses:
             calls.append(api_key)
             return False, f'{_PAUSED_RESULT}: TorBox adds paused for 600s'
         assert w._try_releases(rels, handler, os.path.basename(orig), orig,
-                               debrid='torbox') is False
+                               debrid='torbox') is None   # "retry later", not "exhausted"
         assert calls == ['tbkey']        # stopped at the first pause, routed key
+
+    def test_transient_error_in_alt_search_parks_instead_of_exhausting(self, tmp_dir, monkeypatch):
+        """An RD 503 (no rate-limit window) during the alt-release search is
+        no verdict on the alternatives: park, don't mark exhausted."""
+        from utils.blackhole import RetryMeta
+        w = BlackholeWatcher(os.path.join(tmp_dir, 'watch'), 'rdkey', 'realdebrid',
+                             completed_dir=os.path.join(tmp_dir, 'completed'))
+        rels = [{'guid': 'magnet:?xt=urn:btih:' + c * 40, 'title': f'Alt {c}'} for c in 'bcd']
+        compromise = []
+        monkeypatch.setattr(w, '_seed_tier_state', lambda *a, **k: None)
+        monkeypatch.setattr(w, '_try_compromise', lambda *a, **k: compromise.append(1) or False)
+        import utils.arr_client as ac
+        fake = type('R', (), {'configured': True,
+                              'find_movie_in_library': lambda self, **k: {'id': 1},
+                              'get_movie_releases': lambda self, mid: rels})()
+        monkeypatch.setattr(ac, 'RadarrClient', lambda: fake)
+        staged = self._magnet(tmp_dir, 'Movie.2026.1080p.WEB.x264-GRP.magnet')
+        handler = lambda path, **k: (False, 'temporary failure: Real-Debrid HTTP 503')
+        w._try_alternative_release(os.path.basename(staged), staged, handler, debrid='realdebrid')
+        dest = os.path.join(tmp_dir, 'watch', 'failed', os.path.basename(staged))
+        assert os.path.exists(dest) and not compromise
+        assert RetryMeta.is_alt_exhausted(dest) is False
+        assert RetryMeta.read(dest)[0] == 0
 
     def test_paused_alt_search_retries_instead_of_marking_exhausted(self, tmp_dir, monkeypatch):
         from utils.blackhole import RetryMeta

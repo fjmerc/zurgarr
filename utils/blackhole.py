@@ -3996,8 +3996,9 @@ class BlackholeWatcher:
         except Exception as e:
             logger.error(f"[blackhole] Error during alternative release search: {e}")
 
-        paused = (not alt_ok and _rate_limit_remaining(debrid or self.debrid_service)
-                  > _RATE_LIMIT_MAX_INLINE_WAIT)
+        paused = alt_ok is None or (
+            not alt_ok and _rate_limit_remaining(debrid or self.debrid_service)
+            > _RATE_LIMIT_MAX_INLINE_WAIT)
         if paused and os.path.exists(file_path):
             # The provider paused mid-search (5xx / cooldown): the
             # alternatives weren't rejected, so don't mark them exhausted
@@ -4074,9 +4075,10 @@ class BlackholeWatcher:
             releases = []
 
         self._seed_tier_state(client, 'series', series, orig_path)
-        if self._try_releases(releases, debrid_handler, orig_filename, orig_path, label=label,
-                              debrid=debrid):
-            return True
+        found = self._try_releases(releases, debrid_handler, orig_filename, orig_path,
+                                   label=label, debrid=debrid)
+        if found or found is None:
+            return found  # None: provider unavailable — retry later, skip compromise
         return self._try_compromise(
             client, 'series', series,
             context={'media_type': 'series', 'season': season, 'episode': ep_num,
@@ -4105,9 +4107,10 @@ class BlackholeWatcher:
             releases = []
 
         self._seed_tier_state(client, 'movie', movie, orig_path)
-        if self._try_releases(releases, debrid_handler, orig_filename, orig_path, label=label,
-                              debrid=debrid):
-            return True
+        found = self._try_releases(releases, debrid_handler, orig_filename, orig_path,
+                                   label=label, debrid=debrid)
+        if found or found is None:
+            return found  # None: provider unavailable — retry later, skip compromise
         return self._try_compromise(
             client, 'movie', movie,
             context={'media_type': 'movie'},
@@ -4910,6 +4913,8 @@ class BlackholeWatcher:
                         },
                         advance_state=None,
                     )
+                    if submitted is None:
+                        return None  # debrid unavailable — retry the pack later
                     if submitted:
                         # Only consume the pack-probe flag on success —
                         # a transient debrid failure on a GOOD pack
@@ -5007,6 +5012,10 @@ class BlackholeWatcher:
                 pass
 
         if not success:
+            if _is_retry_later(result):
+                logger.info(f"[blackhole] Compromise submission deferred — debrid "
+                            f"unavailable: {str(result)[:100]}")
+                return None
             logger.info(f"[blackhole] Compromise submission rejected by debrid: "
                         f"{str(result)[:100]}")
             return False
@@ -5070,6 +5079,10 @@ class BlackholeWatcher:
         *debrid* names the provider behind *debrid_handler* — without it,
         ID extraction and the monitor default to the primary service and
         misparse/mispoll when the handler is the routed alternative.
+
+        Returns True on a grab, False when every tried alternative was
+        rejected, None when the provider was unavailable (``_is_retry_later``)
+        — callers must not treat None as "alternatives exhausted".
         """
         import tempfile
 
@@ -5134,10 +5147,12 @@ class BlackholeWatcher:
                         _notify('download_complete', 'Blackhole: Alt Release Found',
                                 f'Original rejected, using: {alt_title[:60]}')
                     return True
-                elif _is_paused_result(result):
-                    logger.info(f"[blackhole] {debrid or self.debrid_service} paused; "
+                elif _is_retry_later(result):
+                    # Pause / 429 / 5xx: no verdict on this or the remaining
+                    # alternatives — stop and let the caller retry later.
+                    logger.info(f"[blackhole] {debrid or self.debrid_service} unavailable; "
                                 f"stopping alternative search: {result}")
-                    break
+                    return None
                 else:
                     logger.debug(f"[blackhole] Alternative also rejected: {alt_title[:60]}: {str(result)[:100]}")
             except Exception as e:
