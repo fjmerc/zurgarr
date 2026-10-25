@@ -1821,19 +1821,25 @@ class BlackholeWatcher:
         ext = os.path.splitext(file_path)[1].lower()
         headers = {'Authorization': f'Bearer {api_key}'}
 
-        if ext == '.magnet':
-            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-                magnet_link = f.read().strip()
-            url = 'https://api.real-debrid.com/rest/1.0/torrents/addMagnet'
-            response = tracked_request('realdebrid', requests.post, url, headers=headers, data={'magnet': magnet_link}, timeout=30)
-        elif ext == '.torrent':
-            url = 'https://api.real-debrid.com/rest/1.0/torrents/addTorrent'
-            with open(file_path, 'rb') as f:
-                response = tracked_request('realdebrid', requests.put, url,
-                                           headers={**headers, 'Content-Type': 'application/x-bittorrent'},
-                                           data=f.read(), timeout=30)
-        else:
-            return False, f'Unsupported extension: {ext}'
+        try:
+            if ext == '.magnet':
+                with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                    magnet_link = f.read().strip()
+                url = 'https://api.real-debrid.com/rest/1.0/torrents/addMagnet'
+                response = tracked_request('realdebrid', requests.post, url, headers=headers, data={'magnet': magnet_link}, timeout=30)
+            elif ext == '.torrent':
+                url = 'https://api.real-debrid.com/rest/1.0/torrents/addTorrent'
+                with open(file_path, 'rb') as f:
+                    response = tracked_request('realdebrid', requests.put, url,
+                                               headers={**headers, 'Content-Type': 'application/x-bittorrent'},
+                                               data=f.read(), timeout=30)
+            else:
+                return False, f'Unsupported extension: {ext}'
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            # Unreachable is no verdict on the torrent: retry later
+            # (parked, uncounted) instead of re-adding every poll or
+            # counting it as a rejected alternative.
+            return False, f'{_TRANSIENT_RESULT}: Real-Debrid {type(e).__name__}'
 
         if response.status_code in (200, 201):
             torrent_id = response.json().get('id')
@@ -1858,17 +1864,23 @@ class BlackholeWatcher:
         ext = os.path.splitext(file_path)[1].lower()
         params = {'agent': 'zurgarr', 'apikey': api_key}
 
-        if ext == '.magnet':
-            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-                magnet_link = f.read().strip()
-            url = 'https://api.alldebrid.com/v4/magnet/upload'
-            response = tracked_request('alldebrid', requests.post, url, params=params, data={'magnets[]': magnet_link}, timeout=30)
-        elif ext == '.torrent':
-            url = 'https://api.alldebrid.com/v4/magnet/upload/file'
-            with open(file_path, 'rb') as f:
-                response = tracked_request('alldebrid', requests.post, url, params=params, files={'files[]': f}, timeout=30)
-        else:
-            return False, f'Unsupported extension: {ext}'
+        try:
+            if ext == '.magnet':
+                with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                    magnet_link = f.read().strip()
+                url = 'https://api.alldebrid.com/v4/magnet/upload'
+                response = tracked_request('alldebrid', requests.post, url, params=params, data={'magnets[]': magnet_link}, timeout=30)
+            elif ext == '.torrent':
+                url = 'https://api.alldebrid.com/v4/magnet/upload/file'
+                with open(file_path, 'rb') as f:
+                    response = tracked_request('alldebrid', requests.post, url, params=params, files={'files[]': f}, timeout=30)
+            else:
+                return False, f'Unsupported extension: {ext}'
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            # Unreachable is no verdict on the torrent: retry later
+            # (parked, uncounted) instead of re-adding every poll or
+            # counting it as a rejected alternative.
+            return False, f'{_TRANSIENT_RESULT}: AllDebrid {type(e).__name__}'
 
         if response.status_code == 200:
             return True, response.json()
@@ -4149,8 +4161,14 @@ class BlackholeWatcher:
         toward MAX_RETRIES (the failure said nothing about the torrent).
         The sidecar is written before the file lands so ``_retry_failed``
         never sees it without its backoff timestamp."""
+        if not os.path.exists(file_path):
+            return  # already moved on (e.g. a rescue restore that couldn't relink)
         error_dir = self._failed_dir(label)
-        os.makedirs(error_dir, exist_ok=True)
+        try:
+            os.makedirs(error_dir, exist_ok=True)
+        except OSError as e:
+            logger.warning(f"[blackhole] Could not park {filename}: {e}")
+            return
         dest = os.path.join(error_dir, filename)
         if os.path.exists(dest):
             base, fext = os.path.splitext(filename)

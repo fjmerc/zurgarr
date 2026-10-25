@@ -1341,6 +1341,47 @@ class TestTorboxAddPauses:
         ok, msg = w._add_to_realdebrid(self._magnet(tmp_dir))
         assert ok is False and _is_retry_later(msg)
 
+    @pytest.mark.parametrize('service', ['realdebrid', 'alldebrid'])
+    @pytest.mark.parametrize('exc', ['ConnectTimeout', 'ConnectionError'])
+    def test_unreachable_rd_ad_is_a_temporary_failure(self, tmp_dir, monkeypatch, service, exc):
+        import requests as _rq
+        from utils.blackhole import _is_retry_later
+
+        def boom(*a, **k):
+            raise getattr(_rq.exceptions, exc)('unreachable')
+        monkeypatch.setattr('utils.blackhole.tracked_request', boom)
+        monkeypatch.setattr('utils.blackhole._check_rate_limit', lambda *a, **k: None)
+        w = BlackholeWatcher(os.path.join(tmp_dir, 'watch'), 'key', service)
+        ok, msg = getattr(w, f'_add_to_{service}')(self._magnet(tmp_dir))
+        assert ok is False and _is_retry_later(msg)
+
+    def test_unreachable_rd_parks_main_path_and_alt_search(self, tmp_dir, monkeypatch):
+        """A network error from RD: the main path parks once (no re-add every
+        poll), and an alt-release search stops with "retry later" instead of
+        counting five rejections and marking alts exhausted."""
+        import requests as _rq
+        from utils.blackhole import RetryMeta
+        calls = []
+
+        def boom(*a, **k):
+            calls.append(1)
+            raise _rq.exceptions.ConnectTimeout('timed out')
+        monkeypatch.setattr('utils.blackhole.tracked_request', boom)
+        monkeypatch.setattr('utils.blackhole._check_rate_limit', lambda *a, **k: None)
+        monkeypatch.setattr('utils.search._existing_hashes', lambda *a, **kw: set())
+        w = BlackholeWatcher(os.path.join(tmp_dir, 'watch'), 'rdkey', 'realdebrid',
+                             completed_dir=os.path.join(tmp_dir, 'completed'))
+        path = self._magnet(tmp_dir)
+        w._process_file(path)
+        dest = os.path.join(tmp_dir, 'watch', 'failed', os.path.basename(path))
+        assert os.path.exists(dest) and RetryMeta.read(dest)[0] == 0
+        calls.clear()
+        rels = [{'guid': 'magnet:?xt=urn:btih:' + c * 40, 'title': f'Alt {c}'} for c in 'bcdef']
+        orig = self._magnet(tmp_dir, 'Other.2026.1080p.WEB.x264-GRP.magnet')
+        assert w._try_releases(rels, w._add_to_realdebrid, os.path.basename(orig), orig,
+                               debrid='realdebrid') is None
+        assert len(calls) == 1
+
     def test_alt_pending_recovery_skips_sidecars_and_carries_them(self, tmp_dir):
         from utils.blackhole import RetryMeta
         watch = os.path.join(tmp_dir, 'watch')
