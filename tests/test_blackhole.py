@@ -1027,6 +1027,155 @@ class TestTorboxAddCooldownGate:
         assert _rate_limit_until.get('torbox', 0) <= time.time()
 
 
+class TestTorboxAddPauses:
+    """A failed TorBox add pauses TorBox adds briefly — never for the
+    account's advisory ``cooldown_until`` (pinned ~24h on this account) —
+    and a paused TorBox never stalls the serial worker: TorBox-bound drops
+    wait in the watch dir while other providers keep adding.  Regression
+    for 2026-10-25, when one failed add during a TorBox API outage gated
+    every TorBox add for 23h and the worker slept through it, queueing
+    every grab behind it."""
+
+    def setup_method(self):
+        import utils.blackhole as bh
+        _rate_limit_until.clear()
+        _tb_cooldown_cache['checked_at'] = 0.0
+        _tb_cooldown_cache['seconds_until'] = 0.0
+        bh._tb_cooldown_strikes = 0
+
+    teardown_method = setup_method
+
+    def _watcher(self, tmp_dir, service='torbox'):
+        return BlackholeWatcher(
+            os.path.join(tmp_dir, 'watch'), 'key', service,
+            completed_dir=os.path.join(tmp_dir, 'completed'),
+        )
+
+    def _magnet(self, tmp_dir, name='Movie.2026.1080p.WEB.x264-GRP.magnet'):
+        d = os.path.join(tmp_dir, 'watch')
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, name)
+        with open(path, 'w') as f:
+            f.write('magnet:?xt=urn:btih:' + ('a' * 40))
+        os.utime(path, (time.time() - 60, time.time() - 60))
+        return path
+
+    def _post(self, monkeypatch, status, text='{}'):
+        from unittest.mock import MagicMock
+        resp = MagicMock()
+        resp.status_code = status
+        resp.text = text
+        monkeypatch.setattr('utils.blackhole.tracked_request', lambda *a, **kw: resp)
+
+    def test_cooldown_flag_pauses_15_minutes_not_its_full_window(self, tmp_dir, monkeypatch):
+        from unittest.mock import MagicMock
+        from datetime import datetime, timedelta, timezone
+        from utils.blackhole import _TB_COOLDOWN_PAUSE_MAX
+        self._post(monkeypatch, 400, '{"error":"DOWNLOAD_SERVER_ERROR"}')
+        me = MagicMock()
+        me.status_code = 200
+        until = datetime.now(timezone.utc) + timedelta(seconds=84353)
+        me.json.return_value = {'data': {'cooldown_until': until.strftime('%Y-%m-%dT%H:%M:%SZ')}}
+        monkeypatch.setattr('utils.blackhole.requests.get', lambda *a, **kw: me)
+        ok, msg = self._watcher(tmp_dir)._add_to_torbox(self._magnet(tmp_dir))
+        assert ok is False and 'cooldown' in msg
+        remaining = _rate_limit_until['torbox'] - time.time()
+        assert _TB_COOLDOWN_PAUSE_MAX - 5 < remaining <= _TB_COOLDOWN_PAUSE_MAX
+
+    def test_repeated_cooldown_failures_back_off_and_success_resets(self, tmp_dir, monkeypatch):
+        """If enforcement is real, each create can re-arm TorBox's 24h
+        penalty — consecutive cooldown-flagged failures double the pause
+        (never past the flag); a successful add resets the streak."""
+        from unittest.mock import MagicMock
+        from datetime import datetime, timedelta, timezone
+        from utils.blackhole import _TB_COOLDOWN_PAUSE_MAX as base
+        resp = MagicMock()
+        monkeypatch.setattr('utils.blackhole.tracked_request', lambda *a, **kw: resp)
+        me = MagicMock()
+        me.status_code = 200
+        until = datetime.now(timezone.utc) + timedelta(seconds=5000)
+        me.json.return_value = {'data': {'cooldown_until': until.strftime('%Y-%m-%dT%H:%M:%SZ')}}
+        monkeypatch.setattr('utils.blackhole.requests.get', lambda *a, **kw: me)
+        monkeypatch.setattr('utils.blackhole._check_rate_limit', lambda *a, **kw: None)
+        w, path = self._watcher(tmp_dir), self._magnet(tmp_dir)
+        pauses = []
+        for _ in range(4):
+            resp.status_code, resp.text = 400, '{"error":"DOWNLOAD_SERVER_ERROR"}'
+            w._add_to_torbox(path)
+            pauses.append(round(_rate_limit_until['torbox'] - time.time(), -1))
+        assert pauses[0] == base and pauses[1] == 2 * base
+        assert pauses[2] == 4 * base and pauses[3] <= 5000      # capped by the flag
+        resp.status_code = 200
+        resp.json.return_value = {'data': {'torrent_id': 1}}
+        assert w._add_to_torbox(path)[0] is True
+        resp.status_code = 400
+        w._add_to_torbox(path)
+        assert round(_rate_limit_until['torbox'] - time.time(), -1) == base
+
+    def test_timeout_pauses_torbox_adds_and_reraises(self, tmp_dir, monkeypatch):
+        import requests as _rq
+        from utils.blackhole import _TB_ERROR_PAUSE
+
+        def boom(*a, **kw):
+            raise _rq.exceptions.ReadTimeout('read timed out')
+        monkeypatch.setattr('utils.blackhole.tracked_request', boom)
+        with pytest.raises(_rq.exceptions.ReadTimeout):
+            self._watcher(tmp_dir)._add_to_torbox(self._magnet(tmp_dir))
+        assert _rate_limit_until['torbox'] - time.time() > _TB_ERROR_PAUSE - 5
+
+    def test_server_error_pauses_torbox_adds(self, tmp_dir, monkeypatch):
+        from utils.blackhole import _TB_ERROR_PAUSE
+        self._post(monkeypatch, 502, 'Bad Gateway')
+        ok, msg = self._watcher(tmp_dir)._add_to_torbox(self._magnet(tmp_dir))
+        assert ok is False and '502' in msg
+        assert _rate_limit_until['torbox'] - time.time() > _TB_ERROR_PAUSE - 5
+
+    def test_short_window_still_waits_inline(self):
+        from utils.blackhole import _rate_limit_remaining, _RATE_LIMIT_MAX_INLINE_WAIT
+        w = BlackholeWatcher('/tmp', 'key', 'torbox')
+        _rate_limit_until['torbox'] = time.time() + _RATE_LIMIT_MAX_INLINE_WAIT - 5
+        assert w._defer_for_provider_pause('torbox', 'x.magnet') is False
+        _rate_limit_until['torbox'] = time.time() + 600
+        assert w._defer_for_provider_pause('torbox', 'x.magnet') is True
+        assert _rate_limit_remaining('realdebrid') == 0.0
+
+    def test_paused_torbox_defers_drop_without_adding_or_sleeping(self, tmp_dir, monkeypatch):
+        monkeypatch.setattr('utils.search._existing_hashes', lambda *a, **kw: set())
+        w = self._watcher(tmp_dir)
+        added = []
+        monkeypatch.setattr(w, '_add_to_torbox', lambda *a, **k: added.append(1) or (True, {}))
+        _rate_limit_until['torbox'] = time.time() + 600
+        path = self._magnet(tmp_dir)
+        start = time.time()
+        w._process_file(path)
+        assert time.time() - start < 5
+        assert not added
+        assert os.path.exists(path)          # retried once the pause ends
+
+    def test_paused_torbox_does_not_hold_up_realdebrid(self, tmp_dir, monkeypatch):
+        monkeypatch.setattr('utils.search._existing_hashes', lambda *a, **kw: set())
+        w = self._watcher(tmp_dir, service='realdebrid')
+        added = []
+        monkeypatch.setattr(w, '_add_to_realdebrid',
+                            lambda *a, **k: added.append(1) or (True, 'RDID'))
+        _rate_limit_until['torbox'] = time.time() + 600
+        w._process_file(self._magnet(tmp_dir))
+        assert added == [1]
+
+    def test_tb_alt_waits_instead_of_failing_the_grab(self, tmp_dir, monkeypatch):
+        """With TorBox paused, an uncached drop that TB-alt would try to
+        recover stays in the watch dir — not failed to the arr, not slept on."""
+        monkeypatch.setenv('BLACKHOLE_TB_ALT_RECOVERY_ENABLED', 'true')
+        w = BlackholeWatcher(os.path.join(tmp_dir, 'watch'), 'tbkey', 'torbox',
+                             completed_dir=os.path.join(tmp_dir, 'completed'),
+                             debrid_api_keys={'torbox': 'tbkey'})
+        _rate_limit_until['torbox'] = time.time() + 600
+        assert w._tb_alt_would_wait('x.magnet', 'a' * 40) is True
+        assert w._tb_alt_would_wait('x.magnet', '') is False
+        _rate_limit_until.clear()
+        assert w._tb_alt_would_wait('x.magnet', 'a' * 40) is False
+
+
 class TestSymlinkConstants:
 
     def test_media_extensions_include_common_video(self):

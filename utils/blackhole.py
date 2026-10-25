@@ -145,6 +145,25 @@ _rate_limit_until = {}    # provider -> unix timestamp until which adds wait
 _TB_COOLDOWN_CACHE_TTL = 30  # seconds — short enough to react to manual lift
 _tb_cooldown_cache = {'checked_at': 0.0, 'seconds_until': 0.0}
 
+# On this account ``cooldown_until`` stays pinned ~24h out while creates keep
+# succeeding (it is advisory), so a create that fails while it is set — e.g.
+# during a TorBox API outage — must not gate TB adds for the flag's full
+# remaining time: that wedged every TorBox-routed grab for ~23h (2026-10-25).
+# Pause briefly, doubling per consecutive cooldown-flagged failure (capped
+# at the flag's remaining time): when enforcement is real, each create during
+# it may re-arm the 24h penalty, so retries must back off fast; when it isn't,
+# adds resume within the first pause.  Any successful add resets the streak.
+_TB_COOLDOWN_PAUSE_MAX = 900  # seconds — first pause
+_tb_cooldown_strikes = 0      # consecutive failed adds with the flag set
+# createtorrent timeout / connection error / 5xx: the TB API is struggling,
+# and a timed-out create may have landed anyway — pause TB adds rather than
+# re-creating the same drop on every scan (which feeds the abuse system).
+_TB_ERROR_PAUSE = 300  # seconds
+# Longest rate-limit window the serial worker waits out inline.  Longer
+# windows defer the drop (left in the watch dir) so grabs routed to other
+# providers keep moving instead of queueing behind one sleeping add.
+_RATE_LIMIT_MAX_INLINE_WAIT = _RATE_LIMIT_BACKOFF
+
 # Coalesced root re-list.  Phase 2 of ``_process_torrent`` kicks rclone to
 # re-list the mount root via RC ``vfs/refresh`` so a freshly-cached torrent
 # surfaces without waiting for the dir-cache to expire.  On a FLAT TorBox
@@ -305,6 +324,13 @@ def _check_rate_limit(provider, *, _max_chunk=None, stop_event=None):
         # manual reset can wake us up early).
         if wait < max_chunk:
             return
+
+
+def _rate_limit_remaining(provider):
+    """Seconds left on *provider*'s rate-limit window (0.0 if none)."""
+    with _rate_limit_lock:
+        until = _rate_limit_until.get(provider, 0)
+    return max(0.0, until - time.time())
 
 
 def _mark_rate_limited(provider, seconds=None):
@@ -1796,35 +1822,49 @@ class BlackholeWatcher:
         headers = {'Authorization': f'Bearer {api_key}'}
         url = 'https://api.torbox.app/v1/api/torrents/createtorrent'
 
-        if ext == '.magnet':
-            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-                magnet_link = f.read().strip()
-            response = tracked_request('torbox', requests.post, url, headers=headers, data={'magnet': magnet_link}, timeout=30)
-        elif ext == '.torrent':
-            # TB rejects with BOZO_TORRENT unless the file part carries Content-Type: application/x-bittorrent.
-            with open(file_path, 'rb') as f:
-                files = {'file': (os.path.basename(file_path), f, 'application/x-bittorrent')}
-                response = tracked_request('torbox', requests.post, url, headers=headers, files=files, timeout=30)
-        else:
-            return False, f'Unsupported extension: {ext}'
+        try:
+            if ext == '.magnet':
+                with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                    magnet_link = f.read().strip()
+                response = tracked_request('torbox', requests.post, url, headers=headers, data={'magnet': magnet_link}, timeout=30)
+            elif ext == '.torrent':
+                # TB rejects with BOZO_TORRENT unless the file part carries Content-Type: application/x-bittorrent.
+                with open(file_path, 'rb') as f:
+                    files = {'file': (os.path.basename(file_path), f, 'application/x-bittorrent')}
+                    response = tracked_request('torbox', requests.post, url, headers=headers, files=files, timeout=30)
+            else:
+                return False, f'Unsupported extension: {ext}'
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            _mark_rate_limited('torbox', seconds=_TB_ERROR_PAUSE)
+            raise
 
+        global _tb_cooldown_strikes
         if response.status_code in (200, 201):
+            _tb_cooldown_strikes = 0
             return True, response.json()
         if _is_rate_limit_response(response):
             _mark_rate_limited('torbox')
             return False, 'rate limit exceeded'
+        if response.status_code >= 500:
+            _mark_rate_limited('torbox', seconds=_TB_ERROR_PAUSE)
+            return False, (f'TorBox API error {response.status_code} — pausing '
+                           f'TorBox adds for {_TB_ERROR_PAUSE}s')
         # TB does not surface its account-level cooldown via 429 — instead
         # it returns HTTP 400 ``DOWNLOAD_SERVER_ERROR`` while ``cooldown_until``
-        # on /user/me is set.  Probe the cooldown so a quota-exhausted
-        # account converts into a precise rate-limit window rather than
-        # an open retry loop that wastes every subsequent createtorrent
-        # call until the cooldown lifts.
+        # on /user/me is set.  Probe the cooldown so a failed add during it
+        # pauses TB adds rather than retrying createtorrent on every scan —
+        # but only for _TB_COOLDOWN_PAUSE_MAX, not the flag's remaining
+        # time: the flag is advisory (adds usually succeed while it's set).
         cooldown_seconds = _check_torbox_cooldown(api_key)
         if cooldown_seconds > 0:
-            _mark_rate_limited('torbox', seconds=cooldown_seconds)
+            pause = min(cooldown_seconds,
+                        _TB_COOLDOWN_PAUSE_MAX * 2 ** min(_tb_cooldown_strikes, 10))
+            _tb_cooldown_strikes += 1
+            _mark_rate_limited('torbox', seconds=pause)
             return False, (
-                f'TorBox account cooldown active for '
-                f'{int(cooldown_seconds)}s — gating subsequent adds'
+                f'TorBox add failed with account cooldown flag set '
+                f'({int(cooldown_seconds)}s left) — pausing TorBox adds '
+                f'for {int(pause)}s'
             )
         return False, response.text[:200]
 
@@ -3975,6 +4015,35 @@ class BlackholeWatcher:
             debrid=debrid,
         )
 
+    def _defer_for_provider_pause(self, provider, filename):
+        """True (and the caller should return, leaving the drop in the watch
+        dir) when *provider*'s add window is paused longer than the worker
+        should wait inline — see ``_RATE_LIMIT_MAX_INLINE_WAIT``.  Logs once
+        per pause window at INFO, per file at DEBUG."""
+        remaining = _rate_limit_remaining(provider)
+        if remaining <= _RATE_LIMIT_MAX_INLINE_WAIT:
+            return False
+        until = int(time.time() + remaining)
+        announced = getattr(self, '_pause_announced', None)
+        if announced is None:
+            announced = self._pause_announced = {}
+        if announced.get(provider) != until:
+            announced[provider] = until
+            logger.info(f"[blackhole] {provider} adds paused for {remaining:.0f}s — "
+                        f"{provider}-bound drops wait in the watch dir; other "
+                        f"providers keep going")
+        logger.debug(f"[blackhole] Deferring {filename}: {provider} adds paused "
+                     f"for {remaining:.0f}s")
+        return True
+
+    def _tb_alt_would_wait(self, filename, info_hash):
+        """True when TB-alt recovery would run for this drop but TorBox adds
+        are paused — defer the drop instead of failing it to the arr (or
+        sleeping the worker through the pause)."""
+        return bool(self._tb_alt_recovery_enabled() and info_hash
+                    and self._api_key_for('torbox')
+                    and self._defer_for_provider_pause('torbox', filename))
+
     @staticmethod
     def _tb_alt_recovery_enabled():
         return str(os.environ.get(
@@ -5136,6 +5205,8 @@ class BlackholeWatcher:
                     # deleting, see if a DIFFERENT release of the same title
                     # is cached on TorBox and grab that instead — otherwise
                     # an abundantly-cached title silently falls to "Wanted".
+                    if self._tb_alt_would_wait(filename, info_hash):
+                        return
                     if self._try_torbox_cached_alternative(file_path, filename, info_hash, debrid, label=label):
                         return
                     # No cached alternative either — before the silent
@@ -5185,6 +5256,8 @@ class BlackholeWatcher:
                         # debrid and TorBox — but a different release of the
                         # same title may still be TB-cached.  Try to recover
                         # before deleting.
+                        if self._tb_alt_would_wait(filename, info_hash):
+                            return
                         if self._try_torbox_cached_alternative(file_path, filename, info_hash, debrid, label=label):
                             return
                         self._push_arr_failed_feedback(filename, info_hash, debrid, label=label)
@@ -5303,6 +5376,8 @@ class BlackholeWatcher:
         handler = dispatch.get(debrid)
         if not handler:
             logger.error(f"[blackhole] Unsupported debrid service: {debrid}")
+            return
+        if self._defer_for_provider_pause(debrid, filename):
             return
 
         try:
