@@ -504,6 +504,16 @@ def _poster_url(path, size='w300'):
     return _IMAGE_BASE + size + path
 
 
+# A year-qualified cache key: "<norm> (YYYY)".
+_YEAR_KEY_RE = re.compile(r'^(.+)\s+\(\d{4}\)$')
+
+
+def _key_base(norm_key):
+    """*norm_key* with any trailing " (YYYY)" removed."""
+    m = _YEAR_KEY_RE.match(norm_key)
+    return m.group(1) if m else norm_key
+
+
 def _cache_key(norm, year=None):
     """Build a year-qualified cache key to disambiguate same-title entries.
 
@@ -516,7 +526,7 @@ def _cache_key(norm, year=None):
     return norm
 
 
-def _cache_lookup(section, norm, year=None):
+def _cache_lookup(section, norm, year=None, families=None):
     """Look up a cache entry, trying year-qualified key first then yearless.
 
     On-read sanity: when both *year* is supplied AND the returned entry
@@ -526,12 +536,21 @@ def _cache_lookup(section, norm, year=None):
     fallback_no_year wrote unrelated content under a movie-style key
     in the wrong section) without forcing operators to clear the cache.
     Entries without a stored date fail-open — legacy/year-less entries
-    must continue to work.
+    must continue to work.  For a reboot family's base title there is no
+    yearless fallback: a miss on the year-qualified key is a miss.
+    *families* is the section's ``_year_collision_bases`` when the caller
+    already has it (bulk lookups); otherwise it's computed on a miss.
     """
     qualified = _cache_key(norm, year) if year is not None else norm
     entry = None
     if year is not None and qualified != norm:
         entry = section.get(qualified)
+        if families is None and entry is None:
+            families = _year_collision_bases(section)
+        if entry is None and norm in families:
+            # A dated item in a reboot family has no entry of its own
+            # yet — the bare key is some sibling's identity, not its.
+            return None
     if entry is None:
         entry = section.get(norm)
     if entry and year is not None:
@@ -682,7 +701,12 @@ def get_cached_posters(items):
     """Return cached poster/status data for a list of library items.
 
     Performs a single cache file read — no TMDB API calls.  Items without
-    a fresh cache entry are silently omitted from the result.
+    a fresh cache entry are silently omitted from the result.  A hit is
+    also stored under its yearless key, except for a reboot family's base
+    title, which is never stored (not even for a yearless item): the
+    library falls back to the yearless key, so it would hand one
+    sibling's IMDb ID to the other (whose own entry may be stale), and
+    the ID-based dedup would then fold the two shows together.
 
     Args:
         items: list of dicts with 'title', 'year', 'type' ('show'|'movie')
@@ -701,6 +725,8 @@ def get_cached_posters(items):
 
     shows_cache = cache.get('shows', {})
     movies_cache = cache.get('movies', {})
+    show_families = _year_collision_bases(shows_cache)
+    movie_families = _year_collision_bases(movies_cache)
     today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
     result = {}
 
@@ -714,8 +740,13 @@ def get_cached_posters(items):
         result_key = _cache_key(key, year)
 
         item_type = item.get('type', '')
+        families = show_families if item_type == 'show' else movie_families
+        if result_key == key and key in families:
+            # A yearless item in a reboot family can't say which sibling it
+            # is, and its bare hit would be read back by a sibling's lookup.
+            continue
         if item_type == 'show':
-            entry = _cache_lookup(shows_cache, key, year)
+            entry = _cache_lookup(shows_cache, key, year, show_families)
             if entry and _is_fresh(entry):
                 # Count only episodes that have already aired (air_date strictly
                 # in the past).  Today's episode is excluded — until it actually
@@ -738,10 +769,10 @@ def get_cached_posters(items):
                 }
                 result[result_key] = info
                 # Also store under yearless key if no collision
-                if key != result_key and key not in result:
+                if key != result_key and key not in result and key not in show_families:
                     result[key] = info
         elif item_type == 'movie':
-            entry = _cache_lookup(movies_cache, key, year)
+            entry = _cache_lookup(movies_cache, key, year, movie_families)
             if entry and _is_fresh(entry):
                 # Movies don't have a status field in the cache; use
                 # release_date presence to infer "Released" vs empty.
@@ -755,7 +786,7 @@ def get_cached_posters(items):
                     'title': entry.get('title', '') or '',
                 }
                 result[result_key] = info
-                if key != result_key and key not in result:
+                if key != result_key and key not in result and key not in movie_families:
                     result[key] = info
 
     return result
@@ -780,7 +811,7 @@ def _key_words(norm_key):
     return set(_PUNCT_STRIP.sub('', norm_key).split()) - _STOP_WORDS
 
 
-def _find_alt_show_entry(shows_cache, norm_key, max_season):
+def _find_alt_show_entry(shows_cache, norm_key, max_season, year=None):
     """Search the show cache for an alternative entry covering *max_season*.
 
     Returns the best matching cache entry dict (most seasons) whose title
@@ -791,7 +822,13 @@ def _find_alt_show_entry(shows_cache, norm_key, max_season):
     Stop words are excluded to prevent "The Flash" matching "The Office".
     The query's content words must be a subset of the candidate's content
     words, so "Daredevil" can match "Marvel's Daredevil" but "Gordon"
-    cannot match "Flash Gordon".
+    cannot match "Flash Gordon".  Same-title entries for other years
+    ("dark matter (2015)" for "dark matter") are skipped when *year* hits
+    its own entry, or when the title is a reboot family (yearless family
+    items are attributed by episode shape at scan time); otherwise they
+    stay candidates, since the bare key
+    may hold the wrong show (bare "quantum leap" = the 2022 reboot, the
+    original only under "quantum leap (1989)").
     """
     norm_words = _key_words(norm_key)
     if not norm_words:
@@ -799,9 +836,18 @@ def _find_alt_show_entry(shows_cache, norm_key, max_season):
 
     best = None
     best_season_count = 0
+    base = _key_base(norm_key)
+    # Only a year that hit its own entry says which show the item is —
+    # folder years are often wrong ("iCarly.2010.S04").
+    year_known = year is not None and _cache_key(norm_key, year) in shows_cache
+    skip_same_base = year_known or base in _year_collision_bases(shows_cache)
 
     for alt_key, alt_entry in shows_cache.items():
         if alt_key == norm_key or not _is_fresh(alt_entry):
+            continue
+        # A same-title entry with another year is a different show (a
+        # reboot-family sibling), not a prefixed revival.
+        if skip_same_base and _key_base(alt_key) == base:
             continue
         alt_seasons = {s['number'] for s in alt_entry.get('seasons', [])}
         if max_season not in alt_seasons:
@@ -865,7 +911,7 @@ def find_show_by_season(norm_key, max_season, year=None):
     elif primary:
         return None  # stale primary, no fallback
 
-    alt = _find_alt_show_entry(shows_cache, norm_key, max_season)
+    alt = _find_alt_show_entry(shows_cache, norm_key, max_season, year)
     if alt:
         logger.debug(
             "[tmdb] Season-aware fallback: '%s' S%02d resolved via alternative cache entry",
@@ -894,7 +940,7 @@ def find_show_tmdb_id_by_season(norm_key, max_season, year=None):
     elif primary:
         return None  # stale primary, no fallback
 
-    alt = _find_alt_show_entry(shows_cache, norm_key, max_season)
+    alt = _find_alt_show_entry(shows_cache, norm_key, max_season, year)
     if alt:
         logger.debug(
             "[tmdb] Season-aware TMDB ID fallback: '%s' S%02d → TMDB %s",
@@ -960,8 +1006,6 @@ def get_cached_tmdb_ids():
     with _cache_lock:
         cache = _load_cache()
 
-    _year_re = re.compile(r'^(.+)\s+\(\d{4}\)$')
-
     result = {}
     for section in ('shows', 'movies'):
         entries = {}
@@ -976,15 +1020,17 @@ def get_cached_tmdb_ids():
                 entries[norm_title] = tmdb_id
             # Collisions count stale entries too (a title's ID doesn't
             # expire): an alias that ignores a stale sibling would point
-            # the bare title at the wrong show.
-            m = _year_re.match(norm_title)
+            # the bare title at the wrong show.  Unlike
+            # _year_collision_bases, a bare entry counts here — for
+            # aliasing, the stricter rule errs safe.
+            m = _YEAR_KEY_RE.match(norm_title)
             base = m.group(1) if m else norm_title
             if base in yearless_seen and yearless_seen[base] != tmdb_id:
                 yearless_collisions.add(base)
             yearless_seen[base] = tmdb_id
         # Add yearless aliases for non-colliding entries
         for norm_title, tmdb_id in list(entries.items()):
-            m = _year_re.match(norm_title)
+            m = _YEAR_KEY_RE.match(norm_title)
             if m:
                 base = m.group(1)
                 if base not in yearless_collisions and base not in entries:
@@ -1014,25 +1060,27 @@ def get_yearless_collision_bases():
     with _cache_lock:
         cache = _load_cache()
 
-    _year_re = re.compile(r'^(.+)\s+\(\d{4}\)$')
+    return {section: _year_collision_bases(cache.get(section, {}))
+            for section in ('shows', 'movies')}
 
-    result = {}
-    for section in ('shows', 'movies'):
-        seen = {}  # base -> tmdb_id
-        collisions = set()
-        for norm_title, entry in cache.get(section, {}).items():
-            tmdb_id = entry.get('tmdb_id')
-            if not tmdb_id:
-                continue
-            m = _year_re.match(norm_title)
-            if not m:
-                continue
-            base = m.group(1)
-            if base in seen and seen[base] != tmdb_id:
-                collisions.add(base)
-            seen[base] = tmdb_id
-        result[section] = collisions
-    return result
+
+
+def _year_collision_bases(section):
+    """Bases with 2+ year-qualified entries carrying different TMDB IDs."""
+    seen = {}  # base -> tmdb_id
+    collisions = set()
+    for norm_title, entry in section.items():
+        tmdb_id = entry.get('tmdb_id')
+        if not tmdb_id:
+            continue
+        m = _YEAR_KEY_RE.match(norm_title)
+        if not m:
+            continue
+        base = m.group(1)
+        if base in seen and seen[base] != tmdb_id:
+            collisions.add(base)
+        seen[base] = tmdb_id
+    return collisions
 
 
 # TMDB statuses after which a show's season/episode list is final.

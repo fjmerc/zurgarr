@@ -889,3 +889,205 @@ class TestCachedTmdbIdsYearlessAlias:
     def test_bare_alias_published_without_collision(self):
         _seed_cache(shows={'andor (2022)': _entry('Andor', 300)})
         assert tmdb.get_cached_tmdb_ids()['shows']['andor'] == 300
+
+
+# ---------------------------------------------------------------------------
+# tmdb.get_cached_posters / enrichment — no cross-sibling bare fallback
+# ---------------------------------------------------------------------------
+
+def _seed_dark_matter_stale_2015():
+    _seed_cache(shows={
+        'dark matter (2015)': dict(_entry('Dark Matter', 62425, {1: 13}, stale=True),
+                                   imdb_id='tt4159076'),
+        'dark matter (2024)': dict(_entry('Dark Matter', 196322, {1: 9}),
+                                   imdb_id='tt19231492'),
+    })
+
+
+class TestPostersYearlessAlias:
+
+    def test_no_bare_alias_for_reboot_family(self):
+        _seed_dark_matter_stale_2015()
+        cached = tmdb.get_cached_posters([
+            {'title': 'Dark Matter', 'year': 2024, 'type': 'show'},
+            {'title': 'Dark Matter', 'year': 2015, 'type': 'show'},
+        ])
+        assert 'dark matter (2024)' in cached
+        assert 'dark matter' not in cached
+
+    def test_no_bare_alias_for_movie_family(self):
+        _seed_cache(movies={
+            'dune (1984)': _entry('Dune', 841),
+            'dune (2021)': _entry('Dune', 438631),
+        })
+        cached = tmdb.get_cached_posters([
+            {'title': 'Dune', 'year': 1984, 'type': 'movie'},
+            {'title': 'Dune', 'year': 2021, 'type': 'movie'},
+        ])
+        assert 'dune (1984)' in cached and 'dune (2021)' in cached
+        assert 'dune' not in cached
+
+    def test_bare_alias_kept_without_collision(self):
+        _seed_cache(shows={'andor (2022)': _entry('Andor', 300)})
+        cached = tmdb.get_cached_posters([{'title': 'Andor', 'year': 2022, 'type': 'show'}])
+        assert 'andor' in cached
+
+    def test_stale_sibling_not_labelled_with_other_shows_id(self, monkeypatch):
+        # Prod 2026-10-26: the 2015 item fell back to the bare key the
+        # fresh 2024 entry published, took the 2024 imdb_id, and
+        # _dedup_shows_by_external_id folded the two shows together.
+        _seed_dark_matter_stale_2015()
+        queued = []
+        monkeypatch.setattr(tmdb, 'background_populate_cache', queued.extend)
+        shows = [
+            {'title': 'Dark Matter', 'year': 2024, 'type': 'show',
+             '_norm_key': 'dark matter (2024)', 'episodes': 9, 'season_data': []},
+            {'title': 'Dark Matter', 'year': 2015, 'type': 'show',
+             '_norm_key': 'dark matter (2015)', 'episodes': 13, 'season_data': []},
+        ]
+        library._enrich_with_tmdb_cache([], shows)
+
+        assert shows[0]['imdb_id'] == 'tt19231492'
+        assert shows[1]['imdb_id'] is None
+        assert {'title': 'Dark Matter', 'year': 2015, 'type': 'show'} in queued
+        _dedup_shows_by_external_id(shows)
+        assert len(shows) == 2
+
+    def test_yearless_family_item_does_not_publish_bare_key(self, monkeypatch):
+        # Prod has an ambiguous yearless "Dark Matter" item and a bare
+        # 'dark matter' entry (= the 2024 show).  Publishing that bare
+        # hit hands it to the stale 2015 item just like the derived alias.
+        _seed_dark_matter_stale_2015()
+        with open(tmdb._CACHE_PATH) as f:
+            data = json.load(f)
+        data['shows']['dark matter'] = dict(data['shows']['dark matter (2024)'])
+        _seed_cache(shows=data['shows'])
+        monkeypatch.setattr(tmdb, 'background_populate_cache', lambda items: None)
+        shows = [
+            {'title': 'Dark Matter', 'year': 2024, 'type': 'show',
+             '_norm_key': 'dark matter (2024)', 'episodes': 9, 'season_data': []},
+            {'title': 'Dark Matter', 'year': 2015, 'type': 'show',
+             '_norm_key': 'dark matter (2015)', 'episodes': 13, 'season_data': []},
+            {'title': 'Dark Matter', 'year': None, 'type': 'show',
+             '_ambiguous_reboot': True, 'episodes': 1, 'season_data': []},
+        ]
+        library._enrich_with_tmdb_cache([], shows)
+
+        assert shows[1]['imdb_id'] is None
+        _dedup_shows_by_external_id(shows)
+        assert len(shows) == 3
+
+    def test_yearless_movie_does_not_lend_bare_hit_to_sibling(self, monkeypatch):
+        now = datetime.now(timezone.utc).isoformat(timespec='seconds')
+        _seed_cache(movies={
+            'moana (2016)': {'cached_at': '2000-01-01T00:00:00+00:00', 'title': 'Moana',
+                             'tmdb_id': 277834, 'imdb_id': 'tt3521164',
+                             'release_date': '2016-10-13'},
+            'moana (2026)': {'cached_at': now, 'title': 'Moana', 'tmdb_id': 1108427,
+                             'imdb_id': 'tt27419466', 'release_date': '2026-07-08'},
+            'moana': {'cached_at': now, 'title': 'Moana', 'tmdb_id': 1108427,
+                      'imdb_id': 'tt27419466', 'release_date': '2026-07-08'},
+        })
+        monkeypatch.setattr(tmdb, 'background_populate_cache', lambda items: None)
+        movies = [{'title': 'Moana', 'year': 2016}, {'title': 'Moana', 'year': None}]
+        library._enrich_with_tmdb_cache(movies, [])
+        assert movies[0]['imdb_id'] is None
+
+    def test_season_check_does_not_hop_to_same_title_sibling(self, monkeypatch):
+        # 2024's newest season isn't in its (fresh) entry yet; the
+        # season-aware lookup must not take the 2015 run's identity just
+        # because that one has an S03.
+        _seed_cache(shows={
+            'dark matter (2015)': dict(_entry('Dark Matter', 62425, {1: 13, 2: 13, 3: 13}),
+                                       imdb_id='tt4159076'),
+            'dark matter (2024)': dict(_entry('Dark Matter', 196322, {1: 9, 2: 10}),
+                                       imdb_id='tt19231492'),
+        })
+        monkeypatch.setattr(tmdb, 'background_populate_cache', lambda items: None)
+        seasons = [{'number': 1}, {'number': 2}, {'number': 3}]
+        shows = [
+            {'title': 'Dark Matter', 'year': 2024, 'type': 'show',
+             '_norm_key': 'dark matter (2024)', 'episodes': 20, 'season_data': seasons},
+            {'title': 'Dark Matter', 'year': 2015, 'type': 'show',
+             '_norm_key': 'dark matter (2015)', 'episodes': 39, 'season_data': seasons},
+        ]
+        library._enrich_with_tmdb_cache([], shows)
+
+        assert [s['imdb_id'] for s in shows] == ['tt19231492', 'tt4159076']
+
+    @pytest.mark.parametrize('cache, item_year', [
+        # A third run with no cache key of its own yet.
+        ({'doctor who (1963)': ('Doctor Who', 121, 'tt0056751'),
+          'doctor who (2005)': ('Doctor Who', 57243, 'tt0436992'),
+          'doctor who': ('Doctor Who', 57243, 'tt0436992')}, 2023),
+        # A folder year that matches neither sibling's key.
+        ({'dark matter (2015)': ('Dark Matter', 62425, 'tt4159076'),
+          'dark matter (2024)': ('Dark Matter', 196322, 'tt19231492'),
+          'dark matter': ('Dark Matter', 196322, 'tt19231492')}, 2016),
+    ])
+    def test_family_item_without_own_year_key_not_given_bare_identity(
+            self, monkeypatch, cache, item_year):
+        _seed_cache(shows={k: dict(_entry(t, tid, {1: 9}), imdb_id=imdb)
+                           for k, (t, tid, imdb) in cache.items()})
+        queued = []
+        monkeypatch.setattr(tmdb, 'background_populate_cache', queued.extend)
+        title = next(iter(cache.values()))[0]
+        base = title.lower()
+        newest = max(int(k[-5:-1]) for k in cache if k.endswith(')'))
+        shows = [
+            {'title': title, 'year': newest, 'type': 'show',
+             '_norm_key': f'{base} ({newest})', 'episodes': 9, 'season_data': []},
+            {'title': title, 'year': item_year, 'type': 'show',
+             '_norm_key': f'{base} ({item_year})', 'episodes': 8, 'season_data': []},
+        ]
+        library._enrich_with_tmdb_cache([], shows)
+
+        assert shows[1]['imdb_id'] is None
+        # Queued so populate searches TMDB with the item's own year.
+        assert {'title': title, 'year': item_year, 'type': 'show'} in queued
+        _dedup_shows_by_external_id(shows)
+        assert len(shows) == 2
+
+
+class TestSeasonAwareSameTitle:
+
+    def _seed_quantum_leap(self):
+        # Bare key holds the 2022 reboot; the original is only under its
+        # year.  One year-qualified entry → not a family.
+        _seed_cache(shows={
+            'quantum leap': dict(_entry('Quantum Leap', 202000, {1: 18, 2: 13}),
+                                 imdb_id='tt15791034'),
+            'quantum leap (1989)': dict(
+                _entry('Quantum Leap', 4598, {1: 9, 2: 22, 3: 22, 4: 22, 5: 22}),
+                imdb_id='tt0096684'),
+        })
+
+    def test_season_hop_still_corrects_a_wrong_bare_key(self, monkeypatch):
+        # Daredevil-style rescue, with the right show stored under the
+        # same title plus a year: a yearless S05 item can only be 1989.
+        self._seed_quantum_leap()
+        monkeypatch.setattr(tmdb, 'background_populate_cache', lambda items: None)
+        assert tmdb.find_show_tmdb_id_by_season('quantum leap', 5) == 4598
+        shows = [{'title': 'Quantum Leap', 'year': None, 'type': 'show',
+                  'episodes': 22, 'season_data': [{'number': 5}]}]
+        library._enrich_with_tmdb_cache([], shows)
+        assert shows[0]['imdb_id'] == 'tt0096684'
+
+    def test_unmatched_year_does_not_disable_the_hop(self):
+        # Folder years are often wrong ("iCarly.2010.S04" parses as 2010);
+        # a year with no entry of its own doesn't say which show it is.
+        self._seed_quantum_leap()
+        assert tmdb.find_show_tmdb_id_by_season('quantum leap', 5, 1990) == 4598
+
+    def test_year_with_own_entry_never_hops_to_same_title(self):
+        # 1989 has its own entry, so S06 (beyond it) mustn't be handed to
+        # the same-title show stored under the bare key.
+        _seed_cache(shows={
+            'quantum leap': dict(
+                _entry('Quantum Leap', 202000, {1: 18, 2: 13, 3: 13, 4: 13, 5: 13, 6: 13}),
+                imdb_id='tt15791034'),
+            'quantum leap (1989)': dict(
+                _entry('Quantum Leap', 4598, {1: 9, 2: 22, 3: 22, 4: 22, 5: 22}),
+                imdb_id='tt0096684'),
+        })
+        assert tmdb.find_show_tmdb_id_by_season('quantum leap', 6, 1989) is None

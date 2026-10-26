@@ -1354,7 +1354,9 @@ def _enrich_with_tmdb_cache(movies, shows, _shared_tmdb_cache=None):
         # canonical TMDB release year (off-by-one is common around
         # festival vs wide-release dates), the year-qualified key misses
         # but the yearless fallback below recovers it because
-        # get_cached_posters stores info under both keys (tmdb.py:664-666).
+        # get_cached_posters stores info under both keys — except for a
+        # reboot-family title, whose bare key is never published (it
+        # would be some sibling's identity); that item is queued instead.
         try:
             recheck = get_cached_posters([{
                 'title': canonical['title'],
