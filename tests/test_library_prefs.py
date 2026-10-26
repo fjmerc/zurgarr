@@ -478,3 +478,30 @@ class TestSetPendingWarned:
         assert entry['last_error'] == 'some error'
         assert entry['direction'] == 'to-debrid'
         assert 'warned_at' in entry
+
+
+class TestPendingShowTags:
+    """Gap-fill tags a reboot-family sibling's pending episode with its own
+    norm (``show``): the siblings' S02E06 are different episodes."""
+
+    def test_siblings_same_episode_kept_separately(self, tmp_dir, monkeypatch):
+        monkeypatch.setattr(lp, 'PENDING_PATH', os.path.join(tmp_dir, 'pending.json'))
+        lp.set_pending('dark matter', [{'season': 2, 'episode': 6, 'show': 'dark matter (2024)'}], 'to-any')
+        lp.set_pending('dark matter', [{'season': 2, 'episode': 6, 'show': 'dark matter (2015)'}], 'to-any')
+        assert len(lp.get_all_pending()['dark matter']['episodes']) == 2
+
+    def test_tagged_clear_removes_only_that_sibling(self, tmp_dir, monkeypatch):
+        monkeypatch.setattr(lp, 'PENDING_PATH', os.path.join(tmp_dir, 'pending.json'))
+        lp.set_pending('dark matter', [{'season': 2, 'episode': 6, 'show': 'dark matter (2024)'},
+                                       {'season': 2, 'episode': 6, 'show': 'dark matter (2015)'}], 'to-any')
+        lp.clear_pending('dark matter', [{'season': 2, 'episode': 6, 'show': 'dark matter (2015)'}])
+        assert lp.get_all_pending()['dark matter']['episodes'] == [
+            {'season': 2, 'episode': 6, 'show': 'dark matter (2024)'}]
+
+    def test_untagged_clear_removes_every_sibling(self, tmp_dir, monkeypatch):
+        # UI / switch paths clear with plain {season, episode}.
+        monkeypatch.setattr(lp, 'PENDING_PATH', os.path.join(tmp_dir, 'pending.json'))
+        lp.set_pending('dark matter', [{'season': 2, 'episode': 6, 'show': 'dark matter (2024)'},
+                                       {'season': 2, 'episode': 6}], 'to-any')
+        lp.clear_pending('dark matter', [{'season': 2, 'episode': 6}])
+        assert 'dark matter' not in lp.get_all_pending()

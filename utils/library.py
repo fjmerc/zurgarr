@@ -4525,10 +4525,13 @@ class LibraryScanner:
                 pref = self._get_pref(norm, preferences)
                 if pref != 'prefer-debrid':
                     continue
+                # Pending lives under the bare title, also for reboot-family
+                # siblings (whose norm is year-qualified).
+                pending_norm = _normalize_title(show.get('title') or '') or norm
 
                 # Guard: don't replace local files for episodes downloaded via local-fallback
                 fallback_guard = set()
-                fb_entry = all_pending.get(norm, {})
+                fb_entry = all_pending.get(pending_norm, {})
                 if not fb_entry:
                     for alias in self._alias_norms.get(norm, ()):
                         fb_entry = all_pending.get(alias, {})
@@ -4582,7 +4585,7 @@ class LibraryScanner:
                             for e in to_switch if os.path.islink(e['local_path'])
                         ]
                         if cleared:
-                            clear_pending(norm, cleared)
+                            clear_pending(pending_norm, cleared)
                         try:
                             from utils.notifications import notify
                             notify('library_refresh',
@@ -4857,7 +4860,7 @@ class LibraryScanner:
         # by missing-count desc) is preserved within each band.
         return [t for t, _ in sorted(flagged, key=lambda f: 0 if f[1] else 1)]
 
-    def _check_pending_freshness(self, norm, pending, direction):
+    def _check_pending_freshness(self, norm, pending, direction, show_tag=None):
         """Resolve a title's pending entry and decide retry-vs-wait.
 
         Shared by the shows and movies paths of
@@ -4884,7 +4887,8 @@ class LibraryScanner:
                 can't mutate a wrong-direction entry that would zombify
                 when the search loop errors out).
           * ``pending_keys`` — the entry's ``(season, episode)`` set; only
-            populated for ``'wait'``.
+            populated for ``'wait'``.  Episodes tagged for another
+            reboot-family sibling (``show`` != *show_tag*) are left out.
         """
         from utils.library_prefs import clear_pending, update_pending_error
 
@@ -4941,6 +4945,7 @@ class LibraryScanner:
             (e['season'], e['episode'])
             for e in pending_entry.get('episodes', [])
             if isinstance(e, dict) and e.get('season') is not None and e.get('episode') is not None
+            and e.get('show') in (None, show_tag)
         }
         return pending_norm, 'wait', pending_keys
 
@@ -5032,11 +5037,15 @@ class LibraryScanner:
                 direction = {True: 'to-debrid', False: 'to-local', None: 'to-any'}[route]
 
                 # Pending state is keyed by the BARE title norm, not the
-                # year-qualified reboot-family key: the UI writes pending
-                # under the bare norm, and pre-collision behavior was one
-                # shared row per title.  Keying by _show_norm would split
-                # the row and orphan UI-written entries.
+                # year-qualified reboot-family key: the UI reads, shows and
+                # cancels pending there.  A reboot-family sibling's episodes
+                # are tagged with its own norm (``show``) instead, so the
+                # resolver and the wait filter don't mix the siblings up —
+                # untagged, Dark Matter (2015)'s S02E06 "resolved" the 2024
+                # show's pending S02E06 every scan and gap-fill re-searched
+                # it each pass.
                 pending_key = _normalize_title(show.get('title') or '')
+                show_tag = norm if show.get('_norm_key') else None
 
                 # Check pending state — skip debrid-unavailable, allow retries
                 # for stale entries whose direction matches the current route.
@@ -5044,7 +5053,8 @@ class LibraryScanner:
                 # by pending_keys below, so non-pending episodes of the same
                 # show can still be searched.
                 pending_norm, verdict, pending_keys = \
-                    self._check_pending_freshness(pending_key, pending, direction)
+                    self._check_pending_freshness(pending_key, pending, direction,
+                                                  show_tag=show_tag)
                 if verdict == 'give-up':
                     continue  # escalated — stop retrying
                 is_retry = verdict == 'retry'
@@ -5130,7 +5140,10 @@ class LibraryScanner:
                             # Only what was searched — episodes Sonarr already
                             # has a file for were skipped, not "searching".
                             for en in result.get('searched_episodes') or ep_nums:
-                                new_pending.append({'season': sn, 'episode': en})
+                                ep = {'season': sn, 'episode': en}
+                                if show_tag:
+                                    ep['show'] = show_tag
+                                new_pending.append(ep)
                             if route is True and result.get('grabbed'):
                                 fg_count = attempt_ledger.bump(fg_key)
                                 # The >= cap gate above freezes the count at
@@ -6545,7 +6558,15 @@ class LibraryScanner:
             title_exists = norm_title in source_map
             for ep in episodes:
                 key = (ep.get('season', 0), ep.get('episode', 0))
-                src = sources.get(key, '')
+                # A reboot-family sibling's episode is judged against that
+                # sibling alone, not the bare key's merge of both shows.  A
+                # tag whose sibling is no longer in the library is stale —
+                # the survivor's episodes can't speak for it.
+                tag = ep.get('show')
+                if tag and tag not in source_map:
+                    resolved.append(ep)
+                    continue
+                src = (source_map[tag] if tag else sources).get(key, '')
                 if direction == 'to-debrid' and src in ('debrid', 'both'):
                     resolved.append(ep)
                 elif direction == 'debrid-unavailable' and src in ('debrid', 'both'):

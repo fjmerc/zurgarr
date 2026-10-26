@@ -2940,7 +2940,7 @@ class BlackholeWatcher:
             logger.debug(f"[blackhole] Could not write pending monitors: {e}")
 
     def _add_pending(self, torrent_id, filename, label=None, compromise=None, debrid=None,
-                     file_scope=None):
+                     file_scope=None, preexisting=False):
         """Add a torrent to the pending monitors file.
 
         *compromise* is an optional dict annotating this grab as a
@@ -2959,10 +2959,17 @@ class BlackholeWatcher:
         *file_scope* (TB-alt grabs only) restricts symlink creation to one
         season / episode set — see ``_create_symlinks``.  Entries without
         it symlink every media file, as before.
+
+        *preexisting* (re-dropped duplicates) is persisted so a resumed
+        monitor still never deletes the torrent.
         """
         with self._monitors_lock:
             entries = self._load_pending()
-            if any(e['torrent_id'] == torrent_id for e in entries):
+            existing = next((e for e in entries if e['torrent_id'] == torrent_id), None)
+            if existing is not None:
+                if preexisting and not existing.get('preexisting'):
+                    existing['preexisting'] = True
+                    self._save_pending(entries)
                 return
             entry_debrid = debrid or self.debrid_service
             entry = {
@@ -2983,6 +2990,8 @@ class BlackholeWatcher:
                 entry['compromise_strategy'] = compromise.get('strategy')
             if file_scope:
                 entry['file_scope'] = file_scope
+            if preexisting:
+                entry['preexisting'] = True
             entries.append(entry)
             self._save_pending(entries)
 
@@ -2997,7 +3006,7 @@ class BlackholeWatcher:
     # ── Monitor orchestration ────────────────────────────────────────
 
     def _start_monitor(self, torrent_id, filename, label=None, compromise=None, debrid=None,
-                       file_scope=None):
+                       file_scope=None, preexisting=False):
         """Spawn a background thread to monitor a torrent and create symlinks.
 
         *compromise* is an optional dict forwarded to ``_add_pending`` so
@@ -3010,6 +3019,10 @@ class BlackholeWatcher:
 
         *file_scope* is forwarded to ``_add_pending`` (persisted for resume)
         and ``_create_symlinks``.
+
+        *preexisting* marks a torrent that was already in the account before
+        this grab (a re-dropped duplicate): persisted for resume, and the
+        monitor never deletes it.
         """
         debrid = debrid or self.debrid_service
         current = _watcher
@@ -3019,7 +3032,7 @@ class BlackholeWatcher:
             # monitor would exit at once, and the new watcher resumed its
             # pending monitors before this grab — hand it over.
             current._start_monitor(torrent_id, filename, label=label, compromise=compromise,
-                                   debrid=debrid, file_scope=file_scope)
+                                   debrid=debrid, file_scope=file_scope, preexisting=preexisting)
             return
         with self._monitors_lock:
             if torrent_id in self._active_monitors:
@@ -3028,11 +3041,11 @@ class BlackholeWatcher:
             self._active_monitors.add(torrent_id)
 
         self._add_pending(torrent_id, filename, label=label, compromise=compromise, debrid=debrid,
-                          file_scope=file_scope)
+                          file_scope=file_scope, preexisting=preexisting)
         t = threading.Thread(
             target=self._monitor_and_symlink,
             args=(torrent_id, filename, label, debrid),
-            kwargs={'file_scope': file_scope},
+            kwargs={'file_scope': file_scope, 'preexisting': preexisting},
             daemon=True,
         )
         t.start()
@@ -3118,7 +3131,8 @@ class BlackholeWatcher:
             return False
         return True
 
-    def _monitor_and_symlink(self, torrent_id, filename, label=None, debrid=None, file_scope=None):
+    def _monitor_and_symlink(self, torrent_id, filename, label=None, debrid=None, file_scope=None,
+                             preexisting=False):
         """Background thread: poll debrid status, wait for mount, create symlinks.
 
         This method runs in its own thread and must not block the main scan loop.
@@ -3165,8 +3179,9 @@ class BlackholeWatcher:
                 # rip cleanup pattern below — same per-service client lookup,
                 # same guards.
                 deleted_from_debrid = False
-                if str(os.environ.get('BLACKHOLE_DELETE_UNCACHED_ON_TIMEOUT',
-                                       'false')).lower() == 'true':
+                # Never a torrent that was in the account before this grab.
+                if not preexisting and str(os.environ.get('BLACKHOLE_DELETE_UNCACHED_ON_TIMEOUT',
+                                                          'false')).lower() == 'true':
                     try:
                         from utils.debrid_client import get_debrid_client
                         # Route through the grab's debrid — NOT the priority
@@ -3218,8 +3233,11 @@ class BlackholeWatcher:
                 # the terminal_error path below — same env gate, same
                 # source, same history shape.  Hash comes from the most
                 # recent successful check_status; empty hash (every poll
-                # raised before timeout) silently skips the add.
-                if _blocklist and str(os.environ.get('BLOCKLIST_AUTO_ADD', 'true')).lower() == 'true':
+                # raised before timeout) silently skips the add.  Not for
+                # a torrent that was already in the account: a slow status
+                # check isn't evidence its release is dead.
+                if (_blocklist and not preexisting
+                        and str(os.environ.get('BLOCKLIST_AUTO_ADD', 'true')).lower() == 'true'):
                     bl_hash = self._extract_hash_from_info(info, debrid=debrid)
                     if bl_hash:
                         _blocklist.add(bl_hash, filename,
@@ -3275,7 +3293,8 @@ class BlackholeWatcher:
                             service=debrid,
                             api_key=api_key,
                         )
-                        if client:
+                        # Never a torrent that was in the account before this grab.
+                        if client and not preexisting:
                             client.delete_torrent(str(torrent_id))
                     except Exception as e:
                         msg = str(e)
@@ -3297,7 +3316,9 @@ class BlackholeWatcher:
                     if _notify:
                         _notify('download_error', 'Blackhole: No Media Files',
                                 f'{filename} contains no recognized media files. '
-                                f'Auto-blocklisted and removed from debrid.',
+                                + ('Auto-blocklisted (kept on debrid — it was already '
+                                   'in the account).' if preexisting
+                                   else 'Auto-blocklisted and removed from debrid.'),
                                 level='warning')
                     self._remove_pending(torrent_id)
                     return
@@ -3565,7 +3586,8 @@ class BlackholeWatcher:
                             continue
                 if torrent_id:
                     self._start_monitor(torrent_id, filename, label=label, debrid=entry_debrid,
-                                        file_scope=file_scope)
+                                        file_scope=file_scope,
+                                        preexisting=entry.get('preexisting') is True)
             except Exception as e:
                 logger.warning(f"[blackhole] Skipping bad pending entry {entry!r}: {e}")
 
@@ -4457,6 +4479,63 @@ class BlackholeWatcher:
             return int(os.environ.get('BLACKHOLE_ARR_FEEDBACK_MAX_STRIKES', '8'))
         except (ValueError, TypeError):
             return 8
+
+    def _link_existing_duplicate(self, filename, info_hash, debrid, api_key, label=None):
+        """Hand a grab whose hash is already in the *debrid* account to the
+        normal monitor, so the arr imports the existing torrent.
+
+        Discarding the drop (the fallback) leaves the arr without a file: it
+        re-searches and re-grabs the same release on every pass, one
+        "Grabbed" notification each.  The monitor runs with
+        ``preexisting=True`` — it never deletes that torrent, which may
+        already back library links.
+
+        Returns True when the existing torrent is (now) being monitored —
+        started here, or already running for an earlier drop of the same
+        hash; the caller then removes the drop.  Never raises.
+        """
+        if not self.symlink_enabled:
+            return False
+        try:
+            from utils.search import find_existing_torrent_id
+            torrent_id = find_existing_torrent_id(debrid, api_key, info_hash)
+            if torrent_id is False:
+                # Only an expired/dead copy: nothing to import, and a silent
+                # discard has the arr re-grab the same release — report it.
+                self._push_arr_failed_feedback(filename, info_hash, debrid, label=label)
+                return False
+            if not torrent_id:
+                return False
+            with self._monitors_lock:
+                already = torrent_id in self._active_monitors
+            if already:
+                # The arr re-dropped a grab that's already being linked.
+                logger.debug(f"[blackhole] {filename}: torrent {torrent_id} already "
+                             f"being monitored — dropping the repeat")
+                return True
+            self._start_monitor(torrent_id, filename, label=label, debrid=debrid,
+                                preexisting=True)
+        except Exception as e:
+            logger.warning(f"[blackhole] Could not link existing {debrid} torrent for "
+                           f"{filename}: {e}")
+            return False
+        logger.info(f"[blackhole] {filename} already in {debrid} account — "
+                    f"linking existing torrent {torrent_id} for import")
+        if _history:
+            _mt, _ep = _enrich_for_history(filename)
+            _history.log_event('cached', filename, episode=_ep, source='blackhole',
+                               detail=f'Already on {debrid} — linked for import',
+                               meta={'cause': 'duplicate_linked',
+                                     'info_hash': info_hash,
+                                     'provider': debrid,
+                                     'torrent_id': torrent_id},
+                               media_title=_mt)
+        try:
+            from utils.metrics import metrics
+            metrics.inc('blackhole_processed', {'status': 'duplicate_linked'})
+        except Exception:
+            pass
+        return True
 
     def _push_arr_failed_feedback(self, filename, info_hash, debrid, label=None):
         """Tell the owning arr that the grab identified by *info_hash* failed.
@@ -5482,6 +5561,10 @@ class BlackholeWatcher:
         # Check blocklist before submitting to debrid
         if _blocklist and info_hash and _blocklist.is_blocked(info_hash):
             logger.info(f"[blackhole] Skipping blocklisted torrent: {filename} ({info_hash[:16]}...)")
+            # Tell the arr, or it re-grabs this same blocked release on every
+            # search (one Gotify "Grabbed" each) — it blocklists it on its
+            # side and picks another.
+            self._push_arr_failed_feedback(filename, info_hash, self.debrid_service, label=label)
             if _history:
                 _mt, _ep = _enrich_for_history(filename)
                 _history.log_event('blocklisted', filename, episode=_ep, source='blackhole',
@@ -5575,6 +5658,12 @@ class BlackholeWatcher:
             if debrid_dedup_enabled:
                 existing = _existing_hashes(debrid, api_key)
                 if existing is not None and lowered in existing:
+                    if self._link_existing_duplicate(filename, info_hash, debrid, api_key, label):
+                        try:
+                            os.remove(file_path)
+                        except OSError as e:
+                            logger.warning(f"[blackhole] Could not remove duplicate file {filename}: {e}")
+                        return
                     logger.info(f"[blackhole] Skipping duplicate: {filename} already in {debrid} account")
                     if _history:
                         _mt, _ep = _enrich_for_history(filename)
@@ -5719,6 +5808,15 @@ class BlackholeWatcher:
                         if debrid_dedup_enabled:
                             existing = _existing_hashes('torbox', tb_key)
                             if existing is not None and lowered in existing:
+                                if self._link_existing_duplicate(filename, info_hash, 'torbox',
+                                                                 tb_key, label):
+                                    try:
+                                        os.remove(file_path)
+                                    except OSError as e:
+                                        logger.warning(
+                                            f"[blackhole] Could not remove duplicate file {filename}: {e}"
+                                        )
+                                    return
                                 logger.info(
                                     f"[blackhole] Skipping duplicate: {filename} "
                                     f"already in torbox account (cross-probe re-route)"

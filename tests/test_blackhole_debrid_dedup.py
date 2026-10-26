@@ -33,6 +33,8 @@ def handler(tmp_dir):
     h._check_local_library = MagicMock(return_value=False)
     h._extract_torrent_id = MagicMock(return_value='TID')
     h._start_monitor = MagicMock()
+    h._monitors_lock = threading.Lock()
+    h._active_monitors = set()
     return h
 
 
@@ -840,3 +842,210 @@ class TestArrFailedFeedbackWiring:
             handler._process_file(path)
         handler._push_arr_failed_feedback.assert_not_called()
         assert os.path.exists(path)
+
+
+class TestDuplicateLinksExistingTorrent:
+    """A grab whose hash is already in the debrid account is the arr asking
+    for something it can't see.  Deleting the drop (the old behaviour) left
+    the arr without a file, so it re-searched and re-grabbed the same
+    release every pass (prod 2026-10-26, Dark Matter S02E02: 4 grabs in
+    80 min, a Gotify each).  Hand the existing torrent to the normal
+    monitor so the arr imports it — and never let that monitor delete a
+    torrent that was already in the account."""
+
+    def test_existing_torrent_handed_to_monitor(self, handler, magnet_file):
+        path, h = magnet_file
+        handler.symlink_enabled = True
+        with patch('utils.search._existing_hashes', return_value={h}), \
+                patch('utils.search.find_existing_torrent_id', return_value='EXIST1') as find:
+            handler._process_file(path, label='sonarr')
+        assert [(a[0], a[1], a[2].lower()) for a, _ in find.call_args_list] == [
+            ('realdebrid', 'test_key', h)]
+        handler._add_to_realdebrid.assert_not_called()
+        handler._start_monitor.assert_called_once()
+        args, kwargs = handler._start_monitor.call_args
+        assert args[:2] == ('EXIST1', 'release.magnet')
+        assert kwargs.get('label') == 'sonarr' and kwargs.get('preexisting') is True
+        assert not os.path.exists(path)
+
+    def test_link_logged_as_info_event_with_torrent(self, handler, magnet_file, monkeypatch):
+        path, h = magnet_file
+        handler.symlink_enabled = True
+        events = []
+        monkeypatch.setattr('utils.blackhole._history', type('H', (), {
+            'log_event': staticmethod(lambda *a, **k: events.append((a, k)))})())
+        with patch('utils.search._existing_hashes', return_value={h}), \
+                patch('utils.search.find_existing_torrent_id', return_value='EXIST1'):
+            handler._process_file(path)
+        (args, kwargs), = events
+        assert args[0] == 'cached'  # info in Recent Events, not a warning
+        assert kwargs['meta'] == {'cause': 'duplicate_linked', 'info_hash': kwargs['meta']['info_hash'],
+                                  'provider': 'realdebrid', 'torrent_id': 'EXIST1'}
+
+    def test_repeat_drop_while_monitored_is_quiet(self, handler, magnet_file):
+        path, h = magnet_file
+        handler.symlink_enabled = True
+        handler._active_monitors.add('EXIST1')
+        with patch('utils.search._existing_hashes', return_value={h}), \
+                patch('utils.search.find_existing_torrent_id', return_value='EXIST1'):
+            handler._process_file(path)
+        handler._start_monitor.assert_not_called()
+        assert not os.path.exists(path)
+
+    def test_lookup_error_falls_back_without_raising(self, handler, magnet_file):
+        path, h = magnet_file
+        handler.symlink_enabled = True
+        with patch('utils.search._existing_hashes', return_value={h}), \
+                patch('utils.search.find_existing_torrent_id', side_effect=RuntimeError('x')):
+            handler._process_file(path)
+        handler._start_monitor.assert_not_called()
+        assert not os.path.exists(path)
+
+    def test_cross_probe_reroute_duplicate_also_linked(self, handler, magnet_file, monkeypatch):
+        # RD can't say whether it's cached, TB says cached → re-routed to TB,
+        # where the hash is already in the account.
+        path, h = magnet_file
+        handler.symlink_enabled = True
+        handler.debrid_api_keys = {'realdebrid': 'rd-key', 'torbox': 'tb-key'}
+        monkeypatch.setenv('BLACKHOLE_REQUIRE_CACHED', 'true')
+
+        def _probe(hashes, service=None, api_key=None):
+            return {h: True} if service == 'torbox' else {h: None}
+
+        def _existing(service, api_key):
+            return {h} if service == 'torbox' else set()
+
+        with patch('utils.search._existing_hashes', side_effect=_existing), \
+                patch('utils.search.check_debrid_cache', side_effect=_probe), \
+                patch('utils.search.find_existing_torrent_id', return_value='TB7') as find:
+            handler._process_file(path)
+        assert find.call_args.args[0] == 'torbox'
+        handler._start_monitor.assert_called_once()
+        assert handler._start_monitor.call_args.kwargs.get('debrid') == 'torbox'
+        assert not os.path.exists(path)
+
+    def test_only_dead_copy_reports_grab_failed(self, handler, magnet_file):
+        # The account holds the hash only as an expired/dead copy: nothing to
+        # import, and discarding silently loops — tell the arr it failed.
+        path, h = magnet_file
+        handler.symlink_enabled = True
+        handler._push_arr_failed_feedback = MagicMock(return_value=True)
+        with patch('utils.search._existing_hashes', return_value={h}), \
+                patch('utils.search.find_existing_torrent_id', return_value=False):
+            handler._process_file(path, label='sonarr')
+        handler._push_arr_failed_feedback.assert_called_once()
+        handler._start_monitor.assert_not_called()
+        assert not os.path.exists(path)
+
+    def test_unknown_lookup_does_not_report_failed(self, handler, magnet_file):
+        path, h = magnet_file
+        handler.symlink_enabled = True
+        handler._push_arr_failed_feedback = MagicMock(return_value=True)
+        with patch('utils.search._existing_hashes', return_value={h}), \
+                patch('utils.search.find_existing_torrent_id', return_value=None):
+            handler._process_file(path)
+        handler._push_arr_failed_feedback.assert_not_called()
+
+    def test_existing_id_not_found_falls_back_to_skip(self, handler, magnet_file):
+        path, h = magnet_file
+        handler.symlink_enabled = True
+        with patch('utils.search._existing_hashes', return_value={h}), \
+                patch('utils.search.find_existing_torrent_id', return_value=None):
+            handler._process_file(path)
+        handler._start_monitor.assert_not_called()
+        assert not os.path.exists(path)
+
+    def test_symlinks_disabled_keeps_old_skip(self, handler, magnet_file):
+        path, h = magnet_file
+        with patch('utils.search._existing_hashes', return_value={h}), \
+                patch('utils.search.find_existing_torrent_id') as find:
+            handler._process_file(path)
+        find.assert_not_called()
+        handler._start_monitor.assert_not_called()
+
+
+class TestBlocklistedDropReportsFailed:
+    """A drop whose hash zurgarr blocklisted used to be deleted silently,
+    so the arr re-grabbed the same blocked release forever (prod: Dark
+    Matter S02E06/E07, a Gotify each pass).  Report it failed so the arr
+    blocklists the release on its side and picks another."""
+
+    def test_blocklisted_drop_reported_to_arr(self, handler, magnet_file, monkeypatch):
+        path, h = magnet_file
+        stub = type('B', (), {'is_blocked': staticmethod(lambda x: x.lower() == h)})()
+        monkeypatch.setattr('utils.blackhole._blocklist', stub)
+        handler._push_arr_failed_feedback = MagicMock(return_value=True)
+        handler._process_file(path, label='sonarr')
+        handler._push_arr_failed_feedback.assert_called_once()
+        args, kwargs = handler._push_arr_failed_feedback.call_args
+        assert args[0] == 'release.magnet' and args[1].lower() == h
+        assert kwargs.get('label') == 'sonarr'
+        handler._add_to_realdebrid.assert_not_called()
+        assert not os.path.exists(path)
+
+
+class TestBlocklistedDropReportsFailedRadarr:
+
+    def test_blocklisted_movie_drop_reported_with_radarr_label(self, handler, magnet_file,
+                                                              monkeypatch):
+        path, h = magnet_file
+        stub = type('B', (), {'is_blocked': staticmethod(lambda x: True)})()
+        monkeypatch.setattr('utils.blackhole._blocklist', stub)
+        handler._push_arr_failed_feedback = MagicMock(return_value=False)
+        handler._process_file(path, label='radarr')
+        assert handler._push_arr_failed_feedback.call_args.kwargs.get('label') == 'radarr'
+        assert not os.path.exists(path)
+
+
+class TestPreexistingTorrentProtection:
+
+    @pytest.fixture
+    def watcher(self):
+        from utils.blackhole import BlackholeWatcher
+        w = BlackholeWatcher.__new__(BlackholeWatcher)
+        w.debrid_service = 'realdebrid'
+        w.debrid_api_key = 'test_key'
+        w.mount_poll_timeout = 0
+        w.mount_poll_interval = 1
+        w._stop_event = threading.Event()
+        w._remove_pending = MagicMock()
+        w._check_realdebrid_status = MagicMock()
+        w._check_alldebrid_status = MagicMock()
+        w._check_torbox_status = MagicMock()
+        return w
+
+    def test_preexisting_torrent_not_deleted_on_timeout(self, watcher, monkeypatch):
+        monkeypatch.setenv('BLACKHOLE_DELETE_UNCACHED_ON_TIMEOUT', 'true')
+        mock_client = MagicMock()
+        with patch('utils.debrid_client.get_debrid_client',
+                   return_value=(mock_client, 'realdebrid')):
+            watcher._monitor_and_symlink('T123', 'release.magnet', preexisting=True)
+        mock_client.delete_torrent.assert_not_called()
+        watcher._remove_pending.assert_called_once_with('T123')
+
+    def test_preexisting_timeout_not_blocklisted(self, watcher, monkeypatch):
+        added = []
+        monkeypatch.setattr('utils.blackhole._blocklist', type('B', (), {
+            'add': staticmethod(lambda *a, **k: added.append(a))})())
+        monkeypatch.setattr(watcher, '_extract_hash_from_info', lambda *a, **k: 'ab' * 20,
+                            raising=False)
+        with patch('utils.debrid_client.get_debrid_client', return_value=(MagicMock(), 'realdebrid')):
+            watcher._monitor_and_symlink('T123', 'release.magnet', preexisting=True)
+        assert added == []
+        with patch('utils.debrid_client.get_debrid_client', return_value=(MagicMock(), 'realdebrid')):
+            watcher._monitor_and_symlink('T124', 'other.magnet')
+        assert len(added) == 1  # a torrent zurgarr just added still is
+
+    def test_preexisting_flag_survives_restart(self, tmp_dir, monkeypatch):
+        from utils.blackhole import BlackholeWatcher
+        for d in ('watch', 'completed'):
+            os.makedirs(os.path.join(tmp_dir, d), exist_ok=True)
+        w = BlackholeWatcher(os.path.join(tmp_dir, 'watch'), 'key', 'realdebrid',
+                             completed_dir=os.path.join(tmp_dir, 'completed'))
+        w._add_pending('T9', 'release.magnet', label='sonarr', preexisting=True)
+        assert w._load_pending()[0].get('preexisting') is True
+        captured = []
+        monkeypatch.setattr(w, '_start_monitor',
+                            lambda tid, fn, **kw: captured.append((tid, kw.get('preexisting'))))
+        w._resume_pending_monitors()
+        assert captured == [('T9', True)]

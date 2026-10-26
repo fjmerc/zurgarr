@@ -389,6 +389,11 @@ def _fmt_duplicate_skipped(ev, meta):
     return f'Skipped — already on {prov}', f'Skipped — already on {prov}'
 
 
+def _fmt_duplicate_linked(ev, meta):
+    prov = meta.get('provider', 'debrid')
+    return f'Already on {prov} — linked for import', f'Already on {prov} — linked for import'
+
+
 def _fmt_blocklisted_hash(ev, meta):
     return 'Skipped — info hash is blocklisted', 'Skipped — info hash is blocklisted'
 
@@ -581,6 +586,7 @@ _CAUSE_FORMATTERS = {
     'incomplete_release': _fmt_incomplete_release,
     'alts_exhausted': _fmt_alts_exhausted,
     'duplicate_skipped': _fmt_duplicate_skipped,
+    'duplicate_linked': _fmt_duplicate_linked,
     'blocklisted_hash': _fmt_blocklisted_hash,
     'arr_feedback_blocklisted': _fmt_arr_feedback_blocklisted,
     'disc_rip_rejected': _fmt_disc_rip_rejected,
@@ -785,6 +791,7 @@ FORMATTER_JS = r"""
     },
     alts_exhausted: function(){ return 'All alternative releases tried and failed'; },
     duplicate_skipped: function(ev,m){ return 'Skipped — already on ' + (m.provider||'debrid'); },
+    duplicate_linked: function(ev,m){ return 'Already on ' + (m.provider||'debrid') + ' — linked for import'; },
     blocklisted_hash: function(){ return 'Skipped — info hash is blocklisted'; },
     arr_feedback_blocklisted: function(ev,m){
       var arr = m.arr_service === 'sonarr' ? 'Sonarr' : (m.arr_service === 'radarr' ? 'Radarr' : 'arr');

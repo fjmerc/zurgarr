@@ -51,6 +51,9 @@ CAUSE_UNCACHED_REJECTED = 'uncached_rejected'
 CAUSE_INCOMPLETE_RELEASE = 'incomplete_release'
 CAUSE_ALTS_EXHAUSTED = 'alts_exhausted'
 CAUSE_DUPLICATE_SKIPPED = 'duplicate_skipped'
+# Re-dropped grab already in the debrid account, handed to the monitor so
+# the arr imports the existing torrent instead of re-grabbing it.
+CAUSE_DUPLICATE_LINKED = 'duplicate_linked'
 CAUSE_BLOCKLISTED_HASH = 'blocklisted_hash'
 # Uncached-rejected grab reported back to the owning arr via the failed-
 # download API: the arr blocklists THAT release and immediately searches for

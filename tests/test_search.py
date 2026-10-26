@@ -2039,3 +2039,91 @@ class TestUrllibGetErrorLogging:
             out = s._urllib_get('http://prowlarr:9696/api?x=1')
         assert out is None
         assert any('401' in rec.message for rec in caplog.records)
+
+
+class TestFindExistingTorrentId:
+    """Id of a torrent already in the account, for handing a re-dropped
+    duplicate to the blackhole monitor.  Only a usable copy counts."""
+
+    def setup_method(self):
+        from utils.search import invalidate_existing_hashes_cache
+        invalidate_existing_hashes_cache()
+
+    teardown_method = setup_method
+
+    def test_torbox_ready_copy_preferred_over_expired(self):
+        from utils.search import find_existing_torrent_id
+        rows = [{'id': 1, 'hash': 'AB' * 20, 'download_state': 'expired'},
+                {'id': 2, 'hash': 'ab' * 20, 'download_state': 'cached'}]
+        with patch('utils.search._tb_mylist_rows', return_value=rows):
+            assert find_existing_torrent_id('torbox', 'k', 'AB' * 20) == '2'
+
+
+    def test_realdebrid_downloaded_copy(self):
+        from utils.search import find_existing_torrent_id
+        rows = [{'id': 'X1', 'hash': 'cd' * 20, 'status': 'magnet_error'},
+                {'id': 'X2', 'hash': 'cd' * 20, 'status': 'downloaded'}]
+        with patch('utils.search._urllib_get', return_value=rows):
+            assert find_existing_torrent_id('realdebrid', 'k', 'cd' * 20) == 'X2'
+
+    def test_alldebrid_ready_copy(self):
+        from utils.search import find_existing_torrent_id
+        data = {'status': 'success', 'data': {'magnets': [
+            {'id': 77, 'hash': 'ef' * 20, 'status': 'Ready'}]}}
+        with patch('utils.search._urllib_get', return_value=data):
+            assert find_existing_torrent_id('alldebrid', 'k', 'ef' * 20) == '77'
+
+    def test_not_present_or_unlistable_is_none(self):
+        from utils.search import find_existing_torrent_id
+        with patch('utils.search._tb_mylist_rows', return_value=[]):
+            assert find_existing_torrent_id('torbox', 'k', 'ab' * 20) is None
+        with patch('utils.search._tb_mylist_rows', return_value=None):
+            assert find_existing_torrent_id('torbox', 'k2', 'ab' * 20) is None
+        assert find_existing_torrent_id('torbox', '', 'ab' * 20) is None
+        assert find_existing_torrent_id('premiumize', 'k', 'ab' * 20) is None
+
+    def test_burst_of_lookups_lists_once(self):
+        # A Sonarr burst of N duplicates must not list the account N times.
+        from utils.search import find_existing_torrent_id
+        rows = [{'id': i, 'hash': f'{i:040x}', 'download_state': 'cached'} for i in range(5)]
+        with patch('utils.search._tb_mylist_rows', return_value=rows) as listing:
+            for i in range(5):
+                assert find_existing_torrent_id('torbox', 'k', f'{i:040x}') == str(i)
+        assert listing.call_count == 1
+
+    def test_only_dead_copies_is_false_not_none(self):
+        # False = "listed, and the only copies are unusable" (the blackhole
+        # reports the grab failed); None = absent or unknown (it doesn't).
+        from utils.search import find_existing_torrent_id
+        rows = [{'id': 1, 'hash': 'ab' * 20, 'download_state': 'expired'}]
+        with patch('utils.search._tb_mylist_rows', return_value=rows):
+            assert find_existing_torrent_id('torbox', 'k', 'ab' * 20) is False
+            assert find_existing_torrent_id('torbox', 'k', 'cd' * 20) is None
+
+    @pytest.mark.parametrize('service, field, state', [
+        ('torbox', 'download_state', 'downloading'),
+        ('torbox', 'download_state', 'stalled (no seeds)'),
+        ('realdebrid', 'status', 'waiting_files_selection'),
+        ('realdebrid', 'status', 'downloading'),
+        ('alldebrid', 'status', 'Downloading'),
+    ])
+    def test_in_progress_copy_is_not_reported_dead(self, service, field, state):
+        # A download zurgarr may be in the middle of must never make the
+        # blackhole tell the arr the grab failed.
+        from utils.search import find_existing_torrent_id
+        row = {'id': 1, 'hash': 'ab' * 20, field: state}
+        if service == 'torbox':
+            ctx = patch('utils.search._tb_mylist_rows', return_value=[row])
+        elif service == 'realdebrid':
+            ctx = patch('utils.search._urllib_get', return_value=[row])
+        else:
+            ctx = patch('utils.search._urllib_get', return_value={
+                'status': 'success', 'data': {'magnets': [row]}})
+        with ctx:
+            assert find_existing_torrent_id(service, 'k', 'ab' * 20) is None
+
+    def test_realdebrid_dead_copy_is_false(self):
+        from utils.search import find_existing_torrent_id
+        with patch('utils.search._urllib_get',
+                   return_value=[{'id': 'X', 'hash': 'ab' * 20, 'status': 'magnet_error'}]):
+            assert find_existing_torrent_id('realdebrid', 'k', 'ab' * 20) is False

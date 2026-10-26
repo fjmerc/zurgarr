@@ -780,12 +780,14 @@ def remember_added_hash(service, info_hash):
 
 
 def invalidate_existing_hashes_cache(service=None):
-    """Drop the dedup cache for one service (or all if None)."""
+    """Drop the dedup caches for one service (or all if None)."""
     with _existing_hashes_lock:
         if service is None:
             _existing_hashes_cache.clear()
+            _existing_ids_cache.clear()
         else:
             _existing_hashes_cache.pop(service, None)
+            _existing_ids_cache.pop(service, None)
 
 
 def _coerce_hash(value):
@@ -931,6 +933,104 @@ def _tb_mylist_rows(api_key, timeout):
     logger.warning(f"[search] TB mylist still returning rows after {_TB_MYLIST_MAX_PAGES} "
                    f"pages; treating the listing as incomplete")
     return None
+
+
+# States in which an existing torrent is usable as-is (its files are
+# there).  A copy in any other state — TorBox "expired", RD "magnet_error",
+# an AD error — is never handed to the blackhole monitor.
+_READY_STATES = {
+    'torbox': ('download_state', {'cached', 'completed', 'uploading'}),
+    'realdebrid': ('status', {'downloaded'}),
+    'alldebrid': ('status', {'Ready'}),
+}
+# States in which an existing torrent is definitely dead — the only ones
+# that let the blackhole report a re-dropped grab failed.  Anything else
+# that isn't ready (downloading, queued, waiting for file selection) may be
+# a download zurgarr is in the middle of, so it is never treated as dead.
+# RD mirrors blackhole.RD_TERMINAL_ERRORS; AllDebrid's error statuses are
+# free-form, so AD copies are never declared dead.
+_DEAD_STATES = {
+    'torbox': {'expired', 'error', 'failed'},
+    'realdebrid': {'magnet_error', 'error', 'virus', 'dead'},
+    'alldebrid': set(),
+}
+# {service: (fetched_at, api_key, {hash: id}, {hash whose copies are all dead})}
+_existing_ids_cache = {}
+
+
+def _existing_ids_rows(service, api_key):
+    """Raw torrent rows for *service*, or None when they can't be listed."""
+    if service == 'torbox':
+        return _tb_mylist_rows(api_key, _MYLIST_TIMEOUT)
+    if service == 'realdebrid':
+        rows = _urllib_get(
+            f'https://api.real-debrid.com/rest/1.0/torrents?limit={_RD_LIST_LIMIT}',
+            headers={'Authorization': f'Bearer {api_key}'}, timeout=_CACHE_PROBE_TIMEOUT,
+        )
+        return rows if isinstance(rows, list) else None
+    if service == 'alldebrid':
+        qs = urllib.parse.urlencode({'agent': 'zurgarr', 'apikey': api_key})
+        data = _urllib_get(f'https://api.alldebrid.com/v4/magnet/status?{qs}',
+                           timeout=_CACHE_PROBE_TIMEOUT)
+        if not isinstance(data, dict) or data.get('status') != 'success':
+            return None
+        inner = data.get('data') if isinstance(data.get('data'), dict) else {}
+        rows = inner.get('magnets')
+        return rows if isinstance(rows, list) else None
+    return None
+
+
+def find_existing_torrent_id(service, api_key, info_hash):
+    """Id of a usable copy of the torrent with *info_hash* already in the
+    *service* account; ``False`` when the account was listed and every copy
+    is dead (``_DEAD_STATES``: expired, errored); ``None`` when it isn't
+    there, is still in progress, or can't be listed.  Used by the blackhole to hand a re-dropped
+    duplicate to its normal monitor instead of discarding the arr's grab
+    (and, on ``False``, to report the grab failed).
+
+    The account listing is cached for ``_EXISTING_HASHES_TTL`` so a burst
+    of duplicate drops lists it once, not once per drop.
+    """
+    want = _coerce_hash(info_hash)
+    if not want or not api_key or service not in _READY_STATES:
+        return None
+    now = time.time()
+    with _existing_hashes_lock:
+        cached = _existing_ids_cache.get(service)
+    if cached and cached[1] == api_key and (now - cached[0]) < _EXISTING_HASHES_TTL:
+        ids, unusable = cached[2], cached[3]
+    else:
+        try:
+            rows = _existing_ids_rows(service, api_key)
+        except (urllib.error.URLError, OSError, ValueError, AttributeError, TypeError) as e:
+            logger.warning(f"[search] Existing-torrent lookup failed for {service}: "
+                           f"{type(e).__name__}")
+            return None
+        if rows is None:
+            return None
+        field, ready = _READY_STATES[service]
+        dead_states = _DEAD_STATES[service]
+        ids, dead, alive = {}, set(), set()
+        for entry in rows:
+            if not isinstance(entry, dict):
+                continue
+            h = _coerce_hash(entry.get('hash'))
+            if not h:
+                continue
+            state = entry.get(field)
+            tid = entry.get('id')
+            if state in ready and tid not in (None, '') and h not in ids:
+                ids[h] = str(tid)
+            if state in dead_states:
+                dead.add(h)
+            else:
+                alive.add(h)
+        unusable = dead - alive - set(ids)
+        with _existing_hashes_lock:
+            _existing_ids_cache[service] = (now, api_key, ids, unusable)
+    if want in ids:
+        return ids[want]
+    return False if want in unusable else None
 
 
 def list_torbox_torrents(api_key, timeout=_MYLIST_TIMEOUT):

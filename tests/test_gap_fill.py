@@ -713,3 +713,82 @@ class TestForceGrabCap:
         assert 'icarly' not in lp.get_all_pending()
         assert self.ledger.get('tbalt:tt2007:s1') == 1
         assert self.ledger.get('tbalt:tt2021:s1') == 1
+
+
+class TestRebootFamilyPendingKey:
+    """Pending stays under the bare title (the UI reads, shows and cancels
+    it there), but a reboot-family sibling's gap-fill episodes are tagged
+    with its own norm.  Untagged, the resolver merged the siblings' episodes
+    under the bare key, so Dark Matter (2015)'s S02E06 "satisfied" the 2024
+    show's pending S02E06 every scan, the entry was cleared, and gap-fill
+    re-searched it each pass (prod 2026-10-26: 4 grabs in 80 min)."""
+
+    def _dm(self, year, present):
+        show = _show('Dark Matter', present, year=year)
+        show['_norm_key'] = f'dark matter ({year})'
+        return show
+
+    def test_family_item_pends_under_bare_key_with_tag(self, scanner, mock_sonarr):
+        with _stub_tmdb_episodes([(2, 5), (2, 6)]):
+            with patch('utils.arr_client.get_download_service', return_value=(mock_sonarr, 'sonarr')):
+                with patch('utils.tmdb.search_show', return_value=None):
+                    scanner._search_for_missing_episodes([self._dm(2024, [(2, 5)])], [], {})
+        assert lp.get_all_pending()['dark matter']['episodes'] == [
+            {'season': 2, 'episode': 6, 'show': 'dark matter (2024)'}]
+
+    def test_sibling_episodes_do_not_resolve_tagged_pending(self, scanner):
+        from utils import attempt_ledger
+        lp.set_pending('dark matter', [{'season': 2, 'episode': 6, 'show': 'dark matter (2024)'}],
+                       'to-any')
+        with patch.object(attempt_ledger, 'prune'):
+            scanner._clear_resolved_pending(
+                [self._dm(2024, [(2, 5)]), self._dm(2015, [(2, 6)])], [])
+        assert lp.get_all_pending()['dark matter']['episodes'] == [
+            {'season': 2, 'episode': 6, 'show': 'dark matter (2024)'}]
+
+    def test_own_episode_arriving_resolves_tagged_pending(self, scanner):
+        from utils import attempt_ledger
+        lp.set_pending('dark matter', [{'season': 2, 'episode': 6, 'show': 'dark matter (2024)'}],
+                       'to-any')
+        with patch.object(attempt_ledger, 'prune'):
+            scanner._clear_resolved_pending([self._dm(2024, [(2, 6)])], [])
+        assert 'dark matter' not in lp.get_all_pending()
+
+    def test_sibling_pending_does_not_block_this_shows_search(self, scanner, mock_sonarr):
+        # 2015's own pending S02E06 mustn't stop 2024's S02E06 being searched.
+        lp.set_pending('dark matter', [{'season': 2, 'episode': 6, 'show': 'dark matter (2015)'}],
+                       'to-any')
+        with _stub_tmdb_episodes([(2, 5), (2, 6)]):
+            with patch('utils.arr_client.get_download_service', return_value=(mock_sonarr, 'sonarr')):
+                with patch('utils.tmdb.search_show', return_value=None):
+                    scanner._search_for_missing_episodes([self._dm(2024, [(2, 5)])], [], {})
+        mock_sonarr.ensure_and_search.assert_called_once()
+        assert mock_sonarr.ensure_and_search.call_args.args[3] == [6]
+
+    def test_own_pending_still_blocks_research(self, scanner, mock_sonarr):
+        lp.set_pending('dark matter', [{'season': 2, 'episode': 6, 'show': 'dark matter (2024)'}],
+                       'to-any')
+        with _stub_tmdb_episodes([(2, 5), (2, 6)]):
+            with patch('utils.arr_client.get_download_service', return_value=(mock_sonarr, 'sonarr')):
+                with patch('utils.tmdb.search_show', return_value=None):
+                    scanner._search_for_missing_episodes([self._dm(2024, [(2, 5)])], [], {})
+        mock_sonarr.ensure_and_search.assert_not_called()
+
+    def test_untagged_bare_entry_blocks_family_item_as_before(self, scanner, mock_sonarr):
+        # Entries written by the UI / blackhole hand-off carry no tag.
+        lp.set_pending('dark matter', [{'season': 2, 'episode': 6}], 'to-any')
+        with _stub_tmdb_episodes([(2, 5), (2, 6)]):
+            with patch('utils.arr_client.get_download_service', return_value=(mock_sonarr, 'sonarr')):
+                with patch('utils.tmdb.search_show', return_value=None):
+                    scanner._search_for_missing_episodes([self._dm(2024, [(2, 5)])], [], {})
+        mock_sonarr.ensure_and_search.assert_not_called()
+
+    def test_tag_for_a_show_no_longer_in_the_library_is_stale(self, scanner):
+        # The 2024 sibling is gone (deleted in Sonarr, or re-attributed): its
+        # tagged episode can't be judged against the survivor — clear it.
+        from utils import attempt_ledger
+        lp.set_pending('dark matter', [{'season': 2, 'episode': 9, 'show': 'dark matter (2024)'}],
+                       'to-any')
+        with patch.object(attempt_ledger, 'prune'):
+            scanner._clear_resolved_pending([self._dm(2015, [(2, 6)])], [])
+        assert 'dark matter' not in lp.get_all_pending()

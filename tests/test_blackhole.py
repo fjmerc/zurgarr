@@ -1461,7 +1461,8 @@ class TestTorboxAddPauses:
         old._start_monitor('tid1', 'Movie.magnet', label='radarr', debrid='realdebrid')
         assert started == [(('tid1', 'Movie.magnet'),
                             {'label': 'radarr', 'compromise': None,
-                             'debrid': 'realdebrid', 'file_scope': None})]
+                             'debrid': 'realdebrid', 'file_scope': None,
+                             'preexisting': False})]
         assert 'tid1' not in old._active_monitors
 
     def test_search_after_watcher_stopped_parks_for_the_new_watcher(self, tmp_dir, monkeypatch):
@@ -6898,7 +6899,7 @@ class TestTbAltFileScope:
         w2._save_pending(entries)
         resumed = {}
         monkeypatch.setattr(w2, '_start_monitor',
-                            lambda tid, fn, label=None, debrid=None, file_scope=None:
+                            lambda tid, fn, label=None, debrid=None, file_scope=None, **_:
                             resumed.__setitem__(tid, file_scope))
         w2._resume_pending_monitors()
         assert resumed == {'t1': {'season': 2, 'episodes': [5]}, 't2': None,

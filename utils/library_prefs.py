@@ -165,9 +165,11 @@ def set_pending(normalized_title, episodes, direction='to-debrid'):
             if 'last_searched' not in entry:
                 entry['last_searched'] = entry['created']
             existing = entry.get('episodes', [])
-            existing_keys = {(e['season'], e['episode']) for e in existing}
+            # ``show`` tags a reboot-family sibling's episode (gap-fill):
+            # two siblings' S02E06 are different pending episodes.
+            existing_keys = {(e['season'], e['episode'], e.get('show')) for e in existing}
             for ep in episodes:
-                key = (ep['season'], ep['episode'])
+                key = (ep['season'], ep['episode'], ep.get('show'))
                 if key not in existing_keys:
                     existing.append(ep)
             entry['episodes'] = existing
@@ -188,9 +190,14 @@ def clear_pending(normalized_title, episodes=None):
         if episodes is None:
             del pending[normalized_title]
         else:
-            clear_keys = {(e['season'], e['episode']) for e in episodes}
+            # An untagged clear matches the episode for every show; a
+            # ``show``-tagged one only that reboot-family sibling's.
+            any_show = {(e['season'], e['episode']) for e in episodes if not e.get('show')}
+            tagged = {(e['season'], e['episode'], e['show']) for e in episodes if e.get('show')}
             existing = pending[normalized_title].get('episodes', [])
-            remaining = [e for e in existing if (e['season'], e['episode']) not in clear_keys]
+            remaining = [e for e in existing
+                         if (e['season'], e['episode']) not in any_show
+                         and (e['season'], e['episode'], e.get('show')) not in tagged]
             if remaining:
                 pending[normalized_title]['episodes'] = remaining
             else:

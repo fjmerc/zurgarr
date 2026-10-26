@@ -364,6 +364,38 @@ class TestAutoEnforcement:
         assert os.readlink(local_file).startswith('/mnt/debrid/')
         assert identity_checks == ['show']  # checked against Sonarr
 
+    def test_local_fallback_guard_applies_to_reboot_family_show(self, tmp_dir, monkeypatch):
+        """Local-fallback pending is written under the bare title; a
+        reboot-family sibling's year-qualified norm must still find it, or
+        auto-enforce replaces the local-fallback download with a symlink."""
+        local_tv = os.path.join(tmp_dir, 'tv')
+        show_dir = os.path.join(local_tv, 'Show (2024)', 'Season 01')
+        os.makedirs(show_dir)
+        local_file = os.path.join(show_dir, 'ep1.mkv')
+        with open(local_file, 'w') as f:
+            f.write('local content')
+        mount = os.path.join(tmp_dir, 'mount')
+        debrid_file = os.path.join(mount, 'shows', 'Show.2024.S01E01', 'ep1.mkv')
+        os.makedirs(os.path.dirname(debrid_file))
+        with open(debrid_file, 'w') as f:
+            f.write('debrid content')
+        monkeypatch.setenv('BLACKHOLE_RCLONE_MOUNT', mount)
+        monkeypatch.setenv('BLACKHOLE_SYMLINK_TARGET_BASE', '/mnt/debrid')
+        monkeypatch.setenv('LIBRARY_PREFERENCE_AUTO_ENFORCE', 'true')
+
+        scanner = self._make_scanner(local_tv, monkeypatch)
+        show = self._make_show('Show', [(1, 1, 'both')])
+        show['year'] = 2024
+        show['_norm_key'] = 'show (2024)'
+        path_index = {('show (2024)', 1, 1): debrid_file}
+        local_path_index = {('show (2024)', 1, 1): local_file}
+        lp.set_pending('show', [{'season': 1, 'episode': 1}], 'to-local-fallback')
+
+        scanner._enforce_preferences([show], [], {'show': 'prefer-debrid'},
+                                     path_index, local_path_index)
+
+        assert not os.path.islink(local_file)
+
     def test_prefer_debrid_skips_already_symlinked(self, tmp_dir, monkeypatch):
         """Already-symlinked files should not be re-processed."""
         local_tv = os.path.join(tmp_dir, 'tv')
