@@ -1689,6 +1689,11 @@ def _apply_sonarr_monitored_filter(shows, degraded=None):
         return None
 
     for show in shows:
+        # A release that could belong to either reboot sibling has no
+        # identity to match — any series' counts would be a guess (it put a
+        # second "Dark Matter — 3 missing" card in Wanted).
+        if show.get('_ambiguous_reboot'):
+            continue
         series = None
         title = show.get('title', '')
         parsed_title = show.get('_parsed_title') or ''

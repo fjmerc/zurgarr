@@ -4361,6 +4361,24 @@ class TestApplySonarrMonitoredFilter:
     episodes because the count was pure TMDB total minus on-disk count.
     """
 
+    def test_ambiguous_reboot_item_not_given_a_series_counts(self):
+        """A release that could belong to either reboot sibling has no
+        identity: stamping one sibling's missing count on it put a second
+        "Dark Matter — 3 missing" card in Wanted (prod 2026-10-26)."""
+        from utils.library import _apply_sonarr_monitored_filter
+        shows = [{'title': 'Dark Matter', 'year': None, 'missing_episodes': None,
+                  '_ambiguous_reboot': True}]
+        series = [{
+            'id': 7, 'title': 'Dark Matter', 'tmdbId': 196322,
+            'seasons': [{'seasonNumber': 2, 'monitored': True,
+                         'statistics': {'episodeCount': 10, 'episodeFileCount': 7}}],
+        }]
+        with _fake_sonarr(series):
+            matched = _apply_sonarr_monitored_filter(shows)
+        assert shows[0]['missing_episodes'] is None
+        assert 'monitored_episodes' not in shows[0]
+        assert matched == set()
+
     def test_unmonitored_seasons_excluded_from_count(self):
         """Unmonitored seasons must not contribute to missing_episodes."""
         from utils.library import _apply_sonarr_monitored_filter
