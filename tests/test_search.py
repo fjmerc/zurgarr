@@ -235,6 +235,72 @@ class TestSearchTorrentio:
         assert search_torrentio('tt1234567') == []
 
 
+class TestIsPrereleaseSource:
+    """Cinema captures and pre-release sources (CAM/TS/TC/screener) must
+    be recognisable from the release name — the Wanted recovery and the
+    compromise path add straight to a debrid, so no arr quality profile
+    filters them (prod 2026-10-25: a 360p camrip reached Plex)."""
+
+    @pytest.mark.parametrize('title', [
+        'You.Can.See.Everything.2026.CAM.EN-OnlyFlix',
+        'You.Can.See.Everything.2026.camrip.360',
+        'You.Can.See.Everything.2026.CAM.1080p.EN-OnlyFlix',
+        'Movie 2026 HDCAM x264-GRP',
+        'Movie.2026.NEWCAM.x264',
+        'Movie.2026.HDTS.1080p',
+        'Movie.2026.1080p.HD-TS.x264',
+        'Movie (2026) TS 720p',
+        'Movie.2026.TELESYNC.XviD',
+        'Movie 2026 TC 720p',
+        'Movie.2026.HDTC.x264',
+        'Movie.2026.TELECINE',
+        'Movie.2026.DVDScr.XviD',
+        'Movie.2026.SCREENER.x264',
+        'Movie (2026) [CAM-Rip]',
+        # no year: the tag sits before the resolution
+        'You.Can.See.Everything.CAM.1080p.EN',
+        'You Can See Everything HDCAM 720p x264',
+        # -Rip / prefixed / spelled-out variants
+        'Movie.2024.HDTSRip', 'Movie.2024.TSRip', 'Movie.2024.HDTCRip',
+        'Movie.2024.TCRip', 'Movie.2024.DVDScrRip', 'Movie.2024.DVDScreener',
+        'Movie.2024.WEBScreener', 'Movie.2024.HQCAM.x264', 'Movie.2024.HQCAMRip',
+        'Movie.2024.NEWHDCAM', 'Movie.2024.PreDVD.x264', 'Movie.2024.Pre-DVDRip',
+        'Movie.2024.PDVDRip', 'Movie.2024.TELE-SYNC', 'Movie.2024.HDTELESYNC',
+        'Movie (2024) Hindi 1080p HQ S-Print x264', 'Movie.2024.WORKPRINT',
+    ])
+    def test_prerelease(self, title):
+        from utils.search import is_prerelease_source
+        assert is_prerelease_source(title)
+
+    @pytest.mark.parametrize('title', [
+        'Cam.2018.1080p.WEB-DL.x264',                 # the film "Cam"
+        'Camera.Shy.2020.1080p.BluRay.x264',
+        'The.Cam.Kid.2021.1080p.WEB',
+        'Movie.2026.1080p.WEB-DL.DTS-HD.MA.5.1.x264',  # DTS, not TS
+        'Scream.2022.1080p.BluRay',
+        'Movie.2026.2160p.UHD.BluRay.x265-SCREAM',
+        'Show.S01E01.1080p.WEB.H264-NTb',
+        'Tsunami.2026.1080p.WEB',
+        # episode names after SxxEyy aren't release tags
+        'Show.S01E05.Nanny.Cam.1080p.WEB.h264-GRP',
+        'Show.S02E03.The.Cam.720p.HDTV.x264',
+        'Show.S03E04.TC.1080p.WEB',
+        '1923 S02E03 Ts and Cs 1080p WEB-DL',
+        # bare ts/tc next to a real source: container, subs or group tags
+        'Movie.2024.1080p.WEB-DL.x264.ts',
+        'Spy x Family S01E01 1080p WEB [TC]',
+        'Movie.2024.1080p.BluRay.x264 - TC',
+        # no year at all
+        'The.Cam.Kid.WEB-DL', 'Cam Girl WEB-DL x264',
+        '',
+        None,
+        42,            # a malformed result field must not raise
+    ])
+    def test_not_prerelease(self, title):
+        from utils.search import is_prerelease_source
+        assert not is_prerelease_source(title)
+
+
 class TestAddToTbFailureKind:
     """A TorBox create that never got an answer (timeout, network, 5xx,
     408/429, cut-off reply) is flagged transient; a real rejection (4xx,

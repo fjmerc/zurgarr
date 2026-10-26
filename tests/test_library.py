@@ -8291,6 +8291,49 @@ class TestRecoverWantedViaTorbox:
         assert add['cause'] == 'wanted_tb_recovered'
         assert add['media_title'] == 'The Substance'
 
+    def test_cam_releases_never_recovered(self, wire, monkeypatch, caplog):
+        import logging
+        # Prod 2026-10-25/26: the only cached releases of a new cinema title
+        # were camrips; both legs added one and the 360p copy reached Plex
+        # via the post-symlink disk rescan (no arr profile in that path).
+        wire['torrentio'] = [
+            {'info_hash': 'a' * 40, 'title': 'The.Substance.2024.CAM.1080p.EN',
+             'seeds': 90, 'quality': {'label': '1080p', 'score': 100}},
+            {'info_hash': 'b' * 40, 'title': 'The.Substance.2024.HDTS.720p',
+             'seeds': 50, 'quality': {'label': '720p', 'score': 50}},
+        ]
+        sc = self._scanner()
+        prowlarr = []
+        monkeypatch.setattr(sc, '_prowlarr_fallback_candidates',
+                            lambda *a, **k: prowlarr.append(1) or [
+                                {'info_hash': 'c' * 40,
+                                 'title': 'The.Substance.2024.TELESYNC.1080p',
+                                 'seeds': 9, 'quality': {'label': '1080p', 'score': 100}}])
+        movies = [{'title': 'The Substance', 'source': 'wanted',
+                   'imdb_id': 'tt1', 'is_available': True}]
+        with caplog.at_level(logging.INFO):
+            sc._recover_wanted_via_debrid([], movies, {})
+        assert wire['adds'] == []
+        assert prowlarr   # all-CAM Torrentio counts as nothing usable
+        # a title stuck in Wanted says why
+        assert ("Wanted recovery dropped 2/2 cinema-capture / pre-release "
+                "result(s) for 'The Substance'") in caplog.text
+        assert ("Wanted recovery dropped 1/1 cinema-capture / pre-release "
+                "Prowlarr result(s) for 'The Substance'") in caplog.text
+
+    def test_cam_dropped_real_release_still_recovered(self, wire):
+        wire['torrentio'] = [
+            {'info_hash': 'a' * 40, 'title': 'The.Substance.2024.CAM.2160p',
+             'seeds': 90, 'quality': {'label': '2160p', 'score': 200}},
+            {'info_hash': 'b' * 40, 'title': 'The.Substance.2024.720p.WEB-DL.RelB',
+             'seeds': 5, 'quality': {'label': '720p', 'score': 50}},
+        ]
+        sc = self._scanner()
+        movies = [{'title': 'The Substance', 'source': 'wanted',
+                   'imdb_id': 'tt1', 'is_available': True}]
+        sc._recover_wanted_via_debrid([], movies, {})
+        assert [a['info_hash'] for a in wire['adds']] == ['b' * 40]
+
     def test_disabled_flag_noops(self, wire, monkeypatch):
         monkeypatch.setenv('WANTED_TB_RECOVERY_ENABLED', 'false')
         sc = self._scanner()

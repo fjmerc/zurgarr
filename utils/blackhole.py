@@ -1123,7 +1123,12 @@ def _tb_alt_reject_reason(want_scope, want_codec, alt_title):
     """Why a TB-alt candidate is not like-for-like with the original grab,
     or None if it is.  Same scope (episode set / season / movie) and the
     same codec family — Sonarr/Radarr profiles routinely score H.264 and
-    x265 very differently, so a codec swap gets the import rejected."""
+    x265 very differently, so a codec swap gets the import rejected.
+    Never a cinema capture / pre-release copy: no arr profile vets this
+    grab before it's imported."""
+    from utils.search import is_prerelease_source
+    if is_prerelease_source(alt_title):
+        return "cinema capture / pre-release"
     got_scope = _release_scope(alt_title)
     if got_scope != want_scope:
         return f"{_scope_label(got_scope)}, wanted {_scope_label(want_scope)}"

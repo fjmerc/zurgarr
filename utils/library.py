@@ -5110,6 +5110,21 @@ class LibraryScanner:
                     self._search_cooldown[(norm, 0)] = now
                     update_pending_error(pending_norm, f"Radarr: {e}")
 
+    @staticmethod
+    def _drop_prerelease(results, media_title, source=''):
+        """*results* without cinema captures / pre-release copies (see
+        ``search.is_prerelease_source``), logging how many went — a title
+        whose only releases are CAMs stays Wanted, and the log says why."""
+        from utils import search as _search
+        kept = [r for r in results or []
+                if not _search.is_prerelease_source(r.get('title'))]
+        if len(kept) < len(results or []):
+            logger.info(
+                f"[library] Wanted recovery dropped {len(results) - len(kept)}"
+                f"/{len(results)} cinema-capture / pre-release {source}"
+                f"result(s) for '{media_title}'")
+        return kept
+
     def _recover_wanted_via_debrid(self, shows, movies, preferences):
         """Proactively grab debrid-cached copies of "Wanted" media.
 
@@ -5409,6 +5424,10 @@ class LibraryScanner:
                     results = []
             except Exception:
                 results = []
+            # CAM/telesync/screener copies: this pass adds straight to a
+            # debrid and the post-symlink disk rescan imports whatever lands,
+            # so no arr quality profile ever filters them.
+            results = self._drop_prerelease(results, media_title)
             # Blocklisted hashes were rejected for a reason (bad release,
             # prior filter block, ...) — never re-add them via this pass.
             if results and _is_blocked is not None:
@@ -5477,12 +5496,14 @@ class LibraryScanner:
             # add → memo machinery runs on them unchanged.
             if not results or wb_strikes > 0:
                 try:
-                    results.extend(self._prowlarr_fallback_candidates(
+                    fallback = self._prowlarr_fallback_candidates(
                         media_title, item.get('year'), media_type,
                         season, episode,
                         exclude_hashes={r['info_hash'] for r in results},
                         season_cls=season_cls,
-                        is_blocked=_is_blocked))
+                        is_blocked=_is_blocked)
+                    results.extend(self._drop_prerelease(
+                        fallback, media_title, source='Prowlarr '))
                 except Exception:
                     logger.warning(
                         "[library] Prowlarr fallback failed — continuing "

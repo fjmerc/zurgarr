@@ -356,3 +356,31 @@ def test_find_season_pack_candidate_uses_is_multi_season_pack_detector(
     )
     assert winner is not None
     assert winner['info_hash'] == 'a' * 40
+
+
+@patch('utils.quality_compromise.is_blocked', return_value=False)
+@patch('utils.quality_compromise.search_torrents')
+def test_find_compromise_candidate_never_picks_cam(mock_search, _blocked):
+    # "CAM.1080p" parses as a 1080p tier — it must not count as one.
+    cam = _result(info_hash='a' * 40, seeds=500)
+    cam['title'] = 'Movie.2026.CAM.1080p.EN'
+    real = _result(info_hash='b' * 40, seeds=5)
+    real['title'] = 'Movie.2026.1080p.WEB-DL.x264'
+    mock_search.return_value = [cam, real]
+    winner = find_compromise_candidate(
+        arr_client=MagicMock(), imdb_id='tt1234567', tier_label='1080p',
+        min_seeders=1, only_cached=True, context={'media_type': 'movie'},
+    )
+    assert winner['info_hash'] == 'b' * 40
+
+
+@patch('utils.quality_compromise.is_blocked', return_value=False)
+@patch('utils.quality_compromise.search_torrents')
+def test_find_season_pack_candidate_never_picks_cam(mock_search, _blocked):
+    episodes = [_episode(1, i, False) for i in range(1, 6)]
+    mock_search.return_value = [_result(info_hash='a' * 40, seeds=500,
+                                        title='Show.S01.1080p.HDCAM.x264-GRP')]
+    winner = find_season_pack_candidate(
+        arr_client=_mock_arr(episodes), series_id=42, season_number=1,
+        tier_label='1080p', min_missing=1, min_seeders=1, only_cached=True)
+    assert winner is None

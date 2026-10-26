@@ -6499,6 +6499,32 @@ class TestTorboxAltLikeForLike:
         assert 'TB-alt: rejected Tulsa.King.S01E04.1080p.AMZN.WEBRip.x265-PGW ' \
                '(codec x265, wanted x264)' in caplog.text
 
+    def test_cam_alt_rejected_before_cache_probe(self, tmp_dir, monkeypatch, caplog):
+        # A high-seed CAM of the same scope/codec must neither be grabbed
+        # nor spend a TorBox cache-probe slot.
+        import utils.search as search
+        caplog.set_level('INFO')
+        probed = []
+        monkeypatch.setattr(search, 'check_debrid_cache',
+                            lambda hashes, **k: probed.extend(hashes) or
+                            {h: True for h in hashes})
+        grab = 'Tulsa.King.S01E04.Visitation.Place.1080p.AMZN.WEBRip.DDP5.1.x264-NTb[rartv].magnet'
+        cam = self._candidate(self.ALT, seeds=900,
+                              title='Tulsa.King.S01E04.1080p.HDCAM.x264-GRP')
+        w = self._make_watcher(tmp_dir, symlink_enabled=True)
+        monkeypatch.setattr(w, '_resolve_arr_identity',
+                            lambda fn, label=None: ('tt16358384', 'series', 1, 4))
+        self._stub_search(monkeypatch, [cam])
+        added = []
+        monkeypatch.setattr(w, '_add_to_torbox',
+                            lambda path, api_key=None: added.append(path) or (True, {}))
+        fp = self._make_file(tmp_dir, grab)
+        result = w._try_torbox_cached_alternative(fp, grab, self.REJECTED, 'realdebrid',
+                                                  label='sonarr')
+        assert result is False and not added and not probed
+        assert 'TB-alt: rejected Tulsa.King.S01E04.1080p.HDCAM.x264-GRP ' \
+               '(cinema capture / pre-release)' in caplog.text
+
     def test_x265_grab_rejects_h264_alt(self, tmp_dir, monkeypatch):
         grab = 'Show.S01E04.1080p.WEB.x265-GRP.magnet'
         result, added, _, _ = self._run(

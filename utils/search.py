@@ -190,6 +190,62 @@ def _urllib_post(url, data=None, json_body=None, headers=None,
         return None
 
 
+# Cinema captures and pre-release sources (CAM, telesync, telecine,
+# screener, ...).  Tags that only ever mean that ("HDCAM", "TeleSync",
+# "DVDScr") count anywhere in the release tags; bare "TS"/"TC"/"SCR" are
+# also a .ts container, Traditional-Chinese subs or group names, so they
+# count only when the name carries no real source (WEB-DL, BluRay, ...).
+_PRERELEASE_STRONG_RE = re.compile(r"""
+    (?<![a-z0-9])
+    (?:(?:hd|hq|new)[ ._-]?)*            # HD / HQ / NEW prefixes, stackable
+    (?: cam
+      | h[dq][ ._-]?(?:ts|tc)            # HDTS, HQ-TC
+      | tele[ ._-]?(?:sync|cine)
+      | (?:dvd|bd|web)[ ._-]?scr(?:eener)?
+      | screener
+      | pre[ ._-]?dvd | pdvd
+      | s[ ._-]?print | workprint )
+    (?:[ ._-]?rip)?
+    (?![a-z0-9])""", re.IGNORECASE | re.VERBOSE)
+_PRERELEASE_WEAK_RE = re.compile(
+    r'(?<![a-z0-9])(?:ts|tc|scr)(?:[ ._-]?rip)?(?![a-z0-9])', re.IGNORECASE)
+_REAL_SOURCE_RE = re.compile(
+    r'(?<![a-z0-9])(?:blu[ ._-]?ray|b[dr][ ._-]?rip|web(?:[ ._-]?(?:dl|rip))?'
+    r'|hdtv|remux|hdrip|dvdrip|amzn|nf|dsnp|hmax|atvp)(?![a-z0-9])', re.IGNORECASE)
+_EPISODE_TAG_RE = re.compile(r'\bS\d{1,2}(?:E\d{1,3})?\b', re.IGNORECASE)
+_YEAR_TAG_RE = re.compile(r'(?<![0-9])(?:19|20)\d{2}(?![0-9])')
+_RESOLUTION_TAG_RE = re.compile(r'\b(?:2160|1080|720|480)p\b', re.IGNORECASE)
+
+
+def is_prerelease_source(title):
+    """True when *title* is a cinema capture or pre-release copy (CAM,
+    telesync, telecine, screener, ...).  Automation that adds straight to
+    a debrid (Wanted recovery, quality compromise, TB-alt) bypasses the
+    arr's quality profile, so it must skip these itself.
+
+    Only the release tags are read — after SxxEyy (and an episode name up
+    to the resolution) or the year — so a film or episode called "Cam"
+    isn't one.  With neither, everything after the first word is read for
+    the unambiguous tags only, and only when no real source (WEB-DL,
+    BluRay, ...) is named — a capture never carries one.
+    """
+    if not title or not isinstance(title, str):
+        return False
+    anchor = _EPISODE_TAG_RE.search(title) or _YEAR_TAG_RE.search(title)
+    if not anchor:
+        rest = re.split(r'[ ._]', title, 1)
+        return (len(rest) > 1 and bool(_PRERELEASE_STRONG_RE.search(rest[1]))
+                and not _REAL_SOURCE_RE.search(title))
+    tags = title[anchor.end():]
+    if anchor.group(0)[:1] in 'sS':
+        res = _RESOLUTION_TAG_RE.search(tags)
+        if res:
+            tags = tags[res.start():]
+    if _PRERELEASE_STRONG_RE.search(tags):
+        return True
+    return bool(_PRERELEASE_WEAK_RE.search(tags)) and not _REAL_SOURCE_RE.search(title)
+
+
 def parse_quality(title):
     """Extract quality label and numeric score from a release title.
 

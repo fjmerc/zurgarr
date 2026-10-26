@@ -19,7 +19,7 @@ warning; Phase 5/7 messaging should stay consistent with that behaviour.
 import re
 
 from utils.blocklist import is_blocked
-from utils.search import search_torrents
+from utils.search import is_prerelease_source, search_torrents
 
 _EPISODE_TOKEN_RE = re.compile(r'S\d{1,2}E\d+', re.IGNORECASE)
 
@@ -114,6 +114,9 @@ def _filter_candidates(results, tier_label, min_seeders, only_cached):
         # a search result whose resolution doesn't match the requested
         # tier is ineligible no matter how well everything else scores.
         if quality.get('label') != tier_label:
+            continue
+        # "CAM.1080p" parses as 1080p — a cinema capture is no tier at all
+        if is_prerelease_source(r.get('title')):
             continue
         # Defence-in-depth: search_torrents() already filters blocklisted
         # hashes, but _filter_candidates is the shared entry point for any
