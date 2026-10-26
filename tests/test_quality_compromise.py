@@ -4,6 +4,8 @@ import os
 import sys
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
@@ -219,6 +221,31 @@ def test_find_compromise_candidate_sort_within_tier(mock_search, _blocked):
     )
     # Tie on seeders (100) → smaller size wins: 8 GB over 60 GB
     assert winner['info_hash'] == 'c' * 40
+
+
+@pytest.mark.parametrize('strict,only_cached,want', [
+    (True, True, True),     # unknown cache state can't qualify → need a real verdict
+    (True, False, False),   # aggressive mode accepts unknowns — nothing to wait for
+    (False, True, False),
+])
+@patch('utils.quality_compromise.is_blocked', return_value=False)
+@patch('utils.quality_compromise.search_torrents')
+def test_find_candidates_ask_for_cache_verdicts_only_when_needed(
+        mock_search, _blocked, strict, only_cached, want):
+    mock_search.return_value = []
+    find_compromise_candidate(
+        arr_client=MagicMock(), imdb_id='tt1234567', tier_label='1080p',
+        min_seeders=1, only_cached=only_cached, context={'media_type': 'movie'},
+        strict=strict,
+    )
+    find_season_pack_candidate(
+        arr_client=_mock_arr([_episode(1, i, False) for i in range(1, 6)]),
+        series_id=42, season_number=1, tier_label='1080p', min_missing=1,
+        min_seeders=1, only_cached=only_cached, strict=strict,
+    )
+    for call in mock_search.call_args_list:
+        assert call.kwargs['strict'] is strict
+        assert call.kwargs['strict_cache'] is want
 
 
 # ---------------------------------------------------------------------------

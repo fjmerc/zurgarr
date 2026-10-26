@@ -13,6 +13,7 @@ Service priority:
 """
 
 import datetime
+import http.client
 import json
 import os
 import re
@@ -36,6 +37,31 @@ _TIMEOUT = 15  # seconds — Arr APIs can be slow on large libraries
 _RELEASE_TIMEOUT = 120  # seconds — interactive search queries all indexers synchronously
 _NOT_FOUND = object()  # sentinel for "looked up, not found" in tag cache
 _tag_creation_lock = threading.Lock()  # prevents duplicate tags from concurrent requests
+
+
+class ArrUnavailable(Exception):
+    """A ``strict=True`` request got no answer from the arr (connection
+    error, timeout, 5xx/408/429, cut-off or unparseable body — e.g. a proxy
+    page while the arr restarts) — as opposed to an answer, which includes
+    "nothing found" and other 4xx errors (a bad API key's 401 or a wrong
+    path's 404 won't fix itself on a retry)."""
+
+
+# HTTP statuses that say "ask again later" rather than "no"
+_TRANSIENT_HTTP = (408, 429)
+
+
+def _as_list(result, strict, service, what):
+    """*result* if it is a list, else ``[]``.  With *strict* the request
+    already raised for transient failures, so None is a 4xx answer (→ ``[]``)
+    while an empty or non-list body from a list endpoint raises
+    ArrUnavailable."""
+    if isinstance(result, list):
+        return result
+    if strict and result is not None:
+        raise ArrUnavailable(f"{service} gave no usable answer for {what}")
+    return []
+
 
 # Sonarr/Radarr rejection-reason substrings that the force-grab is designed
 # to override (the feature's whole purpose is bypassing the cutoff when the
@@ -236,8 +262,13 @@ class _ArrClientBase:
         """
         return self._base
 
-    def _request(self, method, path, body=None, params=None, timeout=None):
-        """Make an HTTP request. Returns parsed JSON or None on error."""
+    def _request(self, method, path, body=None, params=None, timeout=None, strict=False):
+        """Make an HTTP request. Returns parsed JSON or None on error.
+
+        *strict*: raise ArrUnavailable for transient failures (see
+        ``ArrUnavailable``) instead of returning None; other 4xx still
+        return None.
+        """
         if not self.configured:
             return None
 
@@ -273,17 +304,24 @@ class _ArrClientBase:
             logger.error(f"[{self._name}] HTTP {e.code} for {method} {path}")
             if body_text:
                 logger.debug(f"[{self._name}] Response body: {body_text[:200]}")
+            if strict and (e.code >= 500 or e.code in _TRANSIENT_HTTP):
+                raise ArrUnavailable(f"{self._name} HTTP {e.code} for {method} {path}") from e
             return None
-        except (urllib.error.URLError, json.JSONDecodeError, OSError, ValueError) as e:
+        except (urllib.error.URLError, http.client.HTTPException, json.JSONDecodeError,
+                OSError, ValueError) as e:
+            # HTTPException: IncompleteRead/BadStatusLine when the arr
+            # restarts mid-response (not OSError subclasses)
             logger.error(f"[{self._name}] Request failed for {method} {path}: {e}")
+            if strict:
+                raise ArrUnavailable(f"{self._name} request failed for {method} {path}: {e}") from e
             return None
 
     def _add_auth(self, req):
         """Add service-specific auth header. Override in subclasses."""
         raise NotImplementedError
 
-    def _get(self, path, params=None, timeout=None):
-        return self._request('GET', path, params=params, timeout=timeout)
+    def _get(self, path, params=None, timeout=None, strict=False):
+        return self._request('GET', path, params=params, timeout=timeout, strict=strict)
 
     def _post(self, path, body=None):
         return self._request('POST', path, body=body)
@@ -927,9 +965,12 @@ class SonarrClient(_ArrClientBase):
             return result[0]
         return None
 
-    def get_series(self, series_id):
-        """Get a series already in Sonarr by its internal ID."""
-        return self._get(f'/api/v3/series/{series_id}')
+    def get_series(self, series_id, strict=False):
+        """Get a series already in Sonarr by its internal ID.
+
+        *strict*: raise ArrUnavailable when Sonarr doesn't answer.
+        """
+        return self._get(f'/api/v3/series/{series_id}', strict=strict)
 
     def get_profile_id_for_series(self, series_id):
         """Return the quality profile ID assigned to a series, or None.
@@ -940,19 +981,23 @@ class SonarrClient(_ArrClientBase):
         """
         return self._profile_id_from_record(self.get_series(series_id))
 
-    def get_all_series(self):
-        """Get all series currently in Sonarr."""
-        result = self._get('/api/v3/series')
-        return result if isinstance(result, list) else []
+    def get_all_series(self, strict=False):
+        """Get all series currently in Sonarr.
 
-    def find_series_in_library(self, tmdb_id=None, title=None):
+        *strict*: raise ArrUnavailable when the arr doesn't answer instead
+        of returning [].
+        """
+        return _as_list(self._get('/api/v3/series', strict=strict), strict, 'sonarr', 'series list')
+
+    def find_series_in_library(self, tmdb_id=None, title=None, strict=False):
         """Check if a series is already added to Sonarr.
 
         When both tmdb_id and title are provided, prefers a match on both
         criteria before falling back to single-criterion matches.
-        Returns the series dict if found, None otherwise.
+        Returns the series dict if found, None otherwise.  *strict*: raise
+        ArrUnavailable when Sonarr doesn't answer instead of returning None.
         """
-        all_series = self.get_all_series()
+        all_series = self.get_all_series(strict=strict)
         if tmdb_id and title:
             for s in all_series:
                 if s.get('tmdbId') == tmdb_id and s.get('title', '').lower() == title.lower():
@@ -998,18 +1043,24 @@ class SonarrClient(_ArrClientBase):
         }
         return self._post('/api/v3/series', body)
 
-    def get_episodes(self, series_id):
-        """Get all episodes for a series."""
-        return self._get('/api/v3/episode', {'seriesId': series_id}) or []
+    def get_episodes(self, series_id, strict=False):
+        """Get all episodes for a series.
 
-    def get_episode_releases(self, episode_id):
+        *strict*: raise ArrUnavailable when Sonarr doesn't answer.
+        """
+        return _as_list(self._get('/api/v3/episode', {'seriesId': series_id}, strict=strict),
+                        strict, 'sonarr', 'episode list')
+
+    def get_episode_releases(self, episode_id, strict=False):
         """Fetch available releases for an episode from all indexers.
 
         Uses a longer timeout because this queries all indexers synchronously.
-        Returns list of release dicts, or empty list on failure.
+        Returns list of release dicts, or empty list on failure (*strict*:
+        raise ArrUnavailable when the arr doesn't answer).
         """
-        result = self._get('/api/v3/release', {'episodeId': episode_id}, timeout=_RELEASE_TIMEOUT)
-        return result if isinstance(result, list) else []
+        result = self._get('/api/v3/release', {'episodeId': episode_id},
+                           timeout=_RELEASE_TIMEOUT, strict=strict)
+        return _as_list(result, strict, 'sonarr', 'release search')
 
     def push_release(self, release):
         """Push a release for manual download, bypassing quality cutoff.
@@ -1075,19 +1126,23 @@ class SonarrClient(_ArrClientBase):
         logger.warning(f"[sonarr] Failed to push release for episode {episode_id}")
         return None
 
-    def get_episode_id(self, series_title, season_number, episode_number):
+    def get_episode_id(self, series_title, season_number, episode_number, strict=False,
+                       series=None):
         """Find a Sonarr episode ID by series title and S/E numbers.
 
-        Returns the episode ID int, or None.
+        Returns the episode ID int, or None.  *strict*: raise ArrUnavailable
+        when Sonarr doesn't answer instead of returning None.  *series*: an
+        already-fetched series record, skipping the library lookup.
         """
-        series = self.find_series_in_library(title=series_title)
+        if series is None:
+            series = self.find_series_in_library(title=series_title, strict=strict)
         if not series:
             return None
         # Use season filter to avoid fetching all episodes for long-running shows
-        episodes = self._get('/api/v3/episode', {
+        episodes = _as_list(self._get('/api/v3/episode', {
             'seriesId': series['id'],
             'seasonNumber': season_number,
-        }) or []
+        }, strict=strict), strict, 'sonarr', 'episode list')
         for ep in episodes:
             if ep.get('episodeNumber') == episode_number:
                 return ep.get('id')
@@ -1968,14 +2023,20 @@ class RadarrClient(_ArrClientBase):
             return result[0]
         return None
 
-    def get_all_movies(self):
-        """Get all movies currently in Radarr."""
-        result = self._get('/api/v3/movie')
-        return result if isinstance(result, list) else []
+    def get_all_movies(self, strict=False):
+        """Get all movies currently in Radarr.
 
-    def get_movie(self, movie_id):
-        """Get a movie already in Radarr by its internal ID."""
-        return self._get(f'/api/v3/movie/{movie_id}')
+        *strict*: raise ArrUnavailable when the arr doesn't answer instead
+        of returning [].
+        """
+        return _as_list(self._get('/api/v3/movie', strict=strict), strict, 'radarr', 'movie list')
+
+    def get_movie(self, movie_id, strict=False):
+        """Get a movie already in Radarr by its internal ID.
+
+        *strict*: raise ArrUnavailable when Radarr doesn't answer.
+        """
+        return self._get(f'/api/v3/movie/{movie_id}', strict=strict)
 
     def get_profile_id_for_movie(self, movie_id):
         """Return the quality profile ID assigned to a movie, or None.
@@ -1986,14 +2047,15 @@ class RadarrClient(_ArrClientBase):
         """
         return self._profile_id_from_record(self.get_movie(movie_id))
 
-    def find_movie_in_library(self, tmdb_id=None, title=None):
+    def find_movie_in_library(self, tmdb_id=None, title=None, strict=False):
         """Check if a movie is already added to Radarr.
 
         When both tmdb_id and title are provided, prefers a match on both
         criteria before falling back to single-criterion matches.
-        Returns the movie dict if found, None otherwise.
+        Returns the movie dict if found, None otherwise.  *strict*: raise
+        ArrUnavailable when Radarr doesn't answer instead of returning None.
         """
-        all_movies = self.get_all_movies()
+        all_movies = self.get_all_movies(strict=strict)
         if tmdb_id and title:
             for m in all_movies:
                 if m.get('tmdbId') == tmdb_id and m.get('title', '').lower() == title.lower():
@@ -2038,14 +2100,16 @@ class RadarrClient(_ArrClientBase):
         }
         return self._post('/api/v3/movie', body)
 
-    def get_movie_releases(self, movie_id):
+    def get_movie_releases(self, movie_id, strict=False):
         """Fetch available releases for a movie from all indexers.
 
         Uses a longer timeout because this queries all indexers synchronously.
-        Returns list of release dicts, or empty list on failure.
+        Returns list of release dicts, or empty list on failure (*strict*:
+        raise ArrUnavailable when the arr doesn't answer).
         """
-        result = self._get('/api/v3/release', {'movieId': movie_id}, timeout=_RELEASE_TIMEOUT)
-        return result if isinstance(result, list) else []
+        result = self._get('/api/v3/release', {'movieId': movie_id},
+                           timeout=_RELEASE_TIMEOUT, strict=strict)
+        return _as_list(result, strict, 'radarr', 'release search')
 
     def push_release(self, release):
         """Push a release for manual download, bypassing quality cutoff."""

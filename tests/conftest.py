@@ -124,3 +124,14 @@ def _fresh_startup_record():
     boot_layout.STARTED.clear()
     boot_layout.STARTED.update(saved)
     zs._HOOK_WARNED = warned
+
+
+@pytest.fixture(autouse=True)
+def _clear_alt_search_registry():
+    """Alt-release searches in flight are module state (they must survive
+    a watcher restart); a test that stages one without running its thread
+    to the end would otherwise leave it reserved for later tests."""
+    yield
+    import utils.blackhole as bh
+    with bh._alt_inflight_lock:
+        bh._alt_inflight.clear()

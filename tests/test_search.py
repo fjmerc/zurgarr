@@ -1,7 +1,9 @@
 """Tests for utils/search.py — Torrentio search and debrid add."""
 
+import http.client
 import json
 import os
+import urllib.error
 import sys
 import pytest
 from unittest.mock import patch, MagicMock
@@ -16,7 +18,7 @@ from utils.search import (
     _parse_seeds,
     _parse_size_from_title,
     _parse_source,
-    search_torrentio,
+    search_torrentio, search_torrents, SearchUnavailable,
     search_torrents,
     add_to_debrid,
     check_debrid_cache,
@@ -231,6 +233,90 @@ class TestSearchTorrentio:
         monkeypatch.setenv('TORRENTIO_URL', 'https://torrentio.strem.fun')
         mock_get.return_value = None
         assert search_torrentio('tt1234567') == []
+
+
+class TestSearchTorrentioStrict:
+    """strict=True (the quality-compromise path): Torrentio not answering
+    raises SearchUnavailable instead of looking like "no torrents"."""
+
+    @pytest.fixture(autouse=True)
+    def _url(self, monkeypatch):
+        monkeypatch.setenv('TORRENTIO_URL', 'https://torrentio.strem.fun')
+
+    @pytest.mark.parametrize('failure', [
+        urllib.error.URLError('Connection refused'),
+        urllib.error.HTTPError('https://t', 503, 'Unavailable', {}, None),
+        urllib.error.HTTPError('https://t', 429, 'Too Many Requests', {}, None),
+        TimeoutError('timed out'),
+        http.client.IncompleteRead(b''),
+    ])
+    @patch('urllib.request.urlopen')
+    def test_strict_raises_when_unreachable(self, mock_urlopen, failure):
+        mock_urlopen.side_effect = failure
+        with pytest.raises(SearchUnavailable):
+            search_torrentio('tt1234567', strict=True)
+        with pytest.raises(SearchUnavailable):
+            search_torrents('tt1234567', strict=True)
+
+    @patch('urllib.request.urlopen')
+    def test_strict_client_error_is_an_answer(self, mock_urlopen):
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            'https://t', 404, 'Not Found', {}, None)
+        assert search_torrentio('tt1234567', strict=True) == []
+
+    @patch('urllib.request.urlopen')
+    def test_default_swallows_cut_off_response(self, mock_urlopen):
+        # Was uncaught: IncompleteRead isn't an OSError.
+        mock_urlopen.side_effect = http.client.IncompleteRead(b'')
+        assert search_torrentio('tt1234567') == []
+
+    @patch('urllib.request.urlopen')
+    def test_strict_null_body_raises(self, mock_urlopen):
+        mock_urlopen.return_value.__enter__.return_value.read.return_value = b'null'
+        with pytest.raises(SearchUnavailable):
+            search_torrentio('tt1234567', strict=True)
+
+    @patch('utils.search._urllib_get')
+    def test_null_streams_is_no_torrents(self, mock_get):
+        mock_get.return_value = {'streams': None}
+        assert search_torrentio('tt1234567', strict=True) == []
+
+    @pytest.mark.parametrize('body', [[], 0, '', ['x']])
+    @patch('utils.search._urllib_get')
+    def test_strict_non_object_body_raises(self, mock_get, body):
+        mock_get.return_value = body
+        with pytest.raises(SearchUnavailable):
+            search_torrentio('tt1234567', strict=True)
+        assert search_torrentio('tt1234567') == []
+
+    @pytest.mark.parametrize('not_probed', [True, False])
+    @patch('utils.search.check_debrid_cache')
+    @patch('utils.search.search_torrentio')
+    def test_strict_cache_raises_when_torbox_not_asked(self, mock_tio, mock_cache,
+                                                       not_probed):
+        # TorBox throttle / breaker / HTTP failure: every verdict is "unknown"
+        # without TorBox having been asked — no answer, not "uncached".
+        mock_tio.return_value = [{'info_hash': 'a' * 40, 'title': 'x', 'seeds': 5,
+                                  'quality': {'label': '1080p', 'score': 3}}]
+
+        def probe(hashes, service=None, api_key=None, _stats=None):
+            if not_probed and _stats is not None:
+                _stats['tb_not_probed'] = True
+                _stats['tb_unavailable'] = True
+            return {h: None for h in hashes}
+        mock_cache.side_effect = probe
+        if not_probed:
+            with pytest.raises(SearchUnavailable):
+                search_torrents('tt1234567', annotate_cache=True, strict_cache=True)
+        else:
+            assert search_torrents('tt1234567', annotate_cache=True, strict_cache=True)
+        # default: unknowns pass through as before
+        assert search_torrents('tt1234567', annotate_cache=True)[0]['cached'] is None
+
+    @patch('utils.search._urllib_get')
+    def test_strict_empty_answer_is_not_an_error(self, mock_get):
+        mock_get.return_value = {'streams': []}
+        assert search_torrentio('tt1234567', strict=True) == []
 
 
 class TestSearchSortAndFilter:
@@ -1666,6 +1752,68 @@ class TestCheckCacheTbNotProbedSignal:
         out = s._check_cache_tb(['b' * 40], 'key', _stats=stats)
         assert out == {'b' * 40: None}
         assert stats.get('tb_not_probed') is True
+        s._reset_tb_probe_state()
+
+    def test_rate_cap_is_transient(self, monkeypatch):
+        import utils.search as s
+        s._reset_tb_probe_state()
+        monkeypatch.setattr(s, '_TB_PROBE_MAX_PER_MIN', 0)
+        stats = {}
+        s._check_cache_tb(['a' * 40], 'key', _stats=stats)
+        assert stats.get('tb_unavailable') is True
+        s._reset_tb_probe_state()
+
+    def test_auth_block_is_not_transient(self, monkeypatch):
+        # A dead key won't fix itself on a retry.
+        import time as _time
+        import utils.search as s
+        s._reset_tb_probe_state()
+        monkeypatch.setattr(s, '_tb_auth_block_until', _time.monotonic() + 1000)
+        stats = {}
+        s._check_cache_tb(['b' * 40], 'key', _stats=stats)
+        assert not stats.get('tb_unavailable')
+        s._reset_tb_probe_state()
+
+    @pytest.mark.parametrize('failure,transient', [
+        (urllib.error.HTTPError('https://t', 503, 'Unavailable', {}, None), True),
+        (urllib.error.HTTPError('https://t', 429, 'Too Many', {}, None), True),
+        (urllib.error.URLError('Connection refused'), True),
+        (TimeoutError('timed out'), True),
+        (http.client.IncompleteRead(b''), True),
+        (urllib.error.HTTPError('https://t', 404, 'Not Found', {}, None), False),
+        (urllib.error.HTTPError('https://t', 401, 'Unauthorized', {}, None), False),
+    ])
+    @patch('urllib.request.urlopen')
+    def test_http_failures_classified(self, mock_urlopen, failure, transient):
+        import utils.search as s
+        s._reset_tb_probe_state()
+        mock_urlopen.side_effect = failure
+        stats = {}
+        assert s._check_cache_tb(['c' * 40], 'key', _stats=stats) == {'c' * 40: None}
+        assert stats.get('tb_not_probed') is True
+        assert bool(stats.get('tb_unavailable')) is transient
+        s._reset_tb_probe_state()
+
+    @patch('urllib.request.urlopen')
+    def test_rate_limit_in_body_is_transient(self, mock_urlopen):
+        # TorBox reports some rate limits in the body (as the add path
+        # already handles), not as a 429.
+        import io
+        import utils.search as s
+        s._reset_tb_probe_state()
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            'https://t', 400, 'Bad Request', {},
+            io.BytesIO(b'{"success": false, "detail": "Rate limit exceeded"}'))
+        stats = {}
+        s._check_cache_tb(['d' * 40], 'key', _stats=stats)
+        assert stats.get('tb_unavailable') is True
+        s._reset_tb_probe_state()
+        mock_urlopen.side_effect = None
+        mock_urlopen.return_value = _mock_urlopen_response(
+            {'success': False, 'error': 'RATE_LIMIT', 'detail': 'slow down'})
+        stats = {}
+        s._check_cache_tb(['e' * 40], 'key', _stats=stats)
+        assert stats.get('tb_unavailable') is True
         s._reset_tb_probe_state()
 
     def test_check_debrid_cache_forwards_stats(self, monkeypatch):

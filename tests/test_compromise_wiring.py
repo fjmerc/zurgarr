@@ -425,3 +425,105 @@ def test_compromise_movie_path(watcher, tmp_dir, compromise_env):
     assert result is True
     ts = RetryMeta.read_tier_state(orig_path)
     assert ts['current_tier_index'] == 1
+
+
+# ---------------------------------------------------------------------------
+# An arr or Torrentio outage mid-compromise is no verdict: retry later
+# (None → parked), never "no candidate" → alt_exhausted.
+# ---------------------------------------------------------------------------
+
+def _pack_env(monkeypatch):
+    monkeypatch.setenv('SEASON_PACK_FALLBACK_ENABLED', 'true')
+    monkeypatch.setenv('SEASON_PACK_FALLBACK_MIN_MISSING', '2')
+
+
+@pytest.mark.parametrize('down', ['get_episodes', 'get_series'])
+def test_compromise_arr_outage_in_pack_probe_retries_later(
+        watcher, tmp_dir, compromise_env, monkeypatch, down):
+    from utils.arr_client import ArrUnavailable
+    _pack_env(monkeypatch)
+    orig_path = _write_torrent(tmp_dir, 'Show.S01E01.torrent')
+    _seed_series_tier_state(orig_path)
+    client = _mock_sonarr_client()
+    client.get_episodes.return_value = [
+        {'seasonNumber': 1, 'episodeNumber': i, 'hasFile': False} for i in (1, 2, 3)]
+    getattr(client, down).side_effect = ArrUnavailable('sonarr down')
+    with patch('utils.arr_client.SonarrClient', return_value=client), \
+         patch('utils.quality_compromise.search_torrents', return_value=[]), \
+         patch('utils.quality_compromise.is_blocked', return_value=False):
+        result = watcher._try_alt_episode(
+            'Show Name', 1, [1], MagicMock(), 'Show.S01E01.torrent', orig_path,
+            label='sonarr')
+    assert result is None
+    ts = RetryMeta.read_tier_state(orig_path)
+    assert ts.get('season_pack_attempted') is not True   # probe not burned
+    assert ts['current_tier_index'] == 0
+
+
+@pytest.mark.parametrize('pack', [True, False])
+def test_compromise_torrentio_outage_retries_later(
+        watcher, tmp_dir, compromise_env, monkeypatch, pack):
+    from utils.search import SearchUnavailable
+    if pack:
+        _pack_env(monkeypatch)
+    orig_path = _write_torrent(tmp_dir, 'Show.S01E01.torrent')
+    _seed_series_tier_state(orig_path)
+    client = _mock_sonarr_client()
+    client.get_episodes.return_value = [
+        {'seasonNumber': 1, 'episodeNumber': i, 'hasFile': False} for i in (1, 2, 3)]
+    seen = []
+
+    def down(*a, **k):
+        seen.append(k.get('strict'))
+        raise SearchUnavailable('torrentio down')
+    with patch('utils.arr_client.SonarrClient', return_value=client), \
+         patch('utils.quality_compromise.search_torrents', side_effect=down), \
+         patch('utils.quality_compromise.is_blocked', return_value=False):
+        result = watcher._try_alt_episode(
+            'Show Name', 1, [1], MagicMock(), 'Show.S01E01.torrent', orig_path,
+            label='sonarr')
+    assert result is None and seen == [True]
+    ts = RetryMeta.read_tier_state(orig_path)
+    assert ts.get('season_pack_attempted') is not True
+    assert ts['current_tier_index'] == 0
+
+
+def test_compromise_torrentio_outage_retries_later_movie(
+        watcher, tmp_dir, compromise_env):
+    from utils.search import SearchUnavailable
+    orig_path = _write_torrent(tmp_dir, 'Movie.2024.torrent')
+    _seed_series_tier_state(orig_path)
+    client = _mock_radarr_client()
+    with patch('utils.arr_client.RadarrClient', return_value=client), \
+         patch('utils.quality_compromise.search_torrents',
+               side_effect=SearchUnavailable('torrentio down')), \
+         patch('utils.quality_compromise.is_blocked', return_value=False):
+        result = watcher._try_alt_movie(
+            'Movie Name', MagicMock(), 'Movie.2024.torrent', orig_path, label='radarr')
+    assert result is None
+    assert RetryMeta.read_tier_state(orig_path)['current_tier_index'] == 0
+
+
+def test_compromise_grab_retires_parked_copies(watcher, tmp_dir, compromise_env,
+                                              monkeypatch):
+    """A compromise grab, like an alt-release grab, retires other parked
+    copies of the drop (label-scoped failed/) so they don't grab again."""
+    monkeypatch.setattr(watcher, '_start_monitor', lambda *a, **k: None)  # no RD polling
+    orig_path = _write_torrent(tmp_dir, 'Show.S01E01.torrent')
+    _seed_series_tier_state(orig_path)
+    failed = os.path.join(tmp_dir, 'failed', 'sonarr')
+    os.makedirs(failed)
+    copy = os.path.join(failed, 'Show.S01E01_1761400000.torrent')
+    unrelated = os.path.join(failed, 'Show.S01E02.torrent')
+    for p in (copy, unrelated):
+        with open(p, 'w') as f:
+            f.write('x')
+    cached = _torrentio_result(info_hash='c' * 40, label='1080p', cached=True,
+                               title='Show.S01E01.1080p.BluRay-GROUP')
+    with patch('utils.arr_client.SonarrClient', return_value=_mock_sonarr_client()), \
+         patch('utils.quality_compromise.search_torrents', return_value=[cached]), \
+         patch('utils.quality_compromise.is_blocked', return_value=False):
+        assert watcher._try_alt_episode(
+            'Show Name', 1, [1], MagicMock(return_value=(True, '{"id": 1}')),
+            'Show.S01E01.torrent', orig_path, label='sonarr') is True
+    assert not os.path.exists(copy) and os.path.exists(unrelated)

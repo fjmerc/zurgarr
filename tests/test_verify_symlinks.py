@@ -1,5 +1,6 @@
 """Tests for verify_symlinks in utils/scheduled_tasks.py."""
 
+import json
 import os
 import time
 from unittest.mock import MagicMock, patch
@@ -767,6 +768,50 @@ class TestHousekeepingMetadataCleanup:
         housekeeping()
         assert not os.path.exists(magnet)   # swept
         assert os.path.exists(sidecar)      # preserved this cycle
+
+    @pytest.mark.parametrize('last_attempt_age,kept', [(3600, True), (8 * 86400, False)])
+    def test_parked_payload_swept_only_after_7_days_unretried(self, tmp_dir, monkeypatch,
+                                                      last_attempt_age, kept):
+        """A drop parked through a long outage keeps its arr-drop mtime
+        (rename preserves it) but is still on the retry schedule — sweeping
+        it would silently lose the grab.  Once nothing has retried it for
+        7 days it's abandoned like any other."""
+        from utils.scheduled_tasks import housekeeping
+        watch = self._setup(tmp_dir, monkeypatch)
+        magnet = os.path.join(watch, 'failed', 'parked.magnet')
+        with open(magnet, 'w') as f:
+            f.write('magnet:?xt=...')
+        with open(magnet + '.meta', 'w') as f:
+            json.dump({'retries': 0, 'parks': 9,
+                       'last_attempt': time.time() - last_attempt_age}, f)
+        os.utime(magnet, (time.time() - 20 * 86400, time.time() - 20 * 86400))
+
+        housekeeping()
+        assert os.path.exists(magnet) is kept
+
+    @pytest.mark.parametrize('sidecar', [
+        {'retries': 0, 'alt_exhausted': True},
+        {'retries': 3},
+        None,          # no sidecar
+        'not json',    # corrupt sidecar
+    ])
+    def test_terminal_payload_swept_despite_recent_attempt(self, tmp_dir, monkeypatch,
+                                                           sidecar):
+        from utils.scheduled_tasks import housekeeping
+        watch = self._setup(tmp_dir, monkeypatch)
+        magnet = os.path.join(watch, 'failed', 'done.magnet')
+        with open(magnet, 'w') as f:
+            f.write('magnet:?xt=...')
+        if sidecar is not None:
+            with open(magnet + '.meta', 'w') as f:
+                if isinstance(sidecar, dict):
+                    json.dump(dict(sidecar, last_attempt=time.time() - 3600), f)
+                else:
+                    f.write(sidecar)
+        os.utime(magnet, (time.time() - 20 * 86400, time.time() - 20 * 86400))
+
+        housekeeping()
+        assert not os.path.exists(magnet)
 
     def test_preserves_unknown_file_types_in_failed(self, tmp_dir, monkeypatch):
         """If anything other than .torrent/.magnet/.meta lands in failed/

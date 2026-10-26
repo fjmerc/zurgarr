@@ -155,7 +155,7 @@ def _rank_within_tier(candidates):
 
 
 def find_compromise_candidate(arr_client, imdb_id, tier_label, min_seeders,
-                              only_cached, context):
+                              only_cached, context, strict=False):
     """Return the best cached release at ``tier_label``, or ``None``.
 
     Args:
@@ -172,6 +172,9 @@ def find_compromise_candidate(arr_client, imdb_id, tier_label, min_seeders,
             ``'series'``), ``season``, ``episode`` — forwarded to
             ``search_torrents`` so the same function works for movies
             and single-episode TV searches.
+        strict: raise SearchUnavailable when Torrentio (or, with
+            *only_cached*, the TorBox cache check) doesn't answer, instead
+            of returning ``None`` as if nothing qualified.
     """
     del arr_client  # accepted for signature symmetry; no arr I/O needed here
     ctx = context or {}
@@ -182,6 +185,10 @@ def find_compromise_candidate(arr_client, imdb_id, tier_label, min_seeders,
         episode=ctx.get('episode'),
         annotate_cache=True,
         sort_mode='cached_first',
+        strict=strict,
+        # only_cached drops unknown-cache results, so "TorBox not asked"
+        # would read as "nothing cached"
+        strict_cache=strict and only_cached,
     )
     candidates = _filter_candidates(results, tier_label, min_seeders, only_cached)
     return _rank_within_tier(candidates)
@@ -205,7 +212,7 @@ def _looks_like_single_season_pack(title, season_number):
 
 def find_season_pack_candidate(arr_client, series_id, season_number,
                                tier_label, min_missing, min_seeders,
-                               only_cached, min_ratio=0.0):
+                               only_cached, min_ratio=0.0, strict=False):
     """Return the best cached season pack at ``tier_label`` for *series_id*, or ``None``.
 
     TV-only.  Preflight: the series must have at least ``min_missing``
@@ -216,6 +223,10 @@ def find_season_pack_candidate(arr_client, series_id, season_number,
     legitimate 67% hole, but 4 of 40 is only 10% and should not grab
     a 40-episode pack).  ``min_ratio=0`` (default) disables the ratio
     gate and keeps back-compat with pre-Phase-7 callers.
+
+    ``strict=True`` raises ArrUnavailable / SearchUnavailable when Sonarr,
+    Torrentio or (with *only_cached*) the TorBox cache check doesn't
+    answer, instead of returning ``None`` as if no pack qualified.
 
     ``season_number`` is coerced to ``int`` so callers handing a string
     through from ``pending_monitors.json`` or a URL query param don't
@@ -233,7 +244,10 @@ def find_season_pack_candidate(arr_client, series_id, season_number,
     except (TypeError, ValueError):
         return None
 
-    episodes = arr_client.get_episodes(series_id) or []
+    # strict: an arr/Torrentio outage raises ArrUnavailable/SearchUnavailable
+    # instead of reading as "no pack" (the caller burns the one-shot probe
+    # on that)
+    episodes = arr_client.get_episodes(series_id, strict=strict) or []
     missing = 0
     season_total = 0
     for ep in episodes:
@@ -256,7 +270,7 @@ def find_season_pack_candidate(arr_client, series_id, season_number,
         if (missing / season_total) < min_ratio:
             return None
 
-    series = arr_client.get_series(series_id) or {}
+    series = arr_client.get_series(series_id, strict=strict) or {}
     imdb_id = series.get('imdbId')
     if not imdb_id:
         return None
@@ -270,6 +284,8 @@ def find_season_pack_candidate(arr_client, series_id, season_number,
         media_type='series',
         annotate_cache=True,
         sort_mode='cached_first',
+        strict=strict,
+        strict_cache=strict and only_cached,
     )
 
     packs = []

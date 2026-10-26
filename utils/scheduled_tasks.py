@@ -754,16 +754,16 @@ def housekeeping():
     # failed/ tree holds the original .torrent/.magnet payloads alongside
     # their .meta sidecars.  ``BlackholeWatcher._retry_failed`` DOES poll
     # this tree and will retry items up to ``MAX_RETRIES`` (3) with the
-    # ``RETRY_SCHEDULE`` backoff ([5m, 15m, 1h]) — so the maximum live
-    # retry window for any file is ~80 minutes from the moment it lands
-    # in failed/ (plus the time between scheduler ticks).  After that
-    # window, the retry loop skips the file on every pass (retries >=
-    # MAX_RETRIES or alt_exhausted=True), and nothing else touches it.
-    # A 7-day-old payload has been terminal for >>160× the max retry
-    # window — safely abandoned.  Without this sweep the payload class
+    # ``RETRY_SCHEDULE`` backoff ([5m, 15m, 1h]); once retries >=
+    # MAX_RETRIES or alt_exhausted=True it skips the file on every pass
+    # and nothing else touches it.  Parked drops (provider/arr outage)
+    # are the exception: they retry uncounted on ``PARK_SCHEDULE`` (≤1h)
+    # for as long as the outage lasts, keeping the arr-drop mtime — so a
+    # payload whose sidecar says it's still retrying is kept regardless
+    # of its age.  A payload that's terminal (or hasn't been retried) for
+    # 7 days is safely abandoned.  Without this sweep the payload class
     # would accumulate indefinitely while only the .meta sidecars ever
-    # got cleaned, since the retry loop bumps sidecar mtime on every
-    # poll.  Supports both flat (watch_dir/failed/<file>) and labeled
+    # got cleaned.  Supports both flat (watch_dir/failed/<file>) and labeled
     # (watch_dir/failed/<label>/<file>) layouts via the recursive walk.
     # Non-retry file types are preserved so a misplaced file can be
     # inspected manually.
@@ -771,6 +771,7 @@ def housekeeping():
     from utils.env import watch_dir_from_env
     watch_dir = watch_dir_from_env()
     try:
+        from utils.blackhole import RetryMeta
         failed_root = os.path.join(watch_dir, 'failed')
         if os.path.isdir(failed_root):
             # followlinks=False (default, but explicit for defensive clarity):
@@ -787,6 +788,9 @@ def housekeeping():
                     fpath = os.path.join(root, fname)
                     try:
                         age_days = (now - os.path.getmtime(fpath)) / 86400
+                        if (age_days > 7 and not fname.endswith('.meta')
+                                and RetryMeta.still_retrying(fpath, 7 * 86400)):
+                            continue
                         if age_days > 7:
                             os.remove(fpath)
                             cleaned += 1

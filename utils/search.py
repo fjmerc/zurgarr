@@ -6,6 +6,7 @@ and one-click add them to their debrid provider.  Uses urllib only
 """
 
 import collections
+import http.client
 import itertools
 import json
 import os
@@ -19,6 +20,13 @@ from base import load_secret_or_env
 from utils.logger import get_logger
 
 logger = get_logger()
+
+
+class SearchUnavailable(Exception):
+    """A ``strict=True`` search got no answer (connection error, timeout,
+    5xx/408/429, cut-off or unparseable body) — as opposed to an answer,
+    which includes "no torrents" and other 4xx errors."""
+
 
 _SEARCH_TIMEOUT = 10
 _ADD_TIMEOUT = 15
@@ -111,20 +119,31 @@ def _safe_log_url(url):
     return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', ''))
 
 
-def _urllib_get(url, headers=None, timeout=_SEARCH_TIMEOUT):
-    """GET request returning parsed JSON or None."""
+def _urllib_get(url, headers=None, timeout=_SEARCH_TIMEOUT, strict=False):
+    """GET request returning parsed JSON or None.
+
+    *strict*: raise SearchUnavailable for transient failures (see
+    ``SearchUnavailable``) instead of returning None; other 4xx still
+    return None.
+    """
     req = urllib.request.Request(url, headers=headers or {})
     req.add_header('User-Agent', 'zurgarr/1.0')
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read(10 * 1024 * 1024).decode('utf-8'))
-    except (urllib.error.URLError, urllib.error.HTTPError,
+            data = json.loads(resp.read(10 * 1024 * 1024).decode('utf-8'))
+        if strict and data is None:   # JSON null: None must mean a 4xx answer
+            raise ValueError('null body')
+        return data
+    except (urllib.error.URLError, urllib.error.HTTPError, http.client.HTTPException,
             json.JSONDecodeError, OSError, ValueError) as e:
         # HTTP status carries no credential and makes a rotated API key
         # (401/403) distinguishable from a timeout in the logs.
         code = getattr(e, 'code', None)
         detail = f"{type(e).__name__}{f' {code}' if code else ''}"
         logger.warning(f"[search] GET {_safe_log_url(url)}: {detail}")
+        if strict and not (isinstance(e, urllib.error.HTTPError)
+                           and e.code < 500 and e.code not in (408, 429)):
+            raise SearchUnavailable(f"GET {_safe_log_url(url)}: {detail}") from e
         return None
 
 
@@ -224,7 +243,8 @@ def _hash_to_magnet(info_hash):
 # F9.1 — Torrentio search
 # ---------------------------------------------------------------------------
 
-def search_torrentio(imdb_id, media_type='movie', season=None, episode=None):
+def search_torrentio(imdb_id, media_type='movie', season=None, episode=None,
+                     strict=False):
     """Search Torrentio for streams matching an IMDb ID.
 
     Args:
@@ -232,6 +252,8 @@ def search_torrentio(imdb_id, media_type='movie', season=None, episode=None):
         media_type: 'movie' or 'series'
         season: Season number (for series)
         episode: Episode number (for series)
+        strict: raise SearchUnavailable when Torrentio doesn't answer
+            instead of returning [].
 
     Returns:
         List of dicts: [{title, info_hash, size_bytes, seeds, source_name,
@@ -254,11 +276,14 @@ def search_torrentio(imdb_id, media_type='movie', season=None, episode=None):
         path = f'/stream/{stream_type}/{imdb_id}.json'
 
     url = base_url + path
-    data = _urllib_get(url, timeout=_SEARCH_TIMEOUT)
-    if not data:
+    data = _urllib_get(url, timeout=_SEARCH_TIMEOUT, strict=strict)
+    if not isinstance(data, dict):
+        # None: failed (strict already raised unless it was a 4xx answer)
+        if strict and data is not None:
+            raise SearchUnavailable(f"GET {_safe_log_url(url)}: non-object body")
         return []
 
-    streams = data.get('streams', [])
+    streams = data.get('streams') or []
     results = []
     seen_hashes = set()
 
@@ -483,6 +508,13 @@ def _reset_tb_probe_state():
         _tb_probe_call_times.clear()
 
 
+def _says_rate_limited(text):
+    """TorBox reports some rate limits in a 200/4xx body rather than a 429
+    (same test as the blackhole add path's ``_is_rate_limit_response``)."""
+    text = (text or '').lower()
+    return 'rate limit' in text or 'rate_limit' in text
+
+
 def _check_cache_tb(hashes, api_key, _stats=None):
     """TorBox batched cache probe via ``/api/torrents/checkcached``.
 
@@ -502,9 +534,14 @@ def _check_cache_tb(hashes, api_key, _stats=None):
     """
     global _tb_auth_block_until
 
-    def _flag_not_probed():
+    def _flag_not_probed(transient=False):
+        # transient: asking again later may get verdicts (throttle,
+        # 5xx/408/429, network, garbled reply) — vs. a dead key or a
+        # 4xx/"success": false that a retry won't change
         if _stats is not None:
             _stats['tb_not_probed'] = True
+            if transient:
+                _stats['tb_unavailable'] = True
 
     result = {h: None for h in hashes}
     now = time.monotonic()
@@ -530,7 +567,7 @@ def _check_cache_tb(hashes, api_key, _stats=None):
         while _tb_probe_call_times and now - _tb_probe_call_times[0] > 60:
             _tb_probe_call_times.popleft()
         if len(_tb_probe_call_times) >= _TB_PROBE_MAX_PER_MIN:
-            _flag_not_probed()
+            _flag_not_probed(transient=True)
             return result
         _tb_probe_call_times.append(now)
     headers = {
@@ -544,8 +581,14 @@ def _check_cache_tb(hashes, api_key, _stats=None):
         with urllib.request.urlopen(req, timeout=_CACHE_PROBE_TIMEOUT) as resp:
             raw = resp.read(1 * 1024 * 1024)
             data = json.loads(raw.decode('utf-8')) if raw else None
-    except (urllib.error.URLError, urllib.error.HTTPError,
+    except (urllib.error.URLError, urllib.error.HTTPError, http.client.HTTPException,
             json.JSONDecodeError, OSError, ValueError) as e:
+        rate_limited = False
+        if isinstance(e, urllib.error.HTTPError):
+            try:
+                rate_limited = _says_rate_limited(e.read(4096).decode('utf-8', 'replace'))
+            except Exception:
+                pass
         if isinstance(e, urllib.error.HTTPError) and e.code in (401, 403):
             with _tb_probe_state_lock:
                 _tb_auth_block_until = time.monotonic() + _TB_AUTH_COOLDOWN
@@ -559,10 +602,16 @@ def _check_cache_tb(hashes, api_key, _stats=None):
                 f"[search] TB batch cache probe ({len(batch)} hashes): "
                 f"{type(e).__name__}"
             )
-        _flag_not_probed()
+        _flag_not_probed(transient=rate_limited or not (
+            isinstance(e, urllib.error.HTTPError)
+            and e.code < 500 and e.code not in (408, 429)))
         return result
-    if not isinstance(data, dict) or not data.get('success'):
-        _flag_not_probed()
+    if not isinstance(data, dict):   # empty/garbled body
+        _flag_not_probed(transient=True)
+        return result
+    if not data.get('success'):
+        _flag_not_probed(transient=_says_rate_limited(
+            f"{data.get('error', '')} {data.get('detail', '')}"))
         return result
     payload = data.get('data')
     if not isinstance(payload, dict):
@@ -826,7 +875,8 @@ def list_torbox_torrents(api_key, timeout=_MYLIST_TIMEOUT):
 
 def search_torrents(imdb_id, media_type='movie', season=None, episode=None,
                     annotate_cache=False, sort_mode='quality',
-                    cache_service=None, title=None, year=None):
+                    cache_service=None, title=None, year=None, strict=False,
+                    strict_cache=False):
     """Search Torrentio (and Prowlarr, when configured) for torrents,
     sorted by quality then seeds.
 
@@ -859,6 +909,15 @@ def search_torrents(imdb_id, media_type='movie', season=None, episode=None,
             (the only provider with a working pre-add probe) — used by
             the manual-search UI, where ``cached_service`` labels the
             badge and the user picks the add target themselves.
+        strict: raise SearchUnavailable when Torrentio doesn't answer
+            (Prowlarr stays best-effort).
+        strict_cache: raise SearchUnavailable when the cache annotation
+            came back unknown because TorBox couldn't be asked *for now*
+            (``tb_unavailable``: per-minute throttle, 5xx/408/429, network
+            error) — for callers that can only use confirmed-cached
+            results.  A dead key or other 4xx is an answer, not a retry;
+            RD/AD unknowns are by design and never raise; the TB
+            throttles are untouched.
 
     Returns list of dicts sorted per the chosen ``sort_mode``.
     Blocklisted hashes are filtered out.
@@ -869,7 +928,7 @@ def search_torrents(imdb_id, media_type='movie', season=None, episode=None,
     degrades to quality order for those users.  Only TorBox
     (``/api/torrents/checkcached``) still returns meaningful True/False.
     """
-    results = search_torrentio(imdb_id, media_type, season, episode)
+    results = search_torrentio(imdb_id, media_type, season, episode, strict=strict)
 
     # Prowlarr merge — lazy import because utils.prowlarr imports from
     # this module at load time (one-way at import, both ways at call).
@@ -936,10 +995,13 @@ def search_torrents(imdb_id, media_type='movie', season=None, episode=None,
         probe_order = []
         for pair in itertools.zip_longest(tio, prw):
             probe_order.extend(p for p in pair if p is not None)
+        probe_stats = {}
         cache_map = check_debrid_cache(
             [r['info_hash'] for r in probe_order],
-            service=service, api_key=api_key,
+            service=service, api_key=api_key, _stats=probe_stats,
         )
+        if strict_cache and probe_stats.get('tb_unavailable'):
+            raise SearchUnavailable('TorBox cache check not answered')
         for r in results:
             r['cached'] = cache_map.get(r['info_hash'])
             r['cached_service'] = service

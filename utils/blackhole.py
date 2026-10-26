@@ -60,6 +60,32 @@ _HEARTBEAT_STALE_AFTER = 900
 
 # Retry configuration for failed torrent submissions
 RETRY_SCHEDULE = [300, 900, 3600]  # 5 min, 15 min, 1 hour
+# Backoff for parked drops (outage, not failure — never counted toward
+# MAX_RETRIES): escalates with consecutive parks, capped so a long outage
+# costs one retry an hour, never a give-up.
+PARK_SCHEDULE = [300, 900, 1800, 3600]
+
+# A re-dropped release that collides in failed/ is parked as
+# ``<name>_<int(time.time())>.ext`` — still the same drop.
+_COPY_SUFFIX_RE = re.compile(r'_\d{10}(?=\.(?:magnet|torrent)$)', re.IGNORECASE)
+
+
+def _drop_key(path):
+    """*path* with any copy suffix stripped: one key per drop per dir."""
+    return os.path.join(os.path.dirname(path),
+                        _COPY_SUFFIX_RE.sub('', os.path.basename(path)))
+
+
+# Drops (``_drop_key`` of the staged path) with an alt-release search thread
+# running or waiting for a slot.  Module-level so it survives a settings
+# reload — the new watcher's startup recovery must not sweep a file an old
+# watcher's thread still owns — and is empty after a real restart, when
+# every staged file is an orphan.
+_alt_inflight = set()
+_alt_inflight_lock = threading.Lock()
+# Searches running at once: everything parked through one outage wakes
+# together, and each search queries every indexer.
+_alt_search_slots = threading.BoundedSemaphore(2)
 MAX_RETRIES = 3
 
 # Max same-tier alternatives to probe against TorBox when recovering an
@@ -1248,7 +1274,7 @@ class RetryMeta:
                 data = json.load(f)
             if isinstance(data, dict):
                 return data
-        except (json.JSONDecodeError, IOError):
+        except (ValueError, OSError):   # incl. JSONDecodeError, UnicodeDecodeError
             pass
         return {}
 
@@ -1330,7 +1356,9 @@ class RetryMeta:
     def read(file_path):
         """Read retry count and last attempt time. Returns (retries, last_attempt)."""
         data = RetryMeta._load_raw(file_path)
-        return data.get('retries', 0), data.get('last_attempt', 0)
+        last = data.get('last_attempt', 0)
+        return (RetryMeta._int_field(data, 'retries'),
+                last if isinstance(last, (int, float)) and not isinstance(last, bool) else 0)
 
     @staticmethod
     def write(file_path, retries):
@@ -1341,6 +1369,8 @@ class RetryMeta:
         this, the first retry after tier_state is seeded would silently
         wipe the dwell timer and reset the state machine.
 
+        Drops ``parks``: a counted failure ends any outage backoff.
+
         A persistent I/O failure used to be a debug-level log; it's now
         a warning so operators see the cause if retry counts appear
         stuck at zero (a read-only sidecar dir would otherwise retry
@@ -1350,6 +1380,7 @@ class RetryMeta:
             data = RetryMeta._load_raw(file_path)
             data['retries'] = retries
             data['last_attempt'] = time.time()
+            data.pop('parks', None)
             if not RetryMeta._save_raw(file_path, data):
                 logger.warning(
                     f"[blackhole] Retry count for {file_path} may not be persisted; "
@@ -1404,6 +1435,40 @@ class RetryMeta:
     def is_alt_exhausted(file_path):
         """Return True if alt-release search has already been exhausted."""
         return bool(RetryMeta._load_raw(file_path).get('alt_exhausted', False))
+
+    @staticmethod
+    def still_retrying(file_path, within):
+        """True when the sidecar shows the drop still on the retry schedule
+        (not exhausted, under MAX_RETRIES) and attempted within *within*
+        seconds — a long-parked drop keeps its old arr-drop mtime."""
+        data = RetryMeta._load_raw(file_path)
+        last = data.get('last_attempt', 0)
+        return bool(data) and not data.get('alt_exhausted') \
+            and RetryMeta._int_field(data, 'retries') < MAX_RETRIES \
+            and isinstance(last, (int, float)) and time.time() - last < within
+
+    @staticmethod
+    def record_park(file_path):
+        """Refresh ``last_attempt`` and bump the park count, leaving
+        ``retries`` alone — a parked drop is waiting out an outage, it
+        didn't fail.  The count drives ``PARK_SCHEDULE``."""
+        with _retry_meta_lock:
+            data = RetryMeta._load_raw(file_path)
+            data['parks'] = RetryMeta._int_field(data, 'parks') + 1
+            data['last_attempt'] = time.time()
+            if not RetryMeta._save_raw(file_path, data):
+                logger.warning(f"[blackhole] Park of {file_path} may not be persisted")
+
+    @staticmethod
+    def parks(file_path):
+        """Consecutive parks since the last counted failure (0 if none)."""
+        return RetryMeta._int_field(RetryMeta._load_raw(file_path), 'parks')
+
+    @staticmethod
+    def _int_field(data, key):
+        v = data.get(key, 0)
+        return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
+
 
     # -- V2 tier-state helpers (plan 33) ----------------------------------
 
@@ -2942,6 +3007,15 @@ class BlackholeWatcher:
         and ``_create_symlinks``.
         """
         debrid = debrid or self.debrid_service
+        current = _watcher
+        if (self._stop_event.is_set() and current is not None and current is not self
+                and not current._stop_event.is_set()):
+            # Grabbed by a search that outlived this (stopped) watcher: its
+            # monitor would exit at once, and the new watcher resumed its
+            # pending monitors before this grab — hand it over.
+            current._start_monitor(torrent_id, filename, label=label, compromise=compromise,
+                                   debrid=debrid, file_scope=file_scope)
+            return
         with self._monitors_lock:
             if torrent_id in self._active_monitors:
                 logger.debug(f"[blackhole] Already monitoring torrent {torrent_id}")
@@ -3972,6 +4046,61 @@ class BlackholeWatcher:
         )
         return True
 
+    def _add_handlers(self):
+        return {
+            'realdebrid': self._add_to_realdebrid,
+            'alldebrid': self._add_to_alldebrid,
+            'torbox': self._add_to_torbox,
+        }
+
+    def _start_alt_search(self, file_path, filename, handler, label, debrid):
+        """Stage the drop in .alt_pending/ and start the alt-release search
+        thread.  False (drop left in place) when staging fails; None (drop
+        left in place, retry later) when a search for another copy of the
+        same drop is still running — both would grab, or share one staged
+        file — or no thread could be started."""
+        # Move file out of watch_dir BEFORE launching the thread
+        # to prevent the next scan cycle from picking it up again
+        staging_dir = self._alt_pending_dir(label)
+        os.makedirs(staging_dir, exist_ok=True)
+        staged_path = os.path.join(staging_dir, filename)
+        key = _drop_key(staged_path)
+        with _alt_inflight_lock:
+            if key in _alt_inflight:
+                logger.info(f"[blackhole] Alt-release search for {filename} "
+                            f"already running; retrying this copy later")
+                return None
+            _alt_inflight.add(key)
+        try:
+            os.rename(file_path, staged_path)
+            RetryMeta.carry(file_path, staged_path)
+        except OSError as e:
+            with _alt_inflight_lock:
+                _alt_inflight.discard(key)
+            logger.warning(
+                f"[blackhole] Could not stage {filename} for alt-retry: {e}. "
+                f"Skipping alt-retry to prevent duplicate submission."
+            )
+            return False
+        try:
+            threading.Thread(
+                target=self._try_alternative_release,
+                args=(filename, staged_path, handler, label, debrid),
+                daemon=True,
+                name=f'alt-retry-{filename[:30]}',
+            ).start()
+        except RuntimeError as e:   # can't start new thread
+            try:
+                os.rename(staged_path, file_path)
+                RetryMeta.carry(staged_path, file_path)
+            except OSError as move_err:
+                logger.warning(f"[blackhole] Could not unstage {filename}: {move_err}")
+            with _alt_inflight_lock:
+                _alt_inflight.discard(key)
+            logger.warning(f"[blackhole] Could not start alt-retry for {filename}: {e}")
+            return None   # resources, not the torrent: retry later, uncounted
+        return True
+
     def _try_alternative_release(self, filename, file_path, debrid_handler, label=None, debrid=None):
         """On debrid rejection, query Sonarr/Radarr for an alternative release.
 
@@ -3989,10 +4118,23 @@ class BlackholeWatcher:
         extraction and the symlink monitor use the matching schema/API.
         None defaults to the primary service (legacy callers).
         """
+        try:
+            with _alt_search_slots:
+                if self._stop_event.is_set():
+                    # Stopped (settings reload) while queued for a slot: a
+                    # grab here would get a monitor that exits at once —
+                    # leave the search to the new watcher.
+                    self._park_for_retry(file_path, filename, label)
+                    return
+                self._alt_search(filename, file_path, debrid_handler, label, debrid)
+        finally:
+            with _alt_inflight_lock:
+                _alt_inflight.discard(_drop_key(file_path))
+
+    def _alt_search(self, filename, file_path, debrid_handler, label, debrid):
+        """Body of ``_try_alternative_release`` (run under a search slot)."""
         alt_ok = False
         try:
-            from utils.arr_client import SonarrClient, RadarrClient
-
             name, season, is_tv = parse_release_name(filename)
             if not name:
                 logger.debug(f"[blackhole] Cannot parse release name for alt-retry: {filename}")
@@ -4012,12 +4154,13 @@ class BlackholeWatcher:
             not alt_ok and _rate_limit_remaining(debrid or self.debrid_service)
             > _RATE_LIMIT_MAX_INLINE_WAIT)
         if paused and os.path.exists(file_path):
-            # The provider paused mid-search (5xx / cooldown): the
-            # alternatives weren't rejected, so don't mark them exhausted
-            # or count the attempt — a plain failed/ entry retries the whole
-            # search later.
-            logger.info(f"[blackhole] Alt-release search for {filename} paused with "
-                        f"{debrid or self.debrid_service}; retrying from failed/ later")
+            # The provider paused mid-search (5xx / cooldown) or the arr
+            # didn't answer: the alternatives weren't rejected, so don't
+            # mark them exhausted or count the attempt — a plain failed/
+            # entry retries the whole search later.
+            logger.info(f"[blackhole] Alt-release search for {filename} paused "
+                        f"({debrid or self.debrid_service} or arr unavailable); "
+                        f"retrying from failed/ later")
             self._park_for_retry(file_path, filename, label)
         elif not alt_ok and os.path.exists(file_path):
             # No alternative worked — move to failed/ and mark alts exhausted
@@ -4043,6 +4186,7 @@ class BlackholeWatcher:
             except OSError as e:
                 RetryMeta.carry(dest, file_path)
                 logger.warning(f"[blackhole] Could not move {filename} to failed/: {e}")
+            self._retire_parked_copies(filename, label, exhausted=True)
 
             # Notify user — all alternatives exhausted, manual intervention needed
             if _notify:
@@ -4060,25 +4204,34 @@ class BlackholeWatcher:
                                    media_title=_mt)
 
     def _try_alt_episode(self, series_name, season, episodes, debrid_handler, orig_filename, orig_path, label=None, debrid=None):
-        """Try alternative releases for a TV episode via Sonarr."""
-        from utils.arr_client import SonarrClient
+        """Try alternative releases for a TV episode via Sonarr.
+
+        Returns None (retry later) when Sonarr doesn't answer — an outage
+        is no verdict on the alternatives."""
+        from utils.arr_client import SonarrClient, ArrUnavailable
 
         client = SonarrClient()
         if not client.configured:
             return False
 
-        series = client.find_series_in_library(title=series_name)
-        if not series:
-            logger.debug(f"[blackhole] Cannot find series '{series_name}' in Sonarr")
-            return False
-
         ep_num = min(episodes)  # primary episode number
-        episode_id = client.get_episode_id(series_name, season, ep_num)
-        if not episode_id:
-            logger.debug(f"[blackhole] Could not find {series_name} S{season:02d}E{ep_num:02d} in Sonarr")
-            return False
+        try:
+            series = client.find_series_in_library(title=series_name, strict=True)
+            if not series:
+                logger.debug(f"[blackhole] Cannot find series '{series_name}' in Sonarr")
+                return False
 
-        releases = client.get_episode_releases(episode_id)
+            episode_id = client.get_episode_id(series_name, season, ep_num, strict=True,
+                                                series=series)
+            if not episode_id:
+                logger.debug(f"[blackhole] Could not find {series_name} S{season:02d}E{ep_num:02d} in Sonarr")
+                return False
+
+            releases = client.get_episode_releases(episode_id, strict=True)
+        except ArrUnavailable as e:
+            logger.info(f"[blackhole] Alt-release search for {orig_filename} "
+                        f"interrupted: {e}; retrying later")
+            return None
         if not releases:
             logger.debug(f"[blackhole] No alternative releases found for {series_name} S{season:02d}E{ep_num:02d}")
             # Empty arr-alt list is the strongest signal that the
@@ -4101,19 +4254,27 @@ class BlackholeWatcher:
         )
 
     def _try_alt_movie(self, movie_name, debrid_handler, orig_filename, orig_path, label=None, debrid=None):
-        """Try alternative releases for a movie via Radarr."""
-        from utils.arr_client import RadarrClient
+        """Try alternative releases for a movie via Radarr.
+
+        Returns None (retry later) when Radarr doesn't answer — an outage
+        is no verdict on the alternatives."""
+        from utils.arr_client import RadarrClient, ArrUnavailable
 
         client = RadarrClient()
         if not client.configured:
             return False
 
-        movie = client.find_movie_in_library(title=movie_name)
-        if not movie:
-            logger.debug(f"[blackhole] Could not find '{movie_name}' in Radarr")
-            return False
+        try:
+            movie = client.find_movie_in_library(title=movie_name, strict=True)
+            if not movie:
+                logger.debug(f"[blackhole] Could not find '{movie_name}' in Radarr")
+                return False
 
-        releases = client.get_movie_releases(movie['id'])
+            releases = client.get_movie_releases(movie['id'], strict=True)
+        except ArrUnavailable as e:
+            logger.info(f"[blackhole] Alt-release search for {orig_filename} "
+                        f"interrupted: {e}; retrying later")
+            return None
         if not releases:
             logger.debug(f"[blackhole] No alternative releases found for '{movie_name}'")
             releases = []
@@ -4156,6 +4317,42 @@ class BlackholeWatcher:
             pass
         return True
 
+    def _retire_parked_copies(self, filename, label, exhausted=False):
+        """Settle the other copies of *filename* waiting in failed/ (an arr
+        re-drop parks as ``<name>_<ts>.ext`` beside the original) once one
+        copy's alt search finished: removed after a grab (retried, each
+        would grab another), marked exhausted when it found nothing (each
+        would repeat the same search and notification)."""
+        canonical = _COPY_SUFFIX_RE.sub('', filename)
+        error_dir = self._failed_dir(label)
+        try:
+            entries = os.listdir(error_dir)
+        except OSError:
+            return
+        for entry in entries:
+            if entry.endswith('.meta') or _COPY_SUFFIX_RE.sub('', entry) != canonical:
+                continue
+            path = os.path.join(error_dir, entry)
+            # Under the sidecar lock: _retry_failed moves file + sidecar
+            # under it too, so a copy can't leave between the check and the
+            # write (which would orphan an exhausted sidecar in failed/ for
+            # the next drop of that name to inherit).
+            with _retry_meta_lock:
+                if not os.path.isfile(path):
+                    continue
+                if exhausted:
+                    if not RetryMeta.is_alt_exhausted(path):
+                        RetryMeta.mark_alt_exhausted(path)
+                    continue
+                try:
+                    os.remove(path)
+                except OSError as e:
+                    logger.warning(f"[blackhole] Could not retire parked copy {entry}: {e}")
+                    continue
+                RetryMeta.remove(path)
+            logger.info(f"[blackhole] Retired parked copy {entry}: an alternative "
+                        f"for {canonical} was grabbed")
+
     def _park_for_retry(self, file_path, filename, label):
         """Move a drop to failed/ for a later retry WITHOUT counting it
         toward MAX_RETRIES (the failure said nothing about the torrent).
@@ -4174,8 +4371,7 @@ class BlackholeWatcher:
             base, fext = os.path.splitext(filename)
             dest = os.path.join(error_dir, f"{base}_{int(time.time())}{fext}")
         RetryMeta.carry(file_path, dest)
-        retries, _ = RetryMeta.read(dest)
-        RetryMeta.write(dest, retries)          # refresh last_attempt only
+        RetryMeta.record_park(dest)
         try:
             os.rename(file_path, dest)
         except OSError as e:
@@ -4819,11 +5015,15 @@ class BlackholeWatcher:
 
         Returns True iff a compromise candidate was successfully
         submitted to the debrid service (and, if symlink mode is on, a
-        monitor started).  Never raises — any unexpected failure falls
-        through to the caller's existing ``failed/`` path.
+        monitor started); None when the arr or Torrentio didn't answer
+        (retry later — no verdict on the candidates).  Never raises — any
+        unexpected failure falls through to the caller's existing
+        ``failed/`` path.
         """
         if not self._compromise_enabled():
             return False
+        from utils.arr_client import ArrUnavailable
+        from utils.search import SearchUnavailable
         try:
             from utils.quality_compromise import (
                 should_compromise, find_compromise_candidate,
@@ -4912,6 +5112,7 @@ class BlackholeWatcher:
                     min_seeders=min_seeders,
                     only_cached=only_cached,
                     min_ratio=min_ratio,
+                    strict=True,
                 )
                 if pack:
                     logger.info(f"[blackhole] Compromise: season-pack candidate "
@@ -4956,7 +5157,7 @@ class BlackholeWatcher:
             candidate = find_compromise_candidate(
                 arr_client=arr_client, imdb_id=imdb_id,
                 tier_label=next_tier, min_seeders=min_seeders,
-                only_cached=only_cached, context=context,
+                only_cached=only_cached, context=context, strict=True,
             )
             if not candidate:
                 logger.info(f"[blackhole] Compromise: no cached {next_tier} "
@@ -4983,6 +5184,10 @@ class BlackholeWatcher:
                     'reason': reason,
                 },
             )
+        except (ArrUnavailable, SearchUnavailable) as e:
+            logger.info(f"[blackhole] Compromise evaluation for {orig_filename} "
+                        f"interrupted: {e}; retrying later")
+            return None
         except Exception as e:
             logger.warning(f"[blackhole] Compromise evaluation failed for "
                            f"{orig_filename}: {e}")
@@ -4998,8 +5203,8 @@ class BlackholeWatcher:
         loop — factored separately because the compromise path needs to
         record distinct pending/history/notification lineage and tier
         state on success.  Returns True iff the debrid service accepted
-        the magnet; on False the caller falls through to the existing
-        ``failed/`` path.
+        the magnet; None when the debrid was unavailable (retry later); on
+        False the caller falls through to the existing ``failed/`` path.
         """
         import tempfile
 
@@ -5043,6 +5248,7 @@ class BlackholeWatcher:
             os.remove(orig_path)
         except OSError as e:
             logger.warning(f"[blackhole] Could not remove original after compromise: {e}")
+        self._retire_parked_copies(orig_filename, label)
 
         # Advance tier state BEFORE starting the monitor so a crash between
         # submit and monitor does not leave the item stuck at the old tier.
@@ -5155,6 +5361,12 @@ class BlackholeWatcher:
                     except OSError as e:
                         logger.warning(f"[blackhole] Could not remove original after alt-retry: {e}")
                     RetryMeta.remove(orig_path)  # carried in at staging; nothing left to retry
+                    self._retire_parked_copies(orig_filename, label)
+                    try:
+                        from utils.search import remember_added_hash
+                        remember_added_hash(debrid or self.debrid_service, info_hash)
+                    except ImportError:
+                        pass
                     # Start symlink monitoring
                     if self.symlink_enabled:
                         torrent_id = self._extract_torrent_id(result, debrid=debrid)
@@ -5551,11 +5763,7 @@ class BlackholeWatcher:
                             pass
                         return
 
-        dispatch = {
-            'realdebrid': self._add_to_realdebrid,
-            'alldebrid': self._add_to_alldebrid,
-            'torbox': self._add_to_torbox,
-        }
+        dispatch = self._add_handlers()
 
         handler = dispatch.get(debrid)
         if not handler:
@@ -5653,28 +5861,16 @@ class BlackholeWatcher:
                 # in a background thread to avoid blocking the scan loop.
                 # Skip if alts were already exhausted in a prior attempt.
                 if self._is_debrid_rejection(result) and not self._alt_exhausted(file_path):
-                    # Move file out of watch_dir BEFORE launching the thread
-                    # to prevent the next scan cycle from picking it up again
-                    staging_dir = self._alt_pending_dir(label)
-                    os.makedirs(staging_dir, exist_ok=True)
-                    staged_path = os.path.join(staging_dir, filename)
-                    try:
-                        os.rename(file_path, staged_path)
-                        RetryMeta.carry(file_path, staged_path)
-                    except OSError as e:
-                        logger.warning(
-                            f"[blackhole] Could not stage {filename} for alt-retry: {e}. "
-                            f"Skipping alt-retry to prevent duplicate submission."
-                        )
-                        # Fall through to normal failed/ path below
-                    else:
-                        threading.Thread(
-                            target=self._try_alternative_release,
-                            args=(filename, staged_path, handler, label, debrid),
-                            daemon=True,
-                            name=f'alt-retry-{filename[:30]}',
-                        ).start()
+                    started = self._start_alt_search(file_path, filename, handler, label, debrid)
+                    if started:
                         return  # Alt-retry thread handles cleanup
+                    if started is None:
+                        # A search for this drop is running (or no thread
+                        # could start): retry this copy later, uncounted —
+                        # left in the watch dir it'd be re-added every scan.
+                        self._park_for_retry(file_path, filename, label)
+                        return
+                    # Fall through to normal failed/ path below
 
                 error_dir = self._failed_dir(label)
                 os.makedirs(error_dir, exist_ok=True)
@@ -5747,12 +5943,24 @@ class BlackholeWatcher:
             if self._alt_exhausted(file_path):
                 continue
 
-            # Determine backoff delay for this retry
+            # Determine backoff delay for this retry; repeated parks back
+            # off on their own schedule
             delay_idx = min(retries, len(RETRY_SCHEDULE) - 1)
             delay = RETRY_SCHEDULE[delay_idx]
+            parks = RetryMeta.parks(file_path)
+            if parks:
+                delay = max(delay, PARK_SCHEDULE[min(parks - 1, len(PARK_SCHEDULE) - 1)])
 
             if time.time() - last_attempt < delay:
                 continue
+
+            # Another copy of this drop is being searched: retrying this one
+            # would only park it again, and left in failed/ the finishing
+            # search settles it (_retire_parked_copies).
+            with _alt_inflight_lock:
+                if _drop_key(os.path.join(self._alt_pending_dir(label), filename)) \
+                        in _alt_inflight:
+                    continue
 
             logger.info(f"[blackhole] Retrying failed file: {filename} (attempt {retries + 1}/{MAX_RETRIES})"
                         f"{f' [label={label}]' if label else ''}")
@@ -5778,13 +5986,14 @@ class BlackholeWatcher:
                     f"[blackhole] Skipping retry of {filename}: a newer file is already at {retry_path}"
                 )
                 continue
-            try:
-                os.rename(file_path, retry_path)
-            except OSError as e:
-                logger.error(f"[blackhole] Failed to move {filename} for retry: {e}")
-            else:
-                # Keep the count: the next failure carries it back to failed/.
-                RetryMeta.carry(file_path, retry_path)
+            with _retry_meta_lock:   # pairs with _retire_parked_copies
+                try:
+                    os.rename(file_path, retry_path)
+                except OSError as e:
+                    logger.error(f"[blackhole] Failed to move {filename} for retry: {e}")
+                else:
+                    # Keep the count: the next failure carries it back to failed/.
+                    RetryMeta.carry(file_path, retry_path)
 
     def _scan(self):
         """Scan watch directory for new files.
@@ -5900,6 +6109,9 @@ class BlackholeWatcher:
         for label, src, filename in stranded:
             if filename.endswith('.meta'):
                 continue  # a payload's retry sidecar — carried with it below
+            with _alt_inflight_lock:
+                if _drop_key(src) in _alt_inflight:
+                    continue  # a search thread from before a settings reload owns it
             # Strip the ``.rescue-<uuid8>-`` prefix the rescue path adds
             # before staging (plan 41 phase A).  Without this restore,
             # Sonarr/Radarr's blackhole-import would not recognise the
@@ -5918,18 +6130,16 @@ class BlackholeWatcher:
                 RetryMeta.carry(src, dest)
                 is_rescue_orphan = recovered_filename != filename
                 if not is_rescue_orphan:
-                    # Alt-release staging: the original hash is debrid-blocked
-                    # and the alt search was interrupted — mark alt_exhausted
-                    # via the centralised helper so tier_state on the
-                    # recovered sidecar is preserved.
+                    # Alt-release staging: the search was interrupted, which
+                    # is no verdict on the alternatives — park it (uncounted)
+                    # so the retry runs the add (and any cross-debrid
+                    # rescue) and the search again.
                     #
-                    # Rescue-staged orphans (``.rescue-`` prefix) must NOT be
-                    # marked: they were staged by the add-time cross-rescue,
-                    # which never ran an alt-release search — flagging them
-                    # exhausted makes _retry_failed skip the file forever.
-                    # Leaving the sidecar alone lets the normal retry
-                    # schedule re-submit (and re-rescue) the release.
-                    RetryMeta.mark_alt_exhausted(dest)
+                    # Rescue-staged orphans (``.rescue-`` prefix) are left
+                    # alone: the add-time cross-rescue never ran an
+                    # alt-release search, and the normal retry schedule
+                    # re-submits (and re-rescues) the release.
+                    RetryMeta.record_park(dest)
                 tag = f" [label={label}]" if label else ""
                 origin = " [rescue-orphan]" if is_rescue_orphan else ""
                 logger.warning(f"[blackhole] Recovered stranded alt-pending file: {recovered_filename}{origin}{tag}")

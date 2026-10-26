@@ -1270,7 +1270,7 @@ class TestTorboxAddPauses:
         import utils.arr_client as ac
         fake = type('R', (), {'configured': True,
                               'find_movie_in_library': lambda self, **k: {'id': 1},
-                              'get_movie_releases': lambda self, mid: rels})()
+                              'get_movie_releases': lambda self, mid, **k: rels})()
         monkeypatch.setattr(ac, 'RadarrClient', lambda: fake)
         staged = self._magnet(tmp_dir, 'Movie.2026.1080p.WEB.x264-GRP.magnet')
         handler = lambda path, **k: (False, 'temporary failure: Real-Debrid HTTP 503')
@@ -1279,6 +1279,333 @@ class TestTorboxAddPauses:
         assert os.path.exists(dest) and not compromise
         assert RetryMeta.is_alt_exhausted(dest) is False
         assert RetryMeta.read(dest)[0] == 0
+
+    def _arr_alt_search(self, tmp_dir, monkeypatch, filename, down=None):
+        """Run the alt-release search against fake arrs where the call named
+        *down* raises ArrUnavailable (None: every call answers, nothing
+        found).  Returns (failed/ dest, compromise calls, notifications)."""
+        import utils.arr_client as ac
+        import utils.blackhole as bh
+        w = BlackholeWatcher(os.path.join(tmp_dir, 'watch'), 'rdkey', 'realdebrid',
+                             completed_dir=os.path.join(tmp_dir, 'completed'))
+        compromise, notes = [], []
+        monkeypatch.setattr(w, '_seed_tier_state', lambda *a, **k: None)
+        monkeypatch.setattr(w, '_try_compromise', lambda *a, **k: compromise.append(1) or False)
+        monkeypatch.setattr(bh, '_notify', lambda *a, **k: notes.append(a))
+
+        def call(name, found):
+            def fn(self, *a, **k):
+                if name == down:
+                    assert k.get('strict') is True, f'{name} must be strict'
+                    raise ac.ArrUnavailable(name)
+                return found
+            return fn
+
+        fake = lambda **calls: type('Arr', (), {'configured': True, **{
+            n: call(n, v) for n, v in calls.items()}})()
+        monkeypatch.setattr(ac, 'SonarrClient', lambda: fake(
+            find_series_in_library={'id': 1}, get_episode_id=7, get_episode_releases=[]))
+        monkeypatch.setattr(ac, 'RadarrClient', lambda: fake(
+            find_movie_in_library={'id': 1}, get_movie_releases=[]))
+        staged = self._magnet(tmp_dir, filename)
+        w._try_alternative_release(filename, staged, lambda *a, **k: (False, 'rejected'),
+                                   debrid='realdebrid')
+        return os.path.join(tmp_dir, 'watch', 'failed', filename), compromise, notes
+
+    @pytest.mark.parametrize('filename,down', [
+        ('Show.S01E02.1080p.WEB.x264-GRP.magnet', 'find_series_in_library'),
+        ('Show.S01E02.1080p.WEB.x264-GRP.magnet', 'get_episode_id'),
+        ('Show.S01E02.1080p.WEB.x264-GRP.magnet', 'get_episode_releases'),
+        ('Movie.2026.1080p.WEB.x264-GRP.magnet', 'find_movie_in_library'),
+        ('Movie.2026.1080p.WEB.x264-GRP.magnet', 'get_movie_releases'),
+    ])
+    def test_unreachable_arr_in_alt_search_parks_instead_of_exhausting(
+            self, tmp_dir, monkeypatch, filename, down):
+        """Sonarr/Radarr not answering during the alt-release search is no
+        verdict on the alternatives: park for a later retry, uncounted, no
+        compromise, no "All Alternatives Failed" notification."""
+        from utils.blackhole import RetryMeta
+        dest, compromise, notes = self._arr_alt_search(tmp_dir, monkeypatch, filename, down)
+        assert os.path.exists(dest)
+        assert RetryMeta.is_alt_exhausted(dest) is False
+        assert RetryMeta.read(dest)[0] == 0
+        assert RetryMeta.parks(dest) == 1
+        assert not compromise and not notes
+
+    @pytest.fixture
+    def held_search(self, monkeypatch):
+        """held_search(w): *w*'s alt searches block until the returned
+        release event is set; teardown releases and joins them so no test
+        leaves a search slot taken."""
+        import threading
+        release = threading.Event()
+        before = set(threading.enumerate())
+
+        def hold(w):
+            running = threading.Event()
+
+            def held(*a, **k):
+                running.set()
+                release.wait(5)
+            monkeypatch.setattr(w, '_alt_search', held)
+            return release, running
+        yield hold
+        release.set()
+        for t in set(threading.enumerate()) - before:
+            if t.name.startswith('alt-retry-'):
+                t.join(5)
+
+    def test_settings_reload_recovery_leaves_running_search_alone(self, tmp_dir, held_search):
+        """A settings reload starts a new watcher whose startup recovery
+        sweeps .alt_pending/ — a search still running in the old watcher's
+        thread must keep its file (else it's retried and grabbed twice)."""
+        w = self._watcher(tmp_dir, 'realdebrid')
+        release, running = held_search(w)
+        path = self._magnet(tmp_dir)
+        assert w._start_alt_search(path, os.path.basename(path), None, None, 'realdebrid')
+        assert running.wait(5)
+        staged = os.path.join(tmp_dir, 'watch', '.alt_pending', os.path.basename(path))
+
+        self._watcher(tmp_dir, 'realdebrid')._recover_alt_pending()
+        assert os.path.exists(staged)
+        assert not os.path.exists(os.path.join(tmp_dir, 'watch', 'failed'))
+
+    @pytest.mark.parametrize('copy_name', [
+        'Movie.2026.1080p.WEB.x264-GRP.magnet',
+        'Movie.2026.1080p.WEB.x264-GRP_1761400999.magnet',   # a parked copy, retried
+    ])
+    def test_second_copy_parks_while_its_search_runs(self, tmp_dir, held_search, copy_name):
+        """Another copy of a drop whose alt search is running must not
+        search too (both would grab) or be staged over it (one shared
+        file and sidecar); it's left for the caller to park."""
+        w = self._watcher(tmp_dir, 'realdebrid')
+        release, running = held_search(w)
+        path = self._magnet(tmp_dir)
+        assert w._start_alt_search(path, os.path.basename(path), None, None, 'realdebrid')
+        assert running.wait(5)
+        again = self._magnet(tmp_dir, copy_name)
+        assert w._start_alt_search(again, copy_name, None, None, 'realdebrid') is None
+        assert os.path.exists(again)
+
+    def test_finished_search_frees_its_slot_for_the_next_copy(self, tmp_dir, held_search):
+        import threading
+        w = self._watcher(tmp_dir, 'realdebrid')
+        release, running = held_search(w)
+        path = self._magnet(tmp_dir)
+        assert w._start_alt_search(path, os.path.basename(path), None, None, 'realdebrid')
+        assert running.wait(5)
+        release.set()
+        for t in threading.enumerate():
+            if t.name.startswith('alt-retry-'):
+                t.join(5)
+        again = self._magnet(tmp_dir)
+        assert w._start_alt_search(again, os.path.basename(again), None, None, 'realdebrid')
+
+    def test_thread_start_failure_unstages_the_drop(self, tmp_dir, monkeypatch):
+        # Out of threads says nothing about the torrent: None → the caller
+        # parks it (uncounted) rather than spending a retry.
+        import threading
+        w = self._watcher(tmp_dir, 'realdebrid')
+        path = self._magnet(tmp_dir)
+        RetryMeta.record_park(path)
+
+        def boom(self):
+            raise RuntimeError("can't start new thread")
+        monkeypatch.setattr(threading.Thread, 'start', boom)
+        assert w._start_alt_search(path, os.path.basename(path), None, None,
+                                   'realdebrid') is None
+        assert os.path.exists(path) and RetryMeta.parks(path) == 1
+        assert not os.listdir(os.path.join(tmp_dir, 'watch', '.alt_pending'))
+        monkeypatch.undo()
+        monkeypatch.setattr(w, '_alt_search', lambda *a, **k: None)
+        assert w._start_alt_search(path, os.path.basename(path), None, None, 'realdebrid')
+
+    def test_copy_stays_parked_while_its_drop_is_searched(self, tmp_dir):
+        """A parked copy isn't woken while another copy's search runs (it
+        would only park again) — kept in failed/, the finishing search
+        settles it instead of it slipping past from the watch dir."""
+        import utils.blackhole as bh
+        w = self._watcher(tmp_dir, 'realdebrid')
+        failed = os.path.join(tmp_dir, 'watch', 'failed')
+        os.makedirs(failed)
+        copy = os.path.join(failed, 'Movie.2026.1080p.WEB.x264-GRP_1761400999.magnet')
+        with open(copy, 'w') as f:
+            f.write('magnet:?xt=urn:btih:' + 'a' * 40)
+        RetryMeta.write(copy, 0)
+        data = RetryMeta._load_raw(copy)
+        data['last_attempt'] = time.time() - 3600
+        RetryMeta._save_raw(copy, data)
+        key = bh._drop_key(os.path.join(tmp_dir, 'watch', '.alt_pending',
+                                        'Movie.2026.1080p.WEB.x264-GRP.magnet'))
+        bh._alt_inflight.add(key)
+        try:
+            w._retry_failed()
+            assert os.path.exists(copy)
+        finally:
+            bh._alt_inflight.discard(key)
+        w._retry_failed()
+        assert not os.path.exists(copy)
+
+    def test_grab_by_stopped_watcher_is_monitored_by_the_new_one(self, tmp_dir, monkeypatch):
+        """A search already running when a settings reload stopped its
+        watcher grabs after the new watcher resumed its monitors: the
+        monitor goes to the new watcher (the old one's exits at once)."""
+        import utils.blackhole as bh
+        old = self._watcher(tmp_dir, 'realdebrid')
+        new = self._watcher(tmp_dir, 'realdebrid')
+        started = []
+        monkeypatch.setattr(new, '_start_monitor',
+                            lambda *a, **k: started.append((a, k)))
+        monkeypatch.setattr(bh, '_watcher', new)
+        old._stop_event.set()
+        old._start_monitor('tid1', 'Movie.magnet', label='radarr', debrid='realdebrid')
+        assert started == [(('tid1', 'Movie.magnet'),
+                            {'label': 'radarr', 'compromise': None,
+                             'debrid': 'realdebrid', 'file_scope': None})]
+        assert 'tid1' not in old._active_monitors
+
+    def test_search_after_watcher_stopped_parks_for_the_new_watcher(self, tmp_dir, monkeypatch):
+        """A search queued for a slot when a settings reload stopped its
+        watcher must not run on the old watcher (its symlink monitor would
+        exit at once): park it for the new watcher instead."""
+        w = self._watcher(tmp_dir, 'realdebrid')
+        ran = []
+        monkeypatch.setattr(w, '_alt_search', lambda *a, **k: ran.append(1))
+        staged = self._magnet(tmp_dir)
+        w._stop_event.set()
+        w._try_alternative_release(os.path.basename(staged), staged, None, debrid='realdebrid')
+        dest = os.path.join(tmp_dir, 'watch', 'failed', os.path.basename(staged))
+        assert not ran and os.path.exists(dest)
+        assert RetryMeta.read(dest)[0] == 0 and RetryMeta.parks(dest) == 1
+
+    def test_exhausted_search_exhausts_parked_copies(self, tmp_dir, monkeypatch):
+        """A copy parked while the search ran mustn't repeat the same
+        search (and notification) once it's exhausted."""
+        name = 'Movie.2026.1080p.WEB.x264-GRP.magnet'
+        failed = os.path.join(tmp_dir, 'watch', 'failed')
+        os.makedirs(failed)
+        parked = os.path.join(failed, name)
+        with open(parked, 'w') as f:
+            f.write('magnet:?xt=urn:btih:' + 'a' * 40)
+        RetryMeta.record_park(parked)
+        dest, _, notes = self._arr_alt_search(tmp_dir, monkeypatch,
+                                              'Movie.2026.1080p.WEB.x264-GRP_1761400999.magnet')
+        assert RetryMeta.is_alt_exhausted(dest) is True
+        assert RetryMeta.is_alt_exhausted(parked) is True
+        assert len(notes) == 1
+
+    def test_rejection_with_search_running_parks_the_copy(self, tmp_dir, monkeypatch):
+        w = BlackholeWatcher(os.path.join(tmp_dir, 'watch'), 'rdkey', 'realdebrid',
+                             completed_dir=os.path.join(tmp_dir, 'completed'))
+        monkeypatch.setattr(w, '_route_grab', lambda h: 'realdebrid')
+        monkeypatch.setattr(w, '_add_to_realdebrid', lambda *a, **k: (
+            False, '{"error": "infringing_file", "error_code": 35}'))
+        monkeypatch.setattr(w, '_attempt_add_time_rescue', lambda *a, **k: False)
+        monkeypatch.setattr(w, '_start_alt_search', lambda *a, **k: None)
+        path = self._magnet(tmp_dir)
+        w._process_file(path)
+        dest = os.path.join(tmp_dir, 'watch', 'failed', os.path.basename(path))
+        assert os.path.exists(dest)
+        assert RetryMeta.read(dest)[0] == 0 and RetryMeta.parks(dest) == 1
+
+    def test_alt_searches_run_at_most_two_at_a_time(self, tmp_dir, monkeypatch):
+        """Everything parked through one outage wakes together; their
+        indexer searches must not all run at once."""
+        import threading
+        w = self._watcher(tmp_dir, 'realdebrid')
+        lock, live, peak = threading.Lock(), [0], [0]
+        release = threading.Event()
+
+        def search(*a, **k):
+            with lock:
+                live[0] += 1
+                peak[0] = max(peak[0], live[0])
+            time.sleep(0.3)
+            with lock:
+                live[0] -= 1
+        monkeypatch.setattr(w, '_alt_search', search)
+        threads = [threading.Thread(target=w._try_alternative_release,
+                                    args=(f'f{i}.magnet', f'/nowhere/f{i}.magnet', None))
+                   for i in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        assert 1 <= peak[0] <= 2
+
+    def test_alt_grab_retires_parked_copies_of_the_same_drop(self, tmp_dir, monkeypatch):
+        """The arr re-drops a release whose first copy is parked (outage):
+        once one copy's alt search grabs an alternative, the parked copies
+        must not grab another."""
+        w = BlackholeWatcher(os.path.join(tmp_dir, 'watch'), 'rdkey', 'realdebrid',
+                             completed_dir=os.path.join(tmp_dir, 'completed'))
+        name = 'Show.S01E02.1080p.WEB.x264-GRP.magnet'
+        failed = os.path.join(tmp_dir, 'watch', 'failed')
+        os.makedirs(failed)
+        parked = [os.path.join(failed, name),
+                  os.path.join(failed, 'Show.S01E02.1080p.WEB.x264-GRP_1761400000.magnet')]
+        other = os.path.join(failed, 'Show.S01E03.1080p.WEB.x264-GRP.magnet')
+        for p in parked + [other]:
+            with open(p, 'w') as f:
+                f.write('magnet:?xt=urn:btih:' + 'a' * 40)
+            RetryMeta.record_park(p)
+        # the re-dropped copy, retried with its timestamped name
+        staged = self._magnet(tmp_dir, 'Show.S01E02.1080p.WEB.x264-GRP_1761400999.magnet')
+        rels = [{'guid': 'magnet:?xt=urn:btih:' + 'b' * 40, 'title': 'Alt b'}]
+        assert w._try_releases(rels, lambda *a, **k: (True, '{"id": "1"}'),
+                               os.path.basename(staged), staged, debrid='realdebrid')
+        assert not any(os.path.exists(p) or os.path.exists(p + '.meta') for p in parked)
+        assert os.path.exists(other) and os.path.exists(other + '.meta')
+
+    def test_park_backoff_escalates_and_caps(self, tmp_dir):
+        from utils.blackhole import PARK_SCHEDULE
+        w = self._watcher(tmp_dir)
+        path = self._magnet(tmp_dir)
+        failed = os.path.join(tmp_dir, 'watch', 'failed')
+        os.makedirs(failed)
+        dest = os.path.join(failed, os.path.basename(path))
+        os.rename(path, dest)
+
+        # due_after: give the parked file *parks* parks and a last attempt
+        # *age* seconds ago, run one retry pass, report whether it was
+        # retried (and move it back to failed/ for the next probe).
+        def due_after(parks, age):
+            for _ in range(parks - RetryMeta.parks(dest)):
+                RetryMeta.record_park(dest)
+            data = RetryMeta._load_raw(dest)
+            data['last_attempt'] = time.time() - age
+            RetryMeta._save_raw(dest, data)
+            w._retry_failed()
+            moved = not os.path.exists(dest)
+            if moved:   # put it back for the next probe
+                os.rename(os.path.join(tmp_dir, 'watch', os.path.basename(dest)), dest)
+                RetryMeta.carry(os.path.join(tmp_dir, 'watch', os.path.basename(dest)), dest)
+            return moved
+
+        assert due_after(1, RETRY_SCHEDULE[0] + 5)            # first park: unchanged 5 min
+        assert not due_after(3, RETRY_SCHEDULE[0] + 5)        # repeated parks back off
+        assert due_after(3, PARK_SCHEDULE[2] + 5)
+        assert not due_after(50, PARK_SCHEDULE[-1] - 5)       # capped, never longer
+        assert due_after(50, PARK_SCHEDULE[-1] + 5)
+        assert RetryMeta.read(dest)[0] == 0                   # parks never count
+
+    def test_counted_failure_after_outage_uses_normal_backoff(self, tmp_dir):
+        # The outage's park backoff must not leak into a real failure.
+        path = self._magnet(tmp_dir)
+        for _ in range(5):
+            RetryMeta.record_park(path)
+        RetryMeta.write(path, 1)
+        assert RetryMeta.parks(path) == 0
+
+    @pytest.mark.parametrize('filename', ['Show.S01E02.1080p.WEB.x264-GRP.magnet',
+                                          'Movie.2026.1080p.WEB.x264-GRP.magnet'])
+    def test_arr_answering_with_no_alternatives_still_exhausts(self, tmp_dir, monkeypatch,
+                                                               filename):
+        from utils.blackhole import RetryMeta
+        dest, compromise, notes = self._arr_alt_search(tmp_dir, monkeypatch, filename)
+        assert os.path.exists(dest)
+        assert RetryMeta.is_alt_exhausted(dest) is True
+        assert compromise and notes
 
     def test_paused_alt_search_retries_instead_of_marking_exhausted(self, tmp_dir, monkeypatch):
         from utils.blackhole import RetryMeta
@@ -4361,12 +4688,11 @@ class TestAltPendingRecoveryPreservesLabel:
         assert not os.path.exists(stranded)
         recovered = os.path.join(watch, 'failed', 'sonarr', 'stranded.torrent')
         assert os.path.exists(recovered)
-        # alt_exhausted marked so retry doesn't loop through alts again
-        meta = recovered + '.meta'
-        assert os.path.exists(meta)
-        with open(meta) as f:
-            data = json.load(f)
-        assert data.get('alt_exhausted') is True
+        # An interrupted search is no verdict: parked (uncounted) so the
+        # search runs again, never marked exhausted.
+        assert RetryMeta.is_alt_exhausted(recovered) is False
+        assert RetryMeta.parks(recovered) == 1
+        assert RetryMeta.read(recovered)[0] == 0
 
     def test_alt_pending_flat_recovery(self, tmp_dir):
         """Legacy flat .alt_pending/ layout must still be recovered."""
@@ -5014,10 +5340,11 @@ class TestRescueOrphanRecovery:
             f"{os.listdir(os.path.join(watch_dir, 'failed'))}"
 
     def test_recover_alt_pending_rescue_orphan_not_alt_exhausted(self, tmp_dir):
-        """A rescue orphan never ran an alt-release search, so it must NOT
-        be marked alt_exhausted on recovery — that flag makes _retry_failed
-        skip the file forever (permanent dead-end). Alt-release orphans
-        (no prefix) keep the exhausted marker."""
+        """Neither orphan may be marked alt_exhausted on recovery — that
+        flag makes _retry_failed skip the file forever (permanent
+        dead-end).  A rescue orphan never ran an alt-release search; an
+        alt-release orphan's search was interrupted, which is no verdict
+        on the alternatives either."""
         from utils.blackhole import RetryMeta
         watch_dir = os.path.join(tmp_dir, 'watch')
         alt_pending = os.path.join(watch_dir, '.alt_pending')
@@ -5040,8 +5367,8 @@ class TestRescueOrphanRecovery:
         assert os.path.isfile(recovered_legacy)
         assert not RetryMeta.is_alt_exhausted(recovered_rescue), \
             "rescue orphan wrongly marked alt_exhausted — _retry_failed would skip it forever"
-        assert RetryMeta.is_alt_exhausted(recovered_legacy), \
-            "alt-release orphan lost its alt_exhausted marker"
+        assert not RetryMeta.is_alt_exhausted(recovered_legacy), \
+            "interrupted alt-release orphan marked exhausted — never retried"
 
 
 class TestAltReleaseProviderBinding:

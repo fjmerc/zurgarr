@@ -1,5 +1,6 @@
 """Tests for the Arr API client module (utils/arr_client.py)."""
 
+import http.client
 import json
 import os
 import urllib.error
@@ -7,7 +8,7 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 from utils.arr_client import (
-    SonarrClient, RadarrClient, OverseerrClient,
+    SonarrClient, RadarrClient, OverseerrClient, ArrUnavailable,
     get_download_service, get_configured_services,
     _NOT_FOUND,
     _force_grab_eligible, _force_grab_sort_key, _release_identifier,
@@ -2358,6 +2359,120 @@ class TestProfileIdLookups:
     def test_get_profile_id_rejects_non_positive(self, mock_urlopen, radarr):
         mock_urlopen.return_value = _mock_urlopen({'id': 12, 'qualityProfileId': 0})
         assert radarr.get_profile_id_for_movie(12) is None
+
+
+# ---------------------------------------------------------------------------
+# strict=True — "arr didn't answer" must not look like "nothing found"
+# ---------------------------------------------------------------------------
+
+class TestStrictLookups:
+    """The blackhole's alt-release search treats an empty result as a
+    verdict; an unreachable arr is not one.  strict=True raises
+    ArrUnavailable on a failed request, while a real empty answer still
+    comes back empty and the default (non-strict) contract is unchanged."""
+
+    # (fixture, method, args) — Sonarr and Radarr in lockstep
+    LOOKUPS = [
+        ('sonarr', 'get_all_series', ()),
+        ('radarr', 'get_all_movies', ()),
+        ('sonarr', 'find_series_in_library', ()),
+        ('radarr', 'find_movie_in_library', ()),
+        ('sonarr', 'get_episode_releases', (5,)),
+        ('radarr', 'get_movie_releases', (5,)),
+        ('sonarr', 'get_episode_id', ('Show', 1, 2)),
+        ('sonarr', 'get_episodes', (3,)),
+    ]
+
+    @staticmethod
+    def _call(request, fixture, method, args, **kw):
+        client = request.getfixturevalue(fixture)
+        if method.startswith('find_'):
+            return getattr(client, method)(title='Show', **kw)
+        return getattr(client, method)(*args, **kw)
+
+    @pytest.mark.parametrize('fixture,method,args', LOOKUPS)
+    @pytest.mark.parametrize('failure', [
+        urllib.error.URLError('Connection refused'),
+        urllib.error.HTTPError('http://arr/api', 503, 'Unavailable', {}, None),
+        urllib.error.HTTPError('http://arr/api', 429, 'Too Many Requests', {}, None),
+        TimeoutError('timed out'),
+        http.client.IncompleteRead(b''),   # arr restarted mid-response
+    ])
+    @patch('urllib.request.urlopen')
+    def test_strict_raises_when_arr_unreachable(self, mock_urlopen, request,
+                                                fixture, method, args, failure):
+        mock_urlopen.side_effect = failure
+        with pytest.raises(ArrUnavailable):
+            self._call(request, fixture, method, args, strict=True)
+
+    @pytest.mark.parametrize('fixture,method,args', LOOKUPS)
+    @pytest.mark.parametrize('body', [{}, {'message': 'Unauthorized'}])
+    @patch('urllib.request.urlopen')
+    def test_strict_raises_on_non_list_body(self, mock_urlopen, request,
+                                            fixture, method, args, body):
+        mock_urlopen.return_value = _mock_urlopen(body)
+        with pytest.raises(ArrUnavailable):
+            self._call(request, fixture, method, args, strict=True)
+
+    @pytest.mark.parametrize('fixture,method,args', LOOKUPS)
+    @patch('urllib.request.urlopen')
+    def test_strict_empty_answer_is_not_an_error(self, mock_urlopen, request,
+                                                 fixture, method, args):
+        mock_urlopen.return_value = _mock_urlopen([])
+        assert not self._call(request, fixture, method, args, strict=True)
+
+    @pytest.mark.parametrize('fixture,method,args', LOOKUPS)
+    @pytest.mark.parametrize('code', [400, 401, 404])
+    @patch('urllib.request.urlopen')
+    def test_strict_client_error_is_an_answer(self, mock_urlopen, request,
+                                              fixture, method, args, code):
+        # A bad API key / URL base / request won't fix itself on retry:
+        # it ends the search the old way instead of parking forever.
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            'http://arr/api', code, 'Client Error', {}, None)
+        assert not self._call(request, fixture, method, args, strict=True)
+
+    @pytest.mark.parametrize('fixture,method,args', LOOKUPS)
+    @patch('urllib.request.urlopen')
+    def test_default_still_swallows_failure(self, mock_urlopen, request,
+                                            fixture, method, args):
+        mock_urlopen.side_effect = urllib.error.URLError('Connection refused')
+        assert not self._call(request, fixture, method, args)
+
+    @pytest.mark.parametrize('fixture,method', [('sonarr', 'get_series'),
+                                                ('radarr', 'get_movie')])
+    @patch('urllib.request.urlopen')
+    def test_strict_record_lookups(self, mock_urlopen, request, fixture, method):
+        client = request.getfixturevalue(fixture)
+        mock_urlopen.side_effect = urllib.error.URLError('Connection refused')
+        with pytest.raises(ArrUnavailable):
+            getattr(client, method)(3, strict=True)
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            'http://arr/api', 404, 'Not Found', {}, None)
+        assert getattr(client, method)(3, strict=True) is None
+        mock_urlopen.side_effect = None
+        mock_urlopen.return_value = _mock_urlopen({'id': 3})
+        assert getattr(client, method)(3, strict=True) == {'id': 3}
+
+    @patch('urllib.request.urlopen')
+    def test_episode_id_reuses_known_series(self, mock_urlopen, sonarr):
+        # The alt search already holds the series record — no second
+        # full-library fetch.
+        mock_urlopen.return_value = _mock_urlopen([{'id': 9, 'episodeNumber': 2}])
+        assert sonarr.get_episode_id('Show', 1, 2, series={'id': 3}) == 9
+        assert mock_urlopen.call_count == 1
+        assert 'seriesId=3' in mock_urlopen.call_args[0][0].full_url
+
+    @patch('urllib.request.urlopen')
+    def test_episode_id_strict_covers_episode_fetch(self, mock_urlopen, sonarr):
+        # Series lookup answers, the per-season episode fetch doesn't —
+        # still unavailable, not "episode not in Sonarr".
+        mock_urlopen.side_effect = [
+            _mock_urlopen([{'id': 3, 'title': 'Show'}]),
+            urllib.error.URLError('Connection refused'),
+        ]
+        with pytest.raises(ArrUnavailable):
+            sonarr.get_episode_id('Show', 1, 2, strict=True)
 
 
 # ---------------------------------------------------------------------------
