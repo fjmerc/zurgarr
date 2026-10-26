@@ -175,10 +175,10 @@ class TestReplaceLocalWithSymlinks:
 
         rclone_mount = os.path.join(tmp_dir, 'mount')
         os.makedirs(os.path.join(rclone_mount, 'Show', 'Season 1'))
-        # Debrid target need not exist on disk — symlinks don't require
-        # the target to resolve at creation time. We only care about the
-        # path translation from rclone_mount → symlink_target_base.
+        # The debrid file must exist on the mount: the swap deletes the
+        # local copy, so a missing target is refused (no dangling link).
         debrid_ep = os.path.join(rclone_mount, 'Show', 'Season 1', 'ep.mkv')
+        open(debrid_ep, 'w').close()
 
         return {
             'local_tv': local_tv,
@@ -187,6 +187,30 @@ class TestReplaceLocalWithSymlinks:
             'debrid_ep': debrid_ep,
             'symlink_target_base': '/mnt/debrid',
         }
+
+    def test_missing_debrid_file_keeps_local_file(self, tmp_dir):
+        p = self._setup_paths(tmp_dir)
+        os.remove(p['debrid_ep'])
+        result = lp.replace_local_with_symlinks(
+            [{'local_path': p['local_ep'], 'debrid_path': p['debrid_ep']}],
+            p['local_tv'], p['rclone_mount'], p['symlink_target_base'],
+        )
+        assert result['switched'] == 0
+        assert os.path.isfile(p['local_ep']) and not os.path.islink(p['local_ep'])
+        assert any('not on the debrid mount' in e for e in result['errors'])
+
+    def test_ampersand_spelling_on_mount_is_used(self, tmp_dir):
+        # TorBox's mount drops '&' from names its API (and path_index) keeps.
+        p = self._setup_paths(tmp_dir)
+        on_disk = os.path.join(p['rclone_mount'], 'Show', 'Season 1', 'Wizard..Warrior.mkv')
+        open(on_disk, 'w').close()
+        listed = os.path.join(p['rclone_mount'], 'Show', 'Season 1', 'Wizard.&.Warrior.mkv')
+        result = lp.replace_local_with_symlinks(
+            [{'local_path': p['local_ep'], 'debrid_path': listed}],
+            p['local_tv'], p['rclone_mount'], p['symlink_target_base'],
+        )
+        assert result['switched'] == 1
+        assert os.readlink(p['local_ep']) == '/mnt/debrid/Show/Season 1/Wizard..Warrior.mkv'
 
     def test_clean_swap_creates_symlink(self, tmp_dir):
         """Normal successful swap: local file is replaced by a symlink,

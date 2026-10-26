@@ -2242,6 +2242,137 @@ class TestCreateDebridSymlinksPhantomSource:
         assert os.path.islink(link)
 
 
+    def test_ampersand_stripped_on_mount_is_linked(self, tmp_dir, monkeypatch):
+        """TorBox's mount drops every '&' from folder and file names while
+        its API keeps them: link the on-disk spelling, named after the real
+        file (prod: Daredevil S03E08, Vice Principals S02E09, iCarly S06E14
+        were skipped every scan)."""
+        scanner = self._make_scanner(tmp_dir, monkeypatch)
+        mount = os.path.join(tmp_dir, 'mount')
+        on_disk = os.path.join(mount, 'Some Show S03E08 UpstairsDownstairs 1080p')
+        os.makedirs(on_disk)
+        real = os.path.join(on_disk, 'Some.Show.S03E08.Wizard..The.Warrior.mkv')
+        open(real, 'w').close()
+
+        from utils.library import _normalize_title
+        norm = _normalize_title('Some Show')
+        shows = [
+            {'title': 'Anchor Show', 'year': 2020, 'source': 'local',
+             'season_data': []},
+            {'title': 'Some Show', 'year': 2024, 'source': 'debrid',
+             'season_data': [{'number': 3, 'episodes': [
+                 {'number': 8, 'source': 'debrid'}]}]},
+        ]
+        enumerated = os.path.join(
+            mount, 'Some Show S03E08 Upstairs&Downstairs 1080p',
+            'Some.Show.S03E08.Wizard.&.The.Warrior.mkv')
+        scanner._create_debrid_symlinks(shows, [], {(norm, 3, 8): enumerated})
+
+        link = os.path.join(scanner._local_tv_path, 'Some Show (2024)',
+                            'Season 03', 'Some.Show.S03E08.Wizard..The.Warrior.mkv')
+        assert os.path.islink(link)
+        assert os.readlink(link).endswith(
+            'Some Show S03E08 UpstairsDownstairs 1080p/Some.Show.S03E08.Wizard..The.Warrior.mkv')
+
+    def test_ampersand_movie_folder_is_linked(self, tmp_dir, monkeypatch):
+        scanner = self._make_scanner(tmp_dir, monkeypatch)
+        mount = os.path.join(tmp_dir, 'mount')
+        on_disk = os.path.join(mount, 'Fast..Furious.2019.1080p.WEB')   # '&' dropped
+        os.makedirs(on_disk)
+        with open(os.path.join(on_disk, 'Fast.Furious.2019.1080p.WEB.mkv'), 'wb') as f:
+            f.write(b'x' * 1024)
+        movies = [{'title': 'Anchor Movie', 'year': 2020, 'source': 'local'},
+                  {'title': 'Fast & Furious', 'year': 2019, 'source': 'debrid',
+                   'path': os.path.join(mount, 'Fast.&.Furious.2019.1080p.WEB')}]
+        scanner._create_debrid_symlinks([], movies, {})
+        link = os.path.join(scanner._local_movies_path, 'Fast & Furious (2019)',
+                            'Fast.Furious.2019.1080p.WEB.mkv')
+        assert os.path.islink(link)
+        assert os.readlink(link).endswith('Fast..Furious.2019.1080p.WEB/Fast.Furious.2019.1080p.WEB.mkv')
+
+    @staticmethod
+    def _block(monkeypatch, blocked):
+        import utils.library as _lib
+        from utils.blocklist import _norm_title
+        monkeypatch.setattr(_lib, '_blocklist', type('BL', (), {
+            'is_blocked_title': staticmethod(
+                lambda name: _norm_title(name) in {_norm_title(b) for b in blocked})})())
+
+    def test_blocklisted_ampersand_episode_not_linked(self, tmp_dir, monkeypatch):
+        # Blocklist entries keep the API/arr spelling ('&' → " and " when
+        # normalised) — the on-disk '&'-free folder must not slip past them.
+        scanner = self._make_scanner(tmp_dir, monkeypatch)
+        mount = os.path.join(tmp_dir, 'mount')
+        on_disk = os.path.join(mount, 'Some Show S03E08 UpstairsDownstairs 1080p')
+        os.makedirs(on_disk)
+        open(os.path.join(on_disk, 'Some.Show.S03E08.mkv'), 'w').close()
+        self._block(monkeypatch, ['Some Show S03E08 Upstairs&Downstairs 1080p'])
+        from utils.library import _normalize_title
+        norm = _normalize_title('Some Show')
+        shows = [
+            {'title': 'Anchor Show', 'year': 2020, 'source': 'local', 'season_data': []},
+            {'title': 'Some Show', 'year': 2024, 'source': 'debrid',
+             'season_data': [{'number': 3, 'episodes': [{'number': 8, 'source': 'debrid'}]}]},
+        ]
+        enumerated = os.path.join(mount, 'Some Show S03E08 Upstairs&Downstairs 1080p',
+                                  'Some.Show.S03E08.mkv')
+        scanner._create_debrid_symlinks(shows, [], {(norm, 3, 8): enumerated})
+        assert os.listdir(scanner._local_tv_path) == []
+
+    def test_blocklisted_ampersand_movie_not_linked(self, tmp_dir, monkeypatch):
+        scanner = self._make_scanner(tmp_dir, monkeypatch)
+        mount = os.path.join(tmp_dir, 'mount')
+        on_disk = os.path.join(mount, 'Fast..Furious.2019.1080p.WEB')
+        os.makedirs(on_disk)
+        with open(os.path.join(on_disk, 'Fast.Furious.2019.1080p.WEB.mkv'), 'wb') as f:
+            f.write(b'x' * 1024)
+        self._block(monkeypatch, ['Fast.&.Furious.2019.1080p.WEB'])
+        movies = [{'title': 'Anchor Movie', 'year': 2020, 'source': 'local'},
+                  {'title': 'Fast & Furious', 'year': 2019, 'source': 'debrid',
+                   'path': os.path.join(mount, 'Fast.&.Furious.2019.1080p.WEB')}]
+        scanner._create_debrid_symlinks([], movies, {})
+        assert os.listdir(scanner._local_movies_path) == []
+
+    def test_already_linked_ampersand_episode_skips_mount_lookup(self, tmp_dir, monkeypatch):
+        # Episodes already linked under either spelling cost no mount I/O
+        # (the TorBox mount is rate-limited; this runs every scan).
+        import utils.library as _lib
+        scanner = self._make_scanner(tmp_dir, monkeypatch)
+        mount = os.path.join(tmp_dir, 'mount')
+        os.makedirs(mount)
+        local = os.path.join(scanner._local_tv_path, 'Some Show (2024)', 'Season 03')
+        os.makedirs(local)
+        os.symlink('/mnt/debrid/x', os.path.join(local, 'Some.Show.S03E08.Wizard..The.Warrior.mkv'))
+        looked = []
+        monkeypatch.setattr(_lib, '_mount_path_on_disk', lambda p: looked.append(p) or p)
+        from utils.library import _normalize_title
+        norm = _normalize_title('Some Show')
+        shows = [
+            {'title': 'Anchor Show', 'year': 2020, 'source': 'local', 'season_data': []},
+            {'title': 'Some Show', 'year': 2024, 'source': 'debrid',
+             'season_data': [{'number': 3, 'episodes': [{'number': 8, 'source': 'debrid'}]}]},
+        ]
+        enumerated = os.path.join(mount, 'Some Show S03E08 Upstairs&Downstairs 1080p',
+                                  'Some.Show.S03E08.Wizard.&.The.Warrior.mkv')
+        scanner._create_debrid_symlinks(shows, [], {(norm, 3, 8): enumerated})
+        assert looked == []
+
+
+class TestMountPathOnDisk:
+
+    def test_returns_stripped_spelling_only_when_it_exists(self, tmp_dir):
+        from utils.library import _mount_path_on_disk
+        real = os.path.join(tmp_dir, 'A  B')                     # '&' dropped
+        os.makedirs(real)
+        assert _mount_path_on_disk(os.path.join(tmp_dir, 'A & B')) == real
+        missing = os.path.join(tmp_dir, 'X & Y')
+        assert _mount_path_on_disk(missing) == missing          # neither exists
+        plain = os.path.join(tmp_dir, 'nope')
+        assert _mount_path_on_disk(plain) == plain              # no '&': untouched
+        assert _mount_path_on_disk(real) == real
+        assert _mount_path_on_disk('') == ''
+
+
 class TestCreateDebridSymlinksBlocklistReleaseFolder:
     """The TV blocklist check must key on the release folder = the FIRST
     path component under the debrid mount. A flat torrent literally named

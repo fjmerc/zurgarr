@@ -435,6 +435,8 @@ def build_tb_lookup_candidates(release_name, file_names=None):
          ``data.files[].name`` is the actual on-WebDAV path, so the
          segment before the first ``/`` is the folder name TB used.
          This is the candidate that bridges the language gap.
+      6. Each of the above containing ``&`` with every ``&`` removed —
+         TB's WebDAV layout drops '&' from names its API keeps.
 
     ``file_names`` may be ``None`` (no TB API data available — caller
     didn't extract); the function then returns only the API-derived
@@ -483,6 +485,10 @@ def build_tb_lookup_candidates(release_name, file_names=None):
             head = fn.split('/', 1)[0].split('\\', 1)[0]
             if head:
                 _add(head)
+
+    for name in list(candidates):
+        if '&' in name:
+            _add(name.replace('&', ''))
 
     return candidates
 

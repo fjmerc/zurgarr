@@ -507,6 +507,48 @@ class TestAutoEnforcement:
         assert target.startswith('/mnt/debrid/')
         assert 'Black.Adam.2022.1080p.mkv' in target
 
+    def test_prefer_debrid_ampersand_torbox_movie_switches(self, tmp_dir, monkeypatch):
+        """A TorBox movie whose listed folder has '&' (the mount drops it)
+        is switched, and the link points at the TorBox target base — not
+        refused as "outside rclone mount"."""
+        import utils.debrid_routing as routing
+        local_movies = os.path.join(tmp_dir, 'movies')
+        movie_dir = os.path.join(local_movies, 'Fast & Furious (2009)')
+        os.makedirs(movie_dir)
+        local_file = os.path.join(movie_dir, 'Fast & Furious (2009).mkv')
+        with open(local_file, 'w') as f:
+            f.write('local movie content')
+
+        rd_mount = os.path.join(tmp_dir, 'mount')
+        os.makedirs(rd_mount)
+        tb_mount = os.path.join(tmp_dir, 'torbox')
+        on_disk = os.path.join(tb_mount, 'Fast..Furious.2009.1080p')
+        os.makedirs(on_disk)
+        with open(os.path.join(on_disk, 'Fast.Furious.2009.1080p.mkv'), 'w') as f:
+            f.write('debrid movie content')
+
+        monkeypatch.setenv('BLACKHOLE_RCLONE_MOUNT', rd_mount)
+        monkeypatch.setenv('BLACKHOLE_SYMLINK_TARGET_BASE', '/mnt/debrid')
+        monkeypatch.setenv('BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX', '/mnt/debrid_torbox')
+        monkeypatch.setenv('LIBRARY_PREFERENCE_AUTO_ENFORCE', 'true')
+        monkeypatch.setattr(routing, 'mount_for_debrid', lambda d, **k: tb_mount)
+
+        local_tv = os.path.join(tmp_dir, 'tv')
+        os.makedirs(local_tv)
+        scanner = self._make_movie_scanner(local_movies, local_tv, monkeypatch)
+
+        from utils.library import _normalize_title
+        movie = {
+            'title': 'Fast & Furious', 'year': 2009, 'source': 'both', 'type': 'movie',
+            'path': os.path.join(tb_mount, 'Fast.&.Furious.2009.1080p'),
+            'local_path': movie_dir,
+        }
+        scanner._enforce_preferences([], [movie], {_normalize_title('Fast & Furious'): 'prefer-debrid'}, {}, {})
+
+        assert os.path.islink(local_file)
+        assert os.readlink(local_file) == (
+            '/mnt/debrid_torbox/Fast..Furious.2009.1080p/Fast.Furious.2009.1080p.mkv')
+
     def test_prefer_debrid_movie_skips_local_only(self, tmp_dir, monkeypatch):
         """source=local movie + prefer-debrid → no action (debrid copy not yet available)."""
         local_movies = os.path.join(tmp_dir, 'movies')

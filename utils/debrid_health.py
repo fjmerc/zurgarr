@@ -742,6 +742,9 @@ def _retarget_symlinks_to_alt(torrent_hash, filename, src_debrid='realdebrid', d
     name blackhole.py builds targets around — exactly equals one of the
     anchor *candidates*), swap the path prefix to the alt debrid's base
     and replace the symlink atomically via ``os.symlink + os.replace``.
+    For a TorBox alt the target is flattened to ``<base>/<release>/...``
+    (its mount has no Zurg category dirs) with every '&' dropped (its
+    mount strips them).
 
     *candidates* is the anchor set from ``_release_anchor_candidates``;
     when ``None`` it is derived from *filename* alone (legacy direct
@@ -756,6 +759,7 @@ def _retarget_symlinks_to_alt(torrent_hash, filename, src_debrid='realdebrid', d
     first rescue, silently breaking the entire library since the alt
     debrid only has THIS torrent's content cached.
     """
+    from utils import debrid_routing
     from utils.debrid_routing import symlink_target_base_for_debrid
 
     src_base = (symlink_target_base_for_debrid(src_debrid) or '').rstrip('/')
@@ -782,6 +786,10 @@ def _retarget_symlinks_to_alt(torrent_hash, filename, src_debrid='realdebrid', d
     # falls back to the same-name swap (correct whenever the alt
     # provider preserves the torrent folder name).
     alt_folder = None
+    # TB-side relative path per file name (from the same torrent info), so
+    # a retarget follows TB's real inner layout even where it differs from
+    # Zurg's (a pack flattened on one side, Season dirs on the other).
+    alt_rel_by_leaf = {}
     if alt_client is not None and alt_torrent_id:
         try:
             info_fn = getattr(alt_client, 'torrent_info', None)
@@ -792,6 +800,11 @@ def _retarget_symlinks_to_alt(torrent_hash, filename, src_debrid='realdebrid', d
                     first = files[0].get('name')
                     if isinstance(first, str) and '/' in first.strip('/'):
                         alt_folder = first.strip('/').split('/')[0]
+                for f in files if isinstance(files, list) else ():
+                    name = f.get('name') if isinstance(f, dict) else None
+                    if isinstance(name, str) and name.strip('/'):
+                        rel = name.strip('/')
+                        alt_rel_by_leaf.setdefault(os.path.basename(rel), []).append(rel)
         except Exception as e:
             logger.debug(
                 f"[debrid_health] alt torrent_info fetch for folder remap "
@@ -808,6 +821,7 @@ def _retarget_symlinks_to_alt(torrent_hash, filename, src_debrid='realdebrid', d
         return 0
 
     src_prefix = src_base + '/'
+    to_torbox = dst_debrid == debrid_routing.TORBOX
     count = 0
     for root in library_roots:
         for dirpath, _dirs, files in os.walk(root, followlinks=False):
@@ -837,7 +851,18 @@ def _retarget_symlinks_to_alt(torrent_hash, filename, src_debrid='realdebrid', d
                 if alt_folder and alt_folder != parts[matched_idx]:
                     parts = (parts[:matched_idx] + [alt_folder]
                              + parts[matched_idx + 1:])
-                new_target = dst_base + '/' + '/'.join(parts)
+                if to_torbox:
+                    # TB's mount is flat — no Zurg category dir (shows/,
+                    # movies/, __all__/) before the release folder — and
+                    # drops every '&' that RD keeps.  Deterministic, so no
+                    # existence check: TB's listing lags the rescue add.
+                    # TB's own path for this file wins when it's unique.
+                    hits = alt_rel_by_leaf.get(parts[-1], [])
+                    tail = (hits[0] if len(hits) == 1
+                            else '/'.join(parts[matched_idx:])).replace('&', '')
+                else:
+                    tail = '/'.join(parts)
+                new_target = dst_base + '/' + tail
                 try:
                     # Atomic-replace: write the new symlink at a temp
                     # path in the same directory, then ``os.replace``

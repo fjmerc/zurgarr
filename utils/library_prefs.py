@@ -367,6 +367,19 @@ def replace_local_with_symlinks(episodes, local_tv_path, rclone_mount, symlink_t
     real_root = os.path.realpath(local_tv_path)
     switched = 0
     errors = []
+    # (mount, target base) per debrid, in the order the library's symlink
+    # pass resolves them: RD/AD first, then TorBox — whose mount and base
+    # are separate, so TB content would otherwise read as "outside mount".
+    mount_bases = [(os.path.realpath(rclone_mount), symlink_target_base)]
+    try:
+        from utils.debrid_routing import (
+            TORBOX, mount_for_debrid, symlink_target_base_for_debrid)
+        tb_mount = mount_for_debrid(TORBOX)
+        tb_base = symlink_target_base_for_debrid(TORBOX)
+        if tb_mount and tb_base and os.path.isdir(tb_mount):
+            mount_bases.append((os.path.realpath(tb_mount), tb_base))
+    except Exception as e:
+        logger.debug(f"[library_prefs] TorBox mount pair unavailable: {e}")
 
     for ep in episodes:
         local_path = ep.get('local_path', '')
@@ -380,17 +393,28 @@ def replace_local_with_symlinks(episodes, local_tv_path, rclone_mount, symlink_t
             errors.append(f"Path outside local library: {local_path}")
             continue
 
+        # The spelling the mount uses (TorBox drops '&' that its API keeps)
+        from utils.library import _mount_path_on_disk
+        debrid_path = _mount_path_on_disk(debrid_path)
+
         # Translate debrid path from Zurgarr namespace to Sonarr namespace
         real_debrid = os.path.realpath(debrid_path)
-        real_mount = os.path.realpath(rclone_mount)
-        if not real_debrid.startswith(real_mount + os.sep) and real_debrid != real_mount:
+        symlink_target = next(
+            (base + real_debrid[len(mount):] for mount, base in mount_bases
+             if real_debrid.startswith(mount + os.sep) or real_debrid == mount),
+            None)
+        if symlink_target is None:
             errors.append(f"Debrid path outside rclone mount: {debrid_path}")
             continue
-        symlink_target = symlink_target_base + real_debrid[len(real_mount):]
 
         try:
             if not os.path.isfile(real_local):
                 errors.append(f"Local file not found: {local_path}")
+                continue
+            # The swap deletes the local copy: never trade it for a link
+            # to a file that isn't on the debrid mount.
+            if not os.path.exists(real_debrid):
+                errors.append(f"Debrid file not on the debrid mount: {debrid_path}")
                 continue
 
             # Atomic swap: rename to backup, create symlink, remove backup on success

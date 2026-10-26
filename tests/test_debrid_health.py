@@ -1532,8 +1532,8 @@ class TestCrossRescue:
         mock_tb_client.add_magnet.assert_called_once_with('AAAA0000')
         # Symlink retargeted
         new_target = os.readlink(str(sym))
-        assert 'debrid_torbox' in new_target
-        assert new_target.endswith('/movies/Release.2025/file.mkv')
+        # TB's mount is flat — RD's category dir doesn't carry over
+        assert new_target.endswith('/debrid_torbox/Release.2025/file.mkv')
         # Existing remediation pipeline NOT triggered
         assert mock_remediation_deps['blocklist_add'].call_count == 0
         assert client.delete_torrent.call_count == 0
@@ -1918,7 +1918,7 @@ class TestCrossRescue:
 
         # The pack's own symlink moved to TB…
         assert os.readlink(str(pack_link)) == (
-            tb_base + f'/shows/{pack_folder}/{ep_folder}.mkv'
+            tb_base + f'/{pack_folder}/{ep_folder}.mkv'
         )
         # …the unrelated same-stem torrent's symlink did NOT.
         assert os.readlink(str(ep_link)) == ep_target, (
@@ -1947,7 +1947,7 @@ class TestCrossRescue:
             debrid_health.run_sweep()
 
         new_target = os.readlink(str(sym))
-        assert new_target.endswith('/movies/Release 2025 Sanitized/file.mkv'), (
+        assert new_target.endswith('/debrid_torbox/Release 2025 Sanitized/file.mkv'), (
             f"TB folder not remapped: {new_target}"
         )
         assert 'debrid_torbox' in new_target
@@ -2134,3 +2134,56 @@ class TestRestoreStateAndSweepGuard:
             debrid_health._sweep_guard.release()
         assert res['status'] == 'success'
         assert res['message'] == 'sweep already running'
+
+
+class TestRetargetAmpersandOnTorbox:
+    """TorBox's mount is flat and drops every '&' that RD (and TB's API)
+    keep: a rescue retarget must point at <tb base>/<release>/<file> in
+    that spelling — even before TB's listing shows the files (it lags),
+    so no existence check decides it."""
+
+    def _setup(self, tmp_path, monkeypatch):
+        lib = tmp_path / 'lib'
+        monkeypatch.setenv('BLACKHOLE_SYMLINK_TARGET_BASE', '/mnt/debrid')
+        monkeypatch.setenv('BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX', '/mnt/debrid_torbox')
+        monkeypatch.setenv('BLACKHOLE_LOCAL_LIBRARY_TV', str(lib))
+        monkeypatch.delenv('BLACKHOLE_LOCAL_LIBRARY_MOVIES', raising=False)
+        season = lib / 'Show (2024)' / 'Season 03'
+        season.mkdir(parents=True)
+        return season
+
+    def test_retarget_drops_category_and_ampersand(self, tmp_path, monkeypatch):
+        season = self._setup(tmp_path, monkeypatch)
+        link = season / 'ep.mkv'
+        os.symlink('/mnt/debrid/shows/Show S03E08 Upstairs&Downstairs/'
+                   'Show.S03E08.Wizard.&.Warrior.mkv', str(link))
+        n = debrid_health._retarget_symlinks_to_alt(
+            'A' * 40, 'x', candidates={'Show S03E08 Upstairs&Downstairs'})
+        assert n == 1
+        assert os.readlink(str(link)) == (
+            '/mnt/debrid_torbox/Show S03E08 UpstairsDownstairs/Show.S03E08.Wizard..Warrior.mkv')
+
+    def test_retarget_without_ampersand_only_drops_category(self, tmp_path, monkeypatch):
+        season = self._setup(tmp_path, monkeypatch)
+        link = season / 'ep.mkv'
+        os.symlink('/mnt/debrid/__all__/Show.S03.1080p/Season 3/Show.S03E08.mkv', str(link))
+        debrid_health._retarget_symlinks_to_alt(
+            'A' * 40, 'x', candidates={'Show.S03.1080p'})
+        assert os.readlink(str(link)) == (
+            '/mnt/debrid_torbox/Show.S03.1080p/Season 3/Show.S03E08.mkv')
+
+    def test_retarget_uses_tb_file_path_when_layouts_differ(self, tmp_path, monkeypatch):
+        # Zurg may flatten a pack while TB keeps its tree (or the reverse):
+        # TB's own file list is authoritative for the inner path.
+        season = self._setup(tmp_path, monkeypatch)
+        link = season / 'ep.mkv'
+        os.symlink('/mnt/debrid/shows/Show.S03.Pack/Show.S03E08.&.More.mkv', str(link))
+        tb = MagicMock()
+        tb.torrent_info.return_value = {'files': [
+            {'name': 'Show.S03.Pack/Season 03/Show.S03E08.&.More.mkv'},
+            {'name': 'Show.S03.Pack/Season 03/Show.S03E09.mkv'}]}
+        debrid_health._retarget_symlinks_to_alt(
+            'A' * 40, 'x', candidates={'Show.S03.Pack'},
+            alt_client=tb, alt_torrent_id='T9')
+        assert os.readlink(str(link)) == (
+            '/mnt/debrid_torbox/Show.S03.Pack/Season 03/Show.S03E08..More.mkv')

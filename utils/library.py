@@ -2859,6 +2859,39 @@ def _empty_scan_payload():
     }
 
 
+def _mount_path_on_disk(path):
+    """*path* as it exists on the debrid mount.  Enumeration (TorBox mylist
+    API / Zurg WebDAV) reports names with '&', which TorBox's mount drops
+    from every folder and file name — fall back to that spelling when the
+    original doesn't exist and the '&'-free one does.  Paths without '&'
+    cost no filesystem call."""
+    if not path or '&' not in path or os.path.exists(path):
+        return path
+    alt = path.replace('&', '')
+    return alt if os.path.exists(alt) else path
+
+
+def _release_folder_of(debrid_path, mount_target_pairs):
+    """Release folder (blocklist key) of an episode's debrid path: the first
+    component under its debrid mount — derived from the mount prefix, not by
+    climbing past Season-dir names (a flat torrent literally named "Season 3
+    (BluRay)" at mount root would make the climb overshoot to the mount root
+    and silently no-op the block).  The climb is kept only as a fallback for
+    paths under no known mount."""
+    for mount, _base in mount_target_pairs:
+        if debrid_path.startswith(mount + os.sep):
+            return debrid_path[len(mount) + 1:].split(os.sep, 1)[0]
+    parent = os.path.dirname(debrid_path)
+    parent_name = os.path.basename(parent)
+    if _match_season_dir(parent_name):
+        grandparent_name = os.path.basename(os.path.dirname(parent))
+        # Abort the climb when the grandparent is empty or itself
+        # season-shaped — the parent is then likely a flat release.
+        if grandparent_name and not _match_season_dir(grandparent_name):
+            return grandparent_name
+    return parent_name
+
+
 class LibraryScanner:
     # Guards the three Wanted-recovery memo dicts (_wanted_tb_cooldown,
     # _wanted_rd_miss, _wanted_no_results).  The scan-effects thread owns all
@@ -4418,7 +4451,7 @@ class LibraryScanner:
                     continue
 
                 local_dir = movie.get('local_path')
-                debrid_dir = movie.get('path')
+                debrid_dir = _mount_path_on_disk(movie.get('path'))
                 if not local_dir or not debrid_dir:
                     continue
 
@@ -7113,8 +7146,8 @@ class LibraryScanner:
             for movie in movies:
                 if movie.get('source') not in ('debrid', 'both'):
                     continue
-                mount_dir = movie.get('path')
-                if not mount_dir:
+                listed_dir = movie.get('path')
+                if not listed_dir:
                     continue
 
                 title = movie['title']
@@ -7124,17 +7157,19 @@ class LibraryScanner:
                 # EZTV) parse into junk hex "movies" — never import them.
                 # The blackhole monitor handles their real identity via the
                 # .magnet-derived display name.
-                if _is_obfuscated_name(title) or _is_obfuscated_name(os.path.basename(mount_dir)):
+                if _is_obfuscated_name(title) or _is_obfuscated_name(os.path.basename(listed_dir)):
                     continue
 
                 # Skip blocklisted items by mount folder name (full release name).
                 # Only match on the release folder — not the parsed title — so
                 # that blocking one quality/release doesn't block replacements
                 # of the same movie (e.g. blocking a 2160p doesn't block a 1080p).
-                if _blocklist:
-                    mount_folder = os.path.basename(mount_dir)
-                    if _blocklist.is_blocked_title(mount_folder):
-                        continue
+                # Entries carry the API/arr spelling ('&'), which the mount
+                # may drop (_mount_path_on_disk) — blocked if either is.
+                if _blocklist and any(
+                        _blocklist.is_blocked_title(os.path.basename(d))
+                        for d in {listed_dir, listed_dir.replace('&', '')}):
+                    continue
 
                 arr_info = _match_arr_entry(
                     title, year, movie.get('_parsed_title'),
@@ -7161,8 +7196,12 @@ class LibraryScanner:
                 # a release-named subdir) still get symlinked — without this
                 # they're detected as on-debrid but never linkable, showing
                 # "available" in zurgarr yet "missing" in Radarr.
+                mount_dir = _mount_path_on_disk(listed_dir)
                 media_rel, media_size = _find_largest_movie_video(mount_dir)
                 if not media_rel:
+                    if '&' in listed_dir and not os.path.exists(mount_dir):
+                        logger.debug("[library] Movie folder not on mount under "
+                                     "either spelling: %r", listed_dir)
                     continue
                 # Local library uses a flat filename (the basename); the arr
                 # re-imports by content, so the nesting need not be preserved.
@@ -7267,65 +7306,48 @@ class LibraryScanner:
                         if ep.get('source') != 'debrid':
                             continue
                         enum = ep['number']
-                        debrid_path = path_index.get((norm, snum, enum))
-                        if not debrid_path:
+                        raw_path = path_index.get((norm, snum, enum))
+                        if not raw_path:
                             continue
+                        # TorBox's mount drops '&' from names its API keeps;
+                        # both spellings matter below (see _mount_path_on_disk).
+                        spellings = [raw_path]
+                        if '&' in raw_path:
+                            spellings.append(raw_path.replace('&', ''))
 
                         # Skip blocklisted items by release folder name.
                         # Only match on the release folder — not the parsed title — so
                         # that blocking one release doesn't block replacements.
-                        # The release folder is the FIRST path component under the
-                        # debrid mount — derived from the mount prefix, not by
-                        # climbing past Season-dir names (a flat torrent literally
-                        # named "Season 3 (BluRay)" at mount root would make the
-                        # climb overshoot to the mount root and silently no-op
-                        # the block).  Climb heuristic kept only as fallback for
-                        # paths under no known mount.
-                        if _blocklist:
-                            release_folder = None
-                            for _m, _b in _mount_target_pairs:
-                                if debrid_path.startswith(_m + os.sep):
-                                    release_folder = debrid_path[len(_m) + 1:].split(os.sep, 1)[0]
-                                    break
-                            if release_folder is None:
-                                parent = os.path.dirname(debrid_path)
-                                parent_name = os.path.basename(parent)
-                                if _match_season_dir(parent_name):
-                                    grandparent_name = os.path.basename(
-                                        os.path.dirname(parent))
-                                    # Abort the climb when the grandparent
-                                    # is empty or itself season-shaped —
-                                    # the parent is then likely a flat
-                                    # release, not a season subdir.
-                                    if grandparent_name and not _match_season_dir(grandparent_name):
-                                        release_folder = grandparent_name
-                                    else:
-                                        release_folder = parent_name
-                                else:
-                                    release_folder = parent_name
-                            if _blocklist.is_blocked_title(release_folder):
-                                continue
-
-                        filename = os.path.basename(debrid_path)
-                        local_path = os.path.join(
-                            self._local_tv_path, show_dir, season_dir, filename
-                        )
+                        # Blocklist entries carry the API/arr spelling ('&'), so
+                        # both spellings are checked — blocked if either is.
+                        if _blocklist and any(
+                                _blocklist.is_blocked_title(
+                                    _release_folder_of(p, _mount_target_pairs))
+                                for p in spellings):
+                            continue
 
                         # Validate output stays within local library root
-                        real_local_dir = os.path.realpath(
-                            os.path.join(self._local_tv_path, show_dir, season_dir)
-                        )
+                        local_dir = os.path.join(self._local_tv_path, show_dir, season_dir)
+                        real_local_dir = os.path.realpath(local_dir)
                         if not real_local_dir.startswith(real_tv_root + os.sep) and real_local_dir != real_tv_root:
-                            logger.warning("[library] Refusing symlink outside local library: %r", local_path)
+                            logger.warning("[library] Refusing symlink outside local library: %r",
+                                           os.path.join(local_dir, os.path.basename(raw_path)))
                             continue
 
-                        if os.path.islink(local_path) or os.path.exists(local_path):
+                        # Already linked (under either spelling): no mount I/O.
+                        if any(os.path.islink(lp) or os.path.exists(lp)
+                               for lp in (os.path.join(local_dir, os.path.basename(p))
+                                          for p in spellings)):
                             continue
+
+                        debrid_path = _mount_path_on_disk(raw_path)
+                        filename = os.path.basename(debrid_path)
+                        local_path = os.path.join(local_dir, filename)
 
                         # Enumeration (TB mylist API / Zurg WebDAV) can report
-                        # folder names the FUSE layer renames (e.g. TorBox
-                        # strips '&' from on-disk folders), so path_index may
-                        # carry paths that don't exist on the mount. A symlink
+                        # names the FUSE layer renames (TorBox's '&' drop is
+                        # undone by _mount_path_on_disk above), so path_index
+                        # may carry paths that don't exist on the mount. A symlink
                         # to such a path is born broken and churns
                         # create→cleanup every scan. The mount is ground
                         # truth: skip sources that don't resolve. (exists()

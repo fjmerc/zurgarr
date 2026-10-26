@@ -989,6 +989,24 @@ class TestBuildTbLookupCandidates:
         # Single occurrence, not two.
         assert out.count('Identical.Folder') == 1
 
+    def test_ampersand_free_spelling_is_a_candidate(self):
+        """TorBox's mount drops '&' from every folder name its API keeps —
+        a blackhole grab of an '&' release otherwise times out on the
+        mount poll.  The '&'-free forms come after every exact candidate."""
+        from utils.debrid_routing import build_tb_lookup_candidates
+        got = build_tb_lookup_candidates(
+            'Daredevil S03E08 Upstairs&Downstairs 1080p.mkv',
+            file_names=['Fast & Furious 2019/Fast & Furious.mkv'])
+        assert got == [
+            'Daredevil S03E08 Upstairs&Downstairs 1080p.mkv',
+            'Daredevil S03E08 Upstairs&Downstairs 1080p',
+            'Fast & Furious 2019',
+            'Daredevil S03E08 UpstairsDownstairs 1080p.mkv',
+            'Daredevil S03E08 UpstairsDownstairs 1080p',
+            'Fast  Furious 2019',
+        ]
+        assert build_tb_lookup_candidates('No.Ampersand.2020') == ['No.Ampersand.2020']
+
 
 class TestStripIndexerPrefix:
     """Plan 41 phase B reviewer fix-up: ``strip_indexer_prefix`` moved
