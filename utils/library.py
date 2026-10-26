@@ -5579,8 +5579,20 @@ class LibraryScanner:
                             f" TB account ({(cached.get('title') or '')[:80]!r})"
                             f" but its files never reached the library —"
                             f" likely an unparsed folder layout")
+                    elif result.get('transient'):
+                        # TorBox never answered (timeout / network / 5xx /
+                        # 429): no proof it's enforcing the cooldown flag,
+                        # so no /user/me re-probe — but still pause the leg
+                        # for this pass: tb_budget only counts successes,
+                        # and carrying on would send a burst of creates at
+                        # a struggling TorBox (a timed-out one may land).
+                        logger.info(
+                            f"[library] Wanted→TB add for {media_title!r} got "
+                            f"no answer from TorBox; pausing the TB leg for "
+                            f"this pass")
+                        tb_ok = False
                     else:
-                        # Enforcement check: an add failure WHILE the account
+                        # Enforcement check: a rejected add WHILE the account
                         # cooldown flag is set means TB is actually rejecting
                         # creates (HTTP 400 DOWNLOAD_SERVER_ERROR surfaces as
                         # a generic failure here) — stop burning the remaining

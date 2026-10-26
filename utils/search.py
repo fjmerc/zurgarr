@@ -148,8 +148,13 @@ def _urllib_get(url, headers=None, timeout=_SEARCH_TIMEOUT, strict=False):
 
 
 def _urllib_post(url, data=None, json_body=None, headers=None,
-                 timeout=_ADD_TIMEOUT, doseq=False):
+                 timeout=_ADD_TIMEOUT, doseq=False, _failure=None):
     """POST request returning parsed JSON or None.
+
+    ``_failure``: optional dict, set on a None return: ``transient`` is
+    True when no answer came back (timeout, network error, 5xx/408/429,
+    cut-off or unparseable reply), False for a 4xx rejection.  An empty
+    200 body returns ``{}`` and isn't flagged.
 
     ``doseq=True`` lets callers pass list-valued dict entries (or a list
     of ``(key, value)`` tuples) so repeated form fields like ``magnets[]``
@@ -168,15 +173,20 @@ def _urllib_post(url, data=None, json_body=None, headers=None,
     else:
         body = b''
     req = urllib.request.Request(url, data=body, headers=hdrs, method='POST')
+    if _failure is not None:
+        _failure.pop('transient', None)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read(10 * 1024 * 1024)
             if not raw:
                 return {}
             return json.loads(raw.decode('utf-8'))
-    except (urllib.error.URLError, urllib.error.HTTPError,
+    except (urllib.error.URLError, urllib.error.HTTPError, http.client.HTTPException,
             json.JSONDecodeError, OSError, ValueError) as e:
         logger.warning(f"[search] POST {_safe_log_url(url)}: {type(e).__name__}")
+        if _failure is not None:
+            _failure['transient'] = not (isinstance(e, urllib.error.HTTPError)
+                                         and e.code < 500 and e.code not in (408, 429))
         return None
 
 
@@ -1046,7 +1056,8 @@ def add_to_debrid(info_hash, title='', media_title=None, episode=None,
 
     Returns:
         {'success': bool, 'torrent_id': str, 'service': str, 'error': str,
-         'duplicate': bool}
+         'duplicate': bool}; a failed TorBox create also carries
+        ``transient`` (True when TorBox never answered).
     """
     if not info_hash or not _HASH_RE.match(info_hash):
         return {'success': False, 'torrent_id': '', 'service': '', 'error': 'Invalid info hash'}
@@ -1244,14 +1255,19 @@ def _add_to_ad(magnet, api_key):
 def _add_to_tb(magnet, api_key):
     """Add magnet to TorBox."""
     headers = {'Authorization': f'Bearer {api_key}'}
+    failure = {}
     resp = _urllib_post(
         'https://api.torbox.app/v1/api/torrents/createtorrent',
         data={'magnet': magnet},
         headers=headers,
         timeout=_ADD_TIMEOUT,
+        _failure=failure,
     )
     if not resp:
-        return {'success': False, 'torrent_id': '', 'error': 'Failed to add magnet to TorBox'}
+        # transient: TorBox never answered — no verdict on the create (a
+        # timed-out create may even have gone through)
+        return {'success': False, 'torrent_id': '', 'error': 'Failed to add magnet to TorBox',
+                'transient': bool(failure.get('transient'))}
 
     if resp.get('success'):
         torrent_id = str(resp.get('data', {}).get('torrent_id', ''))

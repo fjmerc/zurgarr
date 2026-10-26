@@ -235,6 +235,36 @@ class TestSearchTorrentio:
         assert search_torrentio('tt1234567') == []
 
 
+class TestAddToTbFailureKind:
+    """A TorBox create that never got an answer (timeout, network, 5xx,
+    408/429, cut-off reply) is flagged transient; a real rejection (4xx,
+    e.g. the cooldown's 400 DOWNLOAD_SERVER_ERROR) is not."""
+
+    @pytest.mark.parametrize('failure,transient', [
+        (TimeoutError('timed out'), True),
+        (urllib.error.URLError('Connection refused'), True),
+        (http.client.IncompleteRead(b''), True),
+        (urllib.error.HTTPError('https://t', 503, 'Unavailable', {}, None), True),
+        (urllib.error.HTTPError('https://t', 429, 'Too Many', {}, None), True),
+        (urllib.error.HTTPError('https://t', 400, 'Bad Request', {}, None), False),
+    ])
+    @patch('urllib.request.urlopen')
+    def test_failure_kind(self, mock_urlopen, failure, transient):
+        from utils.search import _add_to_tb
+        mock_urlopen.side_effect = failure
+        result = _add_to_tb('magnet:?xt=urn:btih:' + 'a' * 40, 'key')
+        assert result['success'] is False
+        assert bool(result.get('transient')) is transient
+
+    @patch('urllib.request.urlopen')
+    def test_rejection_body_is_not_transient(self, mock_urlopen):
+        from utils.search import _add_to_tb
+        mock_urlopen.return_value = _mock_urlopen_response(
+            {'success': False, 'error': 'DOWNLOAD_SERVER_ERROR', 'detail': 'nope'})
+        result = _add_to_tb('magnet:?xt=urn:btih:' + 'a' * 40, 'key')
+        assert result['success'] is False and not result.get('transient')
+
+
 class TestSearchTorrentioStrict:
     """strict=True (the quality-compromise path): Torrentio not answering
     raises SearchUnavailable instead of looking like "no torrents"."""

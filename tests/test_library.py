@@ -8315,7 +8315,7 @@ class TestRecoverWantedViaTorbox:
              'imdb_id': 'tt2', 'is_available': True},
         ]
 
-    def _failing_add(self, wire, monkeypatch, duplicate=False):
+    def _failing_add(self, wire, monkeypatch, duplicate=False, transient=False):
         import utils.search as search
 
         def _add(info_hash, **kw):
@@ -8324,6 +8324,8 @@ class TestRecoverWantedViaTorbox:
                       'error': 'Failed to add magnet to TorBox'}
             if duplicate:
                 result['duplicate'] = True
+            if transient:
+                result['transient'] = True
             return result
         monkeypatch.setattr(search, 'add_to_debrid', _add)
 
@@ -8353,6 +8355,28 @@ class TestRecoverWantedViaTorbox:
         sc = self._scanner()
         sc._recover_wanted_via_debrid([], self._two_movies(), {})
         assert len(wire['adds']) == 2
+
+    def test_unanswered_add_pauses_leg_without_claiming_enforcement(
+            self, wire, monkeypatch, caplog):
+        # A timeout / network error / 5xx / 429 is no proof TorBox enforces
+        # the cooldown flag (prod 2026-10-26: one createtorrent timeout was
+        # logged as "enforcement confirmed") — but the leg still pauses for
+        # the pass: its budget only counts successes, so carrying on could
+        # send a burst of creates at a struggling TorBox.
+        import logging
+        import utils.blackhole as bh
+        wire['cooldown'] = 3600
+        self._failing_add(wire, monkeypatch, transient=True)
+        reprobes = []
+        monkeypatch.setattr(bh, '_check_torbox_cooldown',
+                            lambda *a, **kw: reprobes.append(kw) or 3600)
+        sc = self._scanner()
+        with caplog.at_level(logging.INFO):
+            sc._recover_wanted_via_debrid([], self._two_movies(), {})
+        assert len(wire['adds']) == 1
+        assert not any(kw.get('force_refresh') for kw in reprobes)
+        assert 'enforcement confirmed' not in caplog.text
+        assert 'no answer from TorBox' in caplog.text
 
     def test_duplicate_add_does_not_trigger_backoff(self, wire, monkeypatch):
         # A duplicate isn't a rejected create — no enforcement inference,
