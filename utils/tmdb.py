@@ -969,13 +969,14 @@ def get_cached_tmdb_ids():
         yearless_seen = {}  # base -> tmdb_id
         yearless_collisions = set()
         for norm_title, entry in cache.get(section, {}).items():
-            if not _is_fresh(entry):
-                continue
             tmdb_id = entry.get('tmdb_id')
             if not tmdb_id:
                 continue
-            entries[norm_title] = tmdb_id
-            # Extract yearless base for alias
+            if _is_fresh(entry):
+                entries[norm_title] = tmdb_id
+            # Collisions count stale entries too (a title's ID doesn't
+            # expire): an alias that ignores a stale sibling would point
+            # the bare title at the wrong show.
             m = _year_re.match(norm_title)
             base = m.group(1) if m else norm_title
             if base in yearless_seen and yearless_seen[base] != tmdb_id:
@@ -996,10 +997,17 @@ def get_yearless_collision_bases():
     """Return normalized yearless bases claimed by multiple distinct titles.
 
     A "collision base" is a bare normalized title (e.g. ``icarly``) for
-    which the cache holds 2+ fresh year-qualified entries with *different*
+    which the cache holds 2+ year-qualified entries with *different*
     TMDB IDs — a reboot family like iCarly (2007) vs iCarly (2021).  The
     library scanner uses this set to switch those titles to year-qualified
     grouping keys so the siblings never aggregate into one item.
+
+    Stale entries count: a title's TMDB ID doesn't expire, and once the
+    siblings merge nothing refreshes the absorbed one's entry — a TTL
+    gate here would switch the guard off for good.  Bare (yearless)
+    entries don't: ``resolve_show_year_by_episodes`` can only attribute
+    to year-qualified siblings, and a bare key is often a wrong first
+    match (prod: ``dark`` → Dark Shadows beside ``dark (2017)``).
 
     Returns: ``{'shows': set(), 'movies': set()}``.
     """
@@ -1013,13 +1021,13 @@ def get_yearless_collision_bases():
         seen = {}  # base -> tmdb_id
         collisions = set()
         for norm_title, entry in cache.get(section, {}).items():
-            if not _is_fresh(entry):
-                continue
             tmdb_id = entry.get('tmdb_id')
             if not tmdb_id:
                 continue
             m = _year_re.match(norm_title)
-            base = m.group(1) if m else norm_title
+            if not m:
+                continue
+            base = m.group(1)
             if base in seen and seen[base] != tmdb_id:
                 collisions.add(base)
             seen[base] = tmdb_id
@@ -1027,19 +1035,33 @@ def get_yearless_collision_bases():
     return result
 
 
+# TMDB statuses after which a show's season/episode list is final.
+_ENDED_STATUSES = frozenset({'Ended', 'Canceled'})
+
+
 def resolve_show_year_by_episodes(base_norm, ep_keys):
     """Attribute a yearless release in a reboot family by episode shape.
 
     Given a bare collision base (e.g. ``icarly``) and the release's
-    ``(season, episode)`` keys, check every fresh year-qualified sibling
+    ``(season, episode)`` keys, check every year-qualified sibling
     entry (``icarly (2007)``, ``icarly (2021)``) for structural coverage:
     a sibling "fits" when its cached episode list contains every key the
     release carries (2007's S01 has 25 episodes, 2021's only 13 — so
     S01E20 fits exactly one).  Returns the sibling's year (int) when
     exactly ONE fits; ``None`` when zero or multiple fit, so ambiguous
     releases stay unattributed rather than guessed.
+
+    Stale siblings count too — dropping one would let the other "fit"
+    alone.  A stale entry for a show that hasn't ended can't rule out
+    episodes in its last known season or later, which may have aired
+    since it was cached.
+
+    Specials (season 0, never cached) and synthetic keys for files
+    without SxxEyy (episode 1000+N) are ignored — no sibling can cover
+    them, so they would make every release carrying one ambiguous.
     """
-    ep_keys = set(ep_keys or ())
+    ep_keys = {k for k in (ep_keys or ())
+               if k[0] != 0 and not (isinstance(k[1], int) and k[1] >= 1000)}
     if not ep_keys or not base_norm:
         return None
     with _cache_lock:
@@ -1050,7 +1072,7 @@ def resolve_show_year_by_episodes(base_norm, ep_keys):
     fits = []
     for norm_title, entry in cache.get('shows', {}).items():
         m = pattern.match(norm_title)
-        if not m or not _is_fresh(entry):
+        if not m:
             continue
         have = set()
         for s in entry.get('seasons', []):
@@ -1062,7 +1084,12 @@ def resolve_show_year_by_episodes(base_norm, ep_keys):
                 ad = ep.get('air_date', '')
                 if ad and ad <= today:
                     have.add((snum, ep.get('number')))
-        if ep_keys <= have:
+        unknown = ep_keys - have
+        if unknown and not _is_fresh(entry) and entry.get('status') not in _ENDED_STATUSES:
+            last_known = max((s.get('number') or 0 for s in entry.get('seasons', [])),
+                             default=0)
+            unknown = {k for k in unknown if k[0] is None or k[0] < last_known}
+        if not unknown:
             fits.append(int(m.group(1)))
     return fits[0] if len(fits) == 1 else None
 

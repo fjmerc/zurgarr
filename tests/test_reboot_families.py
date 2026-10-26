@@ -90,10 +90,34 @@ class TestYearlessCollisionBases:
         bases = tmdb.get_yearless_collision_bases()
         assert bases['shows'] == set()
 
-    def test_stale_entries_ignored(self):
+    def test_stale_sibling_still_collides(self):
+        # A title+year -> TMDB ID mapping doesn't expire.  Once the
+        # siblings merge there's no separate item left to refresh the
+        # absorbed one's entry, so a TTL gate here switches the guard
+        # off for good (prod 2026-10-26: iCarly 2021 cached 84 days
+        # earlier, its episodes linked into iCarly 2007).
         _seed_cache(shows={
-            'icarly (2007)': _entry('iCarly', 100, stale=True),
-            'icarly (2021)': _entry('iCarly', 200),
+            'icarly (2007)': _entry('iCarly', 100),
+            'icarly (2021)': _entry('iCarly', 200, stale=True),
+        })
+        bases = tmdb.get_yearless_collision_bases()
+        assert 'icarly' in bases['shows']
+
+    def test_bare_entry_is_not_a_sibling(self):
+        # The episode-shape resolver only sees year-qualified siblings, so
+        # a bare entry must not form a family it can't resolve: prod's
+        # bare 'dark' is a wrong match (Dark Shadows) next to 'dark (2017)'.
+        _seed_cache(shows={
+            'dark': _entry('Dark Shadows', 2883),
+            'dark (2017)': _entry('Dark', 70523),
+        })
+        bases = tmdb.get_yearless_collision_bases()
+        assert bases['shows'] == set()
+
+    def test_entry_without_tmdb_id_ignored(self):
+        _seed_cache(shows={
+            'icarly (2007)': _entry('iCarly', 100),
+            'icarly (2021)': _entry('iCarly', None),
         })
         bases = tmdb.get_yearless_collision_bases()
         assert bases['shows'] == set()
@@ -126,6 +150,102 @@ class TestResolveShowYearByEpisodes:
     def test_fits_both_siblings_returns_none(self):
         _seed_icarly_family()
         assert tmdb.resolve_show_year_by_episodes('icarly', {(1, 5)}) is None
+
+    def test_stale_sibling_still_counts(self):
+        # Ignoring the stale 2021 entry would let 2007 "fit" alone and
+        # claim a release both runs could have produced.
+        _seed_cache(shows={
+            'icarly (2007)': _entry('iCarly', 100, {1: 25, 2: 25}),
+            'icarly (2021)': dict(_entry('iCarly', 200, {1: 13, 2: 10}, stale=True),
+                                  status='Canceled'),
+        })
+        assert tmdb.resolve_show_year_by_episodes('icarly', {(2, 6)}) is None
+        assert tmdb.resolve_show_year_by_episodes('icarly', {(2, 20)}) == 2007
+
+    def test_stale_running_sibling_may_have_newer_seasons(self):
+        # A stale entry for a show still airing can't rule out episodes
+        # that aired after it was cached — in its last known season or a
+        # later one — so they mustn't be handed to the ended 2015 run.
+        running = _entry('Dark Matter', 200, {1: 9, 2: 3}, stale=True)
+        running['status'] = 'Returning Series'
+        _seed_cache(shows={
+            'dark matter (2015)': dict(_entry('Dark Matter', 100, {1: 13, 2: 13, 3: 13}),
+                                       status='Canceled'),
+            'dark matter (2024)': running,
+        })
+        assert tmdb.resolve_show_year_by_episodes('dark matter', {(2, 8)}) is None
+        assert tmdb.resolve_show_year_by_episodes('dark matter', {(3, 1)}) is None
+        # A finished earlier season still rules it out.
+        assert tmdb.resolve_show_year_by_episodes('dark matter', {(1, 12)}) == 2015
+
+    @pytest.mark.parametrize('extra', [(0, 1), (1, 1003)])
+    def test_specials_and_unnumbered_files_dont_block_attribution(self, extra):
+        # TMDB caching drops season 0, and files without SxxEyy get
+        # synthetic (season, 1000+N) keys — neither can be covered by any
+        # sibling, so they mustn't make an attributable release ambiguous.
+        _seed_icarly_family()
+        assert tmdb.resolve_show_year_by_episodes('icarly', {(1, 20), extra}) == 2007
+        assert tmdb.resolve_show_year_by_episodes('icarly', {extra}) is None
+
+    def test_stale_running_sibling_mixed_seasons(self):
+        # The last-season key is forgiven, but the finished earlier
+        # season still rules the running sibling out.
+        running = _entry('Dark Matter', 200, {1: 9, 2: 3}, stale=True)
+        running['status'] = 'Returning Series'
+        _seed_cache(shows={
+            'dark matter (2015)': dict(_entry('Dark Matter', 100, {1: 13, 2: 13, 3: 13}),
+                                       status='Canceled'),
+            'dark matter (2024)': running,
+        })
+        assert tmdb.resolve_show_year_by_episodes(
+            'dark matter', {(1, 12), (2, 8)}) == 2015
+
+    @pytest.mark.parametrize('status', [None, ''])
+    def test_stale_sibling_without_status_treated_as_running(self, status):
+        unknown = _entry('Dark Matter', 200, {1: 9}, stale=True)
+        if status is not None:
+            unknown['status'] = status
+        _seed_cache(shows={
+            'dark matter (2015)': dict(_entry('Dark Matter', 100, {1: 13, 2: 13}),
+                                       status='Canceled'),
+            'dark matter (2024)': unknown,
+        })
+        assert tmdb.resolve_show_year_by_episodes('dark matter', {(2, 1)}) is None
+
+    @pytest.mark.parametrize('status, expected', [
+        ('Returning Series', None),   # can't rule anything out → ambiguous
+        ('Ended', 2015),              # finished with nothing cached → fits nothing
+    ])
+    def test_stale_sibling_with_no_seasons(self, status, expected):
+        empty = dict(_entry('Dark Matter', 200, stale=True), status=status)
+        _seed_cache(shows={
+            'dark matter (2015)': dict(_entry('Dark Matter', 100, {1: 13}),
+                                       status='Canceled'),
+            'dark matter (2024)': empty,
+        })
+        assert tmdb.resolve_show_year_by_episodes('dark matter', {(1, 1)}) == expected
+
+    @pytest.mark.parametrize('key', [(0, 1), (None, 1)])
+    def test_special_or_unknown_season_key_fits_no_running_stale_sibling(self, key):
+        running = _entry('Dark Matter', 200, {1: 9, 2: 3}, stale=True)
+        running['status'] = 'Returning Series'
+        _seed_cache(shows={
+            'dark matter (2015)': dict(_entry('Dark Matter', 100, {1: 13}),
+                                       status='Canceled'),
+            'dark matter (2024)': running,
+        })
+        assert tmdb.resolve_show_year_by_episodes('dark matter', {key}) is None
+
+    def test_stale_ended_sibling_keeps_known_shape(self):
+        ended = _entry('Dark Matter', 100, {1: 13, 2: 13, 3: 13}, stale=True)
+        ended['status'] = 'Canceled'
+        _seed_cache(shows={
+            'dark matter (2015)': ended,
+            'dark matter (2024)': _entry('Dark Matter', 200, {1: 9, 2: 10}),
+        })
+        # 2015 ended at S03, so a stale entry is still complete: S04 fits neither.
+        assert tmdb.resolve_show_year_by_episodes('dark matter', {(4, 1)}) is None
+        assert tmdb.resolve_show_year_by_episodes('dark matter', {(3, 5)}) == 2015
 
     def test_fits_neither_returns_none(self):
         _seed_icarly_family()
@@ -426,6 +546,24 @@ class TestScanLocalShows:
         assert _show_norm(items[0]) == 'icarly (2007)'
         assert items[0]['year'] == 2007
         assert '_ambiguous_reboot' not in items[0]
+
+    def test_local_scan_keeps_siblings_apart_when_one_entry_is_stale(
+            self, tmp_dir, monkeypatch):
+        _seed_cache(shows={
+            'icarly (2007)': _entry('iCarly', 100, {1: 25, 2: 25}),
+            'icarly (2021)': _entry('iCarly', 200, {1: 13}, stale=True),
+        })
+        local_tv = os.path.join(tmp_dir, 'tv')
+        _touch(os.path.join(local_tv, 'iCarly (2007)', 'Season 01',
+                            'iCarly S01E03.mkv'))
+        _touch(os.path.join(local_tv, 'iCarly (2021)', 'Season 01',
+                            'iCarly S01E03.mkv'))
+        scanner = _make_scanner(None, local_tv, monkeypatch)
+
+        items = scanner._scan_local_shows()
+
+        assert sorted(_show_norm(i) for i in items) == [
+            'icarly (2007)', 'icarly (2021)']
 
     def test_local_scan_marks_unresolvable_ambiguous(self, tmp_dir, monkeypatch):
         _seed_icarly_family()
@@ -728,3 +866,26 @@ class TestSwitchToDebridEndpoint:
         assert code == 400
         assert 'No matching episodes' in body['error']
         assert switched == []
+
+
+# ---------------------------------------------------------------------------
+# tmdb.get_cached_tmdb_ids — yearless aliases
+# ---------------------------------------------------------------------------
+
+class TestCachedTmdbIdsYearlessAlias:
+
+    def test_no_bare_alias_when_stale_sibling_collides(self):
+        # A stale sibling still claims the bare title: publishing
+        # 'dark matter' -> the 2024 show would let the arr-match cascade
+        # link an item attributed to the 2015 show into 2024's folder.
+        _seed_cache(shows={
+            'dark matter (2015)': _entry('Dark Matter', 62425, stale=True),
+            'dark matter (2024)': _entry('Dark Matter', 196322),
+        })
+        shows = tmdb.get_cached_tmdb_ids()['shows']
+        assert 'dark matter' not in shows
+        assert shows['dark matter (2024)'] == 196322
+
+    def test_bare_alias_published_without_collision(self):
+        _seed_cache(shows={'andor (2022)': _entry('Andor', 300)})
+        assert tmdb.get_cached_tmdb_ids()['shows']['andor'] == 300
