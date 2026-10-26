@@ -9,6 +9,8 @@ appears on the rclone mount, then creates symlinks in a completed
 directory for Sonarr/Radarr to import.
 """
 
+import base64
+import collections
 import hashlib
 import json
 import os
@@ -41,8 +43,10 @@ except ImportError:
 
 try:
     from utils import blocklist as _blocklist
+    from utils.blocklist import UNCACHED_TIMEOUT_REASON
 except ImportError:
     _blocklist = None
+    UNCACHED_TIMEOUT_REASON = 'Uncached on debrid (timed out)'
 
 from utils.api_metrics import tracked_request
 
@@ -56,6 +60,12 @@ _watcher_lock = threading.Lock()
 # round-trips (API calls + bounded TB alt probes), not a whole mass drop.
 # 15 minutes for a single file means dead/wedged, not slow.
 _HEARTBEAT_NAME = 'blackhole_watcher'
+# Failed-download reports to Sonarr/Radarr per hour, across all titles: each
+# one makes the arr search every indexer and grab again.  Over the cap a
+# drop is just deleted; the arr re-grabs it later and it's reported then.
+_ARR_FEEDBACK_PER_HOUR = 20
+_arr_feedback_times = collections.deque()
+_arr_feedback_lock = threading.Lock()
 _HEARTBEAT_STALE_AFTER = 900
 
 # Retry configuration for failed torrent submissions
@@ -659,6 +669,38 @@ def _bencode_end(data, start):
             return None
         return colon + 1 + length
     return None
+
+
+_BTIH_RE = re.compile(r'btih:([A-Za-z0-9]+)', re.IGNORECASE)
+
+
+def _btih_from_magnet(text):
+    """Upper-case hex info hash from a magnet URI, or None.
+
+    Accepts both forms the BitTorrent spec allows: 40 hex characters, and
+    the older 32-character base32 encoding (decoded to hex).  Anything else
+    is not a usable hash.
+    """
+    m = _BTIH_RE.search(text or '')
+    if not m:
+        return None
+    raw = m.group(1)
+    if len(raw) == 40 and re.fullmatch(r'[0-9A-Fa-f]{40}', raw):
+        return raw.upper()
+    if len(raw) == 32:
+        try:
+            return base64.b32decode(raw.upper()).hex().upper()
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def _drop_mtime(path):
+    """The drop file's mtime (≈ when the arr grabbed it), or None."""
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
 
 
 def _parse_episodes(filename):
@@ -3241,7 +3283,7 @@ class BlackholeWatcher:
                     bl_hash = self._extract_hash_from_info(info, debrid=debrid)
                     if bl_hash:
                         _blocklist.add(bl_hash, filename,
-                                       reason='Uncached on debrid (timed out)',
+                                       reason=UNCACHED_TIMEOUT_REASON,
                                        source='auto')
                         if _history:
                             _history.log_event('blocklist_added', filename, episode=_ep,
@@ -4492,20 +4534,20 @@ class BlackholeWatcher:
 
         Returns True when the existing torrent is (now) being monitored —
         started here, or already running for an earlier drop of the same
-        hash; the caller then removes the drop.  Never raises.
+        hash; the caller then removes the drop.  False when the account
+        holds only an expired/dead copy (the caller deletes the drop, then
+        reports the grab failed); None when it can't be linked for any
+        other reason.  Never raises.
         """
         if not self.symlink_enabled:
-            return False
+            return None
         try:
             from utils.search import find_existing_torrent_id
             torrent_id = find_existing_torrent_id(debrid, api_key, info_hash)
             if torrent_id is False:
-                # Only an expired/dead copy: nothing to import, and a silent
-                # discard has the arr re-grab the same release — report it.
-                self._push_arr_failed_feedback(filename, info_hash, debrid, label=label)
                 return False
             if not torrent_id:
-                return False
+                return None
             with self._monitors_lock:
                 already = torrent_id in self._active_monitors
             if already:
@@ -4518,7 +4560,7 @@ class BlackholeWatcher:
         except Exception as e:
             logger.warning(f"[blackhole] Could not link existing {debrid} torrent for "
                            f"{filename}: {e}")
-            return False
+            return None
         logger.info(f"[blackhole] {filename} already in {debrid} account — "
                     f"linking existing torrent {torrent_id} for import")
         if _history:
@@ -4537,21 +4579,46 @@ class BlackholeWatcher:
             pass
         return True
 
-    def _push_arr_failed_feedback(self, filename, info_hash, debrid, label=None):
+    def _link_finished_timeout(self, filename, info_hash, entry, label=None):
+        """A hash blocklisted for an uncached timeout stays in the debrid
+        account and may finish later; when the arr grabs it again and a
+        ready copy is there, link it for import (and drop the now-obsolete
+        blocklist entry) instead of refusing it.  True when linked.
+        """
+        keys = dict(getattr(self, 'debrid_api_keys', None) or {})
+        debrids = [self.debrid_service] + [d for d in keys if d != self.debrid_service]
+        for debrid in debrids:
+            if self._link_existing_duplicate(filename, info_hash, debrid,
+                                             self._api_key_for(debrid), label):
+                removed = bool(entry.get('id')) and _blocklist.remove(entry['id'])
+                logger.info(f"[blackhole] {filename}: timed-out torrent finished on "
+                            f"{debrid} — linked"
+                            + (", blocklist entry removed" if removed else ""))
+                return True
+        return False
+
+    def _push_arr_failed_feedback(self, filename, info_hash, debrid, label=None,
+                                  grabbed_since=None):
         """Tell the owning arr that the grab identified by *info_hash* failed.
 
-        Without feedback, an uncached-rejected drop is silently deleted and
-        the arr — never told anything went wrong — re-grabs the identical
-        release on its next RSS/search pass, forever (observed live: same
-        hash 25×/week).  ``mark_download_failed`` makes the arr blocklist
-        THAT release and immediately search for a different one.
+        Only for grabs that can never work — a hash zurgarr blocklisted
+        (an uncached timeout included, unless the torrent has since finished
+        and was linked), or only a dead copy in the debrid account.  Without feedback such a
+        drop is silently deleted and the arr — never told anything went
+        wrong — re-grabs the identical release on its next RSS/search pass,
+        forever.  ``mark_download_failed`` makes the arr blocklist THAT
+        release (permanently — which is why "not cached yet" is never
+        reported) and immediately search for a different one.
+        *grabbed_since* is the drop's mtime; it bounds which arr grab
+        record may match.
 
         A persistent per-title strike cap bounds the resulting escalation
         chain: after ``BLACKHOLE_ARR_FEEDBACK_MAX_STRIKES`` fed-back
         failures for one (title[, season/episode]) the arr has likely
         exhausted its viable candidates, so feedback stops and the reject
         degrades to the status-quo silent delete (the Wanted recovery pass
-        owns the title from there).
+        owns the title from there).  ``_ARR_FEEDBACK_PER_HOUR`` caps reports
+        across all titles the same way.
 
         Returns True iff the arr accepted the failure report.  Never
         raises; any failure degrades to the silent-delete status quo.
@@ -4597,13 +4664,40 @@ class BlackholeWatcher:
                     f"{skey} ({strikes}/{cap}) — not reporting {filename}")
                 return False
 
-            if not client.mark_download_failed(info_hash):
+            now = time.time()
+            # Reserve the slot before the call so concurrent reports can't
+            # overshoot the cap; a report the arr didn't take gives it back.
+            with _arr_feedback_lock:
+                while _arr_feedback_times and now - _arr_feedback_times[0] > 3600:
+                    _arr_feedback_times.popleft()
+                busy = len(_arr_feedback_times) >= _ARR_FEEDBACK_PER_HOUR
+                if not busy:
+                    _arr_feedback_times.append(now)
+            if busy:
+                logger.info(
+                    f"[blackhole] Arr feedback: {_ARR_FEEDBACK_PER_HOUR} reports in "
+                    f"the last hour — not reporting {filename}")
+                return False
+
+            accepted = False
+            try:
+                accepted = client.mark_download_failed(info_hash, grabbed_since=grabbed_since)
+            finally:
+                if not accepted:
+                    with _arr_feedback_lock:
+                        try:
+                            _arr_feedback_times.remove(now)
+                        except ValueError:
+                            pass
+            if not accepted:
                 return False
             strikes = attempt_ledger.bump(skey)
             if _history:
                 _mt, _ep = _enrich_for_history(filename)
+                # Info-level type: the caller logs the reject itself (a
+                # warning); this records only that the arr was told.
                 _history.log_event(
-                    'blocklisted', filename, episode=_ep, source='blackhole',
+                    'arr_feedback', filename, episode=_ep, source='blackhole',
                     detail=f'Reported failed to '
                            f'{"Sonarr" if is_tv else "Radarr"} — release '
                            f'blocklisted, next candidate searched',
@@ -5409,10 +5503,9 @@ class BlackholeWatcher:
                 continue
 
             # Extract info hash from magnet URI
-            m = re.search(r'btih:([A-Fa-f0-9]+)', guid, re.IGNORECASE)
-            if not m:
+            info_hash = _btih_from_magnet(guid)
+            if not info_hash:
                 continue
-            info_hash = m.group(1).upper()
 
             # Skip if same hash as the one that was rejected
             if orig_hash and info_hash == orig_hash.upper():
@@ -5492,7 +5585,7 @@ class BlackholeWatcher:
     def _extract_info_hash_from_file(file_path):
         """Extract info hash from a .magnet or .torrent file.
 
-        For .magnet: parses the btih: URI parameter.
+        For .magnet: parses the btih: URI parameter (hex or base32).
         For .torrent: locates the bencoded 'info' dict and SHA1 hashes
         its raw bytes (the standard BitTorrent info hash computation).
         """
@@ -5501,9 +5594,7 @@ class BlackholeWatcher:
             try:
                 with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
                     content = f.read().strip()
-                m = re.search(r'btih:([A-Fa-f0-9]+)', content, re.IGNORECASE)
-                if m:
-                    return m.group(1).upper()
+                return _btih_from_magnet(content)
             except OSError:
                 pass
         elif ext == '.torrent':
@@ -5559,12 +5650,19 @@ class BlackholeWatcher:
         info_hash = self._extract_info_hash_from_file(file_path)
 
         # Check blocklist before submitting to debrid
-        if _blocklist and info_hash and _blocklist.is_blocked(info_hash):
+        # One lookup: an entry removed meanwhile (UI, expiry) must not be
+        # reported to the arr, whose ban would be permanent.
+        entry = _blocklist.get_entry(info_hash) if (_blocklist and info_hash) else None
+        if entry:
+            if (entry.get('reason') == UNCACHED_TIMEOUT_REASON
+                    and self._link_finished_timeout(filename, info_hash, entry, label)):
+                try:
+                    os.remove(file_path)
+                except OSError as e:
+                    logger.warning(f"[blackhole] Could not remove duplicate file {filename}: {e}")
+                return
             logger.info(f"[blackhole] Skipping blocklisted torrent: {filename} ({info_hash[:16]}...)")
-            # Tell the arr, or it re-grabs this same blocked release on every
-            # search (one Gotify "Grabbed" each) — it blocklists it on its
-            # side and picks another.
-            self._push_arr_failed_feedback(filename, info_hash, self.debrid_service, label=label)
+            grabbed_since = _drop_mtime(file_path)
             if _history:
                 _mt, _ep = _enrich_for_history(filename)
                 _history.log_event('blocklisted', filename, episode=_ep, source='blackhole',
@@ -5576,6 +5674,16 @@ class BlackholeWatcher:
                 os.remove(file_path)
             except OSError as e:
                 logger.warning(f"[blackhole] Could not remove blocklisted file {filename}: {e}")
+            # Tell the arr, or it re-grabs this same blocked release on every
+            # search (one Gotify "Grabbed" each) — it blocklists it on its
+            # side and picks another.  After the delete: its re-search may
+            # drop a same-named file, which the delete would then remove.
+            # A timed-out hash is reported too: whether it was deleted, sits
+            # at 0% forever or died, nothing else ends the re-grab loop.  If
+            # it does finish later, the library scan still links it from the
+            # account; the strike cap bounds the arr's walk either way.
+            self._push_arr_failed_feedback(filename, info_hash, self.debrid_service,
+                                           label=label, grabbed_since=grabbed_since)
             return
 
         # Decide which debrid this grab routes to (plan 39 phase 2).
@@ -5658,12 +5766,15 @@ class BlackholeWatcher:
             if debrid_dedup_enabled:
                 existing = _existing_hashes(debrid, api_key)
                 if existing is not None and lowered in existing:
-                    if self._link_existing_duplicate(filename, info_hash, debrid, api_key, label):
+                    linked = self._link_existing_duplicate(filename, info_hash, debrid,
+                                                           api_key, label)
+                    if linked:
                         try:
                             os.remove(file_path)
                         except OSError as e:
                             logger.warning(f"[blackhole] Could not remove duplicate file {filename}: {e}")
                         return
+                    grabbed_since = _drop_mtime(file_path)
                     logger.info(f"[blackhole] Skipping duplicate: {filename} already in {debrid} account")
                     if _history:
                         _mt, _ep = _enrich_for_history(filename)
@@ -5677,6 +5788,11 @@ class BlackholeWatcher:
                         os.remove(file_path)
                     except OSError as e:
                         logger.warning(f"[blackhole] Could not remove duplicate file {filename}: {e}")
+                    if linked is False:
+                        # Only a dead copy: nothing to import, and a silent
+                        # discard has the arr re-grab the same release.
+                        self._push_arr_failed_feedback(filename, info_hash, debrid, label=label,
+                                                       grabbed_since=grabbed_since)
                     try:
                         from utils.metrics import metrics
                         metrics.inc('blackhole_processed', {'status': 'skipped_duplicate'})
@@ -5698,12 +5814,11 @@ class BlackholeWatcher:
                     if self._try_torbox_cached_alternative(
                             file_path, filename, info_hash, debrid, label=label) is not False:
                         return  # recovered, or TorBox paused — retried next scan
-                    # No cached alternative either — before the silent
-                    # delete, tell the arr the grab failed so it blocklists
-                    # this release and searches for a different one.
-                    self._push_arr_failed_feedback(filename, info_hash, debrid, label=label)
                     # Provider confirmed uncached — safe to delete; nothing
-                    # to wait for.
+                    # to wait for.  The arr is NOT told the grab failed:
+                    # uncached is usually temporary, the arr's blocklist is
+                    # permanent (the release, its upgrades and force-grab
+                    # could never use it once it caches).
                     cache_label = 'uncached'
                     logger.info(f"[blackhole] Skipping {cache_label}: {filename} on {debrid}")
                     if _history:
@@ -5750,7 +5865,7 @@ class BlackholeWatcher:
                         if self._try_torbox_cached_alternative(
                                 file_path, filename, info_hash, debrid, label=label) is not False:
                             return  # recovered, or TorBox paused — retried next scan
-                        self._push_arr_failed_feedback(filename, info_hash, debrid, label=label)
+                        # Not reported to the arr — see the uncached branch above.
                         logger.info(
                             f"[blackhole] Skipping uncached (cross-confirmed via TB): "
                             f"{filename} routed to {debrid}"
@@ -5808,8 +5923,9 @@ class BlackholeWatcher:
                         if debrid_dedup_enabled:
                             existing = _existing_hashes('torbox', tb_key)
                             if existing is not None and lowered in existing:
-                                if self._link_existing_duplicate(filename, info_hash, 'torbox',
-                                                                 tb_key, label):
+                                linked = self._link_existing_duplicate(
+                                    filename, info_hash, 'torbox', tb_key, label)
+                                if linked:
                                     try:
                                         os.remove(file_path)
                                     except OSError as e:
@@ -5817,6 +5933,7 @@ class BlackholeWatcher:
                                             f"[blackhole] Could not remove duplicate file {filename}: {e}"
                                         )
                                     return
+                                grabbed_since = _drop_mtime(file_path)
                                 logger.info(
                                     f"[blackhole] Skipping duplicate: {filename} "
                                     f"already in torbox account (cross-probe re-route)"
@@ -5836,6 +5953,10 @@ class BlackholeWatcher:
                                     logger.warning(
                                         f"[blackhole] Could not remove duplicate file {filename}: {e}"
                                     )
+                                if linked is False:
+                                    self._push_arr_failed_feedback(
+                                        filename, info_hash, 'torbox', label=label,
+                                        grabbed_since=grabbed_since)
                                 try:
                                     from utils.metrics import metrics
                                     metrics.inc('blackhole_processed',

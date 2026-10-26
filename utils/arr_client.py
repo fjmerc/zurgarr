@@ -416,16 +416,22 @@ class _ArrClientBase:
 
     # -- Failed-download feedback (shared, Sonarr/Radarr parity) -----------
 
-    def mark_download_failed(self, info_hash, search_again=True):
+    def mark_download_failed(self, info_hash, search_again=True,
+                             grabbed_since=None):
         """Report the grab identified by *info_hash* as failed so the arr
         blocklists that release and (with ``search_again``) immediately
         searches for a different one.
 
-        Torrent-blackhole grabs record the info hash as the queue item's
-        ``downloadId``, so the queue lookup is exact.  When the queue item
-        is already gone (the arr pruned it as stalled), falls back to
-        marking the grab *history* record failed — same blocklist +
-        redownload semantics on both arrs.
+        Looks the grab up by ``downloadId`` in the queue, then in history;
+        when neither matches — Torrent Blackhole grabs carry no hash
+        ``downloadId`` (live Sonarr: null in history, "<client>_<title>_
+        <ticks>" in the queue) — by the ``torrentInfoHash`` of recent grab
+        records (see ``_fail_grab_by_info_hash``; *grabbed_since* is the
+        drop's mtime, which bounds that match).  A history match is marked
+        failed: same blocklist + redownload semantics as removing the queue
+        item, on both arrs — except that the history endpoint has no
+        skip-redownload option, so there ``search_again`` has no effect; the
+        arr's "Redownload Failed" setting decides its search.
 
         Returns True when the arr accepted the failure report.  Never
         raises; any HTTP failure returns False.
@@ -471,10 +477,103 @@ class _ArrClientBase:
             # POST failed for this record — a re-grabbed release can leave
             # several 'grabbed' records for the same downloadId, so try the
             # rest before giving up.
+        if self._fail_grab_by_info_hash(h, grabbed_since):
+            return True
         logger.debug(
             f"[{self._name}] No queue or grab-history record found for "
             f"downloadId {h} — cannot report failure")
         return False
+
+    # Slack before the drop's mtime: the arr writes the drop, then records
+    # the grab, but clocks and filesystems differ.
+    _GRAB_MATCH_SLACK = 600
+    # A season pack's per-episode grab records share one timestamp; two
+    # grabs of the same release further apart than this are separate grabs.
+    # Failing one record blocklists the whole release; the arr searches only
+    # that record's episode, and the pack's others wait for its normal
+    # missing-episode searches — searching them here would run one search
+    # per episode (packs rejected) on top of the arr's own, so could grab
+    # the same episode twice or every episode separately.
+    _GRAB_GROUP_WINDOW = 60
+
+    @staticmethod
+    def _history_epoch(rec):
+        try:
+            return datetime.datetime.fromisoformat(
+                str(rec.get('date') or '').replace('Z', '+00:00')).timestamp()
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _history_item_key(rec):
+        """(sourceTitle, episode/movie id) — what ties a downloadFailed
+        record to the grab it failed (it carries no hash)."""
+        return (rec.get('sourceTitle'),
+                rec.get('episodeId') if rec.get('episodeId') is not None
+                else rec.get('movieId'))
+
+    def _fail_grab_by_info_hash(self, h, grabbed_since):
+        """Mark failed the newest grab whose ``data.torrentInfoHash`` is *h*.
+
+        Torrent Blackhole grabs record no downloadId in history, so the
+        lookups by downloadId can't match them.  Only grabs since
+        *grabbed_since* (default: the last day) count — an older grab of
+        the same release is not the one that produced this drop — and a
+        grab the arr already has a downloadFailed record for is left alone,
+        so a re-drop isn't blocklisted and searched twice.
+        """
+        cutoff = (grabbed_since if grabbed_since else time.time() - 86400) \
+            - self._GRAB_MATCH_SLACK
+        recent = self._get('/api/v3/history',
+                           {'eventType': 1, 'pageSize': 250,
+                            'sortKey': 'date', 'sortDirection': 'descending'})
+        matches = []
+        for rec in (recent or {}).get('records') or []:
+            if not isinstance(rec, dict) or rec.get('id') is None:
+                continue
+            if str(rec.get('eventType') or '') != 'grabbed':
+                continue
+            when = self._history_epoch(rec)
+            if when is None or when < cutoff:
+                continue
+            data = rec.get('data') if isinstance(rec.get('data'), dict) else {}
+            if str(data.get('torrentInfoHash') or '').strip().upper() == h:
+                matches.append((when, rec))
+        if not matches:
+            return False
+        matches.sort(key=lambda m: m[0], reverse=True)
+        newest_when, newest = matches[0]
+        grab = [rec for when, rec in matches
+                if newest_when - when <= self._GRAB_GROUP_WINDOW
+                and rec.get('sourceTitle') == newest.get('sourceTitle')]
+
+        # The newest 250 failures: on a busy arr an older one can fall out
+        # and that grab be reported again — harmless, the arr dedups it.
+        failed = self._get('/api/v3/history',
+                           {'eventType': 4, 'pageSize': 250,
+                            'sortKey': 'date', 'sortDirection': 'descending'})
+        for rec in (failed or {}).get('records') or []:
+            if not isinstance(rec, dict):
+                continue
+            if str(rec.get('eventType') or '') != 'downloadFailed':
+                continue
+            when = self._history_epoch(rec)
+            if when is not None and when >= newest_when and any(
+                    self._history_item_key(rec) == self._history_item_key(g)
+                    for g in grab):
+                logger.debug(
+                    f"[{self._name}] Grab already marked failed: "
+                    f"{str(newest.get('sourceTitle', '?'))[:70]}")
+                return False
+
+        # One POST only: a timed-out POST may have gone through, and failing
+        # another record of the same grab would blocklist + search twice.
+        if self._post(f'/api/v3/history/failed/{newest["id"]}', {}) is None:
+            return False
+        logger.info(
+            f"[{self._name}] Marked grab-history record failed: "
+            f"{str(newest.get('sourceTitle', '?'))[:70]}")
+        return True
 
 
 # ---------------------------------------------------------------------------

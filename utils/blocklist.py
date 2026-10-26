@@ -25,6 +25,9 @@ _hash_index = {}    # uppercase info_hash -> id  (O(1) lookup)
 _title_index = {}   # normalized title -> id
 _expiry_days = 0    # 0 = no expiry; >0 = auto-expire auto-added entries after N days
 
+# Reason the blackhole records when a debrid didn't finish a torrent in time.
+UNCACHED_TIMEOUT_REASON = 'Uncached on debrid (timed out)'
+
 
 def init(config_dir='/config'):
     """Initialize the blocklist module. Call once at startup."""
@@ -208,6 +211,16 @@ def is_blocked_title(title):
         return False
     norm = _norm_title(title)
     return norm in _title_index if norm else False
+
+
+def get_entry(info_hash):
+    """Return a copy of the entry blocking *info_hash*, or None."""
+    if not info_hash:
+        return None
+    with _lock:
+        entry_id = _hash_index.get(info_hash.strip().upper())
+        entry = _entries.get(entry_id) if entry_id else None
+        return dict(entry) if entry else None
 
 
 def get_all():

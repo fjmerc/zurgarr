@@ -947,13 +947,15 @@ _READY_STATES = {
 # that let the blackhole report a re-dropped grab failed.  Anything else
 # that isn't ready (downloading, queued, waiting for file selection) may be
 # a download zurgarr is in the middle of, so it is never treated as dead.
-# RD mirrors blackhole.RD_TERMINAL_ERRORS; AllDebrid's error statuses are
-# free-form, so AD copies are never declared dead.
+# RD mirrors blackhole.RD_TERMINAL_ERRORS.  AllDebrid's status text is
+# free-form, so AD goes by its numeric statusCode: 0-3 in progress, 4 ready,
+# 5 and up an error (upload failed, not downloaded in 20 min, no peer...).
 _DEAD_STATES = {
     'torbox': {'expired', 'error', 'failed'},
     'realdebrid': {'magnet_error', 'error', 'virus', 'dead'},
     'alldebrid': set(),
 }
+_AD_FIRST_ERROR_CODE = 5
 # {service: (fetched_at, api_key, {hash: id}, {hash whose copies are all dead})}
 _existing_ids_cache = {}
 
@@ -1021,7 +1023,9 @@ def find_existing_torrent_id(service, api_key, info_hash):
             tid = entry.get('id')
             if state in ready and tid not in (None, '') and h not in ids:
                 ids[h] = str(tid)
-            if state in dead_states:
+            code = entry.get('statusCode') if service == 'alldebrid' else None
+            if state in dead_states or (isinstance(code, int) and not isinstance(code, bool)
+                                        and code >= _AD_FIRST_ERROR_CODE):
                 dead.add(h)
             else:
                 alive.add(h)

@@ -1,8 +1,10 @@
 """Tests for the Arr API client module (utils/arr_client.py)."""
 
+import datetime
 import http.client
 import json
 import os
+import time
 import urllib.error
 import pytest
 from unittest.mock import patch, MagicMock
@@ -2479,6 +2481,12 @@ class TestStrictLookups:
 # mark_download_failed — failed-download feedback (blocklist + re-search)
 # ---------------------------------------------------------------------------
 
+def _iso_ago(seconds):
+    """Arr-style UTC timestamp *seconds* in the past."""
+    return datetime.datetime.fromtimestamp(
+        time.time() - seconds, datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
 class TestMarkDownloadFailed:
     """The arr must be told an uncached grab failed, or it re-grabs the
     identical release on every RSS pass.  Queue path: DELETE the queue item
@@ -2488,7 +2496,8 @@ class TestMarkDownloadFailed:
     HASH = 'AB' * 20
 
     def _wire(self, client, monkeypatch, queue=None, history=None,
-              delete_result=None, post_result=None):
+              delete_result=None, post_result=None, recent_grabs=None,
+              failed_records=None):
         calls = {'get': [], 'delete': [], 'post': []}
 
         def fake_get(path, params=None, timeout=None):
@@ -2496,7 +2505,12 @@ class TestMarkDownloadFailed:
             if path == '/api/v3/queue':
                 return queue
             if path == '/api/v3/history':
-                return history
+                params = params or {}
+                if 'downloadId' in params:
+                    return history
+                if params.get('eventType') == 4:
+                    return failed_records
+                return recent_grabs if recent_grabs is not None else history
             return None
 
         def fake_delete(path, params=None):
@@ -2571,6 +2585,162 @@ class TestMarkDownloadFailed:
         assert radarr.mark_download_failed(self.HASH) is False
         assert calls['delete'] == []
         assert calls['post'] == []
+
+    def test_blackhole_grab_found_by_torrent_info_hash(self, sonarr, monkeypatch):
+        # Torrent Blackhole grabs carry no downloadId (prod Sonarr: null in
+        # history, "<client>_<title>_<ticks>" in the queue) — only
+        # data.torrentInfoHash identifies them.  Without this, failed
+        # feedback never matched a blackhole grab in prod.
+        recent = {'records': [
+            {'id': 70, 'eventType': 'grabbed', 'date': _iso_ago(60),
+             'data': {'torrentInfoHash': 'CD' * 20}},
+            {'id': 71, 'eventType': 'grabbed', 'date': _iso_ago(90),
+             'data': {'torrentInfoHash': self.HASH.lower()}}]}
+        calls = self._wire(sonarr, monkeypatch, queue={'records': []},
+                           history={'records': []}, recent_grabs=recent, post_result={})
+        assert sonarr.mark_download_failed(self.HASH) is True
+        assert calls['post'] == [('/api/v3/history/failed/71', {})]
+
+    def test_recent_grabs_without_matching_hash_returns_false(self, radarr, monkeypatch):
+        recent = {'records': [
+            {'id': 70, 'eventType': 'grabbed', 'data': {'torrentInfoHash': 'CD' * 20}},
+            {'id': 72, 'eventType': 'downloadFailed', 'data': {'torrentInfoHash': self.HASH}}]}
+        calls = self._wire(radarr, monkeypatch, queue={'records': []},
+                           history={'records': []}, recent_grabs=recent, post_result={})
+        assert radarr.mark_download_failed(self.HASH) is False
+        assert calls['post'] == []
+
+    def test_radarr_blackhole_grab_found_by_torrent_info_hash(self, radarr, monkeypatch):
+        recent = {'records': [
+            {'id': 9, 'eventType': 'grabbed', 'date': _iso_ago(60),
+             'data': {'torrentInfoHash': self.HASH}}]}
+        calls = self._wire(radarr, monkeypatch, queue={'records': []},
+                           history={'records': []}, recent_grabs=recent, post_result={})
+        assert radarr.mark_download_failed(self.HASH) is True
+        assert calls['post'] == [('/api/v3/history/failed/9', {})]
+
+    def test_hash_match_older_than_drop_is_not_failed(self, sonarr, monkeypatch):
+        # Only the grab that produced this drop may be failed: an older grab
+        # of the same release (imported days ago, or failed already) is
+        # outside the window anchored on the drop's mtime.
+        recent = {'records': [
+            {'id': 71, 'eventType': 'grabbed', 'date': _iso_ago(3 * 3600),
+             'data': {'torrentInfoHash': self.HASH}}]}
+        calls = self._wire(sonarr, monkeypatch, queue={'records': []},
+                           history={'records': []}, recent_grabs=recent, post_result={})
+        assert sonarr.mark_download_failed(
+            self.HASH, grabbed_since=time.time() - 60) is False
+        assert calls['post'] == []
+
+    def test_hash_match_default_window_is_a_day(self, radarr, monkeypatch):
+        recent = {'records': [
+            {'id': 71, 'eventType': 'grabbed', 'date': _iso_ago(2 * 86400),
+             'data': {'torrentInfoHash': self.HASH}}]}
+        calls = self._wire(radarr, monkeypatch, queue={'records': []},
+                           history={'records': []}, recent_grabs=recent, post_result={})
+        assert radarr.mark_download_failed(self.HASH) is False
+        assert calls['post'] == []
+
+    def test_grab_already_marked_failed_is_not_failed_again(self, sonarr, monkeypatch):
+        # A failed report writes a downloadFailed record (no hash in it) but
+        # leaves the grab record as is; a re-drop of the same file must not
+        # blocklist + search a second time.
+        recent = {'records': [
+            {'id': 71, 'eventType': 'grabbed', 'date': _iso_ago(600),
+             'sourceTitle': 'Show.S01E01', 'episodeId': 11,
+             'data': {'torrentInfoHash': self.HASH}}]}
+        failed = {'records': [
+            {'id': 80, 'eventType': 'downloadFailed', 'date': _iso_ago(500),
+             'sourceTitle': 'Show.S01E01', 'episodeId': 11}]}
+        calls = self._wire(sonarr, monkeypatch, queue={'records': []},
+                           history={'records': []}, recent_grabs=recent,
+                           failed_records=failed, post_result={})
+        assert sonarr.mark_download_failed(self.HASH) is False
+        assert calls['post'] == []
+
+    def test_radarr_grab_already_marked_failed_is_not_failed_again(self, radarr, monkeypatch):
+        recent = {'records': [
+            {'id': 9, 'eventType': 'grabbed', 'date': _iso_ago(600),
+             'sourceTitle': 'Film.2020', 'movieId': 5,
+             'data': {'torrentInfoHash': self.HASH}}]}
+        failed = {'records': [
+            {'id': 10, 'eventType': 'downloadFailed', 'date': _iso_ago(500),
+             'sourceTitle': 'Film.2020', 'movieId': 5}]}
+        calls = self._wire(radarr, monkeypatch, queue={'records': []},
+                           history={'records': []}, recent_grabs=recent,
+                           failed_records=failed, post_result={})
+        assert radarr.mark_download_failed(self.HASH) is False
+        assert calls['post'] == []
+
+    def test_earlier_failure_of_same_release_does_not_block_new_grab(self, sonarr, monkeypatch):
+        recent = {'records': [
+            {'id': 71, 'eventType': 'grabbed', 'date': _iso_ago(60),
+             'sourceTitle': 'Show.S01E01', 'episodeId': 11,
+             'data': {'torrentInfoHash': self.HASH}}]}
+        failed = {'records': [
+            {'id': 80, 'eventType': 'downloadFailed', 'date': _iso_ago(3600),
+             'sourceTitle': 'Show.S01E01', 'episodeId': 11}]}
+        calls = self._wire(sonarr, monkeypatch, queue={'records': []},
+                           history={'records': []}, recent_grabs=recent,
+                           failed_records=failed, post_result={})
+        assert sonarr.mark_download_failed(self.HASH) is True
+        assert calls['post'] == [('/api/v3/history/failed/71', {})]
+
+    def _pack(self):
+        # Sonarr writes one grab record per episode of a season pack, all
+        # with the pack's hash and title.
+        when = _iso_ago(120)
+        return {'records': [
+            {'id': 73, 'eventType': 'grabbed', 'date': when, 'sourceTitle': 'Show.S01',
+             'episodeId': 13, 'data': {'torrentInfoHash': self.HASH}},
+            {'id': 72, 'eventType': 'grabbed', 'date': when, 'sourceTitle': 'Show.S01',
+             'episodeId': 12, 'data': {'torrentInfoHash': self.HASH}},
+            {'id': 71, 'eventType': 'grabbed', 'date': when, 'sourceTitle': 'Show.S01',
+             'episodeId': 11, 'data': {'torrentInfoHash': self.HASH}}]}
+
+    def test_season_pack_fails_one_record_and_searches_nothing_more(self, sonarr, monkeypatch):
+        # Failing one record blocklists the whole pack; Sonarr searches that
+        # record's episode.  zurgarr adds no search of its own: an
+        # EpisodeSearch runs one single-episode search per id (packs
+        # rejected) on top of Sonarr's — the same episode twice, or every
+        # episode separately, each a "Grabbed" notification.
+        calls = self._wire(sonarr, monkeypatch, queue={'records': []},
+                           history={'records': []}, recent_grabs=self._pack(),
+                           post_result={})
+        assert sonarr.mark_download_failed(self.HASH) is True
+        assert calls['post'] == [('/api/v3/history/failed/73', {})]
+
+    def test_season_pack_already_failed_on_any_episode_is_not_failed_again(
+            self, sonarr, monkeypatch):
+        failed = {'records': [
+            {'id': 80, 'eventType': 'downloadFailed', 'date': _iso_ago(60),
+             'sourceTitle': 'Show.S01', 'episodeId': 12}]}
+        calls = self._wire(sonarr, monkeypatch, queue={'records': []},
+                           history={'records': []}, recent_grabs=self._pack(),
+                           failed_records=failed, post_result={})
+        assert sonarr.mark_download_failed(self.HASH) is False
+        assert calls['post'] == []
+
+    def test_failed_post_is_not_retried_on_another_record(self, sonarr, monkeypatch):
+        # A POST that timed out may have gone through: failing the next
+        # record of the same grab could blocklist + search twice.
+        calls = self._wire(sonarr, monkeypatch, queue={'records': []},
+                           history={'records': []}, recent_grabs=self._pack(),
+                           post_result=None)
+        assert sonarr.mark_download_failed(self.HASH) is False
+        assert calls['post'] == [('/api/v3/history/failed/73', {})]
+
+    def test_regrab_of_same_release_fails_only_the_newest_grab(self, sonarr, monkeypatch):
+        # Two separate grabs of one release (hours apart) are not a pack.
+        recent = {'records': [
+            {'id': 75, 'eventType': 'grabbed', 'date': _iso_ago(60), 'sourceTitle': 'Show.S01E01',
+             'episodeId': 11, 'data': {'torrentInfoHash': self.HASH}},
+            {'id': 71, 'eventType': 'grabbed', 'date': _iso_ago(7200), 'sourceTitle': 'Show.S01E01',
+             'episodeId': 11, 'data': {'torrentInfoHash': self.HASH}}]}
+        calls = self._wire(sonarr, monkeypatch, queue={'records': []},
+                           history={'records': []}, recent_grabs=recent, post_result={})
+        assert sonarr.mark_download_failed(self.HASH) is True
+        assert calls['post'] == [('/api/v3/history/failed/75', {})]
 
     def test_history_post_failure_returns_false(self, sonarr, monkeypatch):
         history = {'records': [{'id': 41, 'eventType': 'grabbed'}]}

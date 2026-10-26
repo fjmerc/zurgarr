@@ -113,7 +113,6 @@ DEFAULTS = {
     # Scheduled-task intervals (seconds) — mirror scheduled_tasks._DEFAULTS
     'ROUTING_AUDIT_INTERVAL': '21600',
     'QUEUE_CLEANUP_INTERVAL': '900',
-    'STALE_GRAB_INTERVAL': '900',
     'LIBRARY_SCAN_INTERVAL': '3600',
     'SYMLINK_VERIFY_INTERVAL': '21600',
     'PREFERENCE_ENFORCE_INTERVAL': '21600',

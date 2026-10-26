@@ -208,6 +208,58 @@ def test_torrent_info_hash_extraction(tmp_dir):
     assert result == expected_hash
 
 
+def _write_magnet(tmp_dir, text):
+    path = os.path.join(tmp_dir, 'test.magnet')
+    with open(path, 'w') as f:
+        f.write(text)
+    return path
+
+
+def test_magnet_hex_info_hash_extraction(tmp_dir):
+    from utils.blackhole import BlackholeWatcher
+    h = 'ab' * 20
+    path = _write_magnet(tmp_dir, f'magnet:?xt=urn:btih:{h}&dn=Show.S01E01')
+    assert BlackholeWatcher._extract_info_hash_from_file(path) == h.upper()
+
+
+def test_magnet_base32_info_hash_decoded_to_hex(tmp_dir):
+    """Older magnets write the hash as 32 base32 characters.  Reading only
+    the hex-looking prefix gave a wrong hash: never cached, never matched."""
+    import base64
+    from utils.blackhole import BlackholeWatcher
+    raw = bytes(range(20))
+    b32 = base64.b32encode(raw).decode()
+    path = _write_magnet(tmp_dir, f'magnet:?xt=urn:btih:{b32}&dn=Show.S01E01')
+    assert BlackholeWatcher._extract_info_hash_from_file(path) == raw.hex().upper()
+
+
+def test_magnet_malformed_info_hash_is_unknown(tmp_dir):
+    from utils.blackhole import BlackholeWatcher
+    path = _write_magnet(tmp_dir, 'magnet:?xt=urn:btih:ABC123&dn=x')
+    assert BlackholeWatcher._extract_info_hash_from_file(path) is None
+
+
+def test_btih_from_magnet_handles_both_forms():
+    import base64
+    from utils.blackhole import _btih_from_magnet
+    raw = bytes(range(20, 40))
+    assert _btih_from_magnet(
+        'magnet:?xt=urn:btih:' + base64.b32encode(raw).decode().lower()) == raw.hex().upper()
+    assert _btih_from_magnet('magnet:?xt=urn:btih:' + 'C' * 40) == 'C' * 40
+    assert _btih_from_magnet('magnet:?dn=nohash') is None
+
+
+def test_get_entry_by_hash(tmp_dir):
+    blocklist.init(tmp_dir)
+    blocklist.add('abcd' * 10, 'Some.Release', reason='disc rip', source='auto')
+    entry = blocklist.get_entry('ABCD' * 10)
+    assert entry['reason'] == 'disc rip' and entry['title'] == 'Some.Release'
+    entry['reason'] = 'changed'
+    assert blocklist.get_entry('abcd' * 10)['reason'] == 'disc rip'
+    assert blocklist.get_entry('ef' * 20) is None
+    assert blocklist.get_entry('') is None
+
+
 def test_restore_bytes_replaces_disk_and_indexes(tmp_dir):
     """Backup restore: file write + in-memory index rebuild under one lock."""
     blocklist.init(tmp_dir)

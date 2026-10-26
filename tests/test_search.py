@@ -2073,6 +2073,18 @@ class TestFindExistingTorrentId:
         with patch('utils.search._urllib_get', return_value=data):
             assert find_existing_torrent_id('alldebrid', 'k', 'ef' * 20) == '77'
 
+    def test_alldebrid_errored_copy_is_dead(self):
+        # AllDebrid's status text is free-form, but statusCode 5+ is an
+        # error ("not downloaded in 20 min", "no peer", ...); 0-3 is still
+        # in progress and must never be reported failed.
+        from utils.search import find_existing_torrent_id
+        data = {'status': 'success', 'data': {'magnets': [
+            {'id': 5, 'hash': 'aa' * 20, 'status': 'Not downloaded in 20 min', 'statusCode': 7},
+            {'id': 6, 'hash': 'bb' * 20, 'status': 'Downloading', 'statusCode': 1}]}}
+        with patch('utils.search._urllib_get', return_value=data):
+            assert find_existing_torrent_id('alldebrid', 'k2', 'aa' * 20) is False
+            assert find_existing_torrent_id('alldebrid', 'k2', 'bb' * 20) is None
+
     def test_not_present_or_unlistable_is_none(self):
         from utils.search import find_existing_torrent_id
         with patch('utils.search._tb_mylist_rows', return_value=[]):

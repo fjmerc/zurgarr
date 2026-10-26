@@ -75,6 +75,7 @@ __NAV_HTML__
       <optgroup label="Blocklist">
         <option value="blocklisted">Blocklisted</option>
         <option value="blocklist_added">Auto-Blocked</option>
+        <option value="arr_feedback">Reported to Arr</option>
       </optgroup>
       <optgroup label="Health">
         <option value="debrid">Debrid Health</option>

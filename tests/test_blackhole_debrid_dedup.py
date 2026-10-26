@@ -776,12 +776,13 @@ class TestPlexDebridCacheRuleEnforcer:
 
 
 class TestArrFailedFeedbackWiring:
-    """Both reject sites must report the failed grab back to the arr BEFORE
-    deleting the drop — otherwise the arr re-grabs the identical release on
-    every RSS pass (the silent-delete loop).  The feedback result must not
-    change the delete outcome."""
+    """Only permanent failures are reported to the arr.  "Not cached yet" is
+    usually temporary (fresh releases cache within hours), and the arr
+    blocklists a reported release for good — the release, its upgrades and
+    zurgarr's force-grab could never use it once it caches.  So uncached
+    rejects stay a silent delete."""
 
-    def test_uncached_reject_pushes_feedback_then_deletes(
+    def test_uncached_reject_deletes_without_feedback(
         self, handler, magnet_file, monkeypatch,
     ):
         path, h = magnet_file
@@ -790,20 +791,17 @@ class TestArrFailedFeedbackWiring:
         with patch('utils.search._existing_hashes', return_value=set()), \
              patch('utils.search.check_debrid_cache', return_value={h: False}):
             handler._process_file(path)
-        handler._push_arr_failed_feedback.assert_called_once()
-        args, kwargs = handler._push_arr_failed_feedback.call_args
-        assert args[1].lower() == h, 'info hash must be forwarded to the arr'
-        assert args[2] == 'realdebrid'
-        assert not os.path.exists(path), 'feedback must not suppress the delete'
+        handler._push_arr_failed_feedback.assert_not_called()
+        assert not os.path.exists(path)
         handler._add_to_realdebrid.assert_not_called()
 
-    def test_cross_confirmed_reject_pushes_feedback_then_deletes(
+    def test_cross_confirmed_reject_deletes_without_feedback(
         self, handler, magnet_file, monkeypatch,
     ):
         path, h = magnet_file
         handler.debrid_api_keys = {'realdebrid': 'rd-key', 'torbox': 'tb-key'}
         monkeypatch.setenv('BLACKHOLE_REQUIRE_CACHED', 'true')
-        handler._push_arr_failed_feedback = MagicMock(return_value=False)
+        handler._push_arr_failed_feedback = MagicMock(return_value=True)
 
         def _probe(hashes, service=None, api_key=None):
             return {h: False} if service == 'torbox' else {h: None}
@@ -811,9 +809,8 @@ class TestArrFailedFeedbackWiring:
         with patch('utils.search._existing_hashes', return_value=set()), \
              patch('utils.search.check_debrid_cache', side_effect=_probe):
             handler._process_file(path)
-        handler._push_arr_failed_feedback.assert_called_once()
-        assert not os.path.exists(path), \
-            'feedback returning False must degrade to the status-quo delete'
+        handler._push_arr_failed_feedback.assert_not_called()
+        assert not os.path.exists(path)
 
     def test_tb_alt_recovery_success_skips_feedback(
         self, handler, magnet_file, monkeypatch,
@@ -929,11 +926,20 @@ class TestDuplicateLinksExistingTorrent:
         # import, and discarding silently loops — tell the arr it failed.
         path, h = magnet_file
         handler.symlink_enabled = True
-        handler._push_arr_failed_feedback = MagicMock(return_value=True)
+        os.utime(path, (1_700_000_000, 1_700_000_000))
+        seen = []
+        handler._push_arr_failed_feedback = MagicMock(
+            side_effect=lambda *a, **k: seen.append(os.path.exists(path)) or True)
         with patch('utils.search._existing_hashes', return_value={h}), \
                 patch('utils.search.find_existing_torrent_id', return_value=False):
             handler._process_file(path, label='sonarr')
         handler._push_arr_failed_feedback.assert_called_once()
+        kwargs = handler._push_arr_failed_feedback.call_args.kwargs
+        assert kwargs.get('label') == 'sonarr'
+        assert kwargs.get('grabbed_since') == 1_700_000_000
+        # Deleted first: the arr's re-search can drop a same-named file,
+        # which a later delete would remove.
+        assert seen == [False]
         handler._start_monitor.assert_not_called()
         assert not os.path.exists(path)
 
@@ -964,6 +970,18 @@ class TestDuplicateLinksExistingTorrent:
         handler._start_monitor.assert_not_called()
 
 
+def _blocklist_stub(is_blocked, reason='disc rip (no usable media files)'):
+    removed = []
+    stub = type('B', (), {
+        'UNCACHED_TIMEOUT_REASON': 'Uncached on debrid (timed out)',
+        'is_blocked': staticmethod(is_blocked),
+        'get_entry': staticmethod(lambda x: {'id': 'E1', 'reason': reason}),
+        'remove': staticmethod(lambda entry_id: removed.append(entry_id) or True),
+    })()
+    stub.removed = removed
+    return stub
+
+
 class TestBlocklistedDropReportsFailed:
     """A drop whose hash zurgarr blocklisted used to be deleted silently,
     so the arr re-grabbed the same blocked release forever (prod: Dark
@@ -972,15 +990,57 @@ class TestBlocklistedDropReportsFailed:
 
     def test_blocklisted_drop_reported_to_arr(self, handler, magnet_file, monkeypatch):
         path, h = magnet_file
-        stub = type('B', (), {'is_blocked': staticmethod(lambda x: x.lower() == h)})()
+        stub = _blocklist_stub(lambda x: x.lower() == h)
         monkeypatch.setattr('utils.blackhole._blocklist', stub)
-        handler._push_arr_failed_feedback = MagicMock(return_value=True)
+        os.utime(path, (1_700_000_000, 1_700_000_000))
+        seen = []
+        handler._push_arr_failed_feedback = MagicMock(
+            side_effect=lambda *a, **k: seen.append(os.path.exists(path)) or True)
         handler._process_file(path, label='sonarr')
         handler._push_arr_failed_feedback.assert_called_once()
         args, kwargs = handler._push_arr_failed_feedback.call_args
         assert args[0] == 'release.magnet' and args[1].lower() == h
         assert kwargs.get('label') == 'sonarr'
+        assert kwargs.get('grabbed_since') == 1_700_000_000
+        assert seen == [False], 'the drop must be gone before the arr is told'
         handler._add_to_realdebrid.assert_not_called()
+        assert not os.path.exists(path)
+
+
+    def test_timeout_blocklisted_drop_still_downloading_is_reported(self, handler, magnet_file,
+                                                                     monkeypatch):
+        # Not finished (deleted on timeout, stuck at 0%, still running):
+        # nothing else ends the arr's re-grab loop.  If it does finish, the
+        # library scan links it from the account anyway.
+        path, h = magnet_file
+        handler.symlink_enabled = True
+        stub = _blocklist_stub(lambda x: True, reason='Uncached on debrid (timed out)')
+        monkeypatch.setattr('utils.blackhole._blocklist', stub)
+        handler._push_arr_failed_feedback = MagicMock(return_value=True)
+        with patch('utils.search.find_existing_torrent_id', return_value=None):
+            handler._process_file(path, label='sonarr')
+        handler._push_arr_failed_feedback.assert_called_once()
+        handler._start_monitor.assert_not_called()
+        handler._add_to_realdebrid.assert_not_called()
+        assert not os.path.exists(path)
+        assert stub.removed == []
+
+    def test_timeout_blocklisted_torrent_that_finished_is_linked(self, handler, magnet_file,
+                                                                 monkeypatch):
+        # The timed-out torrent stays in the account and can finish later:
+        # the arr's re-grab then imports it instead of being refused, and the
+        # obsolete blocklist entry goes.
+        path, h = magnet_file
+        handler.symlink_enabled = True
+        stub = _blocklist_stub(lambda x: True, reason='Uncached on debrid (timed out)')
+        monkeypatch.setattr('utils.blackhole._blocklist', stub)
+        handler._push_arr_failed_feedback = MagicMock(return_value=True)
+        with patch('utils.search.find_existing_torrent_id', return_value='DONE1'):
+            handler._process_file(path, label='sonarr')
+        handler._start_monitor.assert_called_once()
+        assert handler._start_monitor.call_args.kwargs.get('preexisting') is True
+        assert stub.removed == ['E1']
+        handler._push_arr_failed_feedback.assert_not_called()
         assert not os.path.exists(path)
 
 
@@ -989,7 +1049,7 @@ class TestBlocklistedDropReportsFailedRadarr:
     def test_blocklisted_movie_drop_reported_with_radarr_label(self, handler, magnet_file,
                                                               monkeypatch):
         path, h = magnet_file
-        stub = type('B', (), {'is_blocked': staticmethod(lambda x: True)})()
+        stub = _blocklist_stub(lambda x: True)
         monkeypatch.setattr('utils.blackhole._blocklist', stub)
         handler._push_arr_failed_feedback = MagicMock(return_value=False)
         handler._process_file(path, label='radarr')

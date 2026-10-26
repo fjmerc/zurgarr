@@ -1196,8 +1196,9 @@ class TestTorboxAddPauses:
         assert not os.path.exists(os.path.join(tmp_dir, 'watch', 'failed'))
 
     def test_tb_alt_pause_mid_attempt_keeps_drop_and_skips_arr_feedback(self, tmp_dir, monkeypatch):
-        """Call-site wiring: TB-alt returning None (paused) leaves the drop
-        and never reports the grab failed; False still fails it."""
+        """Call-site wiring: TB-alt returning None (paused) leaves the drop;
+        False deletes it.  Neither reports the grab failed — uncached is
+        temporary, and the arr's blocklist is not."""
         monkeypatch.setenv('BLACKHOLE_REQUIRE_CACHED', 'true')
         monkeypatch.setattr('utils.search._existing_hashes', lambda *a, **kw: set())
         monkeypatch.setattr('utils.search.check_debrid_cache',
@@ -1210,7 +1211,7 @@ class TestTorboxAddPauses:
             path = self._magnet(tmp_dir)
             w._process_file(path)
             assert os.path.exists(path) is kept
-            assert bool(fed_back) is (not kept)
+            assert fed_back == []
 
     def test_paused_torbox_does_not_hold_up_realdebrid(self, tmp_dir, monkeypatch):
         monkeypatch.setattr('utils.search._existing_hashes', lambda *a, **kw: set())
@@ -5097,6 +5098,9 @@ class TestAddTimeFilterBlockRescue:
             def is_blocked(self, h):
                 return False
 
+            def get_entry(self, h):
+                return None
+
         monkeypatch.setattr('utils.blackhole._blocklist', _FakeBlocklist())
 
         # Disable alt-release fallback (we're testing the blocklist annotation)
@@ -6909,11 +6913,12 @@ class TestTbAltFileScope:
 
 
 class TestArrFailedFeedback:
-    """_push_arr_failed_feedback: an uncached-rejected grab must be reported
-    back to the owning arr (blocklist + immediate re-search) instead of
-    silently deleted — otherwise the arr re-grabs the identical release on
-    every RSS pass.  A persistent per-title strike cap bounds the walk down
-    the arr's candidate list."""
+    """_push_arr_failed_feedback: a grab that can never work (blocklisted
+    hash, only a dead copy in the account) must be reported back to the
+    owning arr (blocklist + immediate re-search) instead of silently
+    deleted — otherwise the arr re-grabs the identical release on every
+    RSS pass.  A persistent per-title strike cap bounds the walk down the
+    arr's candidate list."""
 
     HASH = 'c' * 40
 
@@ -6944,10 +6949,12 @@ class TestArrFailedFeedback:
                 def __init__(self):
                     self.configured = configured
 
-                def mark_download_failed(self, info_hash, search_again=True):
+                def mark_download_failed(self, info_hash, search_again=True,
+                                         grabbed_since=None):
                     if raise_on_call:
                         raise RuntimeError('boom')
                     record[service].append(info_hash)
+                    record.setdefault('since', []).append(grabbed_since)
                     return result
             return Fake
 
@@ -6983,6 +6990,56 @@ class TestArrFailedFeedback:
         assert record['sonarr'] == [self.HASH]
         assert record['radarr'] == []
         assert self.ledger.get('arrfail:tt123:s1e2') == 1
+
+    def test_grabbed_since_forwarded_to_arr(self, tmp_dir, monkeypatch):
+        w = self._make_watcher(tmp_dir)
+        record = self._fake_arrs(monkeypatch)
+        monkeypatch.setattr(w, '_resolve_arr_identity',
+                            lambda fn, label=None: ('tt123', 'series', 1, 2))
+        assert w._push_arr_failed_feedback(
+            self.TV_FILE, self.HASH, 'realdebrid', grabbed_since=1234.0) is True
+        assert record['since'] == [1234.0]
+
+    def test_hourly_cap_stops_a_burst(self, tmp_dir, monkeypatch):
+        # Each report makes the arr search every indexer and grab again; a
+        # chain across many titles must not hammer indexers.  Over the cap,
+        # the drop is just deleted (the arr re-grabs it later and it's
+        # reported then).
+        import utils.blackhole as bh
+        monkeypatch.setattr(bh, '_ARR_FEEDBACK_PER_HOUR', 2)
+        monkeypatch.setattr(bh, '_arr_feedback_times', bh.collections.deque())
+        w = self._make_watcher(tmp_dir)
+        record = self._fake_arrs(monkeypatch)
+        monkeypatch.setattr(w, '_resolve_arr_identity',
+                            lambda fn, label=None: (fn, 'series', 1, 2))
+        results = [w._push_arr_failed_feedback(
+            f'Show{i}.S01E02.1080p.WEB.x264-GRP.mkv.magnet', self.HASH, 'realdebrid')
+            for i in range(3)]
+        assert results == [True, True, False]
+        assert len(record['sonarr']) == 2
+
+    def test_arr_error_gives_the_hourly_slot_back(self, tmp_dir, monkeypatch):
+        import utils.blackhole as bh
+        monkeypatch.setattr(bh, '_ARR_FEEDBACK_PER_HOUR', 1)
+        monkeypatch.setattr(bh, '_arr_feedback_times', bh.collections.deque())
+        w = self._make_watcher(tmp_dir)
+        self._fake_arrs(monkeypatch, raise_on_call=True)
+        monkeypatch.setattr(w, '_resolve_arr_identity',
+                            lambda fn, label=None: ('tt123', 'series', 1, 2))
+        assert w._push_arr_failed_feedback(self.TV_FILE, self.HASH, 'realdebrid') is False
+        assert len(bh._arr_feedback_times) == 0
+
+    def test_rejected_report_does_not_use_the_hourly_cap(self, tmp_dir, monkeypatch):
+        import utils.blackhole as bh
+        monkeypatch.setattr(bh, '_ARR_FEEDBACK_PER_HOUR', 1)
+        monkeypatch.setattr(bh, '_arr_feedback_times', bh.collections.deque())
+        w = self._make_watcher(tmp_dir)
+        self._fake_arrs(monkeypatch, result=False)
+        monkeypatch.setattr(w, '_resolve_arr_identity',
+                            lambda fn, label=None: ('tt123', 'series', 1, 2))
+        w._push_arr_failed_feedback(self.TV_FILE, self.HASH, 'realdebrid')
+        record = self._fake_arrs(monkeypatch)
+        assert w._push_arr_failed_feedback(self.TV_FILE, self.HASH, 'realdebrid') is True
 
     def test_movie_success_routes_radarr_and_bumps_ledger(self, tmp_dir, monkeypatch):
         w = self._make_watcher(tmp_dir)
@@ -7106,7 +7163,8 @@ class TestArrFailedFeedback:
             self.TV_FILE, self.HASH, 'realdebrid') is True
         assert len(events) == 1
         etype, _title, kwargs = events[0]
-        assert etype == 'blocklisted'
+        # Info, not a warning: the caller already logs the reject itself.
+        assert etype == 'arr_feedback'
         meta = kwargs['meta']
         assert meta['cause'] == 'arr_feedback_blocklisted'
         assert meta['info_hash'] == self.HASH

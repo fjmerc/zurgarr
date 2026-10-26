@@ -251,7 +251,7 @@ class TestSeveritySyncGuard:
 
     # Types intentionally rendered at info severity in the Recent Events feed.
     KNOWN_INFO = frozenset({
-        'grabbed', 'cached', 'symlink_created', 'search_triggered',
+        'grabbed', 'cached', 'symlink_created', 'search_triggered', 'arr_feedback',
         'rescan_triggered', 'repair', 'local_fallback_triggered',
         'arr_deleted', 'debrid', 'debrid_add', 'routing_repaired',
         'tb_cached_alt_grabbed', 'compromise_grabbed',
