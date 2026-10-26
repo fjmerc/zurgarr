@@ -18,6 +18,20 @@ def _isolate(tmp_dir, monkeypatch):
     monkeypatch.setattr(lp, 'PENDING_PATH', os.path.join(tmp_dir, 'pending.json'))
 
 
+@pytest.fixture(autouse=True)
+def identity_checks(monkeypatch):
+    """These tests cover the swap mechanics; the identity guard has its own
+    suite (test_switch_identity.py).  Records each check's media_type."""
+    import utils.library as _library
+    calls = []
+
+    def _ok(local_path, debrid_path, local_root, media_type, mounts, **kw):
+        calls.append(media_type)
+        return True, ''
+    monkeypatch.setattr(_library, 'verify_switch_identity', _ok)
+    return calls
+
+
 @pytest.fixture
 def local_tv(tmp_dir):
     """Create a fake local TV library with real files."""
@@ -315,7 +329,8 @@ class TestAutoEnforcement:
             season_data.append({'number': sn, 'episode_count': len(by_season[sn]), 'episodes': by_season[sn]})
         return {'title': title, 'source': 'both', 'type': 'show', 'season_data': season_data}
 
-    def test_prefer_debrid_switches_both_to_symlink(self, tmp_dir, monkeypatch):
+    def test_prefer_debrid_switches_both_to_symlink(self, tmp_dir, monkeypatch,
+                                                    identity_checks):
         """source=both + prefer-debrid → local file replaced with symlink."""
         local_tv = os.path.join(tmp_dir, 'tv')
         show_dir = os.path.join(local_tv, 'Show (2025)', 'Season 01')
@@ -347,6 +362,7 @@ class TestAutoEnforcement:
         assert result is True
         assert os.path.islink(local_file)
         assert os.readlink(local_file).startswith('/mnt/debrid/')
+        assert identity_checks == ['show']  # checked against Sonarr
 
     def test_prefer_debrid_skips_already_symlinked(self, tmp_dir, monkeypatch):
         """Already-symlinked files should not be re-processed."""
@@ -467,7 +483,8 @@ class TestAutoEnforcement:
         scanner._local_movies_path = local_movies
         return scanner
 
-    def test_prefer_debrid_movie_switches_to_symlink(self, tmp_dir, monkeypatch):
+    def test_prefer_debrid_movie_switches_to_symlink(self, tmp_dir, monkeypatch,
+                                                      identity_checks):
         """source=both movie + prefer-debrid → local file replaced with symlink."""
         local_movies = os.path.join(tmp_dir, 'movies')
         movie_dir = os.path.join(local_movies, 'Black Adam (2022)')
@@ -506,6 +523,8 @@ class TestAutoEnforcement:
         target = os.readlink(local_file)
         assert target.startswith('/mnt/debrid/')
         assert 'Black.Adam.2022.1080p.mkv' in target
+        # Checked against Radarr, not Sonarr.
+        assert identity_checks == ['movie']
 
     def test_prefer_debrid_ampersand_torbox_movie_switches(self, tmp_dir, monkeypatch):
         """A TorBox movie whose listed folder has '&' (the mount drops it)

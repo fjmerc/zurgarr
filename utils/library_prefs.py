@@ -349,18 +349,29 @@ def remove_local_episodes(episodes, local_tv_path):
     return {'status': 'removed', 'removed': removed, 'errors': errors}
 
 
-def replace_local_with_symlinks(episodes, local_tv_path, rclone_mount, symlink_target_base):
+# (local path, reason) pairs already logged, so a refusal that repeats every
+# scan pass is logged once per process.
+_identity_refusals_logged = set()
+
+
+def replace_local_with_symlinks(episodes, local_tv_path, rclone_mount, symlink_target_base,
+                                media_type='show'):
     """Replace local episode files with symlinks to the debrid mount.
 
     For each episode, deletes the local file and creates a symlink at the
     same path pointing to the debrid mount file (translated to the Sonarr
-    namespace via symlink_target_base).
+    namespace via symlink_target_base).  Each swap first confirms against
+    the Sonarr/Radarr entry owning the local folder (title and year) that
+    the debrid file is the same title (``library.verify_switch_identity``)
+    and is refused otherwise.
 
     Args:
         episodes: list of dicts with 'local_path' and 'debrid_path' keys
         local_tv_path: root local TV path — local paths must be under this
         rclone_mount: mount path inside Zurgarr (e.g., /data/zurgarr)
         symlink_target_base: mount path from Sonarr's perspective (e.g., /mnt/debrid)
+        media_type: 'show' (verified against Sonarr) or 'movie' (Radarr);
+            *local_tv_path* is then the local movies root
 
     Returns dict with status, count switched, and any errors.
     """
@@ -381,6 +392,9 @@ def replace_local_with_symlinks(episodes, local_tv_path, rclone_mount, symlink_t
     except Exception as e:
         logger.debug(f"[library_prefs] TorBox mount pair unavailable: {e}")
 
+    from utils import library as _library
+    verdicts = {}
+
     for ep in episodes:
         local_path = ep.get('local_path', '')
         debrid_path = ep.get('debrid_path', '')
@@ -394,8 +408,8 @@ def replace_local_with_symlinks(episodes, local_tv_path, rclone_mount, symlink_t
             continue
 
         # The spelling the mount uses (TorBox drops '&' that its API keeps)
-        from utils.library import _mount_path_on_disk
-        debrid_path = _mount_path_on_disk(debrid_path)
+        listed_debrid = debrid_path
+        debrid_path = _library._mount_path_on_disk(debrid_path)
 
         # Translate debrid path from Zurgarr namespace to Sonarr namespace
         real_debrid = os.path.realpath(debrid_path)
@@ -415,6 +429,25 @@ def replace_local_with_symlinks(episodes, local_tv_path, rclone_mount, symlink_t
             # to a file that isn't on the debrid mount.
             if not os.path.exists(real_debrid):
                 errors.append(f"Debrid file not on the debrid mount: {debrid_path}")
+                continue
+            # ...and never for a different title.  Same folder pair, same
+            # verdict: checked once per call, not once per episode.
+            real_listed = os.path.realpath(listed_debrid)
+            memo_key = (os.path.relpath(real_local, real_root).split(os.sep, 1)[0],
+                        os.path.dirname(real_debrid), os.path.dirname(real_listed))
+            if memo_key not in verdicts:
+                verdicts[memo_key] = _library.verify_switch_identity(
+                    real_local, real_debrid, real_root, media_type,
+                    [m for m, _b in mount_bases], listed_debrid_path=real_listed)
+            ok, why = verdicts[memo_key]
+            if not ok:
+                if (real_local, why) not in _identity_refusals_logged:
+                    if len(_identity_refusals_logged) > 5000:
+                        _identity_refusals_logged.clear()
+                    _identity_refusals_logged.add((real_local, why))
+                    logger.info(f"[library_prefs] Kept local file, debrid copy not "
+                                f"confirmed as the same title: {real_local} ({why})")
+                errors.append(f"Not confirmed as the same title ({why}): {local_path}")
                 continue
 
             # Atomic swap: rename to backup, create symlink, remove backup on success

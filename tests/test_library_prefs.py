@@ -8,6 +8,14 @@ import pytest
 import utils.library_prefs as lp
 
 
+@pytest.fixture(autouse=True)
+def identity_ok(monkeypatch):
+    """These tests cover the swap mechanics; the identity guard has its own
+    suite (test_switch_identity.py)."""
+    import utils.library as _library
+    monkeypatch.setattr(_library, 'verify_switch_identity', lambda *a, **k: (True, ''))
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------

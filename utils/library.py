@@ -2894,6 +2894,162 @@ def _release_folder_of(debrid_path, mount_target_pairs):
     return parent_name
 
 
+_YEAR_SUFFIX_RE = re.compile(r'\s*\(\d{4}\)\s*$')
+
+
+def _switch_title_key(title):
+    """Loose title key for the switch guard: ``_norm_for_matching`` with any
+    "(YYYY)" suffix and the word "and" dropped — TorBox's mount drops '&'
+    ("Upstairs..Downstairs") where Sonarr spells it out."""
+    norm = _norm_for_matching(_YEAR_SUFFIX_RE.sub('', title or ''))
+    return ' '.join(w for w in norm.split() if w != 'and')
+
+
+# Any 19xx/20xx token not glued to letters or digits — "EDGE2020" is a
+# release group, not a year.
+_SWITCH_RAW_YEAR_RE = re.compile(r'(?<![A-Za-z0-9])(?:19|20)\d{2}(?![0-9])')
+
+
+def _switch_alt_keys(entry):
+    """Usable alternate-title keys of an arr entry.  Skips titles whose
+    transliteration loses letters ("SING/シング: ネクストステージ" would key
+    as "sing", the base film), keys too short or all digits to identify a
+    title, and Sonarr's season-scoped scene titles ("Dexter" for "Dexter:
+    New Blood" S09)."""
+    keys = set()
+    for alt in entry.get('alternateTitles') or ():
+        if not isinstance(alt, dict) or not alt.get('title'):
+            continue
+        if alt.get('sceneSeasonNumber') is not None or alt.get('seasonNumber') not in (None, -1):
+            continue
+        t = alt['title']
+        if any(not c.isascii() and unicodedata.category(c).startswith('L')
+               and not unicodedata.normalize('NFKD', c).encode('ascii', 'ignore')
+               for c in t):
+            continue
+        key = _switch_title_key(t)
+        if len(key) >= 4 and not key.replace(' ', '').isdigit():
+            keys.add(key)
+    return keys
+
+
+def _switch_release_dir(path, mount):
+    """The release folder holding *path* under *mount*: the file's folder,
+    or the one above when that is a Season folder.  None at the mount root."""
+    parent = os.path.dirname(path)
+    if _match_season_dir(os.path.basename(parent)):
+        parent = os.path.dirname(parent)
+    if not parent.startswith(mount + os.sep):
+        return None
+    return os.path.basename(parent)
+
+
+def verify_switch_identity(local_path, debrid_path, local_root, media_type, mounts,
+                           listed_debrid_path=None):
+    """Whether a prefer-debrid swap trades *local_path* for the same title.
+
+    The swap deletes the local file, so it must never rest on the library's
+    title matching or the TMDB title cache: prod 2026-10-26, a poisoned
+    ``lucky (2017)`` cache entry merged "Lucky" with "Logan Lucky" and the
+    local film was replaced by the other one.  The Sonarr/Radarr entry that
+    owns the local folder is the authority: the debrid release's own folder
+    name must carry that entry's title (or one of its alternate titles), and
+    its year, when it has one, must be within a year of the entry's.  A
+    yearless movie release is refused, and so is a yearless show release
+    unless it carries the entry's main title and no other Sonarr entry or
+    TMDB reboot family shares it.  Anything unknown refuses, and the next
+    pass retries.  Residual: a yearless show release of a same-named show
+    that is in neither Sonarr nor the TMDB cache can still pass.
+
+    mounts: debrid mount roots the release must sit under.
+    listed_debrid_path: the path as the debrid API lists it, tried first —
+    TorBox's mount drops '&' that the listed name keeps.
+
+    Returns ``(ok, reason)``.
+    """
+    if media_type not in ('show', 'movie'):
+        return False, f'unknown media type {media_type!r}'
+    is_tv = media_type == 'show'
+    try:
+        from utils.arr_client import get_download_service
+        client, svc = get_download_service(media_type)
+        if svc != ('sonarr' if is_tv else 'radarr'):
+            return False, 'no Sonarr/Radarr to confirm the title'
+        entries = (_get_sonarr_series_list(client) if is_tv
+                   else _get_radarr_movies_list(client))
+    except Exception as e:
+        return False, f'Sonarr/Radarr lookup failed: {e}'
+    if not entries:
+        return False, 'Sonarr/Radarr unavailable (no titles returned)'
+
+    top = os.path.relpath(local_path, local_root).split(os.sep, 1)[0]
+    owners = [x for x in entries
+              if os.path.basename((x.get('path') or '').rstrip('/')) == top]
+    if len(owners) != 1:
+        return False, f'no single Sonarr/Radarr entry owns "{top}"'
+    owner = owners[0]
+    main_key = _switch_title_key(owner.get('title'))
+    owner_keys = ({main_key} | _switch_alt_keys(owner)) - {''}
+    owner_year = owner.get('year') or None
+    shared = set()
+    for x in entries:
+        if x is not owner:
+            shared.add(_switch_title_key(x.get('title')))
+            shared |= _switch_alt_keys(x)
+    try:
+        from utils.tmdb import get_yearless_collision_bases
+        families = {_switch_title_key(b) for b in
+                    get_yearless_collision_bases().get('shows' if is_tv else 'movies', ())}
+    except Exception:
+        families = set()
+
+    releases = []
+    for path in (listed_debrid_path, debrid_path):
+        if not path:
+            continue
+        mount = next((m.rstrip(os.sep) for m in mounts
+                      if m and path.startswith(m.rstrip(os.sep) + os.sep)), None)
+        name = mount and _switch_release_dir(path, mount)
+        if name and name not in releases:
+            releases.append(name)
+    if not releases:
+        return False, 'debrid file is under no known mount'
+
+    name = owner.get('title')
+    reason = ''
+    for release in releases:
+        title, year = _parse_folder_name(release)
+        key = _switch_title_key(title)
+        if not key or key not in owner_keys:
+            reason = reason or f'release "{release}" reads as "{title}", not "{name}"'
+            continue
+        if not year:
+            # The parser stops at the first quality word, so an edition word
+            # hides a later year ("Dune.Extended.Edition.1984" -> no year).
+            title_words = set(key.split())
+            years = [int(m.group(0)) for m in _SWITCH_RAW_YEAR_RE.finditer(release)
+                     if m.group(0) not in title_words]
+            if years:
+                year = next((y for y in years if owner_year and abs(y - int(owner_year)) <= 1),
+                            years[0])
+        if year:
+            if not owner_year:
+                reason = reason or f'"{name}" has no year in Sonarr/Radarr to check {year} against'
+                continue
+            if abs(int(year) - int(owner_year)) > 1:
+                reason = reason or f'release "{release}" is from {year}, "{name}" from {owner_year}'
+                continue
+        elif not is_tv:
+            reason = reason or f'release "{release}" has no year to tell which "{title}" it is'
+            continue
+        elif key != main_key or key in shared or key in families:
+            reason = reason or (f'release "{release}" has no year and "{title}" '
+                                f'is the title of more than one show')
+            continue
+        return True, ''
+    return False, reason
+
+
 class LibraryScanner:
     # Guards the three Wanted-recovery memo dicts (_wanted_tb_cooldown,
     # _wanted_rd_miss, _wanted_no_results).  The scan-effects thread owns all
@@ -4509,7 +4665,8 @@ class LibraryScanner:
                     'episode': 0,
                 }]
                 result = replace_local_with_symlinks(
-                    to_switch, self._local_movies_path, rclone_mount, symlink_base
+                    to_switch, self._local_movies_path, rclone_mount, symlink_base,
+                    media_type='movie',
                 )
                 if result.get('switched', 0) > 0:
                     logger.info(
