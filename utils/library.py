@@ -3672,7 +3672,7 @@ class LibraryScanner:
             # The old per-folder scandir/stat walk over the 5-tps rclone
             # mount (~450 folders) generated 429 storms that contended with
             # real content downloads — occasionally abandoning an in-flight
-            # download.  One mylist call returns the whole account with zero
+            # download.  The paged mylist listing returns the whole account with zero
             # FUSE ops.  The mount is still discovered above because it's
             # needed for symlink TARGETS (real file access), and the
             # synthesized item paths must match its layout.
@@ -5118,10 +5118,13 @@ class LibraryScanner:
                         result = show_client.ensure_and_search(
                             show['title'], show_tmdb_id, sn, ep_nums,
                             prefer_debrid=route, respect_monitored=respect_mon,
+                            skip_has_file=route is not True,
                         )
                         status = result.get('status', '')
                         if status in ('sent', 'pending'):
-                            for en in ep_nums:
+                            # Only what was searched — episodes Sonarr already
+                            # has a file for were skipped, not "searching".
+                            for en in result.get('searched_episodes') or ep_nums:
                                 new_pending.append({'season': sn, 'episode': en})
                             if route is True and result.get('grabbed'):
                                 fg_count = attempt_ledger.bump(fg_key)
@@ -5260,6 +5263,7 @@ class LibraryScanner:
                     result = movie_client.ensure_and_search(
                         movie['title'], movie_tmdb_id, prefer_debrid=route,
                         respect_monitored=respect_mon,
+                        skip_has_file=route is not True,
                     )
                     status = result.get('status', '')
                     if status in ('sent', 'pending'):
@@ -8638,7 +8642,7 @@ class LibraryScanner:
         calls over a 5-tps rclone mount and contended with real content
         downloads, producing 429 storms that occasionally abandoned an
         in-flight download.  ``mylist`` returns the whole account (folder
-        names + per-file paths/sizes) in ONE HTTP call, so enumeration
+        names + per-file paths/sizes) in a few paged HTTP calls, so enumeration
         costs zero FUSE ops.  The FUSE mount is still required for symlink
         TARGETS (real file access) — only enumeration moves to the API.
 
@@ -8661,7 +8665,7 @@ class LibraryScanner:
             return [], []
 
         # TORBOX_SCAN_TIMEOUT was the old FUSE-walk deadline; it now caps the
-        # single mylist HTTP call instead (read live from os.environ so a
+        # mylist calls instead, per page (read live from os.environ so a
         # SIGHUP-less UI change applies next scan).  Floor at 10s — a healthy
         # mylist responds in seconds, but a large account over a slow link
         # shouldn't spuriously fail and drop TB to the last-good fallback.

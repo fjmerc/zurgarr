@@ -81,7 +81,9 @@ class DebridClientBase:
                 ignored.  Caller must normalize via library.normalize_title()
                 before calling.
             target_year: Optional year to narrow matches. When both the
-                target and parsed torrent have a year, they must agree.
+                target and parsed torrent have a year, they must agree; a
+                torrent without a year is skipped when the title is a TMDB
+                reboot family (it could be either sibling).
 
         Returns list of dicts: [{id, filename, parsed_title, year}, ...]
         Raises if list_torrents() fails (API error).
@@ -94,6 +96,16 @@ class DebridClientBase:
             return []
 
         matches = []
+        families = set()
+        if target_year is not None:
+            # A yearless release of a title two shows/films share could be
+            # either — and callers delete what this returns.
+            try:
+                from utils.tmdb import get_yearless_collision_bases
+                bases = get_yearless_collision_bases()
+                families = set(bases.get('shows', ())) | set(bases.get('movies', ()))
+            except Exception as e:
+                logger.debug(f"[debrid] reboot-family lookup failed: {e}")
 
         torrents = self.list_torrents()
         for t in torrents:
@@ -116,6 +128,8 @@ class DebridClientBase:
             if target_year is not None and parsed_year is not None:
                 if target_year != parsed_year:
                     continue
+            if target_year is not None and parsed_year is None and normalized in families:
+                continue
             matches.append({
                 'id': t['id'],
                 'filename': filename,
@@ -149,6 +163,11 @@ class DebridClientBase:
 # treat absence-from-list as "deleted on RD" (debrid_health pruning)
 # must refuse to act on a possibly-incomplete list.
 RD_LIST_LIMIT = 2500
+# TorBox mylist paging: page size (its per-call cap; keep in sync with
+# search._TB_MYLIST_PAGE), page overlap, and a safety stop.
+TB_LIST_PAGE = 1000
+TB_LIST_OVERLAP = 50
+TB_LIST_MAX_PAGES = 20
 
 # RD torrent lifecycle states, for pollers that watch a torrent after
 # ``RealDebridClient.add_magnet``.  ``downloaded`` is the only "on RD
@@ -627,22 +646,51 @@ class TorBoxClient(DebridClientBase):
         return {'Authorization': f'Bearer {self._api_key}'}
 
     def list_torrents(self):
-        resp = tracked_request(
-            self._name, requests.get,
-            f'{self._BASE}/torrents/mylist',
-            headers=self._headers(),
-            params={'bypass_cache': 'true'},
-            timeout=_TIMEOUT,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        torrents = data.get('data', []) if isinstance(data, dict) else None
-        if not isinstance(torrents, list):
-            # TB can return HTTP 200 with a degraded payload
-            # ({"success": false, "data": null}) — same posture as the RD
-            # non-list guard: a silent [] here would read as "account is
-            # empty" to consumers like the quota sweep's warn set.
-            raise ValueError(f'TB /torrents/mylist returned non-list payload ({type(data).__name__})')
+        # mylist returns at most TB_LIST_PAGE torrents per call, so page
+        # with offset/limit (prod: 1514 torrents; unpaged, the quota card
+        # and title lookups saw only 1000).  Mirrors search._tb_mylist_rows
+        # (urllib-only, so it can't share this code): pages overlap by
+        # TB_LIST_OVERLAP so a delete between calls can't hide an entry,
+        # paging ends on a page with nothing new (never on a merely short
+        # page), and anything untrustworthy raises — a partial list must
+        # not pass for the whole account.
+        torrents, seen = [], set()
+        offset = 0
+        for _ in range(TB_LIST_MAX_PAGES):
+            resp = tracked_request(
+                self._name, requests.get,
+                f'{self._BASE}/torrents/mylist',
+                headers=self._headers(),
+                params={'bypass_cache': 'true', 'offset': offset, 'limit': TB_LIST_PAGE},
+                timeout=_TIMEOUT,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            rows = data.get('data') if isinstance(data, dict) and data.get('success') else None
+            if not isinstance(rows, list):
+                # TB can return HTTP 200 with a degraded payload
+                # ({"success": false, "data": null}) — same posture as the RD
+                # non-list guard: a silent [] here would read as "account is
+                # empty" to consumers like the quota sweep's warn set.
+                raise ValueError(f'TB /torrents/mylist returned an unusable page ({type(data).__name__})')
+            new = 0
+            for t in rows:
+                if not isinstance(t, dict):
+                    continue
+                key = t.get('id')
+                if key is not None:
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    new += 1
+                torrents.append(t)
+            if not new:
+                if offset and len(rows) > TB_LIST_OVERLAP:
+                    raise ValueError('TB /torrents/mylist returned an already-seen page (offset ignored?)')
+                break
+            offset += len(rows) - TB_LIST_OVERLAP if len(rows) > TB_LIST_OVERLAP else len(rows)
+        else:
+            raise ValueError(f'TB /torrents/mylist still returning rows after {TB_LIST_MAX_PAGES} pages')
         return [
             {
                 'id': str(t.get('id', '')),

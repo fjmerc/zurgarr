@@ -75,7 +75,7 @@ ENV_SCHEMA = [
             ('TORBOX_RCLONE_TPSLIMIT', 'TorBox rclone tps limit', 'string', False, 'Max requests-per-second issued by the TB rclone mount. Default 5. TB rate-limits reads aggressively under concurrent Plex/Bazarr scans; capping tps avoids the "too many errors 11/10" 429 cascade. Set to 0 to omit the flag.'),
             ('TORBOX_RCLONE_TPSLIMIT_BURST', 'TorBox rclone tps burst', 'string', False, 'Short-burst allowance on top of TORBOX_RCLONE_TPSLIMIT. Default 3 (lowered from 10 to avoid tripping TorBox WebDAV listing rate-limits). Lets quick peeks (ffprobe header reads) succeed without blocking. Set to 0 to omit the flag.'),
             ('TORBOX_RCLONE_DIR_CACHE_TIME', 'TorBox dir-cache time', 'string', False, 'How long the TB rclone mount caches directory listings (rclone --dir-cache-time syntax, e.g. 2h). Default 2h. Must exceed the library scan interval; with a shorter value every cold scan re-lists all TB folders at the throttled tps limit and times out, dropping TB titles. The blackhole grab hook calls vfs/refresh so new content still appears between expiries.'),
-            ('TORBOX_SCAN_TIMEOUT', 'TorBox scan timeout (s)', 'string', False, 'Seconds the library scan may spend walking the TB FUSE mount. Default 180. The main 30s scan deadline cannot enumerate a large TB mount on a cold cache at the throttled tps limit (~450 folders ≈ 90s), so TB gets its own budget; raise it if a very large TB library still truncates.'),
+            ('TORBOX_SCAN_TIMEOUT', 'TorBox scan timeout (s)', 'string', False, 'Timeout in seconds for each call that lists the TorBox account (read from the TorBox API in pages of 1000). Default 180. Raise it if listing a large TorBox account times out.'),
         ],
     },
     {

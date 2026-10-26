@@ -153,6 +153,9 @@ class TestGapFillWithoutPreference:
         assert args[3] == [4]
         assert kwargs.get('prefer_debrid') is None
         assert kwargs.get('respect_monitored') is True
+        # An episode Sonarr already has a file for isn't missing — searching
+        # it lets Sonarr "upgrade" it, re-grabbing all day (Gotify spam).
+        assert kwargs.get('skip_has_file') is True
 
     def test_pending_direction_is_to_any(self, scanner, mock_sonarr):
         show = _show('Lucky Hank', [(1, 1)])
@@ -190,6 +193,8 @@ class TestPreferDebridPreserved:
         mock_sonarr.ensure_and_search.assert_called_once()
         _, kwargs = mock_sonarr.ensure_and_search.call_args
         assert kwargs.get('prefer_debrid') is True
+        # prefer-debrid force-grabs episodes that HAVE files, on purpose.
+        assert not kwargs.get('skip_has_file')
         # prefer-debrid honors Sonarr's monitored flag (same as every other route):
         # unmonitoring a season in Sonarr must suppress gap-fill for that season,
         # even under prefer-debrid force-grab semantics.
@@ -323,6 +328,112 @@ class TestSonarrSkippedReturn:
         assert result['status'] == 'skipped'
 
 
+class TestSkipHasFile:
+    """Gap-fill must not search episodes/movies the arr already has a file
+    for: the arr treats the search as an upgrade hunt and re-grabs (prod
+    2026-10-26: The Penguin S01E04 grabbed 7x in 20h, one Gotify each)."""
+
+    def _sonarr(self, episodes):
+        from utils.arr_client import SonarrClient
+        c = SonarrClient.__new__(SonarrClient)
+        c.url, c.api_key = 'http://fake', 'k'
+        patches = [
+            patch.object(c, 'find_series_in_library', return_value={'id': 1, 'title': 'X'}),
+            patch.object(c, 'get_episodes', return_value=episodes),
+            patch.object(c, '_clear_unavailable_queue_items'),
+            patch.object(c, 'search_episodes', return_value={'id': 5}),
+        ]
+        return c, patches
+
+    def test_only_episodes_without_files_are_searched(self):
+        c, patches = self._sonarr([
+            {'id': 10, 'seasonNumber': 1, 'episodeNumber': 3, 'monitored': True, 'hasFile': True},
+            {'id': 11, 'seasonNumber': 1, 'episodeNumber': 4, 'monitored': True, 'hasFile': False},
+        ])
+        with patches[0], patches[1], patches[2], patches[3] as search:
+            result = c.ensure_and_search('X', None, 1, [3, 4], skip_has_file=True)
+        assert result['status'] == 'sent'
+        assert search.call_args.args[0] == [11]
+
+    def test_reports_which_episodes_were_searched(self):
+        c, patches = self._sonarr([
+            {'id': 10, 'seasonNumber': 1, 'episodeNumber': 3, 'monitored': True, 'hasFile': True},
+            {'id': 11, 'seasonNumber': 1, 'episodeNumber': 4, 'monitored': True, 'hasFile': False},
+        ])
+        with patches[0], patches[1], patches[2], patches[3]:
+            result = c.ensure_and_search('X', None, 1, [3, 4], skip_has_file=True)
+        assert result['searched_episodes'] == [4]
+
+    def test_gap_fill_pends_only_searched_episodes(self, scanner, mock_sonarr):
+        # E1 has a file in Sonarr (not searched) — it mustn't sit in
+        # Pending as "searching" forever.
+        mock_sonarr.ensure_and_search.return_value = {
+            'status': 'sent', 'service': 'sonarr', 'searched_episodes': [2]}
+        show = _show('Lucky Hank', [])
+        with _stub_tmdb_episodes([(1, 1), (1, 2)]):
+            with patch('utils.arr_client.get_download_service', return_value=(mock_sonarr, 'sonarr')):
+                with patch('utils.tmdb.search_show', return_value=None):
+                    scanner._search_for_missing_episodes([show], [], {})
+        entry = lp.get_all_pending()['lucky hank']
+        assert entry['episodes'] == [{'season': 1, 'episode': 2}]
+
+    def test_radarr_default_still_searches_movie_with_file(self):
+        from utils.arr_client import RadarrClient
+        c = RadarrClient.__new__(RadarrClient)
+        c.url, c.api_key = 'http://fake', 'k'
+        movie = {'id': 3, 'title': 'Dune', 'monitored': True, 'hasFile': True}
+        with patch.object(c, 'find_movie_in_library', return_value=movie), \
+                patch.object(c, '_ensure_local_routing', side_effect=lambda m: m), \
+                patch.object(c, '_clear_unavailable_queue_items'), \
+                patch.object(c, 'search_movie', return_value={'id': 1}) as search:
+            result = c.ensure_and_search('Dune', None, prefer_debrid=False)
+        assert result['status'] == 'sent'
+        search.assert_called_once()
+
+    def test_radarr_skip_applies_routing_first_like_sonarr(self):
+        from utils.arr_client import RadarrClient
+        c = RadarrClient.__new__(RadarrClient)
+        c.url, c.api_key = 'http://fake', 'k'
+        movie = {'id': 3, 'title': 'Dune', 'monitored': True, 'hasFile': True}
+        with patch.object(c, 'find_movie_in_library', return_value=movie), \
+                patch.object(c, '_ensure_local_routing', side_effect=lambda m: m) as routing:
+            result = c.ensure_and_search('Dune', None, prefer_debrid=False, skip_has_file=True)
+        assert result['status'] == 'skipped'
+        routing.assert_called_once()
+
+    def test_all_with_files_skipped_without_search(self):
+        c, patches = self._sonarr([
+            {'id': 10, 'seasonNumber': 1, 'episodeNumber': 3, 'monitored': True, 'hasFile': True},
+        ])
+        with patches[0], patches[1], patches[2], patches[3] as search:
+            result = c.ensure_and_search('X', None, 1, [3], skip_has_file=True)
+        assert result['status'] == 'skipped'
+        search.assert_not_called()
+
+    def test_default_still_searches_files(self):
+        c, patches = self._sonarr([
+            {'id': 10, 'seasonNumber': 1, 'episodeNumber': 3, 'monitored': True, 'hasFile': True},
+        ])
+        with patches[0], patches[1], patches[2], patches[3] as search:
+            c.ensure_and_search('X', None, 1, [3])
+        assert search.call_args.args[0] == [10]
+
+    @pytest.mark.parametrize('prefer', [None, False])
+    def test_radarr_movie_with_file_skipped(self, prefer):
+        from utils.arr_client import RadarrClient
+        c = RadarrClient.__new__(RadarrClient)
+        c.url, c.api_key = 'http://fake', 'k'
+        movie = {'id': 3, 'title': 'Dune', 'monitored': True, 'hasFile': True}
+        with patch.object(c, 'find_movie_in_library', return_value=movie), \
+                patch.object(c, '_ensure_local_routing', side_effect=lambda m: m), \
+                patch.object(c, '_clear_unavailable_queue_items'), \
+                patch.object(c, 'search_movie', return_value={'id': 1}) as search:
+            result = c.ensure_and_search('Dune', None, prefer_debrid=prefer,
+                                         respect_monitored=True, skip_has_file=True)
+        assert result['status'] == 'skipped'
+        search.assert_not_called()
+
+
 class TestDirectionChangeClearsStale:
     """Phase 1.2 hardening: a direction change (e.g., user flips preference)
     must clear the stale-direction pending entry rather than leaving it
@@ -387,6 +498,7 @@ class TestMovieGapFill:
         _, kwargs = mock_radarr.ensure_and_search.call_args
         assert kwargs.get('prefer_debrid') is None
         assert kwargs.get('respect_monitored') is True
+        assert kwargs.get('skip_has_file') is True
 
     def test_movie_already_on_local_not_searched_under_unset(self, scanner, mock_radarr):
         movie = {'title': 'Dune', 'year': 2021, 'source': 'local'}  # already available

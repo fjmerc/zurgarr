@@ -1230,7 +1230,7 @@ class SonarrClient(_ArrClientBase):
         return result
 
     def ensure_and_search(self, title, tmdb_id, season_number, episode_numbers,
-                          prefer_debrid=None, respect_monitored=False):
+                          prefer_debrid=None, respect_monitored=False, skip_has_file=False):
         """High-level: ensure series exists in Sonarr, then search for episodes.
 
         Args:
@@ -1242,6 +1242,10 @@ class SonarrClient(_ArrClientBase):
             respect_monitored: When True, drop episodes with ``monitored=False`` from
                 the target set before searching.  Used by the unconditional gap-fill
                 reconcile so an explicit user-unmonitored episode isn't re-searched.
+            skip_has_file: When True, only search episodes Sonarr has no file
+                for.  Used by gap-fill: an episode with a file isn't missing,
+                and searching it lets Sonarr hunt an upgrade — re-grabbing it
+                every pass when the library can't see the file.
 
         Returns dict with status info, or raises on failure.
         """
@@ -1297,6 +1301,7 @@ class SonarrClient(_ArrClientBase):
         target_ids = []
         has_file_ids = []
         no_file_ids = []
+        ep_number = {}  # episode id -> episode number, for 'searched_episodes'
         matched_any = False  # saw a requested (season, episode) regardless of monitor filter
         for ep in episodes:
             if (ep.get('seasonNumber') == season_number
@@ -1306,6 +1311,7 @@ class SonarrClient(_ArrClientBase):
                     continue
                 ep_id = ep.get('id')
                 if ep_id is not None:
+                    ep_number[ep_id] = ep.get('episodeNumber')
                     target_ids.append(ep_id)
                     if ep.get('hasFile'):
                         has_file_ids.append(ep_id)
@@ -1332,6 +1338,15 @@ class SonarrClient(_ArrClientBase):
                 'status': 'error',
                 'message': f'No matching episodes found in Sonarr for S{season_number:02d}',
             }
+
+        if skip_has_file and has_file_ids:
+            if not no_file_ids:
+                return {
+                    'status': 'skipped',
+                    'service': 'sonarr',
+                    'message': f'All requested episodes of {title} S{season_number:02d} already have files in Sonarr',
+                }
+            target_ids, has_file_ids = no_file_ids, []
 
         # Clear any stale queue items for this series before searching
         self._clear_unavailable_queue_items(series_id)
@@ -1378,6 +1393,7 @@ class SonarrClient(_ArrClientBase):
             return {'status': 'error', 'message': 'Failed to trigger episode search'}
 
         return {
+            'searched_episodes': sorted(ep_number[i] for i in target_ids),
             'status': 'sent',
             'service': 'sonarr',
             'message': f'Searching for {len(target_ids)} episode(s) of {title} S{season_number:02d}',
@@ -2222,7 +2238,8 @@ class RadarrClient(_ArrClientBase):
                                media_title=media_title)
         return result
 
-    def ensure_and_search(self, title, tmdb_id, prefer_debrid=None, respect_monitored=False):
+    def ensure_and_search(self, title, tmdb_id, prefer_debrid=None, respect_monitored=False,
+                          skip_has_file=False):
         """High-level: ensure movie exists in Radarr, then trigger search.
 
         Args:
@@ -2232,6 +2249,9 @@ class RadarrClient(_ArrClientBase):
             respect_monitored: When True and the movie is already in Radarr with
                 ``monitored=False``, return early without searching.  Used by the
                 gap-fill reconcile to skip explicitly-unmonitored movies.
+            skip_has_file: When True, don't search a movie Radarr already has a
+                file for (gap-fill: it isn't missing; a search would only hunt
+                an upgrade).  Mirrors the Sonarr flag.
 
         Returns dict with status info.
         """
@@ -2250,6 +2270,12 @@ class RadarrClient(_ArrClientBase):
                 movie = self._ensure_debrid_routing(movie)
             elif prefer_debrid is False:
                 movie = self._ensure_local_routing(movie)
+            if skip_has_file and movie.get('hasFile'):
+                return {
+                    'status': 'skipped',
+                    'service': 'radarr',
+                    'message': f'{title} already has a file in Radarr',
+                }
 
             # Already in Radarr — skip search only if no routing preference
             if movie.get('hasFile') and prefer_debrid is None:

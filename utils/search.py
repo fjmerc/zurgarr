@@ -857,15 +857,10 @@ def _existing_hashes_ad(api_key):
 
 
 def _existing_hashes_tb(api_key):
-    """TB: GET /v1/api/torrents/mylist → {data: [{hash, ...}]}."""
-    headers = {'Authorization': f'Bearer {api_key}'}
-    data = _urllib_get(
-        'https://api.torbox.app/v1/api/torrents/mylist',
-        headers=headers, timeout=_CACHE_PROBE_TIMEOUT,
-    )
-    if not isinstance(data, dict) or not data.get('success'):
+    """TB: GET /v1/api/torrents/mylist (paged) → {data: [{hash, ...}]}."""
+    payload = _tb_mylist_rows(api_key, _CACHE_PROBE_TIMEOUT)
+    if payload is None:
         return None
-    payload = data.get('data') if isinstance(data.get('data'), list) else []
     out = set()
     for entry in payload:
         if not isinstance(entry, dict):
@@ -876,30 +871,86 @@ def _existing_hashes_tb(api_key):
     return out
 
 
+# TorBox's mylist returns at most this many torrents per call; larger
+# accounts must be paged with offset/limit (prod: 1514 torrents, and the
+# unpaged call silently showed the library only 1000 of them).  Keep in
+# sync with debrid_client.TB_LIST_PAGE / TB_LIST_OVERLAP.
+_TB_MYLIST_PAGE = 1000
+# Consecutive pages overlap by this many rows: a delete between two calls
+# shifts the list forward, and the overlap still catches the entries that
+# slide back across the page boundary.
+_TB_MYLIST_OVERLAP = 50
+# Safety stop: no account needs this many pages.
+_TB_MYLIST_MAX_PAGES = 20
+
+
+def _tb_mylist_rows(api_key, timeout):
+    """Every torrent row of the TorBox account (``/torrents/mylist``, paged
+    and deduped by id), or ``None`` when the listing can't be trusted — a
+    failed or malformed page, an API that ignores ``offset`` (a full page
+    of rows already seen), or more than ``_TB_MYLIST_MAX_PAGES`` pages.
+
+    Paging stops on a page with nothing new, never on a merely short page:
+    a server-side cap below ``_TB_MYLIST_PAGE`` would otherwise end the
+    listing early and pass part of the account off as all of it.
+    ``timeout`` applies per page.
+    """
+    headers = {'Authorization': f'Bearer {api_key}'}
+    out, seen = [], set()
+    offset = 0
+    for _ in range(_TB_MYLIST_MAX_PAGES):
+        # bypass_cache=true: TorBox caches mylist server-side, so without
+        # this a scan can promote a STALE page as the authoritative TB
+        # baseline and drop since-added titles to "Wanted".  Mirrors
+        # debrid_client.list_torrents.
+        data = _urllib_get(
+            'https://api.torbox.app/v1/api/torrents/mylist?bypass_cache=true'
+            f'&offset={offset}&limit={_TB_MYLIST_PAGE}',
+            headers=headers, timeout=timeout,
+        )
+        if (not isinstance(data, dict) or not data.get('success')
+                or not isinstance(data.get('data'), list)):
+            return None
+        rows = data['data']
+        new = 0  # rows with an id not seen before — progress through the list
+        for entry in rows:
+            tid = entry.get('id') if isinstance(entry, dict) else None
+            if tid is not None:
+                if tid in seen:
+                    continue
+                seen.add(tid)
+                new += 1
+            out.append(entry)
+        if not new:
+            if offset and len(rows) > _TB_MYLIST_OVERLAP:
+                logger.warning("[search] TB mylist returned an already-seen page "
+                               "(offset ignored?); treating the listing as incomplete")
+                return None
+            return out
+        offset += len(rows) - _TB_MYLIST_OVERLAP if len(rows) > _TB_MYLIST_OVERLAP else len(rows)
+    logger.warning(f"[search] TB mylist still returning rows after {_TB_MYLIST_MAX_PAGES} "
+                   f"pages; treating the listing as incomplete")
+    return None
+
+
 def list_torbox_torrents(api_key, timeout=_MYLIST_TIMEOUT):
     """TB: GET /v1/api/torrents/mylist → full per-torrent listing.
 
-    Returns the entire account in ONE call so the library scanner can
-    enumerate TorBox content without walking the throttled FUSE mount
+    Lists the whole account (``_tb_mylist_rows``) so the library scanner
+    can enumerate TorBox content without walking the throttled FUSE mount
     (the source of the rclone 429 storms).  Each returned dict carries the
     release-folder ``name`` (matches the rclone mount folder) and a ``files``
     list whose ``name`` is the full relative path *including* that folder.
 
-    Returns a ``list[dict]`` on success or ``None`` on any API failure, so
-    the caller can distinguish "TB has zero torrents" (``[]``) from "couldn't
-    reach TB" (``None``) and fall back to its last-good baseline.
+    Returns a ``list[dict]`` on success or ``None`` when the listing can't be
+    trusted (any failed page included), so the caller can distinguish "TB
+    has zero torrents" (``[]``) from "couldn't list TB" (``None``) and fall
+    back to its last-good baseline rather than take part of the account
+    for all of it.
     """
-    headers = {'Authorization': f'Bearer {api_key}'}
-    # bypass_cache=true: TorBox caches mylist server-side, so without this a
-    # scan can promote a STALE page as the authoritative TB baseline and drop
-    # since-added titles to "Wanted".  Mirrors debrid_client.list_torrents.
-    data = _urllib_get(
-        'https://api.torbox.app/v1/api/torrents/mylist?bypass_cache=true',
-        headers=headers, timeout=timeout,
-    )
-    if not isinstance(data, dict) or not data.get('success'):
+    payload = _tb_mylist_rows(api_key, timeout)
+    if payload is None:
         return None
-    payload = data.get('data') if isinstance(data.get('data'), list) else []
     out = []
     for entry in payload:
         if not isinstance(entry, dict):

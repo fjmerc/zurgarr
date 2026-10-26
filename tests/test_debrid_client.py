@@ -191,6 +191,28 @@ class TestTitleMatching:
         assert matches[0]['filename'] == 'The.Eternaut.S01.DUAL.1080p.WEBRip.x265-KONTRAST'
 
     @patch.object(RealDebridClient, 'list_torrents')
+    def test_yearless_release_of_reboot_family_not_matched_for_dated_target(self, mock_list, rd):
+        # Delete paths act on these matches: a yearless "iCarly.S01" pack could
+        # be either iCarly, so it mustn't be deleted as iCarly (2007)'s.
+        mock_list.return_value = self._make_torrents([
+            'ICarly.S01.1080p.AMZN.WEBRip.DDP2.0.x264-Herkz',
+            'iCarly (2007) Season 1-6 S01-06 (1080p AMZN.WEBDL x265)',
+            'iCarly.2021.S02.1080p.WEBRip.x265',
+        ])
+        with patch('utils.tmdb.get_yearless_collision_bases',
+                   return_value={'shows': {'icarly'}, 'movies': set()}):
+            matches = rd.find_torrents_by_title('icarly', target_year=2007)
+        assert [m['filename'] for m in matches] == [
+            'iCarly (2007) Season 1-6 S01-06 (1080p AMZN.WEBDL x265)']
+
+    @patch.object(RealDebridClient, 'list_torrents')
+    def test_yearless_release_still_matches_non_family_title(self, mock_list, rd):
+        mock_list.return_value = self._make_torrents(['The.Eternaut.S01.1080p.WEB'])
+        with patch('utils.tmdb.get_yearless_collision_bases',
+                   return_value={'shows': {'icarly'}, 'movies': set()}):
+            assert len(rd.find_torrents_by_title('the eternaut', target_year=2025)) == 1
+
+    @patch.object(RealDebridClient, 'list_torrents')
     def test_multiple_matches(self, mock_list, rd):
         mock_list.return_value = self._make_torrents([
             'The.Eternaut.S01.DUAL.1080p.WEBRip.x265-KONTRAST',
@@ -695,6 +717,52 @@ class TestTorBox:
         assert result[0]['id'] == '456'
         assert result[0]['filename'] == 'Test.mkv'
         assert result[0]['hash'] == 'CAFEBABE'
+
+    @staticmethod
+    def _mylist(total, cap=1000, ignore_offset=False, bad_offset=None):
+        # TorBox returns at most `cap` per mylist call (live 1000; prod 1514).
+        ids = list(range(total))
+
+        def _page(url, params=None, **kw):
+            off = 0 if ignore_offset else int(params.get('offset', 0))
+            if off == bad_offset:
+                return _mock_response({'success': False, 'data': None})
+            rows = ids[off:off + min(int(params.get('limit', 1000)), cap)]
+            return _mock_response({'success': True, 'data': [
+                {'id': i, 'name': f'R{i}', 'hash': 'ab', 'download_state': 'completed', 'size': 1}
+                for i in rows]})
+        return _page
+
+    @patch('utils.debrid_client.requests.get')
+    def test_list_torrents_pages_past_api_cap(self, mock_get, tb):
+        mock_get.side_effect = self._mylist(1514)
+        result = tb.list_torrents()
+        assert sorted(int(t['id']) for t in result) == list(range(1514))
+        assert all(c.kwargs['params']['bypass_cache'] == 'true' for c in mock_get.call_args_list)
+
+    @patch('utils.debrid_client.requests.get')
+    def test_list_torrents_lower_server_cap_still_complete(self, mock_get, tb):
+        mock_get.side_effect = self._mylist(1514, cap=500)
+        assert len(tb.list_torrents()) == 1514
+
+    @patch('utils.debrid_client.requests.get')
+    def test_list_torrents_failed_page_raises(self, mock_get, tb):
+        mock_get.side_effect = self._mylist(1514, bad_offset=950)
+        with pytest.raises(ValueError):
+            tb.list_torrents()
+
+    @patch('utils.debrid_client.requests.get')
+    def test_list_torrents_offset_ignored_raises_fast(self, mock_get, tb):
+        mock_get.side_effect = self._mylist(1514, ignore_offset=True)
+        with pytest.raises(ValueError):
+            tb.list_torrents()
+        assert mock_get.call_count <= 3
+
+    @patch('utils.debrid_client.requests.get')
+    def test_list_torrents_unsuccessful_first_page_raises(self, mock_get, tb):
+        mock_get.return_value = _mock_response({'success': False, 'data': []})
+        with pytest.raises(ValueError):
+            tb.list_torrents()
 
     @patch('utils.debrid_client.requests.post')
     def test_delete_success(self, mock_post, tb):

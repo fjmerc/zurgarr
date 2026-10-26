@@ -1613,6 +1613,102 @@ class TestExistingHashesHelpers:
         ]
         assert hf['hash'] is None
 
+    class _FakeMylist:
+        """TorBox mylist honouring offset/limit like the live API: at most
+        ``cap`` rows per call (live cap 1000; prod account 1514).  ``ids``
+        is the live account, so a test can mutate it between calls."""
+
+        def __init__(self, total, cap=1000, fail_offset=None, ignore_offset=False,
+                     degraded_offset=None, between_calls=None):
+            self.ids = list(range(total))
+            self.cap, self.fail_offset = cap, fail_offset
+            self.ignore_offset, self.degraded_offset = ignore_offset, degraded_offset
+            self.between_calls = between_calls
+            self.calls = []
+
+        def __call__(self, url, headers=None, timeout=None, **kw):
+            import urllib.parse
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+            off = 0 if self.ignore_offset else int(q.get('offset', ['0'])[0])
+            lim = int(q.get('limit', ['1000'])[0])
+            self.calls.append((off, lim, q.get('bypass_cache', [''])[0]))
+            if self.between_calls and len(self.calls) > 1:
+                self.between_calls(self)
+            if off == self.fail_offset:
+                return None
+            if off == self.degraded_offset:
+                return {'success': True, 'data': None}
+            rows = self.ids[off:off + min(lim, self.cap)]
+            return {'success': True, 'data': [
+                {'id': i, 'name': f'Rel.{i}', 'hash': f'{i:040x}', 'files': []} for i in rows]}
+
+    def _list(self, fake):
+        from utils.search import list_torbox_torrents
+        with patch('utils.search._urllib_get', side_effect=fake):
+            return list_torbox_torrents('key')
+
+    def test_list_torbox_torrents_pages_past_api_cap(self):
+        fake = self._FakeMylist(1514)
+        out = self._list(fake)
+        assert sorted(t['id'] for t in out) == list(range(1514))
+        assert all(c[2] == 'true' for c in fake.calls)  # bypass_cache on every page
+
+    def test_list_torbox_torrents_lower_server_cap_still_complete(self):
+        # A page shorter than asked isn't the end of the list.
+        out = self._list(self._FakeMylist(1514, cap=500))
+        assert len(out) == 1514
+
+    def test_list_torbox_torrents_small_account(self):
+        assert len(self._list(self._FakeMylist(3))) == 3
+        assert self._list(self._FakeMylist(0)) == []
+
+    def test_list_torbox_torrents_failed_page_returns_none(self):
+        # A partial list must never pass for the whole account.
+        assert self._list(self._FakeMylist(1514, fail_offset=950)) is None
+
+    def test_list_torbox_torrents_degraded_page_returns_none(self):
+        assert self._list(self._FakeMylist(1514, degraded_offset=950)) is None
+
+    def test_list_torbox_torrents_offset_ignored_fails_fast(self):
+        fake = self._FakeMylist(1514, ignore_offset=True)
+        assert self._list(fake) is None
+        assert len(fake.calls) <= 3
+
+    def test_list_torbox_torrents_add_between_pages(self):
+        # A new torrent at the top shifts page 1's last entry onto page 2.
+        def add(f):
+            if len(f.calls) == 2:
+                f.ids.insert(0, 99999)
+        out = self._list(self._FakeMylist(1514, between_calls=add))
+        assert len(out) == len({t['id'] for t in out}) >= 1514
+
+    def test_list_torbox_torrents_delete_between_pages(self):
+        # A delete on page 1 pulls page 2's first entry back across the
+        # boundary; the page overlap still sees it.
+        def delete(f):
+            if len(f.calls) == 2:
+                del f.ids[:10]
+        out = self._list(self._FakeMylist(1514, between_calls=delete))
+        assert set(range(10, 1514)) <= {t['id'] for t in out}
+
+    def test_list_torbox_torrents_page_limit_returns_none(self, monkeypatch):
+        import utils.search as search
+        monkeypatch.setattr(search, '_TB_MYLIST_MAX_PAGES', 2)
+        assert self._list(self._FakeMylist(5000)) is None
+
+    def test_existing_hashes_tb_pages_whole_account(self):
+        from utils.search import _existing_hashes_tb
+        fake = self._FakeMylist(1514)
+        with patch('utils.search._urllib_get', side_effect=fake):
+            hashes = _existing_hashes_tb('key')
+        assert len(hashes) == 1514 and f'{1513:040x}' in hashes
+        assert all(c[2] == 'true' for c in fake.calls)
+
+    def test_existing_hashes_tb_failed_page_is_unknown(self):
+        from utils.search import _existing_hashes_tb
+        with patch('utils.search._urllib_get', side_effect=self._FakeMylist(1514, fail_offset=950)):
+            assert _existing_hashes_tb('key') is None
+
     def test_list_torbox_torrents_passes_timeout(self):
         from utils.search import list_torbox_torrents
         with patch('utils.search._urllib_get') as mock_get:

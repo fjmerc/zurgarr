@@ -194,8 +194,14 @@ def download(element, stream=True, query='', force=False):
                             except Exception as e:
                                 ui_print('[torbox] error: could not add magnet for release: ' + release.title + ' ' + str(e))
                                 continue
-                            response = get('https://api.torbox.app/v1/api/torrents/mylist?bypass_cache=true')
-                            selected_torrent = [s for s in response.data if s.id == torrent_id]
+                            # Look the new torrent up by id: the full mylist is
+                            # capped at 1000 per call, so on a large account the
+                            # new torrent may not be on the first page.
+                            response = get('https://api.torbox.app/v1/api/torrents/mylist?bypass_cache=true&id=' + str(torrent_id))
+                            data = getattr(response, 'data', None) if response is not None else None
+                            if not isinstance(data, list):
+                                data = [data] if data is not None else []
+                            selected_torrent = [s for s in data if getattr(s, 'id', None) == torrent_id]
                             if len(selected_torrent) == 0:
                                 ui_print('[torbox] error: unexpected mismatch after adding torrent: ' + release.title)
                                 continue
