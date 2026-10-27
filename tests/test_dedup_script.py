@@ -209,7 +209,7 @@ def test_apply_stops_on_stranded(tmp_path, monkeypatch):
     dedup.main(['plan', '--kind', 'movie', '--out', out], ctx=ctx)
     monkeypatch.setattr(dedup.dd, 'reconcile_plex',
                         lambda *a, **k: {'stranded': ['100'], 'date_failed': []})
-    rc = dedup.main(['apply', '--no-plex', '--plan', out, '--kind', 'movie', '--include-unmatched'], ctx=ctx)
+    rc = dedup.main(['apply', '--plan', out, '--kind', 'movie', '--include-unmatched'], ctx=ctx)
     assert rc == 2
     assert sum(not os.path.lexists(p) for p in (extra, unmatched)) == 1
 
@@ -715,3 +715,35 @@ def test_radarr_rename_needs_include_unmatched_for_unmatched_deferred_rows(tmp_p
         w.writerows(rows)
     rc = dedup.main(['radarr-rename', '--ids', '5', '--plan', out], ctx=ctx)
     assert rc != 0 and os.path.islink(extra)
+
+
+def test_empty_folders_alone_need_nothing_from_plex(tmp_path):
+    """Plex has no entries for an empty folder: a run of only those must not
+    stop on 'Plex knows none of the affected paths'."""
+    L, sonarr, kept, extra = _show_setup(tmp_path)
+    (L.tv / 'Atlanta' / 'Season 01').mkdir(parents=True)
+    out = str(tmp_path / 'plan.tsv')
+    ctx = _ctx(L, sonarr=sonarr, plex=FakePlex([]), tmp_path=tmp_path)
+    dedup.main(['plan', '--kind', 'tv', '--out', out], ctx=ctx)
+    rows = [r for r in _read(out) if r['rule'] != 'empty-folder']
+    for r in rows:
+        r['action'] = 'report'
+    keep = [r for r in _read(out) if r['rule'] == 'empty-folder'] + rows
+    with open(out, 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=list(keep[0]), delimiter='\t')
+        w.writeheader()
+        w.writerows(keep)
+    assert dedup.main(['apply', '--plan', out, '--kind', 'tv', '--include-unmatched'],
+                      ctx=ctx) == 0
+    assert not os.path.exists(L.tv / 'Atlanta')
+    assert os.path.islink(extra)
+
+
+def test_no_plex_flag_skips_plex_even_when_configured(tmp_path):
+    L, sonarr, kept, extra = _show_setup(tmp_path)
+    out = str(tmp_path / 'plan.tsv')
+    plex = FakePlex([])
+    ctx = _ctx(L, sonarr=sonarr, plex=plex, tmp_path=tmp_path)
+    dedup.main(['plan', '--kind', 'tv', '--out', out], ctx=ctx)
+    assert dedup.main(['apply', '--plan', out, '--kind', 'tv', '--no-plex'], ctx=ctx) == 0
+    assert not os.path.lexists(extra)

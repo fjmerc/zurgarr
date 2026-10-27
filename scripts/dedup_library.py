@@ -36,7 +36,7 @@ import re
 import sys
 import time
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 sys.path.insert(0, '/')
 
@@ -330,10 +330,12 @@ def cmd_apply(ctx, args):
         group = groups[(kind, title)]
         root = ctx.local_tv if kind == 'tv' else ctx.local_movies
         if ctx.plex and kind not in snapshots:
+            # Links only: Plex has nothing for an (empty) folder.
             rels = {dd.rel_to_root(p, root) for (k, _t), rs in groups.items()
-                    if k == kind for r in rs for p in (r.path, r.keep) if p}
-            snapshots[kind] = dd.snapshot_plex(ctx.plex, kind, rels)
-            if not snapshots[kind] and not getattr(snapshots[kind], 'ambiguous', ()):
+                    if k == kind for r in rs if r.target for p in (r.path, r.keep) if p}
+            snapshots[kind] = dd.snapshot_plex(ctx.plex, kind, rels) if rels else {}
+            if (rels and not snapshots[kind]
+                    and not getattr(snapshots[kind], 'ambiguous', ())):
                 print(f'STOPPED: Plex knows none of the {len(rels)} affected {kind} paths — is '
                       f'the Plex library rooted somewhere other than {root}? Nothing more '
                       f'removed ({total} removed before this).')
@@ -651,6 +653,8 @@ def main(argv=None, ctx=None):
     from utils.network import install_dns_retry
     install_dns_retry()      # Sonarr/Radarr lookups fail under bursts otherwise
     ctx = ctx or _context()
+    if getattr(args, 'no_plex', False):
+        ctx = replace(ctx, plex=None)   # skip Plex even when it is configured
     return {'plan': cmd_plan, 'apply': cmd_apply, 'undo': cmd_undo, 'reconcile': cmd_reconcile,
             'radarr-folders': cmd_radarr_folders, 'radarr-rename': cmd_radarr_rename,
             'plex-check': cmd_plex_check}[args.cmd](ctx, args)
