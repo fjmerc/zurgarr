@@ -182,3 +182,12 @@ def test_media_deletion_allowed_parses_string_values():
         plex, fake = _client({('GET', '/:/prefs'): prefs})
         with patch('urllib.request.urlopen', fake):
             assert plex.media_deletion_allowed() is expected, value
+
+
+@pytest.mark.parametrize('value,expected', [('1', True), (True, True), ('0', False),
+                                            (False, False), (None, True)])
+def test_auto_empty_trash_reads_pref_and_assumes_on_when_missing(value, expected):
+    settings = [] if value is None else [{'id': 'autoEmptyTrash', 'value': value}]
+    plex, fake = _client({('GET', '/:/prefs'): {'MediaContainer': {'Setting': settings}}})
+    with patch('urllib.request.urlopen', fake):
+        assert plex.auto_empty_trash() is expected

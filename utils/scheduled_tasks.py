@@ -734,11 +734,15 @@ _DUPLICATE_TIDY_PENDING = '/config/duplicate_tidy_pending.json'
 _DUPLICATE_TIDY_INTERVAL = 6 * 3600
 
 # Plex "unavailable" rescan: first run 10 min after start (a restart's mount
-# blip is when marks appear), then every 3h; a bounded number of folders and
-# a bounded wait per run — whatever is left is picked up next time.
+# blip is when marks appear), then every 3h; a bounded number of folders,
+# file-check time and wait per run — whatever is left is picked up next time.
+# The hold list lives in memory: a restart (when new marks appear) retries all.
 _PLEX_RESCAN_INTERVAL = 3 * 3600
 _PLEX_RESCAN_MAX_FOLDERS = 100
 _PLEX_RESCAN_WAIT = 300
+_PLEX_RESCAN_BUDGET = 600        # seconds of file checks per run
+_PLEX_RESCAN_HOLD = 24 * 3600    # a folder whose marks didn't clear waits this long
+_plex_rescan_held = {}           # (section, rel_dir) -> monotonic time it didn't clear
 _DUPLICATE_TIDY_MAX_RETRIES = 5
 
 
@@ -919,10 +923,17 @@ def plex_unavailable_rescan():
     briefly unmounts TorBox), it marks those versions unavailable.  With
     auto-empty-trash off nothing is deleted, but the marks stay until Plex
     rescans the folder — and its scanner skips folders it thinks are
-    unchanged.  For every marked version whose file plays again (a link
-    whose debrid file is back on a readable mount, or a real file), touch
-    its folder and ask Plex for a partial scan of it.  Versions whose file
-    is really gone are left alone: removing those is the user's call.
+    unchanged.  For every marked version whose files play again (links whose
+    debrid files are back on a readable mount, or real files), touch its
+    folder and ask Plex for a partial scan of it.  Versions whose file is
+    really gone are left alone: removing those is the user's call.
+
+    A partial scan covers the whole folder, so a folder is only scanned when
+    every link in it points at a mount that answers — else a sibling on a
+    mount still down would be marked in turn — and never at all while Plex
+    empties its trash after every scan (a missed file would be deleted).
+    Only Plex's own recount decides what was cleared; a folder whose marks
+    stay waits ``_PLEX_RESCAN_HOLD`` so it can't take every run's slots.
 
     Gated by ``PLEX_REFRESH`` (read on every run) plus a Plex address and
     token.
@@ -930,7 +941,7 @@ def plex_unavailable_rescan():
     if str(os.environ.get('PLEX_REFRESH', '')).lower() != 'true':
         return {'status': 'disabled', 'message': 'PLEX_REFRESH is off'}
     from utils import library_dedup
-    from utils.plex_versions import PlexError, PlexLibrary
+    from utils.plex_versions import PlexError, PlexLibrary, touch_dir
 
     plex = PlexLibrary.from_env()
     if plex is None:
@@ -938,57 +949,125 @@ def plex_unavailable_rescan():
     pairs = _readable_mount_pairs(library_dedup)
     if not pairs:
         return {'status': 'skipped', 'message': 'No debrid mount readable'}
-
-    # (section, folder relative to the section root) -> (local folder, kind, [rel paths])
-    folders = {}
     try:
-        for media_type, env_key in (('show', 'BLACKHOLE_LOCAL_LIBRARY_TV'),
-                                    ('movie', 'BLACKHOLE_LOCAL_LIBRARY_MOVIES')):
-            root = os.environ.get(env_key, '').strip()
-            if not root or not os.path.isdir(root):
-                continue
-            for part in plex.unavailable_parts(media_type):
-                local = _library_file(root, part.rel_path)
-                if local and _plays_now(local, pairs, library_dedup):
-                    entry = folders.setdefault(
-                        (part.section, os.path.dirname(part.rel_path)),
-                        (os.path.dirname(local), media_type, []))
-                    entry[2].append(part.rel_path)
+        if plex.auto_empty_trash():
+            logger.info("[plex] Unavailable-version rescan skipped — Plex empties its trash "
+                        "after every scan, so a rescan could delete versions")
+            return {'status': 'skipped', 'message': "Plex's empty-trash-after-every-scan is on"}
+        folders = _rescan_candidates(plex, pairs, library_dedup)
     except PlexError as e:
         logger.warning("[plex] Unavailable-version rescan skipped — Plex unreachable: %s", e)
-        return {'status': 'error', 'message': f'Plex unreachable: {e}'}
+        return {'status': 'skipped', 'message': f'Plex unreachable: {e}'}
     if not folders:
         return {'status': 'success', 'message': 'No unavailable Plex versions to rescan'}
 
-    todo = list(folders.items())[:_PLEX_RESCAN_MAX_FOLDERS]
-    if len(folders) > len(todo):
-        logger.info("[plex] %d more folder(s) with unavailable versions left for the next run",
-                    len(folders) - len(todo))
     scanned, sections = [], []
-    for (section, rel_dir), (local_dir, media_type, rels) in todo:
+    for folder in folders:
         try:
-            os.utime(local_dir, None)   # else Plex skips the folder as unchanged
+            touch_dir(folder.local_dir)   # else Plex skips the folder as unchanged
         except OSError as e:
-            logger.info("[plex] Could not touch %r: %s", local_dir, e)
+            logger.info("[plex] Could not touch %r: %s", folder.local_dir, e)
         try:
-            plex.scan_path(section, rel_dir)
+            plex.scan_path(folder.section, folder.rel_dir)
         except PlexError as e:
-            logger.warning("[plex] Rescan of %r failed: %s", rel_dir, e)
+            logger.warning("[plex] Rescan of %r failed: %s", folder.rel_dir, e)
             continue
-        scanned.append((section, rel_dir, media_type, rels))
-        if section not in sections:
-            sections.append(section)
-    for section in sections:
-        plex.wait_idle(section, timeout=_PLEX_RESCAN_WAIT)
+        scanned.append(folder)
+        if folder.section not in sections:
+            sections.append(folder.section)
+    if not scanned:
+        return {'status': 'skipped', 'message': 'Plex refused every rescan'}
 
-    versions = sum(len(rels) for *_x, rels in scanned)
-    still = _still_unavailable(plex, {(s, d) for s, d, _m, _r in scanned})
-    _log_plex_rescans(scanned)
-    remaining = 'could not recount' if still is None else f'{still} still marked'
+    versions = sum(len(f.versions) for f in scanned)
+    still = None
+    try:
+        if all([plex.wait_idle(s, timeout=_PLEX_RESCAN_WAIT) for s in sections]):
+            media_types = {f.media_type for f in scanned}
+            still = {(p.rating_key, p.media_id)
+                     for mt in sorted(media_types) for p in plex.unavailable_parts(mt)}
+    except PlexError as e:
+        logger.info("[plex] Could not recount unavailable versions: %s", e)
+    if still is None:
+        msg = (f'Rescan requested for {len(scanned)} folder(s) holding {versions} unavailable '
+               f'version(s); Plex is still busy — checked again next run')
+        logger.info("[plex] %s", msg)
+        return {'status': 'success', 'message': msg}
+
+    cleared = []
+    now = time.monotonic()
+    for folder in scanned:
+        done = [v for v in folder.versions if v not in still]
+        if done:
+            cleared.append((folder, len(done)))
+        if len(done) < len(folder.versions):
+            _plex_rescan_held[(folder.section, folder.rel_dir)] = now
+        else:
+            _plex_rescan_held.pop((folder.section, folder.rel_dir), None)
+    _log_plex_rescans(cleared)
+    n_cleared = sum(n for _f, n in cleared)
     msg = (f'Rescanned {len(scanned)} folder(s) holding {versions} unavailable version(s): '
-           + (f'cleared {versions - still}, ' if still is not None else '') + remaining)
+           f'cleared {n_cleared} of {versions}')
     logger.info("[plex] %s", msg)
     return {'status': 'success', 'message': msg}
+
+
+class _RescanFolder:
+    """One folder to rescan: Plex section, folder relative to its root, the
+    local folder, and the marked versions ``(rating key, media id)`` in it
+    whose files play."""
+
+    __slots__ = ('section', 'rel_dir', 'local_dir', 'media_type', 'versions')
+
+    def __init__(self, section, rel_dir, local_dir, media_type, versions):
+        self.section, self.rel_dir, self.local_dir = section, rel_dir, local_dir
+        self.media_type, self.versions = media_type, versions
+
+
+def _rescan_candidates(plex, pairs, library_dedup):
+    """Folders worth a rescan, at most ``_PLEX_RESCAN_MAX_FOLDERS``, found
+    within ``_PLEX_RESCAN_BUDGET`` seconds of file checks.  Raises
+    ``PlexError`` when Plex can't be listed."""
+    now = time.monotonic()
+    for key, since in list(_plex_rescan_held.items()):
+        if now - since >= _PLEX_RESCAN_HOLD:
+            del _plex_rescan_held[key]
+    deadline = now + _PLEX_RESCAN_BUDGET
+    out = []
+    for media_type, env_key in (('show', 'BLACKHOLE_LOCAL_LIBRARY_TV'),
+                                ('movie', 'BLACKHOLE_LOCAL_LIBRARY_MOVIES')):
+        root = os.environ.get(env_key, '').strip()
+        if not root:
+            continue
+        try:   # a stale network share would hang every check below
+            if not _listdir_with_timeout(root, 15):
+                continue
+        except (OSError, TimeoutError) as e:
+            logger.info("[plex] Not checking %s for unavailable versions — it isn't readable: %s",
+                        root, e)
+            continue
+        by_folder = {}   # (section, rel_dir) -> {(rating key, media id): [rel paths]}
+        for part in plex.unavailable_parts(media_type):
+            rel_dir = os.path.dirname(part.rel_path)
+            if not rel_dir:   # loose in the section root: a rescan would cover the whole section
+                continue
+            (by_folder.setdefault((part.section, rel_dir), {})
+             .setdefault((part.rating_key, part.media_id), []).append(part.rel_path))
+        for (section, rel_dir), versions in by_folder.items():
+            if len(out) >= _PLEX_RESCAN_MAX_FOLDERS or time.monotonic() > deadline:
+                logger.info("[plex] More folders with unavailable versions are left for the "
+                            "next run")
+                return out
+            if (section, rel_dir) in _plex_rescan_held:
+                continue
+            local_dir = _library_file(root, rel_dir)
+            if not local_dir:
+                continue
+            playing = [v for v, rels in versions.items()
+                       if all(_plays_now(_library_file(root, r), pairs, library_dedup)
+                              for r in rels)]
+            if playing and _links_all_reachable(local_dir, pairs, library_dedup):
+                out.append(_RescanFolder(section, rel_dir, local_dir, media_type, playing))
+    return out
 
 
 def _library_file(root, rel_path):
@@ -996,39 +1075,45 @@ def _library_file(root, rel_path):
     path inside it (Plex reports files outside its section roots as-is)."""
     if not rel_path or os.path.isabs(rel_path):
         return None
+    root = os.path.normpath(root)
     path = os.path.normpath(os.path.join(root, rel_path))
-    return path if path.startswith(os.path.normpath(root) + os.sep) else None
+    return path if path.startswith(root.rstrip(os.sep) + os.sep) else None
 
 
 def _plays_now(path, pairs, library_dedup):
     """True when the version's file is there: a link whose debrid file is on
     a readable mount, or a real file.  A link to an unknown place is not."""
+    if not path:
+        return False
     if os.path.islink(path):
         return library_dedup.link_resolves(path, pairs) is True
     return os.path.isfile(path)
 
 
-def _still_unavailable(plex, scanned):
-    """How many versions in the *scanned* folders Plex still marks; None
-    when Plex can't be asked."""
-    from utils.plex_versions import PlexError
+def _links_all_reachable(local_dir, pairs, library_dedup):
+    """True when every link in the folder (and below) points at a readable
+    debrid mount — what Plex sees after the rescan is then what zurgarr sees."""
     try:
-        return sum(1 for media_type in ('show', 'movie')
-                   for p in plex.unavailable_parts(media_type)
-                   if (p.section, os.path.dirname(p.rel_path)) in scanned)
-    except PlexError as e:
-        logger.info("[plex] Could not recount unavailable versions: %s", e)
-        return None
+        for dirpath, dirnames, filenames in os.walk(local_dir):
+            for name in dirnames + filenames:
+                path = os.path.join(dirpath, name)
+                if os.path.islink(path) and \
+                        library_dedup.resolve_link_target(path, pairs) is None:
+                    return False
+    except OSError:
+        return False
+    return True
 
 
-def _log_plex_rescans(scanned):
-    """One history event per title (top-level folder) rescanned."""
+def _log_plex_rescans(cleared):
+    """One history event per title (top-level folder) for the versions the
+    rescan cleared."""
     from utils import history
     by_title = {}
-    for _section, rel_dir, media_type, rels in scanned:
-        title = rel_dir.split('/')[0] or rel_dir
-        entry = by_title.setdefault(title, [media_type, 0])
-        entry[1] += len(rels)
+    for folder, count in cleared:
+        title = folder.rel_dir.split('/')[0]
+        entry = by_title.setdefault(title, [folder.media_type, 0])
+        entry[1] += count
     for title, (media_type, count) in by_title.items():
         history.log_event('plex_rescan', title, source='plex', meta={
             'cause': history.CAUSE_PLEX_UNAVAILABLE_RESCAN,

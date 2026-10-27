@@ -416,8 +416,12 @@ starts and every 3 hours after that. For each version Plex marks
 unavailable whose file is back (a debrid link whose file is on a mount that
 answers, or a real file), it bumps the folder's modified time and asks Plex
 to rescan just that folder — up to 100 folders a run; Activity shows "Plex
-rescan". Versions whose file is really gone are left for you to remove (Plex:
-Settings → Troubleshooting → Empty Trash). To clear marks straight away,
+rescan" for the versions that cleared. A folder that also holds a link to a
+mount that isn't answering yet waits for a later run, a folder whose marks
+didn't clear is retried after a day, and nothing runs while Plex's "Empty
+trash automatically after every scan" is on (with it on, Plex deletes such
+versions itself). Versions whose file is really gone are left for you to
+remove (Plex: Settings → Troubleshooting → Empty Trash). To clear marks straight away,
 run the `plex_unavailable_rescan` task from the System page.
 
 ## Sonarr/Radarr requests fail with "Try again" (temporary failure in name resolution)

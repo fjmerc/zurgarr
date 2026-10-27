@@ -22,7 +22,10 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 
+from utils.logger import get_logger
 from utils.plex_refresh import _config
+
+logger = get_logger()
 
 _TIMEOUT = 30
 _PAGE_SIZE = 500
@@ -141,10 +144,16 @@ class PlexLibrary:
 
         Sections with more than one folder are skipped: a part's relative
         path can't say which of them it is under."""
-        return [self._part_ref(key, it, media, part)
-                for key, roots in self.sections(media_type) if len(roots) == 1
-                for it, media, part in self._iter_parts(key, media_type)
-                if media.get('deletedAt') or part.get('deletedAt')]
+        out = []
+        for key, roots in self.sections(media_type):
+            if len(roots) != 1:
+                logger.info("[plex] Not checking section %s for unavailable versions — it has "
+                            "%d folders", key, len(roots))
+                continue
+            out.extend(self._part_ref(key, it, media, part)
+                       for it, media, part in self._iter_parts(key, media_type)
+                       if media.get('deletedAt') or part.get('deletedAt'))
+        return out
 
     def media_status(self, rating_key):
         """The item's media with on-disk presence (``checkFiles=1``); ``[]``
@@ -200,11 +209,20 @@ class PlexLibrary:
         self._request('PUT', f'/library/metadata/{keep_rating_key}/merge',
                       {'ids': ','.join(str(k) for k in other_rating_keys)})
 
-    def media_deletion_allowed(self):
+    def _pref(self, pref_id):
+        """A server pref as True/False; None when Plex doesn't list it."""
         for s in self._request('GET', '/:/prefs').get('MediaContainer', {}).get('Setting', []):
-            if s.get('id') == 'allowMediaDeletion':
+            if s.get('id') == pref_id:
                 return str(s.get('value')).strip().lower() in ('1', 'true')
-        return False
+        return None
+
+    def media_deletion_allowed(self):
+        return self._pref('allowMediaDeletion') is True
+
+    def auto_empty_trash(self):
+        """Whether Plex deletes unavailable versions after every scan
+        (Plex's default; assumed on when the pref isn't listed)."""
+        return self._pref('autoEmptyTrash') is not False
 
 
 def item_type_code(kind):
