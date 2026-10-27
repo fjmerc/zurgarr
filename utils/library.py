@@ -1575,6 +1575,43 @@ def _get_sonarr_series_list(client, force_refresh=False):
     return series_list
 
 
+def arr_title_maps(entries, client, is_tv):
+    """Index a Sonarr series list / Radarr movie list for ``_match_arr_entry``.
+
+    Returns ``(by lowercase title, by _norm_for_matching key, by TMDB id)``,
+    all mapping to the same per-entry info dict (``folder``, ``path``,
+    ``id``, ``tmdb_id``, ``client``; plus ``tvdb_id`` for series and
+    ``has_file`` for movies).  The TMDB map backs the cascade's fallback when
+    torrent titles differ from TMDB titles ("F1 The Movie" vs "F1",
+    "Special Ops Lioness" vs "Lioness").
+    """
+    by_title, by_norm, by_tmdb = {}, {}, {}
+    for e in entries or []:
+        t = e.get('title', '')
+        if not t:
+            continue
+        p = e.get('path', '')
+        info = {
+            'folder': os.path.basename(p) if p else '',
+            'path': p,
+            'id': e.get('id'),
+            'tmdb_id': e.get('tmdbId'),
+            'client': client,
+        }
+        if is_tv:
+            info['tvdb_id'] = e.get('tvdbId')
+        else:
+            info['has_file'] = bool(e.get('hasFile'))
+        by_title[t.lower()] = info
+        nk = _norm_for_matching(t)
+        if nk and nk not in by_norm:
+            by_norm[nk] = info
+    for info in by_title.values():
+        if info.get('tmdb_id'):
+            by_tmdb[info['tmdb_id']] = info
+    return by_title, by_norm, by_tmdb
+
+
 def _dir_has_media_name(path):
     """True when *path* holds any media-named entry, resolving or not.
 
@@ -7453,6 +7490,8 @@ class LibraryScanner:
         sonarr_map_norm = {}  # normalized title -> info
         radarr_map = {}
         radarr_map_norm = {}
+        sonarr_by_tmdb = {}
+        radarr_by_tmdb = {}
         from utils.arr_client import get_download_service
         sonarr_fetch_failed = False
         radarr_fetch_failed = False
@@ -7475,23 +7514,8 @@ class LibraryScanner:
                 if series_list is None:
                     sonarr_fetch_failed = True
                 else:
-                    for s in series_list:
-                        t = s.get('title', '')
-                        if not t:
-                            continue
-                        p = s.get('path', '')
-                        info = {
-                            'folder': os.path.basename(p) if p else '',
-                            'path': p,
-                            'id': s.get('id'),
-                            'tvdb_id': s.get('tvdbId'),
-                            'tmdb_id': s.get('tmdbId'),
-                            'client': client,
-                        }
-                        sonarr_map[t.lower()] = info
-                        nk = _norm_for_matching(t)
-                        if nk and nk not in sonarr_map_norm:
-                            sonarr_map_norm[nk] = info
+                    sonarr_map, sonarr_map_norm, sonarr_by_tmdb = arr_title_maps(
+                        series_list, client, is_tv=True)
         except Exception as e:
             sonarr_fetch_failed = True
             logger.warning(f"[library] Could not fetch Sonarr library: {e}")
@@ -7507,40 +7531,12 @@ class LibraryScanner:
                 if radarr_movies_list is None:
                     radarr_fetch_failed = True
                     radarr_movies_list = []
-                for m in radarr_movies_list:
-                    t = m.get('title', '')
-                    if not t:
-                        continue
-                    p = m.get('path', '')
-                    info = {
-                        'folder': os.path.basename(p) if p else '',
-                        'path': p,
-                        'has_file': bool(m.get('hasFile')),
-                        'id': m.get('id'),
-                        'tmdb_id': m.get('tmdbId'),
-                        'client': client,
-                    }
-                    radarr_map[t.lower()] = info
-                    nk = _norm_for_matching(t)
-                    if nk and nk not in radarr_map_norm:
-                        radarr_map_norm[nk] = info
+                radarr_map, radarr_map_norm, radarr_by_tmdb = arr_title_maps(
+                    radarr_movies_list, client, is_tv=False)
         except Exception as e:
             radarr_fetch_failed = True
             logger.warning(f"[library] Could not fetch Radarr library: {e}")
 
-        # Build TMDB ID → arr info maps for fallback matching when torrent
-        # titles differ from TMDB titles (e.g. "F1 The Movie" vs "F1",
-        # "Special Ops Lioness" vs "Lioness")
-        radarr_by_tmdb = {}
-        for info in radarr_map.values():
-            tid = info.get('tmdb_id')
-            if tid:
-                radarr_by_tmdb[tid] = info
-        sonarr_by_tmdb = {}
-        for info in sonarr_map.values():
-            tid = info.get('tmdb_id')
-            if tid:
-                sonarr_by_tmdb[tid] = info
         # Load cached TMDB IDs so we can translate Zurgarr titles → TMDB IDs
         from utils.tmdb import get_cached_tmdb_ids
         cached_tmdb_ids = get_cached_tmdb_ids()

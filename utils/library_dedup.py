@@ -257,3 +257,112 @@ def plan_movie_duplicates(movie_dir, tracked_path, pairs, title):
             continue
         removals.append(Removal(path, target, 'movie', 'arr-folder-untracked', tracked_path, title))
     return removals + sidecars_for(removals, [tracked_path])
+
+
+def _walk_files(folder):
+    """``[(name, path)]`` of every non-directory under *folder*."""
+    out = []
+    for dirpath, _dirs, files in os.walk(folder):
+        out += [(f, os.path.join(dirpath, f)) for f in files]
+    return out
+
+
+def _keep_for_episode(ep, tracked, arr_index, pairs):
+    """A copy of *ep* that plays: Sonarr's tracked file, else any copy in
+    Sonarr's folder (the arr hasn't accepted one yet — it still plays)."""
+    p = tracked.get(ep)
+    if kept_copy_ok(p, pairs):
+        return p
+    for cand in arr_index.get(ep, []):
+        if kept_copy_ok(cand, pairs):
+            return cand
+    return None
+
+
+def plan_foreign_folders(root, kind, owned, maps, tracked_by_entry, pairs,
+                         cached_tmdb=None, tmdb_cache=None):
+    """Plan removals in top-level folders of *root* that no arr entry owns.
+
+    *maps* is ``library.arr_title_maps(...)``; the folder name is resolved
+    with ``library._match_arr_entry`` (the single title-match cascade).
+    *tracked_by_entry(info)* returns the tracked local path(s) for a matched
+    entry: ``{(s, e): path}`` for TV, a path (or None) for movies.
+
+    Returns ``(removals, report_rows)``; report rows are dicts with
+    ``kind``, ``folder``, ``rule`` and ``detail``.  A folder holding any real
+    media file is never touched.
+    """
+    from utils.library import _SKIP_FOLDERS, _match_arr_entry, _parse_folder_name
+    is_tv = kind == 'tv'
+    by_title, by_norm, by_tmdb = maps
+    removals, report = [], []
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return removals, report
+    for name in names:
+        folder = os.path.join(root, name)
+        if (name in owned or name.startswith('.') or name.lower() in _SKIP_FOLDERS
+                or not os.path.isdir(folder) or os.path.islink(folder)):
+            continue
+        files = _walk_files(folder)
+        media = [(n, p) for n, p in files if _is_media_name(n)]
+        real_media = [n for n, p in media if not os.path.islink(p)]
+        row = {'kind': kind, 'folder': name}
+        if real_media:
+            report.append(dict(row, rule='has-real-files', detail=', '.join(real_media)))
+            continue
+        if not media:
+            if any(not os.path.islink(p) for _n, p in files):
+                report.append(dict(row, rule='has-real-files',
+                                   detail=', '.join(n for n, _p in files)))
+                continue
+            removals += [Removal(p, os.readlink(p), kind, 'empty-folder', '', name)
+                         for _n, p in files]
+            removals.append(Removal(folder, '', kind, 'empty-folder', '', name))
+            report.append(dict(row, rule='empty-folder', detail=''))
+            continue
+
+        title, year = _parse_folder_name(name)
+        eps_of = {p: parse_episode_numbers(n) for n, p in media}
+        info = None
+        if title:
+            max_season = max((s for eps in eps_of.values() for s, _e in eps), default=0)
+            info = _match_arr_entry(title, year, None, by_title, by_norm, by_tmdb,
+                                    cached_tmdb or {}, is_tv=is_tv, max_season=max_season,
+                                    _tmdb_cache=tmdb_cache or {})
+        if not info or not info.get('folder'):
+            planned = [Removal(p, os.readlink(p), kind, 'no-arr-title', '', name)
+                       for _n, p in media if _removable_link(p, pairs) is not None]
+            removals += planned + sidecars_for(planned, [])
+            report.append(dict(row, rule='no-arr-title',
+                               detail=', '.join(n for n, _p in media)))
+            continue
+
+        tracked = tracked_by_entry(info)
+        planned, uncovered = [], []
+        if is_tv:
+            tracked = tracked or {}
+            arr_index = episode_index(os.path.join(root, info['folder']))
+            for n, p in media:
+                eps = eps_of[p]
+                keeps = [_keep_for_episode(ep, tracked, arr_index, pairs) for ep in eps]
+                if (eps and all(keeps) and _removable_link(p, pairs) is not None):
+                    planned.append(Removal(p, os.readlink(p), kind, 'foreign-folder',
+                                           keeps[0], info['folder']))
+                else:
+                    uncovered.append((n, p))
+        else:
+            ok = kept_copy_ok(tracked, pairs)
+            for n, p in media:
+                if ok and _removable_link(p, pairs) is not None:
+                    planned.append(Removal(p, os.readlink(p), kind, 'foreign-folder',
+                                           tracked, info['folder']))
+                else:
+                    uncovered.append((n, p))
+        removals += planned + sidecars_for(planned, [p for _n, p in uncovered])
+        if uncovered:
+            report.append(dict(row, rule='not-covered',
+                               detail='%d kept (arr has no playable copy): %s' % (
+                                   len(uncovered), ', '.join(n for n, _p in uncovered[:5]))))
+    return removals, report

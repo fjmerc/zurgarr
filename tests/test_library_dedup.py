@@ -243,3 +243,104 @@ class TestPlanMovieDuplicates:
         kept = L.link('Film (2020)/Film (2020).mkv', 'A/a.mkv', present=False)
         L.link('Film (2020)/Film.2020.1080p.mkv', 'B/b.mkv')
         assert plan_movie_duplicates(str(L.lib / 'Film (2020)'), kept, L.pairs, 'Film') == []
+
+
+# ---------------------------------------------------------------------------
+# Folders Sonarr/Radarr don't own
+# ---------------------------------------------------------------------------
+
+class TestPlanForeignFolders:
+
+    def _plan(self, L, kind, entries, tracked_by_entry):
+        from utils.library import arr_title_maps
+        from utils.library_dedup import plan_foreign_folders
+        maps = arr_title_maps(entries, None, is_tv=(kind == 'tv'))
+        owned = {os.path.basename(e['path']) for e in entries}
+        return plan_foreign_folders(str(L.lib), kind, owned, maps, tracked_by_entry,
+                                    L.pairs, cached_tmdb={}, tmdb_cache={})
+
+    _TED = [{'title': 'Ted Lasso', 'path': '/data/media/tv/Ted Lasso (2020)', 'id': 1,
+             'tmdbId': None}]
+
+    def test_foreign_tv_link_removed_when_sonarr_tracks_episode(self, tmp_path):
+        L = _Lib(tmp_path)
+        kept = L.link('Ted Lasso (2020)/Season 04/Ted Lasso (2020) - S04E04.mkv', 'A/a.mkv')
+        extra = L.link('Ted Lasso/Season 04/Ted Lasso S04E04 2160p.mkv', 'B/b.mkv')
+        rem, _rep = self._plan(L, 'tv', self._TED, lambda info: {(4, 4): kept})
+        assert [(r.path, r.rule, r.keep) for r in rem] == [(extra, 'foreign-folder', kept)]
+
+    def test_foreign_tv_link_kept_when_sonarr_folder_lacks_episode(self, tmp_path):
+        L = _Lib(tmp_path)
+        (L.lib / 'Ted Lasso (2020)').mkdir()
+        L.link('Ted Lasso/Season 04/Ted Lasso S04E05.mkv', 'B/b.mkv')
+        rem, rep = self._plan(L, 'tv', self._TED, lambda info: {})
+        assert rem == []
+        assert any(r['folder'] == 'Ted Lasso' for r in rep)
+
+    def test_foreign_tv_link_removed_when_sonarr_folder_has_untracked_resolving_copy(self, tmp_path):
+        L = _Lib(tmp_path)
+        inside = L.link('Ted Lasso (2020)/Season 01/Ted Lasso S01E01 x265.mkv', 'A/a.mkv')
+        extra = L.link('Ted Lasso/Season 01/Ted Lasso S01E01 WEB.mkv', 'B/b.mkv')
+        rem, _ = self._plan(L, 'tv', self._TED, lambda info: {})
+        assert [(r.path, r.keep) for r in rem] == [(extra, inside)]
+
+    def test_foreign_movie_folder_removed_when_radarr_file_resolves(self, tmp_path):
+        L = _Lib(tmp_path)
+        kept = L.link('Chinatown ITA (1974)/Chinatown.mkv', 'A/a.mkv')
+        extra = L.link('Chinatown (1974)/Chinatown 1974 1080p.mkv', 'B/b.mkv')
+        movies = [{'title': 'Chinatown', 'year': 1974, 'path': '/m/Chinatown ITA (1974)',
+                   'id': 5, 'tmdbId': None, 'hasFile': True}]
+        rem, _ = self._plan(L, 'movie', movies, lambda info: kept)
+        assert [(r.path, r.rule, r.keep, r.kind) for r in rem] == [(extra, 'foreign-folder', kept, 'movie')]
+
+    def test_foreign_movie_kept_when_radarr_file_broken(self, tmp_path):
+        L = _Lib(tmp_path)
+        kept = L.link('Chinatown ITA (1974)/Chinatown.mkv', 'A/a.mkv', present=False)
+        L.link('Chinatown (1974)/Chinatown 1974 1080p.mkv', 'B/b.mkv')
+        movies = [{'title': 'Chinatown', 'year': 1974, 'path': '/m/Chinatown ITA (1974)',
+                   'id': 5, 'tmdbId': None, 'hasFile': True}]
+        rem, _ = self._plan(L, 'movie', movies, lambda info: kept)
+        assert rem == []
+
+    def test_folder_with_real_file_kept_and_reported(self, tmp_path):
+        L = _Lib(tmp_path)
+        kept = L.link('Thor (2013)/Thor.mkv', 'A/a.mkv')
+        L.file('Thor The Dark World (2013)/Thor real.mkv')
+        L.link('Thor The Dark World (2013)/Thor link.mkv', 'B/b.mkv')
+        movies = [{'title': 'Thor The Dark World', 'year': 2013, 'path': '/m/Thor (2013)',
+                   'id': 6, 'tmdbId': None, 'hasFile': True}]
+        rem, rep = self._plan(L, 'movie', movies, lambda info: kept)
+        assert rem == []
+        assert [r['rule'] for r in rep if r['folder'] == 'Thor The Dark World (2013)'] == ['has-real-files']
+
+    def test_unmatched_folder_reported_as_no_arr_title(self, tmp_path):
+        L = _Lib(tmp_path)
+        link = L.link('Amazing Films 12/Oppenheimer (2023) 1080p.mp4', 'B/b.mp4')
+        rem, rep = self._plan(L, 'movie', [], lambda info: None)
+        assert [(r.path, r.rule) for r in rem] == [(link, 'no-arr-title')]
+        assert any(r['rule'] == 'no-arr-title' and 'Oppenheimer' in r['detail'] for r in rep)
+
+    def test_empty_folder_of_symlink_leftovers(self, tmp_path):
+        L = _Lib(tmp_path)
+        (L.lib / 'Bad Sisters').mkdir()
+        rem, rep = self._plan(L, 'movie', [], lambda info: None)
+        assert [(r.path, r.rule) for r in rem] == [(str(L.lib / 'Bad Sisters'), 'empty-folder')]
+
+    def test_owned_folders_ignored(self, tmp_path):
+        L = _Lib(tmp_path)
+        L.link('Ted Lasso (2020)/Season 01/Ted Lasso S01E01.mkv', 'A/a.mkv')
+        rem, rep = self._plan(L, 'tv', self._TED, lambda info: {})
+        assert rem == [] and rep == []
+
+    def test_foreign_multi_episode_link_kept_if_one_episode_uncovered(self, tmp_path):
+        L = _Lib(tmp_path)
+        kept = L.link('Ted Lasso (2020)/Season 01/Ted Lasso (2020) - S01E01.mkv', 'A/a.mkv')
+        L.link('Ted Lasso/Season 01/Ted Lasso S01E01E02.mkv', 'B/b.mkv')
+        rem, rep = self._plan(L, 'tv', self._TED, lambda info: {(1, 1): kept})
+        assert rem == [] and [r['rule'] for r in rep] == ['not-covered']
+
+    def test_no_video_folder_with_real_leftover_kept(self, tmp_path):
+        L = _Lib(tmp_path)
+        L.file('Bad Sisters/poster.jpg')
+        rem, rep = self._plan(L, 'movie', [], lambda info: None)
+        assert rem == [] and [r['rule'] for r in rep] == ['has-real-files']
