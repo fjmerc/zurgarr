@@ -20,6 +20,7 @@ isn't here, open a [GitHub issue](https://github.com/fjmerc/zurgarr/issues).
 - [New shows/movies only appear in Plex after a manual scan](#new-showsmovies-only-appear-in-plex-after-a-manual-scan)
 - [A download for one show is stuck under a same-name show in Sonarr ("Not an upgrade")](#a-download-for-one-show-is-stuck-under-a-same-name-show-in-sonarr-not-an-upgrade)
 - [Plex shows the same episode or movie two or more times](#plex-shows-the-same-episode-or-movie-two-or-more-times)
+- [Sonarr/Radarr requests fail with "Try again" (temporary failure in name resolution)](#sonarrradarr-requests-fail-with-try-again-temporary-failure-in-name-resolution)
 - [Blackhole: symlinks created but broken](#blackhole-symlinks-created-but-broken)
 - [Stuck ffprobe processes](#stuck-ffprobe-processes)
 - [Dashboard buttons fail with "cross-origin request rejected" behind a reverse proxy](#dashboard-buttons-fail-with-cross-origin-request-rejected-behind-a-reverse-proxy)
@@ -396,6 +397,24 @@ to `/config/duplicate_tidy_manifest.tsv`; `scripts/dedup_library.py undo
 --manifest <file>` puts them back. Copies in folders the arr doesn't own
 are handled by the one-time `scripts/dedup_library.py` clean-up (preview
 with `plan` first).
+
+## Sonarr/Radarr requests fail with "Try again" (temporary failure in name resolution)
+
+Symptom: the log shows `[sonarr] Request failed for GET /api/v3/... <urlopen
+error [Errno -3] Try again>` (or the same for Radarr) every so often, usually
+during busy moments, and the request takes about 5 seconds to fail.
+
+Cause: a DNS lookup was dropped somewhere between Docker's resolver, the
+host's resolver and your DNS server. A LAN DNS server with a per-client rate
+limit (AdGuard Home and Pi-hole have one) sees every container on the host as
+a single client, so bursts of lookups go over the limit; very short TTLs on
+local names (AdGuard rewrites default to 10 seconds) make it more frequent.
+
+Fix: zurgarr retries such lookups automatically (once, a second later; the log
+says "succeeded after a temporary failure" when that helped), so these are rare
+and harmless. To stop them at the source, raise or turn off the
+DNS server's rate limit for your Docker host's address (AdGuard Home: Settings
+→ DNS settings → Rate limit) and optionally raise the minimum cache TTL.
 
 ## Blackhole: symlinks created but broken
 

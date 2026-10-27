@@ -637,6 +637,8 @@ def main(argv=None, ctx=None):
     p.add_argument('--plex-wait', type=int, default=1800)
     sub.add_parser('plex-check')
     args = ap.parse_args(argv)
+    from utils.network import install_dns_retry
+    install_dns_retry()      # Sonarr/Radarr lookups fail under bursts otherwise
     ctx = ctx or _context()
     return {'plan': cmd_plan, 'apply': cmd_apply, 'undo': cmd_undo, 'reconcile': cmd_reconcile,
             'radarr-folders': cmd_radarr_folders, 'radarr-rename': cmd_radarr_rename,

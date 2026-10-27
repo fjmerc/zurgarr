@@ -92,6 +92,8 @@ def _no_link_age_grace(monkeypatch):
 @pytest.fixture(autouse=True)
 def _no_tmdb(monkeypatch):
     monkeypatch.setattr(dedup, '_tmdb_context', lambda kind: ({}, {}))
+    # main() wraps the process-wide resolver; keep that out of the test run
+    monkeypatch.setattr('utils.network.install_dns_retry', lambda: None)
     monkeypatch.setattr(dedup, '_sleep', lambda s: None)
 
 
@@ -612,3 +614,11 @@ def test_radarr_rename_when_plex_replaced_the_item(tmp_path):
     plex.media_status = lambda rk: [] if rk not in plex.added else real_status(rk)  # gone item: 404 → []
     assert dedup.main(['radarr-rename', '--ids', '5', '--plan', out], ctx=ctx) == 0
     assert plex.added['300'] == 5                 # original date (from item 100) restored
+
+
+def test_main_installs_dns_retry(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr('utils.network.install_dns_retry', lambda: calls.append(1))
+    L = Lib(tmp_path)
+    dedup.main(['plex-check'], ctx=_ctx(L, plex=FakePlex([])))
+    assert calls == [1]

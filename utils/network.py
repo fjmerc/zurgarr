@@ -1,10 +1,59 @@
 """Network utility functions."""
 
+import functools
+import socket
+import threading
 import time
 import requests
 from utils.logger import get_logger
 
 logger = get_logger()
+
+_dns_retry_installed = False
+_dns_retry_lock = threading.Lock()
+
+
+def install_dns_retry(retries=1, delay=1.0):
+    """Retry name lookups that fail with a *temporary* resolver error.
+
+    The resolver chain on a homelab host (Docker DNS → host resolver → a
+    LAN DNS server such as AdGuard) drops a few queries under bursts; Python
+    then raises ``gaierror(EAI_AGAIN)`` ("Try again", after ~5s on musl)
+    and the request fails although the name is fine (prod 2026-10-27: ~5% of
+    burst lookups of the Sonarr/Radarr names, from AdGuard's per-client rate
+    limit).  Wrapping ``socket.getaddrinfo`` once covers every client in
+    this process — urllib and requests alike — instead of each call site;
+    child processes (plex_debrid, zurg, rclone) are not covered.  Only
+    EAI_AGAIN is retried, *retries* times (default once: ~11s worst case
+    instead of ~5s, and no HTTP timeout covers name resolution); a name that
+    doesn't exist fails immediately.  Idempotent and thread-safe.
+    """
+    global _dns_retry_installed
+    with _dns_retry_lock:
+        if _dns_retry_installed or getattr(socket.getaddrinfo, '_zurgarr_dns_retry', False):
+            _dns_retry_installed = True
+            return
+        original = socket.getaddrinfo
+
+        @functools.wraps(original)
+        def getaddrinfo(*args, **kwargs):
+            host = args[0] if args else kwargs.get('host')
+            for attempt in range(retries + 1):
+                try:
+                    result = original(*args, **kwargs)
+                except socket.gaierror as e:
+                    if e.errno != socket.EAI_AGAIN or attempt == retries:
+                        raise
+                    time.sleep(delay)
+                    continue
+                if attempt:
+                    logger.info("[network] DNS lookup for %s succeeded after a temporary "
+                                "failure (retried)", host)
+                return result
+
+        getaddrinfo._zurgarr_dns_retry = True
+        socket.getaddrinfo = getaddrinfo
+        _dns_retry_installed = True
 
 
 def wait_for_url(url, endpoint="/", auth=None, timeout=600,

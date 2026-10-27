@@ -77,6 +77,11 @@ def main():
 
     logger.info(banner)
 
+    # Before any network use: a homelab resolver drops a few lookups under
+    # bursts ("Try again"); retry those instead of failing the request.
+    from utils.network import install_dns_retry
+    install_dns_retry()
+
     # Clear heartbeat entries surviving a `docker restart` — a worker that
     # legitimately doesn't start this boot must not inherit a ghost entry.
     # BEFORE run_validation(): a wedge anywhere later in startup must not

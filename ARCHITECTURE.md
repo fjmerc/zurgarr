@@ -670,6 +670,17 @@ housekeeping
 
 ## 9. Error Recovery Patterns
 
+### Temporary DNS Failures
+
+`main()` calls `utils.network.install_dns_retry()` before any network use (the
+one-time `scripts/dedup_library.py` does too). It wraps `socket.getaddrinfo`
+process-wide, so urllib and requests clients alike retry a lookup that fails
+with `EAI_AGAIN` ("Try again") — once, one second later, logging at INFO when
+that saved the lookup. Other resolver errors (e.g. `EAI_NONAME`) are raised at
+once. Child processes (plex_debrid, Zurg, rclone) are not covered. Background: a LAN DNS server's
+per-client rate limit drops a few lookups when every container on the host
+bursts at once.
+
 ### Process Auto-Restart
 
 ```
