@@ -344,3 +344,104 @@ class TestPlanForeignFolders:
         L.file('Bad Sisters/poster.jpg')
         rem, rep = self._plan(L, 'movie', [], lambda info: None)
         assert rem == [] and [r['rule'] for r in rep] == ['has-real-files']
+
+
+# ---------------------------------------------------------------------------
+# Apply / manifest / undo
+# ---------------------------------------------------------------------------
+
+class TestApplyRemovals:
+
+    def _rows(self, manifest):
+        import csv
+        with open(manifest, newline='') as f:
+            return list(csv.DictReader(f, delimiter='\t'))
+
+    def _one(self, L, rel='Ted Lasso/Season 01/x.mkv'):
+        from utils.library_dedup import Removal
+        p = L.link(rel, 'B/b.mkv')
+        return p, Removal(p, '/mnt/debrid_torbox/B/b.mkv', 'tv', 'foreign-folder', '', 'Ted')
+
+    def test_apply_removes_link_and_writes_manifest_first(self, tmp_path, monkeypatch):
+        from utils import library_dedup
+        L = _Lib(tmp_path)
+        p, r = self._one(L)
+        manifest = str(tmp_path / 'm.tsv')
+
+        def boom(path):
+            raise OSError('unlink failed')
+        monkeypatch.setattr(library_dedup.os, 'unlink', boom)
+        assert library_dedup.apply_removals([r], manifest, str(L.lib), set()) == []
+        rows = self._rows(manifest)
+        assert [(x['path'], x['target'], x['action']) for x in rows] == [(p, r.target, 'remove')]
+
+    def test_apply_removes_link(self, tmp_path):
+        from utils.library_dedup import apply_removals
+        L = _Lib(tmp_path)
+        p, r = self._one(L)
+        assert apply_removals([r], str(tmp_path / 'm.tsv'), str(L.lib), set()) == [r]
+        assert not os.path.lexists(p)
+
+    def test_apply_skips_when_target_changed(self, tmp_path):
+        from utils.library_dedup import Removal, apply_removals
+        L = _Lib(tmp_path)
+        p = L.link('Ted Lasso/Season 01/x.mkv', 'C/c.mkv')
+        r = Removal(p, '/mnt/debrid_torbox/B/b.mkv', 'tv', 'foreign-folder', '', 'Ted')
+        assert apply_removals([r], str(tmp_path / 'm.tsv'), str(L.lib), set()) == []
+        assert os.path.islink(p)
+
+    def test_apply_never_unlinks_regular_file(self, tmp_path):
+        from utils.library_dedup import Removal, apply_removals
+        L = _Lib(tmp_path)
+        p = L.file('Ted Lasso/Season 01/x.mkv')
+        r = Removal(p, '/mnt/debrid_torbox/B/b.mkv', 'tv', 'foreign-folder', '', 'Ted')
+        assert apply_removals([r], str(tmp_path / 'm.tsv'), str(L.lib), set()) == []
+        assert os.path.isfile(p)
+
+    def test_apply_removes_sidecar_file(self, tmp_path):
+        from utils.library_dedup import Removal, apply_removals
+        L = _Lib(tmp_path)
+        p = L.file('Ted Lasso (2020)/Season 01/x.en.srt')
+        r = Removal(p, '', 'tv', 'sidecar', '', 'Ted')
+        assert apply_removals([r], str(tmp_path / 'm.tsv'), str(L.lib), set()) == [r]
+        assert not os.path.exists(p)
+
+    def test_apply_removes_empty_foreign_folder_not_library_root(self, tmp_path):
+        from utils.library_dedup import apply_removals
+        L = _Lib(tmp_path)
+        p, r = self._one(L)
+        apply_removals([r], str(tmp_path / 'm.tsv'), str(L.lib), set())
+        assert not os.path.exists(L.lib / 'Ted Lasso')
+        assert os.path.isdir(L.lib)
+
+    def test_apply_never_removes_protected_arr_folder_even_when_empty(self, tmp_path):
+        from utils.library_dedup import apply_removals
+        L = _Lib(tmp_path)
+        p, r = self._one(L, rel='Ted Lasso (2020)/Season 01/x.mkv')
+        protected = {os.path.realpath(L.lib / 'Ted Lasso (2020)'),
+                     os.path.realpath(L.lib / 'Ted Lasso (2020)' / 'Season 01')}
+        apply_removals([r], str(tmp_path / 'm.tsv'), str(L.lib), protected)
+        assert os.path.isdir(L.lib / 'Ted Lasso (2020)' / 'Season 01')
+
+    def test_apply_empty_folder_row_rmdirs_only_when_empty(self, tmp_path):
+        from utils.library_dedup import Removal, apply_removals
+        L = _Lib(tmp_path)
+        (L.lib / 'Empty').mkdir()
+        (L.lib / 'Full').mkdir()
+        (L.lib / 'Full' / 'keep.jpg').write_text('')
+        rs = [Removal(str(L.lib / 'Empty'), '', 'movie', 'empty-folder', '', 'Empty'),
+              Removal(str(L.lib / 'Full'), '', 'movie', 'empty-folder', '', 'Full')]
+        apply_removals(rs, str(tmp_path / 'm.tsv'), str(L.lib), set())
+        assert not os.path.exists(L.lib / 'Empty')
+        assert os.path.isfile(L.lib / 'Full' / 'keep.jpg')
+        assert [r['path'] for r in self._rows(str(tmp_path / 'm.tsv'))] == [str(L.lib / 'Empty')]
+
+    def test_undo_restores_links(self, tmp_path):
+        from utils.library_dedup import apply_removals, undo_manifest
+        L = _Lib(tmp_path)
+        p, r = self._one(L)
+        manifest = str(tmp_path / 'm.tsv')
+        apply_removals([r], manifest, str(L.lib), set())
+        assert undo_manifest(manifest) == 1
+        assert os.readlink(p) == r.target
+        assert undo_manifest(manifest) == 0   # idempotent: nothing missing

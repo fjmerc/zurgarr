@@ -10,8 +10,10 @@ Used by the opt-in scheduled tidy (``scheduled_tasks.library_duplicate_tidy``)
 and the one-time clean-up script (``scripts/dedup_library.py``).
 """
 
+import csv
 import os
 import re
+import time
 from dataclasses import dataclass
 
 from utils.logger import get_logger
@@ -366,3 +368,111 @@ def plan_foreign_folders(root, kind, owned, maps, tracked_by_entry, pairs,
                                detail='%d kept (arr has no playable copy): %s' % (
                                    len(uncovered), ', '.join(n for n, _p in uncovered[:5]))))
     return removals, report
+
+
+MANIFEST_COLUMNS = ('ts', 'action', 'rule', 'kind', 'title', 'path', 'target', 'keep')
+
+
+def _append_manifest(manifest_path, removal, action):
+    """Write one manifest row and fsync it — called BEFORE the removal, so a
+    crash mid-run never loses the record needed to undo it."""
+    new = not os.path.exists(manifest_path) or os.path.getsize(manifest_path) == 0
+    with open(manifest_path, 'a', newline='') as f:
+        w = csv.writer(f, delimiter='\t', lineterminator='\n')
+        if new:
+            w.writerow(MANIFEST_COLUMNS)
+        w.writerow((time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), action,
+                    removal.rule, removal.kind, removal.title, removal.path,
+                    removal.target, removal.keep))
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _prune_empty_parents(path, library_root, protected):
+    """``rmdir`` now-empty parents of *path*, stopping at the library root or
+    any protected (arr-owned) folder.  ``rmdir`` fails on a non-empty dir,
+    which ends the walk harmlessly."""
+    root = os.path.realpath(library_root)
+    d = os.path.dirname(path)
+    while True:
+        real = os.path.realpath(d)
+        if real == root or not real.startswith(root + os.sep) or real in protected:
+            return
+        try:
+            os.rmdir(d)
+        except OSError:
+            return
+        d = os.path.dirname(d)
+
+
+def apply_removals(removals, manifest_path, library_root, protected):
+    """Carry out planned removals; return the ones actually done.
+
+    Each item is re-checked right before acting (a link must still be a
+    link to the same target; a regular file is only ever removed as a
+    subtitle sidecar), and its manifest row is written first.  *protected*
+    holds real paths of arr-owned folders, which are never removed even
+    when they end up empty — the arr fails when its folder disappears.
+    """
+    done = []
+    root = os.path.realpath(library_root)
+    for r in removals:
+        if r.rule == 'empty-folder' and not r.target:
+            real = os.path.realpath(r.path)
+            if (not os.path.isdir(r.path) or os.path.islink(r.path)
+                    or real in protected or real == root):
+                continue
+            try:
+                if os.listdir(r.path):
+                    continue
+                _append_manifest(manifest_path, r, 'rmdir')
+                os.rmdir(r.path)
+            except OSError as e:
+                logger.warning("[dedup] Could not remove folder %r: %s", r.path, e)
+                continue
+            done.append(r)
+            continue
+        if r.rule == 'sidecar':
+            if (os.path.islink(r.path) or not os.path.isfile(r.path)
+                    or not r.path.lower().endswith('.srt')):
+                continue
+        else:
+            try:
+                if not os.path.islink(r.path) or os.readlink(r.path) != r.target:
+                    continue
+            except OSError:
+                continue
+        try:
+            _append_manifest(manifest_path, r, 'remove')
+            os.unlink(r.path)
+        except OSError as e:
+            logger.warning("[dedup] Could not remove %r: %s", r.path, e)
+            continue
+        done.append(r)
+        _prune_empty_parents(r.path, library_root, protected)
+    return done
+
+
+def undo_manifest(manifest_path):
+    """Recreate every link a manifest recorded as removed (where nothing sits
+    at its path now) and folders it recorded as removed.  Sidecar subtitles
+    can't be recreated and are only logged.  Returns links restored."""
+    restored = 0
+    with open(manifest_path, newline='') as f:
+        rows = list(csv.DictReader(f, delimiter='\t'))
+    for row in rows:
+        path, target = row['path'], row['target']
+        if row['action'] == 'rmdir':
+            os.makedirs(path, exist_ok=True)
+            continue
+        if row['action'] != 'remove':
+            continue
+        if not target:
+            logger.info("[dedup] Undo: sidecar %r was a real file — not restorable", path)
+            continue
+        if os.path.lexists(path):
+            continue
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.symlink(target, path)
+        restored += 1
+    return restored
