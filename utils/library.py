@@ -1575,23 +1575,35 @@ def _get_sonarr_series_list(client, force_refresh=False):
     return series_list
 
 
+_PAREN_YEAR_SUFFIX = re.compile(r'\s*\(\d{4}\)\s*$')
+
+
 def arr_title_maps(entries, client, is_tv):
     """Index a Sonarr series list / Radarr movie list for ``_match_arr_entry``.
 
     Returns ``(by lowercase title, by _norm_for_matching key, by TMDB id)``,
-    all mapping to the same per-entry info dict (``folder``, ``path``,
-    ``id``, ``tmdb_id``, ``client``; plus ``tvdb_id`` for series and
-    ``has_file`` for movies).  The TMDB map backs the cascade's fallback when
+    all mapping to the same per-entry info dict (``title``, ``year``,
+    ``family`` — how many entries share the title without its year —
+    ``folder``, ``path``, ``id``, ``tmdb_id``, ``client``; plus ``tvdb_id``
+    for series and ``has_file`` for movies).  The TMDB map backs the cascade's fallback when
     torrent titles differ from TMDB titles ("F1 The Movie" vs "F1",
     "Special Ops Lioness" vs "Lioness").
     """
     by_title, by_norm, by_tmdb = {}, {}, {}
+    family = {}
+    for e in entries or []:
+        k = _norm_for_matching(_PAREN_YEAR_SUFFIX.sub('', e.get('title', '')))
+        if k:
+            family[k] = family.get(k, 0) + 1
     for e in entries or []:
         t = e.get('title', '')
         if not t:
             continue
         p = e.get('path', '')
         info = {
+            'title': t,
+            'year': e.get('year'),
+            'family': family.get(_norm_for_matching(_PAREN_YEAR_SUFFIX.sub('', t)), 1),
             'folder': os.path.basename(p) if p else '',
             'path': p,
             'id': e.get('id'),

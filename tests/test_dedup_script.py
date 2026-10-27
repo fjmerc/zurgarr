@@ -85,6 +85,11 @@ def _read(path):
 
 
 @pytest.fixture(autouse=True)
+def _no_link_age_grace(monkeypatch):
+    monkeypatch.setattr(dedup.dd, 'MIN_LINK_AGE', 0)
+
+
+@pytest.fixture(autouse=True)
 def _no_tmdb(monkeypatch):
     monkeypatch.setattr(dedup, '_tmdb_context', lambda kind: ({}, {}))
     monkeypatch.setattr(dedup, '_sleep', lambda s: None)
@@ -124,7 +129,7 @@ def test_apply_removes_rows_live_plan_agrees_with(tmp_path):
     out = str(tmp_path / 'plan.tsv')
     ctx = _ctx(L, sonarr=sonarr, tmp_path=tmp_path)
     dedup.main(['plan', '--kind', 'tv', '--out', out], ctx=ctx)
-    assert dedup.main(['apply', '--plan', out, '--kind', 'tv'], ctx=ctx) == 0
+    assert dedup.main(['apply', '--no-plex', '--plan', out, '--kind', 'tv'], ctx=ctx) == 0
     assert not os.path.lexists(extra) and os.path.islink(kept)
     assert any(n.startswith('dedup_manifest_') for n in os.listdir(tmp_path))
 
@@ -135,7 +140,7 @@ def test_apply_ignores_rows_live_plan_disagrees_with(tmp_path):
     ctx = _ctx(L, sonarr=sonarr, tmp_path=tmp_path)
     dedup.main(['plan', '--kind', 'tv', '--out', out], ctx=ctx)
     os.unlink(kept)                       # kept copy gone since the plan
-    dedup.main(['apply', '--plan', out, '--kind', 'tv'], ctx=ctx)
+    dedup.main(['apply', '--no-plex', '--plan', out, '--kind', 'tv'], ctx=ctx)
     assert os.path.islink(extra)
 
 
@@ -176,9 +181,9 @@ def test_unmatched_needs_flag(tmp_path):
     out = str(tmp_path / 'plan.tsv')
     ctx = _ctx(L, radarr=radarr, tmp_path=tmp_path)
     dedup.main(['plan', '--kind', 'movie', '--out', out], ctx=ctx)
-    dedup.main(['apply', '--plan', out, '--kind', 'movie'], ctx=ctx)
+    dedup.main(['apply', '--no-plex', '--plan', out, '--kind', 'movie'], ctx=ctx)
     assert os.path.islink(unmatched) and not os.path.lexists(extra)
-    dedup.main(['apply', '--plan', out, '--kind', 'movie', '--include-unmatched'], ctx=ctx)
+    dedup.main(['apply', '--no-plex', '--plan', out, '--kind', 'movie', '--include-unmatched'], ctx=ctx)
     assert not os.path.lexists(unmatched)
 
 
@@ -187,7 +192,7 @@ def test_apply_limit_counts_titles(tmp_path):
     out = str(tmp_path / 'plan.tsv')
     ctx = _ctx(L, radarr=radarr, tmp_path=tmp_path)
     dedup.main(['plan', '--kind', 'movie', '--out', out], ctx=ctx)
-    dedup.main(['apply', '--plan', out, '--kind', 'movie', '--include-unmatched', '--limit', '1'],
+    dedup.main(['apply', '--no-plex', '--plan', out, '--kind', 'movie', '--include-unmatched', '--limit', '1'],
                ctx=ctx)
     assert sum(not os.path.lexists(p) for p in (extra, unmatched)) == 1
 
@@ -199,7 +204,7 @@ def test_apply_stops_on_stranded(tmp_path, monkeypatch):
     dedup.main(['plan', '--kind', 'movie', '--out', out], ctx=ctx)
     monkeypatch.setattr(dedup.dd, 'reconcile_plex',
                         lambda *a, **k: {'stranded': ['100'], 'date_failed': []})
-    rc = dedup.main(['apply', '--plan', out, '--kind', 'movie', '--include-unmatched'], ctx=ctx)
+    rc = dedup.main(['apply', '--no-plex', '--plan', out, '--kind', 'movie', '--include-unmatched'], ctx=ctx)
     assert rc == 2
     assert sum(not os.path.lexists(p) for p in (extra, unmatched)) == 1
 
@@ -293,6 +298,53 @@ def test_radarr_rename_stops_when_path_unchanged(tmp_path):
     rc = dedup.main(['radarr-rename', '--ids', '5', '--plan', out], ctx=ctx)
     assert rc == 2
     assert plex.merged == []
+    assert os.path.islink(extra)          # zurgarr's copy put back
+
+
+def test_radarr_rename_arr_error_restores_links(tmp_path):
+    L, radarr, plex, ctx, out, extra = _rename_setup(tmp_path)
+    radarr.move_movies.side_effect = RuntimeError('radarr down')
+    rc = dedup.main(['radarr-rename', '--ids', '5', '--plan', out], ctx=ctx)
+    assert rc == 2 and os.path.islink(extra)
+
+
+def test_apply_requires_plex_unless_no_plex(tmp_path):
+    L, sonarr, kept, extra = _show_setup(tmp_path)
+    out = str(tmp_path / 'plan.tsv')
+    ctx = _ctx(L, sonarr=sonarr, tmp_path=tmp_path)
+    dedup.main(['plan', '--kind', 'tv', '--out', out], ctx=ctx)
+    assert dedup.main(['apply', '--plan', out, '--kind', 'tv'], ctx=ctx) == 1
+    assert os.path.islink(extra)
+
+
+def test_review_rows_need_flag(tmp_path, monkeypatch):
+    L = Lib(tmp_path)
+    kept = L.link(L.tv, 'Andor (2022)/Season 01/Andor (2022) - S01E01.mkv', 'A/a.mkv')
+    extra = L.link(L.tv, 'Star Wars Andor/Season 01/Andor S01E01.mkv', 'B/b.mkv')
+    sonarr = _sonarr([{'id': 1, 'title': 'Andor', 'year': 2022, 'path': '/d/tv/Andor (2022)',
+                       'tmdbId': 83867}],
+                     {1: [{'seasonNumber': 1, 'episodeNumber': 1, 'episodeFileId': 9}]},
+                     {1: [{'id': 9, 'path': '/d/tv/Andor (2022)/Season 01/Andor (2022) - S01E01.mkv'}]})
+    # alias match via the cached TMDB id, not by title
+    monkeypatch.setattr(dedup, '_tmdb_context', lambda kind: ({'star wars andor': 83867}, {}))
+    out = str(tmp_path / 'plan.tsv')
+    ctx = _ctx(L, sonarr=sonarr, tmp_path=tmp_path)
+    dedup.main(['plan', '--kind', 'tv', '--out', out], ctx=ctx)
+    assert [r['rule'] for r in _read(out) if r['path'] == extra] == ['foreign-folder-review']
+    dedup.main(['apply', '--no-plex', '--plan', out, '--kind', 'tv'], ctx=ctx)
+    assert os.path.islink(extra)
+    dedup.main(['apply', '--no-plex', '--plan', out, '--kind', 'tv', '--include-review'], ctx=ctx)
+    assert not os.path.lexists(extra) and os.path.islink(kept)
+
+
+def test_plan_reports_radarr_accepted_none(tmp_path):
+    L = Lib(tmp_path)
+    L.link(L.movies, 'Film (2020)/Film.2020.mkv', 'A/a.mkv')
+    radarr = _radarr([{'id': 1, 'title': 'Film', 'year': 2020, 'hasFile': False,
+                       'path': '/d/movies/Film (2020)'}])
+    out = str(tmp_path / 'plan.tsv')
+    dedup.main(['plan', '--kind', 'movie', '--out', out], ctx=_ctx(L, radarr=radarr))
+    assert [r['rule'] for r in _read(out)] == ['radarr-accepted-none']
 
 
 def test_plex_check_counts_multi_version_items(tmp_path, capsys):

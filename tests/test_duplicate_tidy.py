@@ -85,12 +85,88 @@ def test_tidy_reconciles_plex_with_touch(env, monkeypatch):
     os.symlink('/mnt/debrid/B/b.mkv', link)
     r = Removal(str(link), '/mnt/debrid/B/b.mkv', 'movie', 'arr-folder-untracked',
                 str(link.parent / 'Film (2020).mkv'), 'Film')
+    from utils.plex_versions import PartRef
     plex = MagicMock()
     monkeypatch.setattr('utils.plex_versions.PlexLibrary.from_env', classmethod(lambda cls: plex))
+    snap = {'Film (2020)/Film.mkv': PartRef('1', 'a', 'Film (2020)/Film.mkv', 5, '1')}
     with patch('utils.arr_client.get_download_service', _svc(radarr=MagicMock())), \
          patch('utils.library_dedup.plan_arr_movies', return_value=([r], set())), \
-         patch('utils.library_dedup.snapshot_plex', return_value={}) as snap, \
-         patch('utils.library_dedup.reconcile_plex', return_value={}) as rec, \
+         patch('utils.library_dedup.snapshot_plex', return_value=snap), \
+         patch('utils.library_dedup.reconcile_items', return_value={'retry': []}) as rec, \
+         patch('utils.scheduled_tasks._DUPLICATE_TIDY_PENDING', str(env / 'p.json')), \
          patch('utils.scheduled_tasks._DUPLICATE_TIDY_MANIFEST', str(env / 'm.tsv')):
         scheduled_tasks.library_duplicate_tidy()
-    assert snap.called and rec.call_args.kwargs['touch'] is True
+    assert not os.path.lexists(link)
+    assert rec.call_args.kwargs['touch'] is True
+    assert [i['rating_key'] for i in rec.call_args[0][2]] == ['1']
+
+
+@pytest.fixture(autouse=True)
+def _no_grace(monkeypatch):
+    monkeypatch.setattr('utils.library_dedup.MIN_LINK_AGE', 0)
+
+
+def _movie_removal(env):
+    link = env / 'movies' / 'Film (2020)' / 'Film.mkv'
+    link.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink('/mnt/debrid/B/b.mkv', link)
+    keep = str(link.parent / 'Film (2020).mkv')
+    return link, Removal(str(link), '/mnt/debrid/B/b.mkv', 'movie', 'arr-folder-untracked', keep, 'Film')
+
+
+def _run_movies(env, monkeypatch, plex, removal, **patches):
+    monkeypatch.setattr('utils.plex_versions.PlexLibrary.from_env', classmethod(lambda cls: plex))
+    with patch('utils.arr_client.get_download_service', _svc(radarr=MagicMock())), \
+         patch('utils.library_dedup.plan_arr_movies', return_value=([removal], set())), \
+         patch('utils.scheduled_tasks._DUPLICATE_TIDY_MANIFEST', str(env / 'm.tsv')), \
+         patch('utils.scheduled_tasks._DUPLICATE_TIDY_PENDING', str(env / 'pending.json')):
+        return scheduled_tasks.library_duplicate_tidy()
+
+
+def test_tidy_skips_removal_when_plex_snapshot_fails(env, monkeypatch):
+    link, r = _movie_removal(env)
+    plex = MagicMock()
+    plex.list_parts.side_effect = RuntimeError('plex down')
+    _run_movies(env, monkeypatch, plex, r)
+    assert os.path.islink(link)
+
+
+def test_tidy_skips_when_plex_knows_none_of_the_paths(env, monkeypatch):
+    link, r = _movie_removal(env)
+    plex = MagicMock()
+    plex.list_parts.return_value = []
+    _run_movies(env, monkeypatch, plex, r)
+    assert os.path.islink(link)
+
+
+def test_tidy_skips_title_whose_kept_copy_is_another_plex_item(env, monkeypatch):
+    from utils.plex_versions import PartRef
+    link, r = _movie_removal(env)
+    plex = MagicMock()
+    plex.list_parts.return_value = [PartRef('1', 'a', 'Film (2020)/Film.mkv', 5, '1'),
+                                    PartRef('2', 'b', 'Film (2020)/Film (2020).mkv', 9, '1')]
+    _run_movies(env, monkeypatch, plex, r)
+    assert os.path.islink(link)
+
+
+def test_tidy_retries_unfinished_plex_items_next_run(env, monkeypatch):
+    import json
+    from utils.plex_versions import PartRef
+    link, r = _movie_removal(env)
+    plex = MagicMock()
+    plex.list_parts.return_value = [PartRef('1', 'a', 'Film (2020)/Film.mkv', 5, '1'),
+                                    PartRef('1', 'c', 'Film (2020)/Film (2020).mkv', 5, '1')]
+    plex.wait_idle.return_value = False          # Plex busy: nothing finished
+    _run_movies(env, monkeypatch, plex, r)
+    assert not os.path.lexists(link)
+    pending = json.load(open(env / 'pending.json'))
+    assert [it['rating_key'] for it in pending['movie']] == ['1']
+
+    seen = []
+    monkeypatch.setattr('utils.library_dedup.reconcile_items',
+                        lambda plex, kind, items, root, touch: (
+                            seen.append([i['rating_key'] for i in items]) or {'retry': []}))
+    with patch('utils.library_dedup.plan_arr_movies', return_value=([], set())):
+        _run_movies(env, monkeypatch, plex, r)
+    assert ['1'] in seen
+    assert json.load(open(env / 'pending.json')).get('movie', []) == []

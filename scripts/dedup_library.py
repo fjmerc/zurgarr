@@ -43,6 +43,7 @@ from utils.library import arr_title_maps  # noqa: E402
 
 PLAN_COLUMNS = ('action', 'rule', 'kind', 'title', 'path', 'target', 'keep', 'detail')
 _UNMATCHED_RULES = {'no-arr-title', 'empty-folder'}
+_REVIEW_RULES = {'foreign-folder-review'}
 _MOVE_POLLS = 40
 _MOVE_POLL_SECONDS = 3
 _sleep = time.sleep
@@ -145,26 +146,28 @@ def _plan_movies(ctx):
     foreign, report = dd.plan_foreign_folders(
         ctx.local_movies, 'movie', owned, arr_title_maps(movies, ctx.radarr, False), tracked,
         ctx.pairs, cached_tmdb=ids, tmdb_cache=full)
+    # Movie folders holding copies Radarr tracks none of — listed, never removed.
+    for m in movies:
+        folder = os.path.basename(os.path.normpath(m.get('path') or ''))
+        if not folder or m.get('hasFile'):
+            continue
+        names = [n for n, _p in dd._media_entries(os.path.join(ctx.local_movies, folder))]
+        if names:
+            report.append({'kind': 'movie', 'folder': folder, 'rule': 'radarr-accepted-none',
+                           'detail': '%d file(s): %s' % (len(names), ', '.join(names[:5]))})
     return removals + foreign, report, protected
 
 
-def _deferred_groups(ctx, removals):
-    """Movie removal groups whose kept copy sits on a DIFFERENT Plex item
-    than the removed copy (the Chinatown case): removing would leave the
-    item that carries the date added with nothing to play.  Part D handles
-    them through ``radarr-rename``."""
-    if not ctx.plex:
+def _deferred_groups(ctx, kind, removals):
+    """Removal groups whose kept copy sits on a DIFFERENT Plex item than the
+    removed copy (the Chinatown case): removing would leave the item that
+    carries the date added with nothing to play.  Part D handles movies
+    through ``radarr-rename``."""
+    if not ctx.plex or not removals:
         return set()
-    rk = {p.rel_path: p.rating_key for p in ctx.plex.list_parts('movie')}
-    deferred = set()
-    for r in removals:
-        if r.kind != 'movie' or not r.keep or r.rule == 'sidecar':
-            continue
-        a = rk.get(dd.rel_to_root(r.path, ctx.local_movies))
-        b = rk.get(dd.rel_to_root(r.keep, ctx.local_movies))
-        if a and b and a != b:
-            deferred.add(('movie', r.title))
-    return deferred
+    root = ctx.local_tv if kind == 'tv' else ctx.local_movies
+    rels = {dd.rel_to_root(p, root) for r in removals for p in (r.path, r.keep) if p}
+    return dd.split_titles(dd.snapshot_plex(ctx.plex, kind, rels), removals, root)
 
 
 def build_plan(ctx, kinds):
@@ -179,7 +182,7 @@ def build_plan(ctx, kinds):
         else:
             continue
         protected |= prot
-        deferred = _deferred_groups(ctx, rem) if kind == 'movie' else set()
+        deferred = _deferred_groups(ctx, kind, rem)
         for r in rem:
             if (r.kind, r.title) in deferred:
                 rows.append(dict(_row(r, 'defer'), rule='plex-split-item', detail=r.rule))
@@ -232,11 +235,23 @@ def _apply_group(ctx, kind, group, manifest, protected, snapshot):
     return done, result
 
 
+def _plex_required(ctx, args):
+    if ctx.plex or args.no_plex:
+        return True
+    print('Plex is not configured (PLEX_ADDRESS/PLEX_TOKEN) — without it removed copies stay '
+          'in Plex as unavailable versions and split items are not detected. '
+          'Pass --no-plex to go ahead anyway.')
+    return False
+
+
 def cmd_apply(ctx, args):
+    if not _plex_required(ctx, args):
+        return 1
     kinds = _kinds(args.kind)
     wanted = {(r['path'], r['target'], r['rule']) for r in _read_rows(args.plan)
               if r['action'] == 'remove' and r['kind'] in kinds
-              and (args.include_unmatched or r['rule'] not in _UNMATCHED_RULES)}
+              and (args.include_unmatched or r['rule'] not in _UNMATCHED_RULES)
+              and (args.include_review or r['rule'] not in _REVIEW_RULES)}
     _rows, live, protected = build_plan(ctx, kinds)
     selected = [r for r in live if (r.path, r.target, r.rule) in wanted]
     skipped = len(wanted) - len(selected)
@@ -345,15 +360,21 @@ def _rename_one(ctx, movie_id, plan_rows, manifest):
 
     done = dd.apply_removals(deferred, manifest, ctx.local_movies,
                              {os.path.realpath(os.path.join(ctx.local_movies, old_folder))})
-    ctx.radarr.move_movies([movie_id], root)
-    moved = _wait_path_change(ctx, movie_id, old_path)
+    try:
+        ctx.radarr.move_movies([movie_id], root)
+        moved = _wait_path_change(ctx, movie_id, old_path)
+        if moved is None:
+            target = os.path.join(root, expected_folder(movie))
+            if os.path.basename(target) != old_folder:
+                ctx.radarr.set_movie_path(movie, target)
+                moved = _wait_path_change(ctx, movie_id, old_path)
+    except Exception as e:
+        print(f'STOPPED: Radarr error renaming {old_folder!r}: {e}')
+        moved = None
     if moved is None:
-        target = os.path.join(root, expected_folder(movie))
-        if os.path.basename(target) != old_folder:
-            ctx.radarr.set_movie_path(movie, target)
-            moved = _wait_path_change(ctx, movie_id, old_path)
-    if moved is None:
-        print(f'STOPPED: Radarr did not rename {old_folder!r}')
+        restored = dd.restore_removals(done)
+        print(f'STOPPED: Radarr did not rename {old_folder!r} — put back {restored} link(s) '
+              f'removed for it (manifest: {manifest})')
         return False
     new_folder = os.path.basename(moved['path'])
     print(f'renamed {old_folder!r} -> {new_folder!r}')
@@ -376,6 +397,8 @@ def _rename_one(ctx, movie_id, plan_rows, manifest):
 
 
 def cmd_radarr_rename(ctx, args):
+    if not _plex_required(ctx, args):
+        return 1
     plan_rows = _read_rows(args.plan)
     manifest = _manifest_path(ctx)
     for movie_id in [int(x) for x in args.ids.split(',') if x.strip()]:
@@ -406,6 +429,10 @@ def main(argv=None, ctx=None):
     p.add_argument('--limit', type=int, default=0, help='max titles to process')
     p.add_argument('--include-unmatched', action='store_true',
                    help='also remove folders whose title Sonarr/Radarr do not have')
+    p.add_argument('--include-review', action='store_true',
+                   help='also remove foreign-folder-review rows (matched by alias/TMDB id, '
+                        'or a yearless folder of a same-name show)')
+    p.add_argument('--no-plex', action='store_true', help='run without Plex reconciliation')
     p = sub.add_parser('undo')
     p.add_argument('--manifest', required=True)
     p = sub.add_parser('radarr-folders')
@@ -414,6 +441,7 @@ def main(argv=None, ctx=None):
     p = sub.add_parser('radarr-rename')
     p.add_argument('--ids', required=True)
     p.add_argument('--plan', required=True)
+    p.add_argument('--no-plex', action='store_true', help='run without Plex reconciliation')
     sub.add_parser('plex-check')
     args = ap.parse_args(argv)
     ctx = ctx or _context()

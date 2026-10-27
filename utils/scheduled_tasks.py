@@ -730,7 +730,52 @@ def verify_symlinks():
 # ---------------------------------------------------------------------------
 
 _DUPLICATE_TIDY_MANIFEST = '/config/duplicate_tidy_manifest.tsv'
+_DUPLICATE_TIDY_PENDING = '/config/duplicate_tidy_pending.json'
 _DUPLICATE_TIDY_INTERVAL = 6 * 3600
+_DUPLICATE_TIDY_MAX_RETRIES = 5
+
+
+def _load_tidy_pending():
+    import json
+    try:
+        with open(_DUPLICATE_TIDY_PENDING) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_tidy_pending(pending):
+    import json
+    from utils.file_utils import atomic_write
+    try:
+        with atomic_write(_DUPLICATE_TIDY_PENDING) as f:
+            json.dump(pending, f)
+    except OSError as e:
+        logger.warning("[dedup] Could not save pending Plex follow-ups: %s", e)
+
+
+def _retry_list(items, result):
+    """Items to try again next run (bounded), from a reconcile result."""
+    keep = []
+    retry = {it['rating_key']: it for it in result.get('retry', [])}
+    for it in items:
+        if it['rating_key'] not in retry:
+            continue
+        it = dict(it, attempts=it.get('attempts', 0) + 1)
+        if it['attempts'] >= _DUPLICATE_TIDY_MAX_RETRIES:
+            logger.warning("[dedup] Giving up on Plex follow-up for item %s after %d tries",
+                           it['rating_key'], it['attempts'])
+            continue
+        keep.append(it)
+    return keep
+
+
+def _tidy_plex_warnings(result):
+    for bucket in ('stranded', 'date_failed', 'deletion_disabled', 'timeout', 'failed'):
+        if result.get(bucket):
+            logger.warning("[dedup] Plex %s after duplicate removal: %s",
+                           bucket.replace('_', ' '), ', '.join(result[bucket]))
 
 
 def library_duplicate_tidy():
@@ -741,6 +786,12 @@ def library_duplicate_tidy():
     once the arr imports its own release; the arr never touches files it
     doesn't track.  Every removal is written to an undo manifest first, and
     Plex is reconciled per item (``library_dedup.reconcile_plex``).
+
+    With Plex configured, nothing is removed unless Plex can be read first
+    and recognises the library (its snapshot maps at least one removed or
+    kept path) — otherwise the removed copies would linger in Plex as
+    unavailable versions.  Plex follow-ups that time out or fail are kept
+    in ``/config/duplicate_tidy_pending.json`` and retried next run.
     """
     if os.environ.get('LIBRARY_DUPLICATE_TIDY', 'false').lower() != 'true':
         return {'status': 'disabled', 'message': 'LIBRARY_DUPLICATE_TIDY is off'}
@@ -760,45 +811,67 @@ def library_duplicate_tidy():
         return {'status': 'skipped', 'message': 'No debrid mount readable'}
 
     plex = PlexLibrary.from_env()
+    pending = _load_tidy_pending() if plex else {}
     total = 0
     for kind, media_type, env_key, planner in (
             ('tv', 'show', 'BLACKHOLE_LOCAL_LIBRARY_TV', 'plan_arr_tv'),
             ('movie', 'movie', 'BLACKHOLE_LOCAL_LIBRARY_MOVIES', 'plan_arr_movies')):
         root = os.environ.get(env_key, '').strip()
+        if not root or not os.path.isdir(root):
+            continue
+        retry = []
+        if plex and pending.get(kind):
+            result = library_dedup.reconcile_items(plex, kind, pending[kind], root, touch=True)
+            _tidy_plex_warnings(result)
+            retry = _retry_list(pending[kind], result)
         client, svc = get_download_service(media_type)
-        if not root or not os.path.isdir(root) or not client:
-            continue
-        try:
-            removals, protected = getattr(library_dedup, planner)(client, root, pairs)
-        except Exception as e:
-            logger.warning("[dedup] Duplicate tidy skipped %s — %s unavailable: %s", kind, svc, e)
-            continue
-        if not removals:
-            continue
-        snapshot, plex_ok = {}, False
+        if client:
+            total += _tidy_kind(library_dedup, plex, kind, root, client, svc, planner,
+                                pairs, retry)
         if plex:
-            try:
-                snapshot = library_dedup.snapshot_plex(
-                    plex, kind, {library_dedup.rel_to_root(r.path, root) for r in removals})
-            except Exception as e:
-                logger.warning("[dedup] Plex snapshot failed (%s); removing without "
-                               "Plex reconciliation", e)
-            else:
-                plex_ok = True
-        done = library_dedup.apply_removals(removals, _DUPLICATE_TIDY_MANIFEST, root, protected)
-        total += len(done)
-        _log_duplicate_removals(done, kind)
-        if plex_ok and done:
-            try:
-                result = library_dedup.reconcile_plex(plex, kind, done, snapshot, root, touch=True)
-            except Exception as e:
-                logger.warning("[dedup] Plex reconciliation failed: %s", e)
-                continue
-            for bucket in ('stranded', 'date_failed', 'deletion_disabled'):
-                if result.get(bucket):
-                    logger.warning("[dedup] Plex %s after duplicate removal: %s",
-                                   bucket.replace('_', ' '), ', '.join(result[bucket]))
+            pending[kind] = retry
+    if plex:
+        _save_tidy_pending(pending)
     return {'status': 'success', 'message': f'Removed {total} duplicate link(s)'}
+
+
+def _tidy_kind(library_dedup, plex, kind, root, client, svc, planner, pairs, retry):
+    """Plan, remove and reconcile one kind; returns how many were removed.
+    Items Plex couldn't finish are appended to *retry*."""
+    try:
+        removals, protected = getattr(library_dedup, planner)(client, root, pairs)
+    except Exception as e:
+        logger.warning("[dedup] Duplicate tidy skipped %s — %s unavailable: %s", kind, svc, e)
+        return 0
+    if not removals:
+        return 0
+    snapshot = {}
+    if plex:
+        rels = {library_dedup.rel_to_root(p, root)
+                for r in removals for p in (r.path, r.keep) if p}
+        try:
+            snapshot = library_dedup.snapshot_plex(plex, kind, rels)
+        except Exception as e:
+            logger.warning("[dedup] Duplicate tidy skipped %s — Plex unavailable: %s", kind, e)
+            return 0
+        if not snapshot:
+            logger.warning("[dedup] Duplicate tidy skipped %s — Plex knows none of the %d "
+                           "affected paths (is the Plex library rooted elsewhere?)",
+                           kind, len(rels))
+            return 0
+        split = library_dedup.split_titles(snapshot, removals, root)
+        for _kind, title in sorted(split):
+            logger.warning("[dedup] Not removing %r duplicates — the kept copy is a separate "
+                           "Plex item (use scripts/dedup_library.py radarr-rename / merge)", title)
+        removals = [r for r in removals if (r.kind, r.title) not in split]
+    done = library_dedup.apply_removals(removals, _DUPLICATE_TIDY_MANIFEST, root, protected)
+    _log_duplicate_removals(done, kind)
+    if plex and done:
+        items = library_dedup.plex_items(done, snapshot, root)
+        result = library_dedup.reconcile_items(plex, kind, items, root, touch=True)
+        _tidy_plex_warnings(result)
+        retry += _retry_list(items, result)
+    return len(done)
 
 
 def _log_duplicate_removals(done, kind):

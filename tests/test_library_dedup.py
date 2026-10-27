@@ -1,6 +1,9 @@
 """Tests for utils/library_dedup.py — duplicate debrid-link detection and removal."""
 
 import os
+import time
+
+import pytest
 
 from utils.library_dedup import episode_index, parse_episode_numbers
 
@@ -401,10 +404,19 @@ class TestApplyRemovals:
     def test_apply_removes_sidecar_file(self, tmp_path):
         from utils.library_dedup import Removal, apply_removals
         L = _Lib(tmp_path)
+        v, rv = self._one(L, rel='Ted Lasso (2020)/Season 01/x.mkv')
         p = L.file('Ted Lasso (2020)/Season 01/x.en.srt')
-        r = Removal(p, '', 'tv', 'sidecar', '', 'Ted')
-        assert apply_removals([r], str(tmp_path / 'm.tsv'), str(L.lib), set()) == [r]
+        r = Removal(p, '', 'tv', 'sidecar', '', 'Ted', owner=v)
+        assert apply_removals([rv, r], str(tmp_path / 'm.tsv'), str(L.lib), set()) == [rv, r]
         assert not os.path.exists(p)
+
+    def test_apply_sidecar_without_its_video_kept(self, tmp_path):
+        from utils.library_dedup import Removal, apply_removals
+        L = _Lib(tmp_path)
+        p = L.file('Ted Lasso (2020)/Season 01/x.en.srt')
+        r = Removal(p, '', 'tv', 'sidecar', '', 'Ted', owner=str(L.lib / 'gone.mkv'))
+        assert apply_removals([r], str(tmp_path / 'm.tsv'), str(L.lib), set()) == []
+        assert os.path.isfile(p)
 
     def test_apply_removes_empty_foreign_folder_not_library_root(self, tmp_path):
         from utils.library_dedup import apply_removals
@@ -682,3 +694,223 @@ class TestPlanArrLibraries:
             raise RuntimeError('sonarr down')
         rem, rep = TestPlanForeignFolders()._plan(L, 'tv', TestPlanForeignFolders._TED, boom)
         assert rem == [] and [r['rule'] for r in rep] == ['arr-error']
+
+
+# ---------------------------------------------------------------------------
+# Review fixes (code-reviewer 2026-10-27)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _no_link_age_grace(monkeypatch):
+    """Links in these tests are seconds old; the production grace period
+    (MIN_LINK_AGE) is exercised by its own test."""
+    from utils import library_dedup
+    monkeypatch.setattr(library_dedup, 'MIN_LINK_AGE', 0)
+
+
+class TestReviewFixes:
+
+    def test_sidecar_kept_when_its_video_removal_skipped(self, tmp_path):
+        from utils.library_dedup import apply_removals, plan_series_duplicates
+        L = _Lib(tmp_path)
+        kept = L.link('Show (2020)/Season 01/Show S01E01 A.mkv', 'A/a.mkv')
+        extra = L.link('Show (2020)/Season 01/Show S01E01 B.mkv', 'B/b.mkv')
+        sub = L.file('Show (2020)/Season 01/Show S01E01 B.en.srt')
+        plan = plan_series_duplicates(str(L.lib / 'Show (2020)'), {(1, 1): kept}, L.pairs, 'Show')
+        os.unlink(extra)
+        os.symlink('/mnt/debrid_torbox/C/c.mkv', extra)       # re-pointed since planning
+        apply_removals(plan, str(tmp_path / 'm.tsv'), str(L.lib), set())
+        assert os.path.isfile(sub)
+
+    def test_sidecar_not_taken_when_kept_video_has_same_stem(self, tmp_path):
+        from utils.library_dedup import plan_movie_duplicates
+        L = _Lib(tmp_path)
+        kept = L.link('Film (2020)/Film.mp4', 'A/a.mp4')
+        L.link('Film (2020)/Film.mkv', 'B/b.mkv')
+        L.file('Film (2020)/Film.en.srt')
+        out = plan_movie_duplicates(str(L.lib / 'Film (2020)'), kept, L.pairs, 'Film')
+        assert [r.rule for r in out] == ['arr-folder-untracked']
+
+    def test_fresh_link_skipped_by_grace_period(self, tmp_path, monkeypatch):
+        from utils import library_dedup
+        monkeypatch.setattr(library_dedup, 'MIN_LINK_AGE', 900)
+        L = _Lib(tmp_path)
+        kept = L.link('Show (2020)/Season 01/Show S01E01 A.mkv', 'A/a.mkv')
+        L.link('Show (2020)/Season 01/Show S01E01 B.mkv', 'B/b.mkv')
+        assert library_dedup.plan_series_duplicates(
+            str(L.lib / 'Show (2020)'), {(1, 1): kept}, L.pairs, 'Show') == []
+
+    def test_old_link_planned_despite_grace_period(self, tmp_path, monkeypatch):
+        from utils import library_dedup
+        monkeypatch.setattr(library_dedup, 'MIN_LINK_AGE', 900)
+        L = _Lib(tmp_path)
+        kept = L.link('Show (2020)/Season 01/Show S01E01 A.mkv', 'A/a.mkv')
+        extra = L.link('Show (2020)/Season 01/Show S01E01 B.mkv', 'B/b.mkv')
+        old = time.time() - 3600
+        os.utime(extra, (old, old), follow_symlinks=False)
+        out = library_dedup.plan_series_duplicates(
+            str(L.lib / 'Show (2020)'), {(1, 1): kept}, L.pairs, 'Show')
+        assert [r.path for r in out] == [extra]
+
+    def test_local_path_outside_folder_is_untracked(self, tmp_path):
+        from unittest.mock import MagicMock
+        from utils.library_dedup import radarr_tracked, sonarr_tracked
+        c = MagicMock()
+        c.get_episode_files.return_value = [{'id': 1, 'path': '/elsewhere/x.mkv'}]
+        c.get_episodes.return_value = [{'seasonNumber': 1, 'episodeNumber': 1, 'episodeFileId': 1}]
+        assert sonarr_tracked(c, {'id': 3, 'path': '/d/tv/Show'}, str(tmp_path)) == {}
+        assert radarr_tracked({'hasFile': True, 'path': '/d/m/Film',
+                               'movieFile': {'path': '/other/Film.mkv'}}, str(tmp_path)) is None
+
+    def test_plan_arr_skips_entry_without_folder_name(self, tmp_path):
+        from unittest.mock import MagicMock
+        from utils.library_dedup import plan_arr_movies
+        L = _Lib(tmp_path)
+        c = MagicMock()
+        c.get_all_movies.return_value = [{'id': 1, 'title': 'X', 'path': '/', 'hasFile': True,
+                                          'movieFile': {'path': '/x.mkv'}}]
+        removals, protected = plan_arr_movies(c, str(L.lib), L.pairs)
+        assert removals == [] and os.path.realpath(L.lib) not in protected
+
+
+class TestForeignFolderSafety:
+
+    def _plan(self, L, kind, entries, tracked_by_entry):
+        return TestPlanForeignFolders()._plan(L, kind, entries, tracked_by_entry)
+
+    def test_same_name_other_year_not_removed(self, tmp_path):
+        L = _Lib(tmp_path)
+        kept = L.link('iCarly (2021)/Season 01/iCarly (2021) - S01E01.mkv', 'A/a.mkv')
+        L.link('iCarly (2007)/Season 01/iCarly S01E01.mkv', 'B/b.mkv')
+        shows = [{'title': 'iCarly', 'year': 2021, 'path': '/t/iCarly (2021)', 'id': 1, 'tmdbId': None}]
+        rem, rep = self._plan(L, 'tv', shows, lambda info: {(1, 1): kept})
+        assert rem == []
+        assert [r['rule'] for r in rep] == ['year-mismatch']
+
+    def test_yearless_folder_in_reboot_family_needs_review(self, tmp_path):
+        L = _Lib(tmp_path)
+        kept = L.link('Dark Matter (2024)/Season 01/Dark Matter (2024) - S01E01.mkv', 'A/a.mkv')
+        extra = L.link('Dark Matter/Season 01/Dark Matter S01E01.mkv', 'B/b.mkv')
+        shows = [{'title': 'Dark Matter', 'year': 2024, 'path': '/t/Dark Matter (2024)', 'id': 1,
+                  'tmdbId': None},
+                 {'title': 'Dark Matter', 'year': 2015, 'path': '/t/Dark Matter (2015)', 'id': 2,
+                  'tmdbId': None}]
+        rem, _rep = self._plan(L, 'tv', shows, lambda info: {(1, 1): kept})
+        assert [(r.path, r.rule) for r in rem] == [(extra, 'foreign-folder-review')]
+
+    def test_different_title_match_needs_review(self, tmp_path):
+        L = _Lib(tmp_path)
+        kept = L.link('Andor (2022)/Season 01/Andor (2022) - S01E01.mkv', 'A/a.mkv')
+        extra = L.link('Star Wars Andor/Season 01/Andor S01E01.mkv', 'B/b.mkv')
+        shows = [{'title': 'Andor', 'year': 2022, 'path': '/t/Andor (2022)', 'id': 1,
+                  'tmdbId': 83867}]
+        from utils.library import arr_title_maps
+        from utils.library_dedup import plan_foreign_folders
+        maps = arr_title_maps(shows, None, is_tv=True)
+        rem, _ = plan_foreign_folders(
+            str(L.lib), 'tv', {'Andor (2022)'}, maps, lambda info: {(1, 1): kept}, L.pairs,
+            cached_tmdb={'star wars andor': 83867}, tmdb_cache={})
+        assert [(r.path, r.rule) for r in rem] == [(extra, 'foreign-folder-review')]
+
+    def test_self_match_never_planned(self, tmp_path):
+        L = _Lib(tmp_path)
+        p = L.link('Ted Lasso (2020)/Season 01/Ted Lasso S01E01.mkv', 'A/a.mkv')
+        os.symlink(str(L.lib / 'Ted Lasso (2020)'), L.lib / 'Ted Lasso alias')
+        shows = [{'title': 'Ted Lasso', 'year': 2020, 'path': '/t/Ted Lasso (2020)', 'id': 1,
+                  'tmdbId': None}]
+        rem, _ = self._plan(L, 'tv', shows, lambda info: {(1, 1): p})
+        assert rem == []
+
+    def test_empty_folder_with_non_debrid_link_kept(self, tmp_path):
+        L = _Lib(tmp_path)
+        (L.lib / 'Odd').mkdir()
+        os.symlink('/home/me/notes.nfo', L.lib / 'Odd' / 'movie.nfo')
+        rem, rep = self._plan(L, 'movie', [], lambda info: None)
+        assert rem == [] and [r['rule'] for r in rep] == ['has-other-links']
+
+
+class TestReconcileReviewFixes:
+
+    def _setup(self, tmp_path):
+        return TestReconcilePlex()._setup(tmp_path)
+
+    def test_touch_rename_also_deletes_stale_gone_version(self, tmp_path, monkeypatch):
+        from utils import library_dedup
+        L, r = self._setup(tmp_path)
+        plex = FakePlex({'10': [('2', 'Show (2020)/Season 01/Show.S01E01.mkv', False)]})
+
+        def touched(p):
+            plex.items['10'].append(('3', 'Show (2020)/Season 01/Show (2020) - S01E01.mkv', True))
+        monkeypatch.setattr(library_dedup, '_touch_dir', touched)
+        snap = library_dedup.snapshot_plex(plex, 'tv', {'Show (2020)/Season 01/Show.S01E01.mkv'})
+        out = library_dedup.reconcile_plex(plex, 'tv', [r], snap, str(L.lib), touch=True)
+        assert out['renamed'] == ['10'] and plex.deleted == [('10', '2')]
+
+    def test_wait_idle_timeout_skips_deletions_and_retries(self, tmp_path):
+        from utils import library_dedup
+        L, r = self._setup(tmp_path)
+        plex = FakePlex({'10': [('1', 'Show (2020)/Season 01/Show (2020) - S01E01.mkv', True),
+                                ('2', 'Show (2020)/Season 01/Show.S01E01.mkv', False)]})
+        plex.wait_idle = lambda *a, **k: False
+        snap = library_dedup.snapshot_plex(plex, 'tv', {'Show (2020)/Season 01/Show.S01E01.mkv'})
+        out = library_dedup.reconcile_plex(plex, 'tv', [r], snap, str(L.lib), touch=True)
+        assert plex.deleted == [] and out['timeout'] == ['10']
+        assert [it['rating_key'] for it in out['retry']] == ['10']
+
+    def test_item_error_does_not_abort_others(self, tmp_path):
+        from utils import library_dedup
+        from utils.library_dedup import Removal
+        L, r = self._setup(tmp_path)
+        r2 = Removal(str(L.lib / 'Show (2020)' / 'Season 01' / 'Show.S01E02.mkv'), '/mnt/debrid_torbox/x',
+                     'tv', 'arr-folder-untracked', r.keep, 'Show')
+        plex = FakePlex({'10': [('1', 'Show (2020)/Season 01/Show (2020) - S01E01.mkv', True),
+                                ('2', 'Show (2020)/Season 01/Show.S01E01.mkv', False)],
+                         '11': [('4', 'Show (2020)/Season 01/Show (2020) - S01E02.mkv', True),
+                                ('5', 'Show (2020)/Season 01/Show.S01E02.mkv', False)]})
+        real_status = plex.media_status
+
+        def status(rk):
+            if rk == '10':
+                raise RuntimeError('plex hiccup')
+            return real_status(rk)
+        plex.media_status = status
+        snap = library_dedup.snapshot_plex(plex, 'tv', {'Show (2020)/Season 01/Show.S01E01.mkv',
+                                                        'Show (2020)/Season 01/Show.S01E02.mkv'})
+        out = library_dedup.reconcile_plex(plex, 'tv', [r, r2], snap, str(L.lib), touch=False)
+        assert out['failed'] == ['10'] and out['deleted'] == ['11']
+
+    def test_snapshot_drops_paths_in_two_sections(self, tmp_path):
+        from utils import library_dedup
+        from utils.plex_versions import PartRef
+
+        class TwoSections:
+            def list_parts(self, media_type):
+                return [PartRef('1', 'a', 'Film (2020)/Film.mkv', 0, '1'),
+                        PartRef('9', 'b', 'Film (2020)/Film.mkv', 0, '7'),
+                        PartRef('2', 'c', 'Other (2019)/Other.mkv', 0, '1')]
+        snap = library_dedup.snapshot_plex(TwoSections(), 'movie',
+                                           {'Film (2020)/Film.mkv', 'Other (2019)/Other.mkv'})
+        assert list(snap) == ['Other (2019)/Other.mkv']
+
+    def test_split_titles_detects_kept_copy_on_other_item(self, tmp_path):
+        from utils import library_dedup
+        from utils.library_dedup import Removal
+        from utils.plex_versions import PartRef
+        root = str(tmp_path)
+        r = Removal(os.path.join(root, 'Chinatown (1974)', 'a.mkv'), 't', 'movie', 'foreign-folder',
+                    os.path.join(root, 'Chinatown ITA (1974)', 'b.mkv'), 'Chinatown ITA (1974)')
+        snap = {'Chinatown (1974)/a.mkv': PartRef('1', 'x', 'Chinatown (1974)/a.mkv', 0, '1'),
+                'Chinatown ITA (1974)/b.mkv': PartRef('2', 'y', 'Chinatown ITA (1974)/b.mkv', 0, '1')}
+        assert library_dedup.split_titles(snap, [r], root) == {('movie', 'Chinatown ITA (1974)')}
+
+    def test_sidecar_kept_while_another_video_with_its_stem_remains(self, tmp_path):
+        from utils.library_dedup import apply_removals, plan_series_duplicates
+        L = _Lib(tmp_path)
+        kept = L.link('Show (2020)/Season 01/Show S01E01 A.mkv', 'A/a.mkv')
+        L.link('Show (2020)/Season 01/Show S01E01 B.mkv', 'B/b.mkv')
+        other = L.lib / 'Show (2020)' / 'Season 01' / 'Show S01E01 B.mp4'
+        os.symlink('/unknown/b.mp4', other)            # not a debrid link: never planned
+        sub = L.file('Show (2020)/Season 01/Show S01E01 B.en.srt')
+        plan = plan_series_duplicates(str(L.lib / 'Show (2020)'), {(1, 1): kept}, L.pairs, 'Show')
+        apply_removals(plan, str(tmp_path / 'm.tsv'), str(L.lib), set())
+        assert os.path.isfile(sub)
