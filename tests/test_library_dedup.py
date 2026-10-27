@@ -1267,3 +1267,17 @@ class TestKeptCopyIsAnotherTitle:
                   'tmdbId': None}]
         rem, _ = TestPlanForeignFolders()._plan(L, 'tv', shows, lambda info: {(1, 1): kept})
         assert rem == []
+
+
+class TestPlexWait:
+
+    def test_reconcile_passes_wait_to_plex(self, tmp_path):
+        from utils import library_dedup
+        L, r = TestReconcilePlex()._setup(tmp_path)
+        plex = FakePlex({'10': [('1', 'Show (2020)/Season 01/Show (2020) - S01E01.mkv', True),
+                                ('2', 'Show (2020)/Season 01/Show.S01E01.mkv', False)]})
+        waits = []
+        plex.wait_idle = lambda section, timeout=300, poll=5: waits.append(timeout) or True
+        snap = library_dedup.snapshot_plex(plex, 'tv', {'Show (2020)/Season 01/Show.S01E01.mkv'})
+        library_dedup.reconcile_plex(plex, 'tv', [r], snap, str(L.lib), touch=False, wait=1800)
+        assert waits == [1800]

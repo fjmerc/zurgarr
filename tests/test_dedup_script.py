@@ -490,3 +490,37 @@ def test_plan_reports_unreadable_radarr_folder(tmp_path, monkeypatch):
     out = str(tmp_path / 'plan.tsv')
     dedup.main(['plan', '--kind', 'movie', '--out', out], ctx=_ctx(L, radarr=radarr))
     assert [r['rule'] for r in _read(out)] == ['arr-error']
+
+
+def test_apply_uses_plex_wait_option(tmp_path, monkeypatch):
+    from utils.plex_versions import PartRef
+    L, radarr, kept, extra, unmatched = _movie_setup(tmp_path)
+    out = str(tmp_path / 'plan.tsv')
+    plex = FakePlex([PartRef('100', '1', 'Chinatown (1974)/Chinatown 1974.mkv', 5, '1')])
+    ctx = _ctx(L, radarr=radarr, plex=plex, tmp_path=tmp_path)
+    dedup.main(['plan', '--kind', 'movie', '--out', out], ctx=ctx)
+    seen = []
+    monkeypatch.setattr(dedup.dd, 'reconcile_plex',
+                        lambda *a, **k: seen.append(k.get('wait')) or {})
+    dedup.main(['apply', '--plan', out, '--kind', 'movie', '--plex-wait', '1800'], ctx=ctx)
+    assert seen and set(seen) == {1800}
+
+
+def test_reconcile_command_finishes_plex_after_a_stopped_run(tmp_path):
+    from utils.library_dedup import Removal, apply_removals
+    from utils.plex_versions import MediaRef, PartRef
+    L = Lib(tmp_path)
+    kept = L.link(L.tv, 'Show (2020)/Season 01/Show (2020) - S01E01.mkv', 'A/a.mkv')
+    extra = L.link(L.tv, 'Show (2020)/Season 01/Show.S01E01.mkv', 'B/b.mkv')
+    manifest = str(tmp_path / 'dedup_manifest_x.tsv')
+    apply_removals([Removal(extra, '/mnt/debrid_torbox/B/b.mkv', 'tv', 'arr-folder-untracked',
+                            kept, 'Show')], manifest, str(L.tv), set())
+    plex = FakePlex([PartRef('10', '1', 'Show (2020)/Season 01/Show (2020) - S01E01.mkv', 5, '2'),
+                     PartRef('10', '2', 'Show (2020)/Season 01/Show.S01E01.mkv', 5, '2')])
+    plex.deleted = []
+    plex.media_status = lambda rk: [MediaRef('1', ['Show (2020)/Season 01/Show (2020) - S01E01.mkv'], True),
+                                    MediaRef('2', ['Show (2020)/Season 01/Show.S01E01.mkv'], False)]
+    plex.delete_media = lambda rk, mid: plex.deleted.append((rk, mid))
+    rc = dedup.main(['reconcile', '--manifest', manifest, '--kind', 'tv'],
+                    ctx=_ctx(L, plex=plex, tmp_path=tmp_path))
+    assert rc == 0 and plex.deleted == [('10', '2')]

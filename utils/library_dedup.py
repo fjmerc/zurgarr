@@ -813,14 +813,14 @@ RECONCILE_BUCKETS = ('deleted', 'renamed', 'stranded', 'date_fixed', 'date_faile
                      'deletion_disabled', 'timeout', 'failed')
 
 
-def reconcile_plex(plex, kind, removed, snapshot, library_root, touch):
+def reconcile_plex(plex, kind, removed, snapshot, library_root, touch, wait=300):
     """Bring Plex in line after *removed* links are gone — see
     ``reconcile_items``."""
     return reconcile_items(plex, kind, plex_items(removed, snapshot, library_root),
-                           library_root, touch)
+                           library_root, touch, wait=wait)
 
 
-def reconcile_items(plex, kind, items, library_root, touch):
+def reconcile_items(plex, kind, items, library_root, touch, wait=300):
     """Per affected item: rescan the touched folders; delete a removed
     copy's now-unavailable version only when the item keeps a version that
     plays (titles Sonarr/Radarr don't have — rule ``no-arr-title`` — may
@@ -832,11 +832,12 @@ def reconcile_items(plex, kind, items, library_root, touch):
 
     Returns the buckets in ``RECONCILE_BUCKETS`` (rating keys) plus
     ``retry``: items not finished because Plex timed out or errored.  A
-    section whose scan doesn't finish gets no deletions this time.
+    section whose scan doesn't finish within *wait* seconds gets no
+    deletions this time.
     """
     out = {k: [] for k in RECONCILE_BUCKETS}
     out['retry'] = []
-    state = {}
+    state = {'wait': wait}
     by_section = {}
     for it in items:
         by_section.setdefault(it['section'], []).append(it)
@@ -849,7 +850,7 @@ def reconcile_items(plex, kind, items, library_root, touch):
             for rel_dir in sorted({os.path.dirname(rel) for it in its
                                    for rel in it['removed'] + it['keep']}):
                 plex.scan_path(section, rel_dir)
-            idle = plex.wait_idle(section)
+            idle = plex.wait_idle(section, timeout=wait)
         except Exception as e:
             logger.warning("[dedup] Plex scan of section %s failed: %s", section, e)
             idle = False
@@ -889,7 +890,7 @@ def _reconcile_item(plex, kind, it, library_root, touch, out, state):
             for d in it['keep_dirs']:
                 _safe_touch(d)
                 plex.scan_path(section, rel_to_root(d, library_root))
-            if not plex.wait_idle(section):
+            if not plex.wait_idle(section, timeout=state.get('wait', 300)):
                 out['timeout'].append(rk)
                 out['retry'].append(it)
                 return

@@ -11,6 +11,8 @@ Subcommands (run inside the zurgarr container):
 
     plan [--kind tv|movie|all] --out PLAN.tsv     dry run — changes nothing
     apply --plan PLAN.tsv [--kind ...] [--limit N] [--include-unmatched]
+          [--include-review] [--plex-wait SECONDS]
+    reconcile --manifest MANIFEST.tsv --kind tv|movie   finish Plex after a stopped run
     undo --manifest MANIFEST.tsv
     radarr-folders --out FOLDERS.tsv [--plan PLAN.tsv]
     radarr-rename --ids 1,2,3 --plan PLAN.tsv
@@ -243,12 +245,12 @@ def _manifest_path(ctx):
                         time.strftime('dedup_manifest_%Y%m%d-%H%M%S.tsv', time.gmtime()))
 
 
-def _apply_group(ctx, kind, group, manifest, protected, snapshot):
+def _apply_group(ctx, kind, group, manifest, protected, snapshot, wait):
     root = ctx.local_tv if kind == 'tv' else ctx.local_movies
     done = dd.apply_removals(group, manifest, root, protected, pairs=ctx.pairs)
     result = {}
     if ctx.plex and done:
-        result = dd.reconcile_plex(ctx.plex, kind, done, snapshot, root, touch=True)
+        result = dd.reconcile_plex(ctx.plex, kind, done, snapshot, root, touch=True, wait=wait)
     return done, result
 
 
@@ -299,7 +301,7 @@ def cmd_apply(ctx, args):
             print(f'{kind:6} {title}: skipped — Plex holds it in more than one section')
             continue
         done, result = _apply_group(ctx, kind, group, manifest, protected,
-                                    snapshots.get(kind, {}))
+                                    snapshots.get(kind, {}), args.plex_wait)
         total += len(done)
         summary = ', '.join(f'{k} {len(v)}' for k, v in result.items() if v)
         print(f'{kind:6} {title}: removed {len(done)}' + (f' — Plex: {summary}' if summary else ''))
@@ -363,7 +365,7 @@ def _wait_path_change(ctx, movie_id, old_path):
     return None
 
 
-def _rename_one(ctx, movie_id, plan_rows, manifest, include_review=False):
+def _rename_one(ctx, movie_id, plan_rows, manifest, include_review=False, wait=1800):
     from utils.library_dedup import Removal
     movie = ctx.radarr.get_movie(movie_id, strict=True)
     old_path = movie['path']
@@ -420,7 +422,7 @@ def _rename_one(ctx, movie_id, plan_rows, manifest, include_review=False):
     if not ctx.plex or orig is None:
         return True
     ctx.plex.scan_path(orig.section, new_folder)
-    ctx.plex.wait_idle(orig.section)
+    ctx.plex.wait_idle(orig.section, timeout=wait)
     new = next((p for p in ctx.plex.list_parts('movie')
                 if p.rel_path.startswith(new_folder + '/')), None)
     if new is not None and new.rating_key != orig.rating_key:
@@ -431,7 +433,8 @@ def _rename_one(ctx, movie_id, plan_rows, manifest, include_review=False):
             print(f'STOPPED: could not restore date added on Plex item {orig.rating_key}')
             return False
     if done:
-        dd.reconcile_plex(ctx.plex, 'movie', done, snapshot, ctx.local_movies, touch=False)
+        dd.reconcile_plex(ctx.plex, 'movie', done, snapshot, ctx.local_movies, touch=False,
+                          wait=wait)
     return True
 
 
@@ -441,8 +444,35 @@ def cmd_radarr_rename(ctx, args):
     plan_rows = _read_rows(args.plan)
     manifest = _manifest_path(ctx)
     for movie_id in [int(x) for x in args.ids.split(',') if x.strip()]:
-        if not _rename_one(ctx, movie_id, plan_rows, manifest, args.include_review):
+        if not _rename_one(ctx, movie_id, plan_rows, manifest, args.include_review,
+                           args.plex_wait):
             return 2
+    return 0
+
+
+def cmd_reconcile(ctx, args):
+    """Finish Plex's side for a manifest whose run stopped (Plex busy or
+    unreachable): delete the now-unavailable versions of removed copies
+    where the item still plays, wait for moved parts — same rules as apply.
+    Removed parts stay listed in Plex until then, so they can be found."""
+    if not ctx.plex:
+        print('Plex is not configured — nothing to reconcile')
+        return 1
+    root = ctx.local_tv if args.kind == 'tv' else ctx.local_movies
+    removed = [dd.Removal(r['path'], r['target'], r['kind'], r['rule'], r['keep'], r['title'])
+               for r in _read_rows(args.manifest)
+               if r['action'] == 'remove' and r['kind'] == args.kind and r['target']]
+    rels = {dd.rel_to_root(p, root) for r in removed for p in (r.path, r.keep) if p}
+    snapshot = dd.snapshot_plex(ctx.plex, args.kind, rels)
+    items = dd.plex_items(removed, snapshot, root)
+    result = dd.reconcile_items(ctx.plex, args.kind, items, root, touch=True, wait=args.plex_wait)
+    print(f'{len(items)} Plex item(s): ' + ', '.join(
+        f'{k} {len(v)}' for k, v in result.items() if v and k != 'retry'))
+    problem = [rk for b in ('stranded', 'date_failed', 'timeout', 'failed')
+               for rk in result.get(b, [])]
+    if problem:
+        print(f'Still needing attention: {problem}')
+        return 2
     return 0
 
 
@@ -472,6 +502,12 @@ def main(argv=None, ctx=None):
                    help='also remove foreign-folder-review rows (matched by alias/TMDB id, '
                         'or a yearless folder of a same-name show)')
     p.add_argument('--no-plex', action='store_true', help='run without Plex reconciliation')
+    p.add_argument('--plex-wait', type=int, default=1800,
+                   help='seconds to wait for a busy Plex scan before stopping (default 1800)')
+    p = sub.add_parser('reconcile')
+    p.add_argument('--manifest', required=True)
+    p.add_argument('--kind', choices=('tv', 'movie'), required=True)
+    p.add_argument('--plex-wait', type=int, default=1800)
     p = sub.add_parser('undo')
     p.add_argument('--manifest', required=True)
     p = sub.add_parser('radarr-folders')
@@ -483,10 +519,11 @@ def main(argv=None, ctx=None):
     p.add_argument('--include-review', action='store_true',
                    help='also act on foreign-folder-review rows (and merge their Plex items)')
     p.add_argument('--no-plex', action='store_true', help='run without Plex reconciliation')
+    p.add_argument('--plex-wait', type=int, default=1800)
     sub.add_parser('plex-check')
     args = ap.parse_args(argv)
     ctx = ctx or _context()
-    return {'plan': cmd_plan, 'apply': cmd_apply, 'undo': cmd_undo,
+    return {'plan': cmd_plan, 'apply': cmd_apply, 'undo': cmd_undo, 'reconcile': cmd_reconcile,
             'radarr-folders': cmd_radarr_folders, 'radarr-rename': cmd_radarr_rename,
             'plex-check': cmd_plex_check}[args.cmd](ctx, args)
 
