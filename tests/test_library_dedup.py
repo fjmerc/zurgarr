@@ -673,3 +673,12 @@ class TestPlanArrLibraries:
         removals, protected = plan_arr_movies(c, str(L.lib), L.pairs)
         assert [(r.path, r.keep) for r in removals] == [(extra, kept)]
         assert os.path.realpath(L.lib / 'Nofile (1999)') in protected
+
+    def test_arr_error_for_folder_is_reported_and_skipped(self, tmp_path):
+        L = _Lib(tmp_path)
+        L.link('Ted Lasso/Season 04/Ted Lasso S04E04.mkv', 'B/b.mkv')
+
+        def boom(info):
+            raise RuntimeError('sonarr down')
+        rem, rep = TestPlanForeignFolders()._plan(L, 'tv', TestPlanForeignFolders._TED, boom)
+        assert rem == [] and [r['rule'] for r in rep] == ['arr-error']

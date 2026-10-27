@@ -341,7 +341,11 @@ def plan_foreign_folders(root, kind, owned, maps, tracked_by_entry, pairs,
                                detail=', '.join(n for n, _p in media)))
             continue
 
-        tracked = tracked_by_entry(info)
+        try:
+            tracked = tracked_by_entry(info)
+        except Exception as e:
+            report.append(dict(row, rule='arr-error', detail=str(e)))
+            continue
         planned, uncovered = [], []
         if is_tv:
             tracked = tracked or {}

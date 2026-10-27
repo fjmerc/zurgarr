@@ -1575,6 +1575,16 @@ class SonarrClient(_ArrClientBase):
         return _as_list(self._get('/api/v3/episode', {'seriesId': series_id}, strict=strict),
                         strict, 'sonarr', 'episode list')
 
+    def move_series(self, series_ids, root_folder):
+        """Sonarr counterpart of ``RadarrClient.move_movies``: with the
+        current root this renames each series folder to Sonarr's format."""
+        return self._put('/api/v3/series/editor', {
+            'seriesIds': list(series_ids), 'rootFolderPath': root_folder, 'moveFiles': True})
+
+    def set_series_path(self, series, new_path):
+        """Point a series at *new_path*, moving its files there."""
+        return self._put(f'/api/v3/series/{series["id"]}?moveFiles=true', dict(series, path=new_path))
+
     def get_episode_files(self, series_id, strict=False):
         """Get all episode files (with their ``path``) for a series.
 
@@ -2678,6 +2688,17 @@ class RadarrClient(_ArrClientBase):
         *strict*: raise ArrUnavailable when Radarr doesn't answer.
         """
         return self._get(f'/api/v3/movie/{movie_id}', strict=strict)
+
+    def move_movies(self, movie_ids, root_folder):
+        """Move movies to *root_folder* via the movie editor — with the
+        current root this renames each movie folder to Radarr's naming
+        format.  Returns the API response (None on failure)."""
+        return self._put('/api/v3/movie/editor', {
+            'movieIds': list(movie_ids), 'rootFolderPath': root_folder, 'moveFiles': True})
+
+    def set_movie_path(self, movie, new_path):
+        """Point a movie at *new_path*, moving its files there."""
+        return self._put(f'/api/v3/movie/{movie["id"]}?moveFiles=true', dict(movie, path=new_path))
 
     _MEDIA_ID_KEY = 'movieId'
     _QUEUE_UNKNOWN_PARAM = 'includeUnknownMovieItems'

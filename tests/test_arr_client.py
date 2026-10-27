@@ -3467,3 +3467,41 @@ class TestOverseerrWriteback:
         assert overseerr.decline_request('9; rm -rf') is False
         assert overseerr.mark_media_available(None) is False
         assert mock_urlopen.call_count == 0
+
+
+class TestFolderMoves:
+    """Sonarr/Radarr parity: folder renames go through the arr's own editor."""
+
+    @patch('urllib.request.urlopen')
+    def test_move_movies_puts_editor_body(self, mock_urlopen, radarr):
+        mock_urlopen.return_value = _mock_urlopen({})
+        radarr.move_movies([5], '/data/media/movies')
+        req = mock_urlopen.call_args[0][0]
+        assert req.get_method() == 'PUT' and req.full_url.endswith('/api/v3/movie/editor')
+        assert json.loads(req.data) == {'movieIds': [5], 'rootFolderPath': '/data/media/movies',
+                                        'moveFiles': True}
+
+    @patch('urllib.request.urlopen')
+    def test_move_series_puts_editor_body(self, mock_urlopen, sonarr):
+        mock_urlopen.return_value = _mock_urlopen({})
+        sonarr.move_series([7], '/data/media/tv')
+        req = mock_urlopen.call_args[0][0]
+        assert req.get_method() == 'PUT' and req.full_url.endswith('/api/v3/series/editor')
+        assert json.loads(req.data) == {'seriesIds': [7], 'rootFolderPath': '/data/media/tv',
+                                        'moveFiles': True}
+
+    @patch('urllib.request.urlopen')
+    def test_set_movie_path_moves_files(self, mock_urlopen, radarr):
+        mock_urlopen.return_value = _mock_urlopen({})
+        radarr.set_movie_path({'id': 5, 'path': '/m/Old'}, '/m/New (1974)')
+        req = mock_urlopen.call_args[0][0]
+        assert req.full_url.endswith('/api/v3/movie/5?moveFiles=true')
+        assert json.loads(req.data)['path'] == '/m/New (1974)'
+
+    @patch('urllib.request.urlopen')
+    def test_set_series_path_moves_files(self, mock_urlopen, sonarr):
+        mock_urlopen.return_value = _mock_urlopen({})
+        sonarr.set_series_path({'id': 7, 'path': '/t/Old'}, '/t/New (2020)')
+        req = mock_urlopen.call_args[0][0]
+        assert req.full_url.endswith('/api/v3/series/7?moveFiles=true')
+        assert json.loads(req.data)['path'] == '/t/New (2020)'
