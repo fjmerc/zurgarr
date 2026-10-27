@@ -1144,6 +1144,42 @@ class TestSonarrClient:
 # Radarr client
 # ---------------------------------------------------------------------------
 
+class TestEnsureAndSearchNoAutoAdd:
+    def test_sonarr_series_not_added_when_asked_not_to(self, sonarr, monkeypatch):
+        calls = []
+        monkeypatch.setattr(sonarr, 'find_series_in_library', lambda **kw: None)
+        monkeypatch.setattr(sonarr, 'lookup_series', lambda **kw: calls.append('lookup') or {'title': 'X'})
+        monkeypatch.setattr(sonarr, 'add_series', lambda *a, **kw: calls.append('add') or {'id': 1})
+        result = sonarr.ensure_and_search('Dark Matter', 62196, 2, [1], add_missing=False)
+        assert result['status'] == 'not_in_arr'
+        assert calls == []
+
+    def test_unreachable_sonarr_is_not_reported_as_not_in_sonarr(self, sonarr, monkeypatch):
+        def find(**kw):
+            assert kw.get('strict') is True
+            raise ArrUnavailable('sonarr request failed')
+        monkeypatch.setattr(sonarr, 'find_series_in_library', find)
+        result = sonarr.ensure_and_search('Some Show', 1, 1, [1], add_missing=False)
+        assert result['status'] == 'error'
+        assert 'unreachable' in result['message']
+
+    def test_unreachable_radarr_is_not_reported_as_not_in_radarr(self, radarr, monkeypatch):
+        def find(**kw):
+            raise ArrUnavailable('radarr request failed')
+        monkeypatch.setattr(radarr, 'find_movie_in_library', find)
+        result = radarr.ensure_and_search('Some Film', 1, add_missing=False)
+        assert result['status'] == 'error'
+
+    def test_sonarr_still_adds_by_default(self, sonarr, monkeypatch):
+        # The library page's Download button relies on this.
+        calls = []
+        monkeypatch.setattr(sonarr, 'find_series_in_library', lambda **kw: None)
+        monkeypatch.setattr(sonarr, 'lookup_series', lambda **kw: calls.append('lookup') or None)
+        result = sonarr.ensure_and_search('Some Show', 1, 1, [1])
+        assert calls == ['lookup']
+        assert result['status'] == 'error'   # lookup found nothing
+
+
 class TestRadarrClient:
 
     @patch('urllib.request.urlopen')
@@ -1370,6 +1406,14 @@ class TestRadarrClient:
         result = radarr.ensure_and_search('New Movie', 999)
         assert result['status'] == 'sent'
         assert 'Added' in result['message']
+
+    @patch('urllib.request.urlopen')
+    def test_ensure_and_search_does_not_add_when_asked_not_to(self, mock_urlopen, radarr):
+        # Background scans: a movie not in Radarr is left alone.
+        mock_urlopen.side_effect = [_mock_urlopen([])]  # get_all_movies only
+        result = radarr.ensure_and_search('New Movie', 999, add_missing=False)
+        assert result['status'] == 'not_in_arr'
+        assert mock_urlopen.call_count == 1   # no lookup, no add
 
     @patch('urllib.request.urlopen')
     def test_ensure_and_search_not_found(self, mock_urlopen, radarr):

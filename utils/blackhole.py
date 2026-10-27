@@ -2811,7 +2811,7 @@ class BlackholeWatcher:
                 self._audit_retrigger_mark(title, season)
                 client.ensure_and_search(
                     title, tmdb_id, season, missing,
-                    prefer_debrid=True, respect_monitored=True,
+                    prefer_debrid=True, respect_monitored=True, add_missing=False,
                 )
         except Exception as e:
             logger.warning(

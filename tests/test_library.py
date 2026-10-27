@@ -71,6 +71,41 @@ class TestParseFolderName:
         assert title == "Show Name"
         assert year is None
 
+    def test_bare_resolution_number_at_end_is_not_title(self):
+        # Prod: a TorBox release named "Evil Dead Burn 1080" (no "p", no
+        # year) showed in the library as a movie titled "Evil Dead Burn
+        # 1080" and got its own stray folder beside Radarr's.
+        assert _parse_folder_name("Evil Dead Burn 1080") == ("Evil Dead Burn", None)
+        assert _parse_folder_name("Some.Show.720") == ("Some Show", None)
+        assert _parse_folder_name("Big Film 2160") == ("Big Film", None)
+        assert _parse_folder_name("Old_Show_480") == ("Old Show", None)
+        assert _parse_folder_name("Evil Dead Burn 1080 BluRay") == ("Evil Dead Burn", None)
+        assert _parse_folder_name("Movie.Name.1080.x264-GRP") == ("Movie Name", None)
+        assert _parse_folder_name("Evil.Dead.Burn.1080.mkv") == ("Evil Dead Burn", None)
+
+    def test_bare_resolution_with_years_and_markers(self):
+        assert _parse_folder_name("Title (2024) 1080") == ("Title", 2024)
+        assert _parse_folder_name("Movie.2024.1080") == ("Movie", 2024)
+        assert _parse_folder_name("Movie.1080.2024") == ("Movie", 2024)
+        assert _parse_folder_name("Show.S01.1080")[0] == "Show"
+
+    def test_number_in_parens_is_not_a_year(self):
+        assert _parse_folder_name("Movie (1080)") == ("Movie", None)
+        assert _parse_folder_name("Movie.(2160)") == ("Movie", None)
+
+    def test_bare_resolution_before_a_year_or_episode_marker(self):
+        assert _parse_folder_name("Evil Dead Burn 1080 (2025)") == ("Evil Dead Burn", 2025)
+        assert _parse_folder_name("Evil.Dead.Burn.1080.(2025).WEB") == ("Evil Dead Burn", 2025)
+        assert _parse_folder_name("Show.1080.S01E01")[0] == "Show"
+        assert _parse_folder_name("Movie.1080.2024.Directors.Cut") == ("Movie", 2024)
+
+    def test_number_that_is_the_title_kept(self):
+        assert _parse_folder_name("1080") == ("1080", None)
+        assert _parse_folder_name("_1080")[0].strip(' _') == "1080"
+        assert _parse_folder_name("Movie 10800") == ("Movie 10800", None)
+        assert _parse_folder_name("Movie 21080") == ("Movie 21080", None)
+        assert _parse_folder_name("Apollo 13") == ("Apollo 13", None)
+
     def test_simple_name_no_year(self):
         title, year = _parse_folder_name("Simple Name")
         assert title == "Simple Name"
@@ -4143,12 +4178,12 @@ class TestCleanupDiscRips:
         ]
         mock_client = type('MockClient', (), {
             'find_torrents_by_title': lambda self, n, target_year=None: [
-                {'id': 'T1', 'filename': 'Why.Him.2016.BluRay', 'hash': 'AABBCCDD', 'year': 2016}
+                {'id': 'T1', 'filename': 'Why.Him.2016', 'hash': 'AABBCCDD', 'year': 2016}
             ],
             'delete_torrent': lambda self, tid: True,
         })()
         monkeypatch.setattr('utils.debrid_client.get_debrid_client',
-                            lambda: (mock_client, 'realdebrid'))
+                            lambda service=None, api_key=None: (mock_client, 'realdebrid'))
         import utils.library as _lib
         monkeypatch.setattr(_lib, '_blocklist', type('MockBL', (), {
             'add': lambda self, *a, **kw: 'id1',
@@ -4159,6 +4194,133 @@ class TestCleanupDiscRips:
         cleaned = scanner._cleanup_disc_rips(movies)
         assert cleaned == 1
         assert len(movies) == 0  # Removed from list
+
+    def test_only_the_disc_rips_own_torrent_deleted(self, scanner, tmp_dir, monkeypatch):
+        """Other copies of the same title (a good 1080p) match by name too;
+        only the torrent behind the disc-rip folder is deleted/blocklisted."""
+        rip_path = self._make_disc_rip_folder(tmp_dir, 'Why.Him.2016.COMPLETE.BLURAY')
+        movies = [{'title': 'Why Him', 'year': 2016, 'source': 'debrid', 'size_bytes': 0,
+                   'path': rip_path, 'quality': {}}]
+        deleted, blocked = [], []
+        mock_client = type('MockClient', (), {
+            'find_torrents_by_title': lambda self, n, target_year=None: [
+                {'id': 'GOOD', 'filename': 'Why.Him.2016.1080p.WEB-DL.mkv', 'hash': 'GOODHASH'},
+                {'id': 'RIP', 'filename': 'Why.Him.2016.COMPLETE.BLURAY', 'hash': 'RIPHASH'},
+            ],
+            'delete_torrent': lambda self, tid: deleted.append(tid) or True,
+        })()
+        monkeypatch.setattr('utils.debrid_client.get_debrid_client',
+                            lambda service=None, api_key=None: (mock_client, 'realdebrid'))
+        import utils.library as _lib
+        monkeypatch.setattr(_lib, '_blocklist', type('MockBL', (), {
+            'add': lambda self, h, *a, **kw: blocked.append(h) or 'id1',
+        })())
+        monkeypatch.setenv('BLOCKLIST_AUTO_ADD', 'true')
+        monkeypatch.setattr(_lib, '_history', None)
+        scanner._cleanup_disc_rips(movies)
+        assert deleted == ['RIP']
+        assert blocked == ['RIPHASH']
+
+    def _run_disc_rip(self, scanner, tmp_dir, monkeypatch, folder, torrents, source=None):
+        if source == 'torbox':
+            monkeypatch.setattr(type(scanner), '_discover_torbox_mount', staticmethod(lambda: tmp_dir))
+        rip_path = self._make_disc_rip_folder(tmp_dir, folder)
+        movies = [{'title': 'Why Him', 'year': 2016, 'source': 'debrid', 'size_bytes': 0,
+                   'path': rip_path, 'quality': {}, 'source_debrid': source}]
+        deleted, asked = [], []
+        mock_client = type('MockClient', (), {
+            'find_torrents_by_title': lambda self, n, target_year=None: torrents,
+            'delete_torrent': lambda self, tid: deleted.append(tid) or True,
+        })()
+        monkeypatch.setattr('utils.debrid_client.get_debrid_client',
+                            lambda service=None, api_key=None: asked.append(service) or (mock_client, service))
+        import utils.library as _lib
+        monkeypatch.setattr(_lib, '_blocklist', type('MockBL', (), {
+            'add': lambda self, *a, **kw: 'id1'})())
+        monkeypatch.setenv('BLOCKLIST_AUTO_ADD', 'true')
+        monkeypatch.setattr(_lib, '_history', None)
+        scanner._cleanup_disc_rips(movies)
+        return deleted, asked
+
+    def test_torbox_disc_rip_matched_by_its_folder(self, scanner, tmp_dir, monkeypatch):
+        # TorBox lists a cleaned-up display name; the mount folder is where
+        # its files sit.
+        deleted, asked = self._run_disc_rip(scanner, tmp_dir, monkeypatch, 'Why.Him.2016.COMPLETE.BLURAY', [
+            {'id': 'RIP', 'filename': 'Why Him 2016 COMPLETE BLURAY', 'folder': 'Why.Him.2016.COMPLETE.BLURAY', 'hash': 'H'},
+            {'id': 'GOOD', 'filename': 'Why Him 2016 1080p', 'folder': 'Why.Him.2016.1080p', 'hash': 'G'},
+        ], source='torbox')
+        assert deleted == ['RIP']
+        assert asked == ['torbox']   # the provider the rip is on, not RD first
+
+    def test_provider_comes_from_the_mount_not_the_tag(self, scanner, tmp_dir, monkeypatch):
+        # Zurg items carry the configured primary (TorBox) as their tag even
+        # though they live on Real-Debrid; a same-named TorBox torrent must
+        # not be deleted for a rip on the Zurg mount.
+        tb_mount = os.path.join(tmp_dir, 'torbox')
+        os.makedirs(tb_mount)
+        monkeypatch.setattr(type(scanner), '_discover_torbox_mount', staticmethod(lambda: tb_mount))
+        rip_path = self._make_disc_rip_folder(tmp_dir, 'Why.Him.2016.COMPLETE.BLURAY')
+        movies = [{'title': 'Why Him', 'year': 2016, 'source': 'debrid', 'size_bytes': 0,
+                   'path': rip_path, 'quality': {}, 'source_debrid': 'torbox'}]
+        deleted = []
+        def client(name, rows):
+            return type('C', (), {
+                'find_torrents_by_title': lambda self, n, target_year=None: rows,
+                'delete_torrent': lambda self, tid: deleted.append((name, tid)) or True})()
+        same = [{'id': 'RIP', 'filename': 'Why.Him.2016.COMPLETE.BLURAY', 'hash': 'H'}]
+        clients = {'torbox': client('torbox', same), 'realdebrid': client('realdebrid', same)}
+        monkeypatch.setattr('utils.debrid_client.get_debrid_client',
+                            lambda service=None, api_key=None: (clients.get(service), service))
+        import utils.library as _lib
+        monkeypatch.setattr(_lib, '_blocklist', type('MockBL', (), {'add': lambda self, *a, **kw: 'id1'})())
+        monkeypatch.setattr(_lib, '_history', None)
+        scanner._cleanup_disc_rips(movies)
+        assert deleted == [('realdebrid', 'RIP')]
+
+    def test_good_copy_with_a_dotted_name_never_matched(self, scanner, tmp_dir, monkeypatch):
+        # "Movie.2016.1080p.BluRay" minus its last dotted part would equal
+        # the rip folder; only real extensions are dropped.
+        deleted, _ = self._run_disc_rip(scanner, tmp_dir, monkeypatch, 'Why.Him.2016.1080p', [
+            {'id': 'GOOD', 'filename': 'Why.Him.2016.1080p.BluRay', 'hash': 'G'}], source='realdebrid')
+        assert deleted == []
+
+    def test_single_file_iso_rip_matched_without_extension(self, scanner, tmp_dir, monkeypatch):
+        deleted, _ = self._run_disc_rip(scanner, tmp_dir, monkeypatch, 'Why.Him.2016', [
+            {'id': 'ISO', 'filename': 'Why.Him.2016.iso', 'hash': 'H'}], source='realdebrid')
+        assert deleted == ['ISO']
+
+    def test_no_torrent_named_like_the_folder_deletes_nothing(self, scanner, tmp_dir, monkeypatch, caplog):
+        import logging
+        with caplog.at_level(logging.INFO):
+            deleted, asked = self._run_disc_rip(scanner, tmp_dir, monkeypatch, 'Why.Him.2016.COMPLETE', [],
+                                                source='realdebrid')
+        assert deleted == []
+        assert 'no debrid torrent named like its folder' in caplog.text
+        # Not looked up again on the next scan the same day.
+        _, asked_again = self._run_disc_rip(scanner, tmp_dir, monkeypatch, 'Why.Him.2016.COMPLETE', [],
+                                            source='realdebrid')
+        assert asked == ['realdebrid', 'alldebrid'] and asked_again == []
+
+    def test_account_listed_once_per_run(self, scanner, tmp_dir, monkeypatch):
+        calls = []
+        class C:
+            def list_torrents(self):
+                calls.append(1)
+                return [{'id': 'X', 'filename': 'Other.Movie'}]
+            def find_torrents_by_title(self, n, target_year=None):
+                return [t for t in self.list_torrents() if False]
+            def delete_torrent(self, tid):
+                return True
+        c = C()
+        monkeypatch.setattr('utils.debrid_client.get_debrid_client',
+                            lambda service=None, api_key=None: (c, service) if service == 'realdebrid' else (None, None))
+        import utils.library as _lib
+        monkeypatch.setattr(_lib, '_history', None)
+        movies = [{'title': t, 'year': 2016, 'source': 'debrid', 'size_bytes': 0, 'quality': {},
+                   'path': self._make_disc_rip_folder(tmp_dir, t.replace(' ', '.'))}
+                  for t in ('Rip One', 'Rip Two', 'Rip Three')]
+        scanner._cleanup_disc_rips(movies)
+        assert len(calls) == 1
 
     def test_normal_movie_not_cleaned(self, scanner, tmp_dir, monkeypatch):
         """Movie with real media files should not be touched."""
@@ -4206,7 +4368,7 @@ class TestCleanupDiscRips:
         monkeypatch.setattr(_lib, '_history', None)
         # get_debrid_client raises
         monkeypatch.setattr('utils.debrid_client.get_debrid_client',
-                            lambda: (_ for _ in ()).throw(ImportError('no client')))
+                            lambda service=None, api_key=None: (_ for _ in ()).throw(ImportError('no client')))
         cleaned = scanner._cleanup_disc_rips(movies)
         # Can't blocklist or delete without client, but shouldn't crash
         assert cleaned == 0
@@ -4253,7 +4415,7 @@ class TestCleanupDiscRips:
             'delete_torrent': lambda self, tid: True,
         })()
         monkeypatch.setattr('utils.debrid_client.get_debrid_client',
-                            lambda: (mock_client, 'realdebrid'))
+                            lambda service=None, api_key=None: (mock_client, 'realdebrid'))
         import utils.library as _lib
         monkeypatch.setattr(_lib, '_blocklist', type('MockBL', (), {
             'add': lambda self, *a, **kw: 'id1',
@@ -6103,6 +6265,84 @@ class TestSearchForMissingEpisodesSkipGhosts:
                                              preferences={})
 
         assert sonarr_client.ensure_and_search.call_count == 0
+
+
+class TestGapFillNeverAddsTitles:
+    """The background gap-fill searches only what the arr already has: a
+    same-name show's TorBox packs once made it add the wrong series."""
+
+    def _scanner(self, monkeypatch, client, kind):
+        from utils.library import LibraryScanner
+        scanner = LibraryScanner.__new__(LibraryScanner)
+        scanner._alias_norms = {}
+        scanner._search_cooldown = {}
+        scanner._lock = __import__('threading').RLock()
+        monkeypatch.setattr('utils.arr_client.get_download_service',
+                            lambda mt: (client, kind) if mt == ('show' if kind == 'sonarr' else 'movie')
+                            else (None, None))
+        monkeypatch.setattr('utils.library.gap_fill_enabled', lambda: True)
+        monkeypatch.setattr('utils.library_prefs.get_all_pending', lambda: {})
+        monkeypatch.setattr('utils.library_prefs.set_pending', MagicMock())
+        monkeypatch.setattr('utils.library_prefs.touch_pending_searched', MagicMock())
+        monkeypatch.setattr('utils.library_prefs.update_pending_error', MagicMock())
+        return scanner
+
+    def test_show_gap_fill_passes_add_missing_false(self, monkeypatch):
+        from utils.library import LibraryScanner
+        client = MagicMock(configured=True)
+        client.ensure_and_search.return_value = {'status': 'skipped'}
+        scanner = self._scanner(monkeypatch, client, 'sonarr')
+        monkeypatch.setattr(LibraryScanner, '_compute_missing_episodes', lambda self, show: [(1, 1)])
+        shows = [{'title': 'Some Show', 'year': 2020, 'source': 'debrid', 'missing_episodes': 1,
+                  'season_data': [{'number': 1, 'episodes': []}]}]
+        scanner._search_for_missing_episodes(shows=shows, movies=[], preferences={})
+        assert client.ensure_and_search.call_count == 1
+        assert client.ensure_and_search.call_args.kwargs['add_missing'] is False
+
+
+    def test_title_not_in_arr_recorded_on_pending_and_counted(self, monkeypatch):
+        # Otherwise its pending entry "waits for retry" forever.
+        from utils.library import LibraryScanner
+        client = MagicMock(configured=True)
+        client.ensure_and_search.return_value = {'status': 'not_in_arr',
+                                                 'message': 'Not in Sonarr — add it there'}
+        scanner = self._scanner(monkeypatch, client, 'sonarr')
+        errors = MagicMock()
+        monkeypatch.setattr('utils.library_prefs.update_pending_error', errors)
+        monkeypatch.setattr(LibraryScanner, '_compute_missing_episodes', lambda self, show: [(1, 1)])
+        shows = [{'title': 'Some Show', 'year': 2020, 'source': 'debrid', 'missing_episodes': 1,
+                  'season_data': [{'number': 1, 'episodes': []}]}]
+        scanner._search_for_missing_episodes(shows=shows, movies=[], preferences={})
+        assert errors.call_count == 1
+        assert 'Not in Sonarr' in errors.call_args.args[1]
+        # Not asked again within the retry window (no re-touching its entry).
+        scanner._search_cooldown.clear()
+        scanner._search_for_missing_episodes(shows=shows, movies=[], preferences={})
+        assert client.ensure_and_search.call_count == 1
+
+    def test_same_name_sibling_not_in_sonarr_leaves_shared_entry_alone(self, monkeypatch):
+        # The bare-title pending entry belongs to the sibling Sonarr has.
+        from utils.library import LibraryScanner
+        client = MagicMock(configured=True)
+        client.ensure_and_search.return_value = {'status': 'not_in_arr', 'message': 'Not in Sonarr'}
+        scanner = self._scanner(monkeypatch, client, 'sonarr')
+        errors = MagicMock()
+        monkeypatch.setattr('utils.library_prefs.update_pending_error', errors)
+        monkeypatch.setattr(LibraryScanner, '_compute_missing_episodes', lambda self, show: [(3, 1)])
+        shows = [{'title': 'Dark Matter', 'year': 2015, 'source': 'debrid', 'missing_episodes': 1,
+                  '_norm_key': 'dark matter (2015)', 'season_data': [{'number': 3, 'episodes': []}]}]
+        scanner._search_for_missing_episodes(shows=shows, movies=[], preferences={})
+        assert client.ensure_and_search.call_count == 1
+        errors.assert_not_called()
+
+    def test_movie_gap_fill_passes_add_missing_false(self, monkeypatch):
+        client = MagicMock(configured=True)
+        client.ensure_and_search.return_value = {'status': 'skipped'}
+        scanner = self._scanner(monkeypatch, client, 'radarr')
+        movies = [{'title': 'Some Film', 'year': 2020, 'source': None}]
+        scanner._search_for_missing_episodes(shows=[], movies=movies, preferences={})
+        assert client.ensure_and_search.call_count == 1
+        assert client.ensure_and_search.call_args.kwargs['add_missing'] is False
 
 
 class TestGetRadarrMoviesList:

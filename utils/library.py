@@ -407,13 +407,55 @@ _QUALITY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# A resolution written without its "p" as the last word of a release name
+# ("Evil Dead Burn 1080", "Evil.Dead.Burn.1080.mkv") — or the last word left
+# once quality tags are cut ("Evil.Dead.Burn.1080.x264").  A number inside a
+# title ("Apollo 13") is left alone.
+_BARE_RESOLUTION_TAIL = re.compile(
+    r'[\s._-]\(?(?:2160|1080|720|480)\)?'
+    r'(?:\.(?:mkv|mp4|avi|m4v|mov|wmv|flv|ts|webm))?\s*$', re.IGNORECASE)
+
+
+def _strip_bare_resolution(title):
+    """*title* without a trailing bare resolution (``_BARE_RESOLUTION_TAIL``),
+    unless that would leave nothing (a title that is just "1080")."""
+    stripped = _BARE_RESOLUTION_TAIL.sub('', title.rstrip(' ._-'))
+    return stripped if stripped.strip(' ._-') else title
+
+
+# Single-file disc rips: Zurg names the folder without the extension.
+_DISC_IMAGE_EXTENSIONS = frozenset({'.iso', '.img', '.bin', '.m2ts', '.rar', '.zip'})
+
+
+def _same_release_key(name):
+    """A torrent/folder name compared loosely: media extension dropped
+    (single-file torrents) and "&" ignored (the TorBox mount drops it)."""
+    name = str(name or '')
+    root, ext = os.path.splitext(name)
+    if ext.lower() in MEDIA_EXTENSIONS:
+        name = root
+    return name.replace('&', '').strip().lower()
+
+
+def _release_keys(match):
+    """Every name a debrid torrent's mount folder can have: its listed name
+    (without a disc-image extension too — Zurg drops it for single files)
+    and, for TorBox, the folder its files sit in.  Only known extensions are
+    dropped: "Movie.2020.1080p.BluRay" must not become "Movie.2020.1080p"."""
+    names = [match.get('filename'), match.get('folder')]
+    root, ext = os.path.splitext(str(match.get('filename') or ''))
+    if ext.lower() in _DISC_IMAGE_EXTENSIONS:
+        names.append(root)
+    return {_same_release_key(n) for n in names if n}
+
+
 _SEASON_EPISODE_PATTERN = re.compile(
     r'[\s.\-_]S\d{1,2}(E\d{1,2})?.*$',
     re.IGNORECASE,
 )
 
 _YEAR_PATTERN = re.compile(r'\s*\((\d{4})\)\s*$')
-_YEAR_INLINE_PATTERN = re.compile(r'[\s.\-_](\d{4})(?:[\s.\-_]|$)')
+_YEAR_INLINE_PATTERN = re.compile(r'[\s.\-_](\d{4})(?=[\s.\-_]|$)')
 _DOTS_DASHES_PATTERN = re.compile(r'[.\-_]')
 _MULTI_SPACE_PATTERN = re.compile(r'\s{2,}')
 
@@ -593,9 +635,9 @@ def _parse_folder_name(name):
     # Strip trailing year in parens: "Movie Name (2024)"
     year = None
     year_match = _YEAR_PATTERN.search(title)
-    if year_match:
+    if year_match and 1900 <= int(year_match.group(1)) <= 2100:
         year = int(year_match.group(1))
-        title = title[:year_match.start()].strip()
+        title = _strip_bare_resolution(title[:year_match.start()].strip())
         return _clean_title(title, year)
 
     # Extract mid-string year in parens before quality truncation:
@@ -607,27 +649,29 @@ def _parse_folder_name(name):
         candidate = int(mid_year_match.group(1))
         if 1900 <= candidate <= 2100:
             year = candidate
-            title = title[:mid_year_match.start()].strip()
+            title = _strip_bare_resolution(title[:mid_year_match.start()].strip())
             return _clean_title(title, year)
 
     # Strip S01E01-style markers (TV episodes/seasons)
     season_match = _SEASON_EPISODE_PATTERN.search(title)
     if season_match:
-        title = title[:season_match.start()]
+        title = _strip_bare_resolution(title[:season_match.start()])
         return _clean_title(title, None)
 
     # Strip quality markers
+    title = _strip_bare_resolution(title)
     quality_match = _QUALITY_PATTERN.search(title)
     if quality_match:
-        title = title[:quality_match.start()]
+        title = _strip_bare_resolution(title[:quality_match.start()])
 
-    # Check for inline year before quality markers: "Movie.Name.2024.1080p"
-    inline_match = _YEAR_INLINE_PATTERN.search(title)
-    if inline_match:
+    # Check for inline year before quality markers: "Movie.Name.2024.1080p".
+    # The first plausible one: "Movie.1080.2024" -> 2024.
+    for inline_match in _YEAR_INLINE_PATTERN.finditer(title):
         candidate = int(inline_match.group(1))
         if 1900 <= candidate <= 2100:
             year = candidate
-            title = title[:inline_match.start()]
+            title = _strip_bare_resolution(title[:inline_match.start()])
+            break
 
     return _clean_title(title, year)
 
@@ -4423,12 +4467,34 @@ class LibraryScanner:
 
         cleaned = 0
         cleaned_paths = set()
-        try:
-            from utils.debrid_client import get_debrid_client
-            client, _svc = get_debrid_client()
-        except Exception as e:
-            logger.warning(f"[library] Disc rip cleanup: debrid client unavailable: {e}")
-            client = None
+        clients = {}
+
+        def client_for(service):
+            # One client per provider per run, its torrent list fetched once
+            # (TorBox's is paged and rate-limited).
+            if service not in clients:
+                try:
+                    from utils.debrid_client import get_debrid_client
+                    client = get_debrid_client(service=service)[0]
+                except Exception as e:
+                    logger.warning(f"[library] Disc rip cleanup: debrid client unavailable: {e}")
+                    client = None
+                if client is not None and hasattr(client, 'list_torrents'):
+                    listed = []
+                    fetch = client.list_torrents
+
+                    def cached_list(fetch=fetch, listed=listed):
+                        if not listed:
+                            listed.append(fetch())
+                        return listed[0]
+                    client.list_torrents = cached_list
+                clients[service] = client
+            return clients[service]
+
+        tb_mount = self._discover_torbox_mount()
+        unmatched = getattr(self, '_disc_rip_unmatched', None)
+        if unmatched is None:
+            unmatched = self._disc_rip_unmatched = {}
 
         for m in confirmed:
             title = m['title']
@@ -4442,18 +4508,38 @@ class LibraryScanner:
             bl_hash = ''
             deleted = 0
 
-            # Find matching debrid torrent(s) and extract hash
-            if client:
+            # Only the disc rip's own torrent: every copy of the title matches
+            # by name, and the good ones must stay.  The provider comes from
+            # where the folder is — the TorBox mount, or the Zurg mount (RD /
+            # AD) — never from the item's tag, which can be the configured
+            # primary instead, and never across the two.
+            folder = _same_release_key(os.path.basename(m['path'].rstrip('/')))
+            on_tb = bool(tb_mount) and os.path.abspath(m['path']).startswith(
+                os.path.abspath(tb_mount) + os.sep)
+            if time.monotonic() - unmatched.get(m['path'], -1e9) < 86400:
+                continue  # no torrent matched it within the day
+            own, client = [], None
+            for service in (('torbox',) if on_tb else ('realdebrid', 'alldebrid')):
+                client = client_for(service)
+                if not client:
+                    continue
                 try:
                     matches = client.find_torrents_by_title(accept_norms, target_year=year)
                 except Exception as e:
-                    logger.debug(f"[library] Disc rip lookup failed for {title}: {e}")
-                    matches = []
-                for match in matches:
-                    if not bl_hash and match.get('hash'):
-                        bl_hash = match['hash']
-                    if client.delete_torrent(str(match['id'])):
-                        deleted += 1
+                    logger.debug(f"[library] Disc rip lookup on {service} failed for {title}: {e}")
+                    continue
+                own = [x for x in matches if folder in _release_keys(x)]
+                if own:
+                    break
+            if not own:
+                unmatched[m['path']] = time.monotonic()
+                logger.info(f"[library] Disc rip {title}: no debrid torrent named "
+                            f"like its folder — nothing deleted (checked again tomorrow)")
+            for match in own:
+                if not bl_hash and match.get('hash'):
+                    bl_hash = match['hash']
+                if client.delete_torrent(str(match['id'])):
+                    deleted += 1
 
             # Auto-blocklist
             if bl_hash and _blocklist and str(os.environ.get('BLOCKLIST_AUTO_ADD', 'true')).lower() == 'true':
@@ -4779,6 +4865,18 @@ class LibraryScanner:
 
     _SEARCH_BUDGET_SECONDS = 30
     _SEARCH_RETRY_HOURS = 6
+
+    def _not_in_arr_recent(self, key):
+        """Whether *key* came back "not in Sonarr/Radarr" within
+        ``_SEARCH_RETRY_HOURS`` — such titles are left alone until then
+        rather than re-touching (and holding back) a shared pending entry."""
+        seen = getattr(self, '_not_in_arr', {}).get(key)
+        return seen is not None and time.monotonic() - seen < self._SEARCH_RETRY_HOURS * 3600
+
+    def _not_in_arr_mark(self, key):
+        if not hasattr(self, '_not_in_arr'):
+            self._not_in_arr = {}
+        self._not_in_arr[key] = time.monotonic()
     # Wanted→TorBox recovery: cap Torrentio fan-out per title probed against
     # TB's cache, and how long a probed-and-missed (or just-grabbed) title is
     # skipped before being re-probed.  6h matches the arr-search retry window.
@@ -5080,6 +5178,8 @@ class LibraryScanner:
                                 continue  # already on debrid
                             candidates.add((sd['number'], ep['number']))
 
+                if self._not_in_arr_recent((norm, show_tag)):
+                    continue  # not in Sonarr; checked again later
                 by_season = {}
                 for sn, en in candidates:
                     if (sn, en) in pending_keys:
@@ -5138,7 +5238,7 @@ class LibraryScanner:
                         result = show_client.ensure_and_search(
                             show['title'], show_tmdb_id, sn, ep_nums,
                             prefer_debrid=route, respect_monitored=respect_mon,
-                            skip_has_file=route is not True,
+                            skip_has_file=route is not True, add_missing=False,
                         )
                         status = result.get('status', '')
                         if status in ('sent', 'pending'):
@@ -5164,6 +5264,16 @@ class LibraryScanner:
                                                level='warning')
                                     except Exception:
                                         pass
+                        elif status == 'not_in_arr':
+                            # Never added from a background scan; not asked
+                            # again for _SEARCH_RETRY_HOURS.  A same-name
+                            # show's entry (show_tag) belongs to the sibling
+                            # Sonarr has — don't write on it.
+                            self._not_in_arr_mark((norm, show_tag))
+                            if not show_tag:
+                                update_pending_error(pending_norm, result.get('message', 'Not in Sonarr'),
+                                                     increment_retry=False)
+                            break
                         elif status == 'skipped':
                             # User-unmonitored episodes — respect intent, don't
                             # cooldown or error-log (would churn retry_count).
@@ -5222,6 +5332,8 @@ class LibraryScanner:
                 if movie.get('source') == 'wanted':
                     continue
                 norm = _normalize_title(movie['title'])
+                if self._not_in_arr_recent((norm, 'movie')):
+                    continue  # not in Radarr; checked again later
                 route = self._route_for(norm, preferences)
                 direction = {True: 'to-debrid', False: 'to-local', None: 'to-any'}[route]
 
@@ -5286,7 +5398,7 @@ class LibraryScanner:
                     result = movie_client.ensure_and_search(
                         movie['title'], movie_tmdb_id, prefer_debrid=route,
                         respect_monitored=respect_mon,
-                        skip_has_file=route is not True,
+                        skip_has_file=route is not True, add_missing=False,
                     )
                     status = result.get('status', '')
                     if status in ('sent', 'pending'):
@@ -5306,6 +5418,10 @@ class LibraryScanner:
                                            level='warning')
                                 except Exception:
                                     pass
+                    elif status == 'not_in_arr':
+                        self._not_in_arr_mark((norm, 'movie'))
+                        update_pending_error(pending_norm, result.get('message', 'Not in Radarr'),
+                                             increment_retry=False)
                     elif status == 'skipped':
                         # Respect_monitored short-circuit — user intentionally
                         # unmonitored; don't touch pending or retry_count.

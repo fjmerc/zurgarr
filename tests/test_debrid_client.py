@@ -717,6 +717,35 @@ class TestTorBox:
         assert result[0]['id'] == '456'
         assert result[0]['filename'] == 'Test.mkv'
         assert result[0]['hash'] == 'CAFEBABE'
+        assert result[0]['folder'] is None   # no files listed
+
+    @patch('utils.debrid_client.requests.get')
+    def test_list_torrents_folder_is_where_the_files_sit(self, mock_get, tb):
+        # mylist `name` is a display title; the mount folder is the first
+        # part of the files' paths.
+        mock_get.return_value = _mock_response({'success': True, 'data': [
+            {'id': 7, 'name': 'Why Him 2016 COMPLETE BLURAY', 'hash': 'ab', 'download_state': 'completed',
+             'size': 1, 'files': [{'name': 'Why.Him.2016.COMPLETE.BLURAY/BDMV/index.bdmv'}]}]})
+        assert tb.list_torrents()[0]['folder'] == 'Why.Him.2016.COMPLETE.BLURAY'
+
+    def test_tb_folder_tolerates_odd_rows(self):
+        from utils.debrid_client import _tb_folder
+        assert _tb_folder({'files': [{'name': None}]}) is None
+        assert _tb_folder({'files': [{'name': 123}]}) is None
+        assert _tb_folder({'files': [{'name': '/Folder/file.mkv'}]}) == 'Folder'
+        assert _tb_folder({}) is None
+        # A bare root-level file has no folder.
+        assert _tb_folder({'files': [{'name': 'Toy.Story.1995.mkv'}]}) is None
+
+    @patch('utils.debrid_client.requests.get')
+    def test_find_by_title_matches_torbox_folder_when_display_name_differs(self, mock_get, tb):
+        # Display name spells "&" as "and"; the library item came from the folder.
+        mock_get.return_value = _mock_response({'success': True, 'data': [
+            {'id': 9, 'name': 'Fast and Furious 6 2013 1080p', 'hash': 'ab', 'download_state': 'completed',
+             'size': 1, 'files': [{'name': 'Fast & Furious 6 2013 1080p/f.mkv'}]}]})
+        from utils.library import normalize_title
+        hits = tb.find_torrents_by_title(normalize_title('Fast & Furious 6'), target_year=2013)
+        assert [h['id'] for h in hits] == ['9']
 
     @staticmethod
     def _mylist(total, cap=1000, ignore_offset=False, bad_offset=None):

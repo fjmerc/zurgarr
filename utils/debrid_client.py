@@ -122,6 +122,12 @@ class DebridClientBase:
                     break
             parsed_title, parsed_year = parse_folder_name(name)
             normalized = normalize_title(parsed_title)
+            if normalized not in accept and t.get('folder'):
+                # TorBox's display name ("&" spelled "and", long names cut)
+                # can parse differently from its folder, which the library
+                # item was named after.
+                parsed_title, parsed_year = parse_folder_name(t['folder'])
+                normalized = normalize_title(parsed_title)
             if normalized not in accept:
                 continue
             # Year-aware matching: if both sides have a year, they must agree
@@ -133,6 +139,7 @@ class DebridClientBase:
             matches.append({
                 'id': t['id'],
                 'filename': filename,
+                'folder': t.get('folder'),
                 'hash': t.get('hash', ''),
                 'parsed_title': parsed_title,
                 'year': parsed_year,
@@ -695,6 +702,9 @@ class TorBoxClient(DebridClientBase):
             {
                 'id': str(t.get('id', '')),
                 'filename': t.get('name', ''),
+                # ``name`` is TorBox's cleaned-up display title; the folder
+                # on the mount is the first part of the files' paths.
+                'folder': _tb_folder(t),
                 'hash': (t.get('hash') or '').upper(),
                 'status': t.get('download_state', ''),
                 'bytes': t.get('size', 0),
@@ -881,6 +891,18 @@ _SERVICE_CLASSES = {
     'alldebrid': AllDebridClient,
     'torbox': TorBoxClient,
 }
+
+
+def _tb_folder(row):
+    """The mount folder of a TorBox mylist row (first path part of its
+    files), or None when the row lists no files."""
+    files = row.get('files') or []
+    name = files[0].get('name') if files and isinstance(files[0], dict) else None
+    if not isinstance(name, str):
+        return None
+    parts = [p for p in name.split('/') if p]
+    # A bare root-level file has no folder (the scanner skips those too).
+    return parts[0] if len(parts) >= 2 else None
 
 
 def get_debrid_client(service=None, api_key=None):

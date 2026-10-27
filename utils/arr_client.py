@@ -1832,7 +1832,8 @@ class SonarrClient(_ArrClientBase):
         return result
 
     def ensure_and_search(self, title, tmdb_id, season_number, episode_numbers,
-                          prefer_debrid=None, respect_monitored=False, skip_has_file=False):
+                          prefer_debrid=None, respect_monitored=False, skip_has_file=False,
+                          add_missing=True):
         """High-level: ensure series exists in Sonarr, then search for episodes.
 
         Args:
@@ -1848,11 +1849,25 @@ class SonarrClient(_ArrClientBase):
                 for.  Used by gap-fill: an episode with a file isn't missing,
                 and searching it lets Sonarr hunt an upgrade — re-grabbing it
                 every pass when the library can't see the file.
+            add_missing: When False, a series not in Sonarr is not added —
+                returns ``not_in_arr``.  Background scans pass False: what the
+                library found on a debrid is no proof the user wants the show
+                (a same-name show's packs added the wrong series this way).
 
         Returns dict with status info, or raises on failure.
         """
-        # Check if already in Sonarr
-        series = self.find_series_in_library(tmdb_id=tmdb_id, title=title)
+        # Check if already in Sonarr.  Without adding, an unanswered lookup
+        # must not read as "not in Sonarr".
+        try:
+            series = self.find_series_in_library(tmdb_id=tmdb_id, title=title,
+                                                 strict=not add_missing)
+        except ArrUnavailable as e:
+            return {'status': 'error', 'service': 'sonarr', 'message': f'Sonarr unreachable: {e}'}
+        if not series and not add_missing:
+            logger.info(f"[sonarr] {title} is not in Sonarr — not adding it from a background search")
+            return {'status': 'not_in_arr', 'service': 'sonarr',
+                    'message': f'Sonarr has no series matching {title!r} — add it there '
+                               f'(or use Download) to search'}
 
         just_added = False
         if not series:
@@ -2891,7 +2906,7 @@ class RadarrClient(_ArrClientBase):
         return result
 
     def ensure_and_search(self, title, tmdb_id, prefer_debrid=None, respect_monitored=False,
-                          skip_has_file=False):
+                          skip_has_file=False, add_missing=True):
         """High-level: ensure movie exists in Radarr, then trigger search.
 
         Args:
@@ -2904,11 +2919,18 @@ class RadarrClient(_ArrClientBase):
             skip_has_file: When True, don't search a movie Radarr already has a
                 file for (gap-fill: it isn't missing; a search would only hunt
                 an upgrade).  Mirrors the Sonarr flag.
+            add_missing: When False, a movie not in Radarr is not added —
+                returns ``not_in_arr`` (background scans; mirrors Sonarr).
 
         Returns dict with status info.
         """
-        # Check if already in Radarr
-        movie = self.find_movie_in_library(tmdb_id=tmdb_id, title=title)
+        # Check if already in Radarr (an unanswered lookup without adding
+        # must not read as "not in Radarr").
+        try:
+            movie = self.find_movie_in_library(tmdb_id=tmdb_id, title=title,
+                                               strict=not add_missing)
+        except ArrUnavailable as e:
+            return {'status': 'error', 'service': 'radarr', 'message': f'Radarr unreachable: {e}'}
 
         if movie:
             if respect_monitored and not movie.get('monitored'):
@@ -2965,6 +2987,12 @@ class RadarrClient(_ArrClientBase):
                 'message': f'Searching for {title}',
                 'command_id': cmd.get('id'),
             }
+
+        if not add_missing:
+            logger.info(f"[radarr] {title} is not in Radarr — not adding it from a background search")
+            return {'status': 'not_in_arr', 'service': 'radarr',
+                    'message': f'Radarr has no movie matching {title!r} — add it there '
+                               f'(or use Download) to search'}
 
         # Look up and add (addOptions.searchForMovie=True triggers immediate search)
         lookup = self.lookup_movie(title=title, tmdb_id=tmdb_id)
