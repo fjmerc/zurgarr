@@ -199,6 +199,12 @@ def _fmt_user_triggered_rescan(ev, meta):
     return f'{svc} rescan — user-triggered', f'{svc} rescan — user-triggered'
 
 
+def _fmt_missing_file_rescan(ev, meta):
+    svc = meta.get('arr_service', 'arr').capitalize()
+    msg = f"{svc} rescan — its file is gone from the folder"
+    return msg, msg
+
+
 def _fmt_user_triggered_search(ev, meta):
     svc = meta.get('arr_service', 'arr').capitalize()
     return f'{svc} search — user-triggered', f'{svc} search — user-triggered'
@@ -593,6 +599,7 @@ _CAUSE_FORMATTERS = {
     'post_symlink_rescan': _fmt_post_symlink_rescan,
     'post_grab_rescan': _fmt_post_grab_rescan,
     'user_triggered_rescan': _fmt_user_triggered_rescan,
+    'missing_file_rescan': _fmt_missing_file_rescan,
     'user_triggered_search': _fmt_user_triggered_search,
     'routing_audit_retry': _fmt_routing_audit_retry,
     'stale_grab_retry': _fmt_stale_grab_retry,
@@ -757,6 +764,7 @@ FORMATTER_JS = r"""
     post_symlink_rescan: function(ev,m){ return cap(m.arr_service) + ' rescan — new symlink available for import'; },
     post_grab_rescan:   function(ev,m){ return cap(m.arr_service) + ' rescan — new grab dropped'; },
     user_triggered_rescan: function(ev,m){ return cap(m.arr_service) + ' rescan — user-triggered'; },
+    missing_file_rescan: function(ev,m){ return cap(m.arr_service) + ' rescan — its file is gone from the folder'; },
     user_triggered_search: function(ev,m){ return cap(m.arr_service) + ' search — user-triggered'; },
     routing_audit_retry: function(ev,m){ return cap(m.arr_service) + ' search — scheduled routing audit retry' + cycleSuffix(m); },
     stale_grab_retry:   function(ev,m){

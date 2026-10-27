@@ -22,8 +22,19 @@ class TestParseEpisodeNumbers:
     def test_lowercase_and_dotted(self):
         assert parse_episode_numbers('show.s03e10.mkv') == [(3, 10)]
 
-    def test_range_not_increasing_is_single(self):
-        assert parse_episode_numbers('Show S01E05-03.mkv') == [(1, 5)]
+    def test_range_not_increasing_is_unknown(self):
+        assert parse_episode_numbers('Show S01E05-03.mkv') == []
+
+    def test_unrecognised_multi_episode_forms_are_unknown(self):
+        # Fail closed: a name that may claim more episodes than we can read
+        # must never be treated as a duplicate of its first episode.
+        for name in ('Show S01E01-S01E02.mkv', 'Show S01E01.E02.mkv', 'Show S01E01+E02.mkv',
+                     'Show S01E01-E08.mkv', 'Show.S01E01 E02.mkv'):
+            assert parse_episode_numbers(name) == [], name
+
+    def test_episode_title_words_are_not_extra_episodes(self):
+        assert parse_episode_numbers('Show - S01E01 - Episode Eleven.mkv') == [(1, 1)]
+        assert parse_episode_numbers('Show S01E01 1080p E-AC3.mkv') == [(1, 1)]
 
 
 class TestEpisodeIndex:
@@ -914,3 +925,133 @@ class TestReconcileReviewFixes:
         plan = plan_series_duplicates(str(L.lib / 'Show (2020)'), {(1, 1): kept}, L.pairs, 'Show')
         apply_removals(plan, str(tmp_path / 'm.tsv'), str(L.lib), set())
         assert os.path.isfile(sub)
+
+
+# ---------------------------------------------------------------------------
+# Review fixes (bug-hunter 2026-10-27)
+# ---------------------------------------------------------------------------
+
+class TestBugHunterFixes:
+
+    def test_apply_rechecks_kept_copy(self, tmp_path):
+        from utils.library_dedup import apply_removals, plan_series_duplicates
+        L = _Lib(tmp_path)
+        kept = L.link('Show (2020)/Season 01/Show S01E01 A.mkv', 'A/a.mkv')
+        extra = L.link('Show (2020)/Season 01/Show S01E01 B.mkv', 'B/b.mkv')
+        plan = plan_series_duplicates(str(L.lib / 'Show (2020)'), {(1, 1): kept}, L.pairs, 'Show')
+        (L.mount / 'A' / 'a.mkv').unlink()          # kept copy's debrid file gone since planning
+        assert apply_removals(plan, str(tmp_path / 'm.tsv'), str(L.lib), set(), pairs=L.pairs) == []
+        assert os.path.islink(extra)
+
+    def test_apply_rechecks_every_episode_keep(self, tmp_path):
+        from utils.library_dedup import apply_removals, plan_series_duplicates
+        L = _Lib(tmp_path)
+        k1 = L.link('Show (2020)/Season 02/Show S02E18.mkv', 'A/a.mkv')
+        k2 = L.link('Show (2020)/Season 02/Show S02E19.mkv', 'C/c.mkv')
+        extra = L.link('Show (2020)/Season 02/Show.S02E18E19.mkv', 'B/b.mkv')
+        plan = plan_series_duplicates(str(L.lib / 'Show (2020)'), {(2, 18): k1, (2, 19): k2},
+                                      L.pairs, 'Show')
+        (L.mount / 'C' / 'c.mkv').unlink()          # E19's copy no longer plays
+        assert apply_removals(plan, str(tmp_path / 'm.tsv'), str(L.lib), set(), pairs=L.pairs) == []
+        assert os.path.islink(extra)
+
+    def test_sidecar_moved_to_quarantine_and_undone(self, tmp_path):
+        from utils.library_dedup import apply_removals, plan_series_duplicates, undo_manifest
+        L = _Lib(tmp_path)
+        kept = L.link('Show (2020)/Season 01/Show S01E01 A.mkv', 'A/a.mkv')
+        extra = L.link('Show (2020)/Season 01/Show S01E01 B.mkv', 'B/b.mkv')
+        sub = L.file('Show (2020)/Season 01/Show S01E01 B.en.srt')
+        with open(sub, 'w') as f:
+            f.write('1\n00:00 --> 00:01\nhi\n')
+        plan = plan_series_duplicates(str(L.lib / 'Show (2020)'), {(1, 1): kept}, L.pairs, 'Show')
+        manifest = str(tmp_path / 'cfg' / 'm.tsv')
+        os.makedirs(os.path.dirname(manifest))
+        apply_removals(plan, manifest, str(L.lib), set(), pairs=L.pairs)
+        assert not os.path.exists(sub)
+        undo_manifest(manifest)
+        assert open(sub).read().endswith('hi\n') and os.path.islink(extra)
+
+    def test_undo_continues_past_a_bad_row(self, tmp_path):
+        from utils.library_dedup import apply_removals, Removal, undo_manifest
+        L = _Lib(tmp_path)
+        p1 = L.link('A/x.mkv', 'A/a.mkv')
+        p2 = L.link('B/y.mkv', 'B/b.mkv')
+        rs = [Removal(p1, '/mnt/debrid_torbox/A/a.mkv', 'movie', 'foreign-folder', '', 'A'),
+              Removal(p2, '/mnt/debrid_torbox/B/b.mkv', 'movie', 'foreign-folder', '', 'B')]
+        manifest = str(tmp_path / 'm.tsv')
+        apply_removals(rs, manifest, str(L.lib), set())
+        (L.lib / 'A').write_text('a file where the folder was')   # blocks restoring p1
+        assert undo_manifest(manifest) == 1
+        assert os.path.islink(p2)
+
+    def test_resolve_rejects_dotdot_escape(self, tmp_path):
+        from utils.library_dedup import resolve_link_target
+        L = _Lib(tmp_path)
+        link = tmp_path / 'l.mkv'
+        os.symlink('/mnt/debrid_torbox/../../etc/passwd', link)
+        assert resolve_link_target(str(link), L.pairs) is None
+
+    def test_episode_index_io_error_is_unknown(self, tmp_path, monkeypatch):
+        import errno
+        from utils import library_dedup
+        real = os.scandir
+
+        def flaky(path):
+            if str(path).endswith('Show (2020)'):
+                raise OSError(errno.ESTALE, 'stale NFS handle')
+            return real(path)
+        monkeypatch.setattr(library_dedup.os, 'scandir', flaky)
+        assert library_dedup.episode_index(str(tmp_path / 'Show (2020)')) is None
+
+    def test_plan_arr_tv_skips_series_with_unreadable_folder(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+        from utils import library_dedup
+        monkeypatch.setattr(library_dedup, 'episode_index', lambda d: None)
+        c = MagicMock()
+        c.get_all_series.return_value = [{'id': 1, 'title': 'S', 'path': '/t/S (2020)'}]
+        removals, _p = library_dedup.plan_arr_tv(c, str(tmp_path), [])
+        assert removals == [] and not c.get_episodes.called
+
+    def test_partly_removed_stacked_version_not_deleted(self, tmp_path):
+        from utils import library_dedup
+        from utils.library_dedup import Removal
+        from utils.plex_versions import MediaRef
+        L = _Lib(tmp_path)
+        keep = L.link('Film (2020)/Film (2020).mkv', 'A/a.mkv')
+        gone = str(L.lib / 'Film (2020)' / 'Film cd1.mkv')
+        r = Removal(gone, '/mnt/debrid_torbox/B/b.mkv', 'movie', 'arr-folder-untracked', keep, 'Film')
+        plex = FakePlex({'10': [('1', 'Film (2020)/Film (2020).mkv', True)]})
+        plex.added['10'] = 100
+        stacked = MediaRef('2', ['Film (2020)/Film cd1.mkv', 'Film (2020)/Film cd2.mkv'], False)
+        real = plex.media_status
+        plex.media_status = lambda rk: real(rk) + [stacked]
+        from utils.plex_versions import PartRef
+        snap = {'Film (2020)/Film cd1.mkv': PartRef('10', '2', 'Film (2020)/Film cd1.mkv', 100, '1')}
+        library_dedup.reconcile_plex(plex, 'movie', [r], snap, str(L.lib), touch=False)
+        assert plex.deleted == []
+
+    def test_same_target_waits_for_kept_path_before_deleting(self, tmp_path, monkeypatch):
+        from utils import library_dedup
+        from utils.library_dedup import Removal
+        L = _Lib(tmp_path)
+        keep = L.link('Show (2020)/Season 01/Show (2020) - S01E01.mkv', 'A/a.mkv')
+        gone = str(L.lib / 'Show (2020)' / 'Season 01' / 'Show.S01E01.mkv')
+        r = Removal(gone, '/mnt/debrid_torbox/A/a.mkv', 'tv', 'arr-folder-untracked', keep, 'Show')
+        # Plex holds the shared file under the removed path, plus a third copy.
+        plex = FakePlex({'10': [('2', 'Show (2020)/Season 01/Show.S01E01.mkv', False),
+                                ('3', 'Show (2020)/Season 01/Show other.mkv', True)]})
+        touched = []
+        monkeypatch.setattr(library_dedup, '_touch_dir', lambda p: touched.append(p))
+        snap = library_dedup.snapshot_plex(plex, 'tv', {'Show (2020)/Season 01/Show.S01E01.mkv'})
+        out = library_dedup.reconcile_plex(plex, 'tv', [r], snap, str(L.lib), touch=True)
+        assert touched                       # kept folder bumped so Plex rescans it
+        assert plex.deleted == [] and out['stranded'] == ['10']
+
+    def test_snapshot_drops_path_on_two_items_in_one_section(self):
+        from utils import library_dedup
+        from utils.plex_versions import PartRef
+
+        class P:
+            def list_parts(self, media_type):
+                return [PartRef('1', 'a', 'X/x.mkv', 0, '1'), PartRef('2', 'b', 'X/x.mkv', 0, '1')]
+        assert library_dedup.snapshot_plex(P(), 'movie', {'X/x.mkv'}) == {}

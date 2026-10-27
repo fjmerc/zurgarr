@@ -239,8 +239,9 @@ def _rename_setup(tmp_path, moved=True):
         if moved:
             state['path'] = '/d/movies/Chinatown (1974)'
             os.rename(L.movies / 'Chinatown ITA (1974)', L.movies / 'Chinatown (1974)')
+        return {}
     radarr.move_movies.side_effect = move
-    radarr.set_movie_path.side_effect = lambda m, p: None
+    radarr.set_movie_path.side_effect = lambda m, p: {}
 
     plex = FakePlex([PartRef('100', '1', 'Chinatown (1974)/Chinatown 1974.mkv', 5, '1'),
                      PartRef('200', '2', 'Chinatown ITA (1974)/Chinatown.mkv', 9, '1')])
@@ -287,6 +288,7 @@ def test_radarr_rename_falls_back_when_editor_noop(tmp_path):
     def set_path(movie, new_path):
         radarr.get_movie.side_effect = lambda mid, strict=False: dict(movie, path=new_path)
         os.rename(L.movies / 'Chinatown ITA (1974)', L.movies / 'Chinatown (1974)')
+        return {}
     radarr.set_movie_path.side_effect = set_path
     rc = dedup.main(['radarr-rename', '--ids', '5', '--plan', out], ctx=ctx)
     assert rc == 0
@@ -354,3 +356,62 @@ def test_plex_check_counts_multi_version_items(tmp_path, capsys):
                      PartRef('2', 'c', 'z', 0, '2')])
     dedup.main(['plex-check'], ctx=_ctx(L, plex=plex))
     assert 'show: 1 item(s) with more than one version' in capsys.readouterr().out
+
+
+def test_radarr_rename_stops_when_move_request_fails(tmp_path):
+    L, radarr, plex, ctx, out, extra = _rename_setup(tmp_path)
+    radarr.move_movies.side_effect = lambda ids, root: None     # HTTP failure
+    radarr.set_movie_path.side_effect = lambda m, p: None
+    assert dedup.main(['radarr-rename', '--ids', '5', '--plan', out], ctx=ctx) == 2
+    assert os.path.islink(extra)          # removed link put back
+
+
+def test_radarr_rename_skips_rows_no_longer_deferred(tmp_path):
+    L, radarr, plex, ctx, out, extra = _rename_setup(tmp_path)
+    os.unlink(extra)
+    os.symlink('/mnt/debrid_torbox/Z/z.mkv', extra)      # re-pointed since the plan
+    (L.mount / 'Z').mkdir()
+    (L.mount / 'Z' / 'z.mkv').write_text('')
+    dedup.main(['radarr-rename', '--ids', '5', '--plan', out], ctx=ctx)
+    assert os.readlink(extra) == '/mnt/debrid_torbox/Z/z.mkv'
+
+
+def test_plan_refuses_empty_arr_library(tmp_path):
+    L = Lib(tmp_path)
+    L.link(L.movies, 'Film (2020)/Film.mkv', 'A/a.mkv')
+    out = str(tmp_path / 'plan.tsv')
+    with pytest.raises(RuntimeError):
+        dedup.main(['plan', '--kind', 'movie', '--out', out], ctx=_ctx(L, radarr=_radarr([])))
+
+
+def test_radarr_rename_skips_rows_live_plan_no_longer_lists(tmp_path):
+    L, radarr, plex, ctx, out, extra = _rename_setup(tmp_path)
+    (L.movies / 'Chinatown (1974)' / 'real copy.mkv').write_text('')   # now a real file there
+    dedup.main(['radarr-rename', '--ids', '5', '--plan', out], ctx=ctx)
+    assert os.path.islink(extra)
+    manifests = [n for n in os.listdir(tmp_path) if n.startswith('dedup_manifest_')]
+    assert all(extra not in open(tmp_path / n).read() for n in manifests)   # never touched
+
+
+def test_radarr_rename_failed_move_does_not_poll(tmp_path):
+    L, radarr, plex, ctx, out, extra = _rename_setup(tmp_path)
+    radarr.move_movies.side_effect = lambda ids, root: None
+    radarr.set_movie_path.side_effect = lambda m, p: None
+    dedup.main(['radarr-rename', '--ids', '5', '--plan', out], ctx=ctx)
+    assert radarr.get_movie.call_count == 1
+
+
+def test_apply_rechecks_kept_copy_during_run(tmp_path, monkeypatch):
+    L, sonarr, kept, extra = _show_setup(tmp_path)
+    out = str(tmp_path / 'plan.tsv')
+    ctx = _ctx(L, sonarr=sonarr, tmp_path=tmp_path)
+    dedup.main(['plan', '--kind', 'tv', '--out', out], ctx=ctx)
+    real = dedup.build_plan
+
+    def plan_then_break(*a, **k):
+        result = real(*a, **k)
+        (L.mount / 'A' / 'a.mkv').unlink()      # kept copy stops playing mid-run
+        return result
+    monkeypatch.setattr(dedup, 'build_plan', plan_then_break)
+    dedup.main(['apply', '--no-plex', '--plan', out, '--kind', 'tv'], ctx=ctx)
+    assert os.path.islink(extra)

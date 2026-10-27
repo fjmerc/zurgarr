@@ -1286,3 +1286,58 @@ class TestRadarrAuthorityGates:
         scanner, local_movies, movies = _movie_fixture(tmp_dir, monkeypatch)
         _run_movie(scanner, None, movies, svc_exc=RuntimeError('config broken'))
         assert os.listdir(local_movies) == []
+
+
+@pytest.mark.usefixtures('_fresh_arr_caches')
+class TestArrFileMissingFromFolder:
+    """Sonarr/Radarr still list a file the folder no longer holds (its link
+    was cleaned up): ask for a rescan so the arr notices, instead of
+    waiting for its own periodic disk scan."""
+
+    def test_sonarr_has_file_but_folder_empty_triggers_rescan_once(self, tmp_dir, monkeypatch):
+        scanner, local_tv, shows, pidx = _show_fixture(tmp_dir, monkeypatch)
+        client = _sonarr(_SERIES, episodes=[{'seasonNumber': 1, 'episodeNumber': 1, 'hasFile': True}])
+        _run_show(scanner, client, shows, pidx)
+        _run_show(scanner, client, shows, pidx)
+        assert client.rescan_series.call_count == 1
+        assert client.rescan_series.call_args[0][0] == 7
+        assert client.rescan_series.call_args.kwargs['cause'] == 'missing_file_rescan'
+        assert not os.path.lexists(os.path.join(local_tv, 'Show (2025)', 'Season 01',
+                                                'Show.S01E01.1080p.mkv'))
+
+    def test_sonarr_has_file_and_folder_has_copy_no_rescan(self, tmp_dir, monkeypatch):
+        scanner, local_tv, shows, pidx = _show_fixture(tmp_dir, monkeypatch)
+        season = os.path.join(local_tv, 'Show (2025)', 'Season 01')
+        os.makedirs(season)
+        os.symlink('/mnt/debrid/x.mkv', os.path.join(season, 'Show (2025) - S01E01.mkv'))
+        client = _sonarr(_SERIES, episodes=[{'seasonNumber': 1, 'episodeNumber': 1, 'hasFile': True}])
+        _run_show(scanner, client, shows, pidx)
+        assert not client.rescan_series.called
+
+    def test_radarr_has_file_but_folder_empty_triggers_rescan(self, tmp_dir, monkeypatch):
+        scanner, local_movies, movies = _movie_fixture(tmp_dir, monkeypatch)
+        client = _radarr(_film(True))
+        _run_movie(scanner, client, movies)
+        assert client.rescan_movie.call_count == 1
+        assert client.rescan_movie.call_args[0][0] == 3
+        assert os.listdir(local_movies) == []
+
+    def test_unreadable_series_folder_skips_show(self, tmp_dir, monkeypatch):
+        scanner, local_tv, shows, pidx = _show_fixture(tmp_dir, monkeypatch)
+        monkeypatch.setattr('utils.library_dedup.episode_index', lambda d: None)
+        client = _sonarr(_SERIES, episodes=[{'seasonNumber': 1, 'episodeNumber': 1, 'hasFile': False}])
+        _run_show(scanner, client, shows, pidx)
+        assert os.listdir(local_tv) == []
+
+
+def test_dir_has_media_name_io_error_counts_as_present(tmp_path, monkeypatch):
+    import errno
+
+    def stale(path):
+        raise OSError(errno.ESTALE, 'stale NFS handle')
+    monkeypatch.setattr(library.os, 'scandir', stale)
+    assert library._dir_has_media_name(str(tmp_path)) is True
+
+
+def test_dir_has_media_name_missing_dir_is_empty(tmp_path):
+    assert library._dir_has_media_name(str(tmp_path / 'nope')) is False

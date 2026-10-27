@@ -388,8 +388,10 @@ Fix: zurgarr now links an episode or movie only when Sonarr/Radarr say it
 has no file and the folder holds no copy, and never for a title the arr
 doesn't have. To clear duplicates that already exist, set
 `LIBRARY_DUPLICATE_TIDY=true`: every 6 hours it removes debrid links that
-duplicate the copy the arr tracks (only symlinks, only when the kept copy
-plays) and removes the leftover version in Plex. Every removal is written
+duplicate the copy the arr tracks (only symlinks at least 15 minutes old,
+only when the kept copy plays, never while Plex can't be read) and removes
+the leftover version in Plex; a removed link's subtitle file is moved aside,
+not deleted. Every removal is written
 to `/config/duplicate_tidy_manifest.tsv`; `scripts/dedup_library.py undo
 --manifest <file>` puts them back. Copies in folders the arr doesn't own
 are handled by the one-time `scripts/dedup_library.py` clean-up (preview

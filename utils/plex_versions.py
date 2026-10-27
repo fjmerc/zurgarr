@@ -186,7 +186,7 @@ class PlexLibrary:
     def media_deletion_allowed(self):
         for s in self._request('GET', '/:/prefs').get('MediaContainer', {}).get('Setting', []):
             if s.get('id') == 'allowMediaDeletion':
-                return bool(s.get('value'))
+                return str(s.get('value')).strip().lower() in ('1', 'true')
         return False
 
 

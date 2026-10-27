@@ -1629,14 +1629,18 @@ def _dir_has_media_name(path):
 
     Unlike ``LibraryScanner._has_media_files`` a broken link counts: it is
     the arr's copy during a mount outage, and linking beside it would make a
-    duplicate once the mount returns.  A missing directory holds nothing.
+    duplicate once the mount returns.  A missing directory holds nothing; a
+    folder that can't be read (stale NFS handle, I/O error) counts as
+    holding media — unknown must never mean "safe to link".
     """
     try:
         with os.scandir(path) as it:
             return any(os.path.splitext(e.name)[1].lower() in MEDIA_EXTENSIONS
                        and not e.is_dir(follow_symlinks=False) for e in it)
-    except OSError:
+    except FileNotFoundError:
         return False
+    except OSError:
+        return True
 
 
 def _sonarr_episode_has_file(client, series_id, cache):
@@ -7351,6 +7355,38 @@ class LibraryScanner:
             except Exception as exc:
                 logger.debug("[library] Failed to log cleanup event: %s", exc)
 
+    _MISSING_FILE_RESCAN_INTERVAL = 24 * 3600
+
+    def _rescan_for_missing_file(self, kind, arr_info, title):
+        """Sonarr/Radarr list a file for an episode/movie whose folder holds
+        no copy — typically the link was removed after its debrid torrent
+        went away.  Linking a replacement is held back while the arr still
+        counts the file (it could be a copy under a name we can't parse), so
+        ask the arr to rescan: it then drops the record and the next scan
+        links the debrid copy.  At most once a day per title."""
+        stamps = getattr(self, '_missing_file_rescans', None)
+        if stamps is None:
+            stamps = self._missing_file_rescans = {}
+        key = (kind, arr_info.get('id'))
+        now = time.monotonic()
+        if now - stamps.get(key, -self._MISSING_FILE_RESCAN_INTERVAL) < \
+                self._MISSING_FILE_RESCAN_INTERVAL:
+            return
+        stamps[key] = now
+        from utils.history import CAUSE_MISSING_FILE_RESCAN
+        client = arr_info.get('client')
+        try:
+            if kind == 'show':
+                client.rescan_series(arr_info['id'], media_title=title,
+                                     cause=CAUSE_MISSING_FILE_RESCAN)
+            else:
+                client.rescan_movie(arr_info['id'], media_title=title,
+                                    cause=CAUSE_MISSING_FILE_RESCAN)
+            logger.info("[library] %r: %s lists a file its folder doesn't hold — rescan "
+                        "requested", title, 'Sonarr' if kind == 'show' else 'Radarr')
+        except Exception as e:
+            logger.warning("[library] Rescan request for %r failed: %s", title, e)
+
     def _create_debrid_symlinks(self, shows, movies, path_index):
         """Create local library symlinks for debrid-only content.
 
@@ -7617,6 +7653,11 @@ class LibraryScanner:
                 if arr_info and arr_info['folder']:
                     movie_dir = arr_info['folder']
                     if arr_info.get('has_file'):
+                        # Radarr lists a file; if the folder has none (its
+                        # link was cleaned up) ask Radarr to notice.
+                        if not _dir_has_media_name(
+                                os.path.join(self._local_movies_path, movie_dir)):
+                            self._rescan_for_missing_file('movie', arr_info, title)
                         continue
                 elif radarr_configured:
                     unmatched_movies += 1
@@ -7762,7 +7803,12 @@ class LibraryScanner:
                 # Sonarr import, or a link broken by a mount outage) and
                 # episodes Sonarr holds a file for are never linked again.
                 present = episode_index(os.path.join(self._local_tv_path, show_dir))
+                if present is None:
+                    logger.info("[library] Not linking %r this scan — its folder can't be read",
+                                title)
+                    continue
                 has_file = {}
+                missing_tracked = False
                 if arr_info:
                     has_file = _sonarr_episode_has_file(
                         arr_info['client'], arr_info['id'], episode_file_cache)
@@ -7778,7 +7824,10 @@ class LibraryScanner:
                         if ep.get('source') != 'debrid':
                             continue
                         enum = ep['number']
-                        if (snum, enum) in present or has_file.get((snum, enum)):
+                        if (snum, enum) in present:
+                            continue
+                        if has_file.get((snum, enum)):
+                            missing_tracked = True   # Sonarr lists a file the folder lacks
                             continue
                         raw_path = path_index.get((norm, snum, enum))
                         if not raw_path:
@@ -7880,6 +7929,8 @@ class LibraryScanner:
                                 "[library] Failed to create symlink for %r S%02dE%02d: %s",
                                 title, snum, enum, e
                             )
+                if missing_tracked:
+                    self._rescan_for_missing_file('show', arr_info, title)
             if unmatched_shows:
                 logger.info("[library] Skipped linking %d show(s) Sonarr doesn't have",
                             unmatched_shows)

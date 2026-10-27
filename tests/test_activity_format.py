@@ -306,6 +306,13 @@ def test_duplicate_link_removed_mirrored_in_js():
     assert 'duplicate_link_removed:' in FORMATTER_JS
 
 
+def test_missing_file_rescan_names_arr():
+    ev = _ev('missing_file_rescan', arr_service='sonarr')
+    assert format_event(ev)['short'] == 'Sonarr rescan — its file is gone from the folder'
+    from utils.activity_format import FORMATTER_JS
+    assert 'missing_file_rescan:' in FORMATTER_JS
+
+
 def test_terminal_error_shows_status():
     ev = _ev('terminal_error', provider='realdebrid', status='magnet_error')
     assert 'Failed on realdebrid: magnet_error' == format_event(ev)['short']

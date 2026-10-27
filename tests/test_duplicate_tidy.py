@@ -24,6 +24,15 @@ def env(tmp_path, monkeypatch):
     return tmp_path
 
 
+def _playable_keep(env, path):
+    """A kept copy that plays: a link into the fake debrid mount."""
+    (env / 'mount' / 'K').mkdir(exist_ok=True)
+    (env / 'mount' / 'K' / 'k.mkv').write_text('')
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.symlink('/mnt/debrid/K/k.mkv', path)
+    return str(path)
+
+
 def _svc(sonarr=None, radarr=None):
     def get(media_type):
         if media_type == 'show':
@@ -51,7 +60,7 @@ def test_tidy_removes_planned_and_logs_event(env):
     link = env / 'tv' / 'Show (2020)' / 'Season 01' / 'Show.S01E01.mkv'
     link.parent.mkdir(parents=True)
     os.symlink('/mnt/debrid/B/b.mkv', link)
-    keep = str(env / 'tv' / 'Show (2020)' / 'Season 01' / 'Show (2020) - S01E01.mkv')
+    keep = _playable_keep(env, env / 'tv' / 'Show (2020)' / 'Season 01' / 'Show (2020) - S01E01.mkv')
     r = Removal(str(link), '/mnt/debrid/B/b.mkv', 'tv', 'arr-folder-untracked', keep, 'Show')
     sonarr = MagicMock()
     with patch('utils.arr_client.get_download_service', _svc(sonarr=sonarr)), \
@@ -84,7 +93,7 @@ def test_tidy_reconciles_plex_with_touch(env, monkeypatch):
     link.parent.mkdir(parents=True)
     os.symlink('/mnt/debrid/B/b.mkv', link)
     r = Removal(str(link), '/mnt/debrid/B/b.mkv', 'movie', 'arr-folder-untracked',
-                str(link.parent / 'Film (2020).mkv'), 'Film')
+                _playable_keep(env, link.parent / 'Film (2020).mkv'), 'Film')
     from utils.plex_versions import PartRef
     plex = MagicMock()
     monkeypatch.setattr('utils.plex_versions.PlexLibrary.from_env', classmethod(lambda cls: plex))
@@ -110,7 +119,7 @@ def _movie_removal(env):
     link = env / 'movies' / 'Film (2020)' / 'Film.mkv'
     link.parent.mkdir(parents=True, exist_ok=True)
     os.symlink('/mnt/debrid/B/b.mkv', link)
-    keep = str(link.parent / 'Film (2020).mkv')
+    keep = _playable_keep(env, link.parent / 'Film (2020).mkv')
     return link, Removal(str(link), '/mnt/debrid/B/b.mkv', 'movie', 'arr-folder-untracked', keep, 'Film')
 
 
@@ -170,3 +179,38 @@ def test_tidy_retries_unfinished_plex_items_next_run(env, monkeypatch):
         _run_movies(env, monkeypatch, plex, r)
     assert ['1'] in seen
     assert json.load(open(env / 'pending.json')).get('movie', []) == []
+
+
+def test_tidy_ignores_non_arr_download_service(env, monkeypatch):
+    def svc(media_type):
+        return MagicMock(), 'overseerr'
+    with patch('utils.arr_client.get_download_service', svc), \
+         patch('utils.library_dedup.plan_arr_tv') as pt, \
+         patch('utils.library_dedup.plan_arr_movies') as pm:
+        scheduled_tasks.library_duplicate_tidy()
+    assert not pt.called and not pm.called
+
+
+def test_tidy_uses_only_mounts_that_answered(env, monkeypatch, tmp_path):
+    dead = str(tmp_path / 'dead-mount')
+    monkeypatch.setattr('utils.library_dedup.target_mount_pairs',
+                        lambda: [('/mnt/debrid/', str(env / 'mount')),
+                                 ('/mnt/debrid_torbox/', dead)])
+    seen = []
+    with patch('utils.arr_client.get_download_service', _svc(radarr=MagicMock())), \
+         patch('utils.library_dedup.plan_arr_movies',
+               side_effect=lambda c, root, pairs: seen.append(pairs) or ([], set())):
+        scheduled_tasks.library_duplicate_tidy()
+    assert seen == [[('/mnt/debrid/', str(env / 'mount'))]]
+
+
+def test_tidy_rechecks_kept_copy_at_apply(env, monkeypatch):
+    link, r = _movie_removal(env)
+    calls = []
+    with patch('utils.arr_client.get_download_service', _svc(radarr=MagicMock())), \
+         patch('utils.library_dedup.plan_arr_movies', return_value=([r], set())), \
+         patch('utils.library_dedup.apply_removals',
+               side_effect=lambda *a, **k: calls.append(k) or []), \
+         patch('utils.scheduled_tasks._DUPLICATE_TIDY_MANIFEST', str(env / 'm.tsv')):
+        scheduled_tasks.library_duplicate_tidy()
+    assert calls and calls[0].get('pairs')

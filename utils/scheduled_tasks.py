@@ -799,14 +799,16 @@ def library_duplicate_tidy():
     from utils.arr_client import get_download_service
     from utils.plex_versions import PlexLibrary
 
-    pairs = library_dedup.target_mount_pairs()
-    live = False
-    for _prefix, mount in pairs:
+    # Only mounts that answer: a stalled FUSE mount would hang the
+    # existence checks; links on it are then neither removed nor kept.
+    pairs = []
+    for prefix, mount in library_dedup.target_mount_pairs():
         try:
-            live = live or bool(_listdir_with_timeout(mount, 15))
+            if _listdir_with_timeout(mount, 15):
+                pairs.append((prefix, mount))
         except (OSError, TimeoutError):
             continue
-    if not live:
+    if not pairs:
         logger.warning("[dedup] Duplicate tidy skipped — no debrid mount is readable")
         return {'status': 'skipped', 'message': 'No debrid mount readable'}
 
@@ -825,7 +827,7 @@ def library_duplicate_tidy():
             _tidy_plex_warnings(result)
             retry = _retry_list(pending[kind], result)
         client, svc = get_download_service(media_type)
-        if client:
+        if client and svc in ('sonarr', 'radarr'):
             total += _tidy_kind(library_dedup, plex, kind, root, client, svc, planner,
                                 pairs, retry)
         if plex:
@@ -864,7 +866,8 @@ def _tidy_kind(library_dedup, plex, kind, root, client, svc, planner, pairs, ret
             logger.warning("[dedup] Not removing %r duplicates — the kept copy is a separate "
                            "Plex item (use scripts/dedup_library.py radarr-rename / merge)", title)
         removals = [r for r in removals if (r.kind, r.title) not in split]
-    done = library_dedup.apply_removals(removals, _DUPLICATE_TIDY_MANIFEST, root, protected)
+    done = library_dedup.apply_removals(removals, _DUPLICATE_TIDY_MANIFEST, root, protected,
+                                        pairs=pairs)
     _log_duplicate_removals(done, kind)
     if plex and done:
         items = library_dedup.plex_items(done, snapshot, root)

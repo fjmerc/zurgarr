@@ -146,3 +146,11 @@ def test_http_failure_raises_plex_error():
 def test_from_env_none_when_unconfigured():
     with patch('utils.plex_versions._config', return_value=(None, None)):
         assert PlexLibrary.from_env() is None
+
+
+def test_media_deletion_allowed_parses_string_values():
+    for value, expected in (('0', False), ('false', False), ('1', True), (True, True), (0, False)):
+        prefs = {'MediaContainer': {'Setting': [{'id': 'allowMediaDeletion', 'value': value}]}}
+        plex, fake = _client({('GET', '/:/prefs'): prefs})
+        with patch('urllib.request.urlopen', fake):
+            assert plex.media_deletion_allowed() is expected, value

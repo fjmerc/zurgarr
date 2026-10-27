@@ -99,6 +99,9 @@ def _kinds(arg):
 
 def _plan_tv(ctx):
     series = ctx.sonarr.get_all_series(strict=True) or []
+    if not series:
+        raise RuntimeError('Sonarr returned no series — refusing to plan (an empty answer '
+                           'would make every folder look foreign)')
     by_id = {s['id']: s for s in series}
     removals, protected = dd.plan_arr_tv(ctx.sonarr, ctx.local_tv, ctx.pairs)
     owned = {os.path.basename(s['path']) for s in series if s.get('path')}
@@ -117,6 +120,10 @@ def _plan_tv(ctx):
             continue
         local_dir = os.path.join(ctx.local_tv, os.path.basename(s['path']))
         index = dd.episode_index(local_dir)
+        if index is None:
+            report.append({'kind': 'tv', 'folder': os.path.basename(local_dir),
+                           'rule': 'arr-error', 'detail': "folder can't be read"})
+            continue
         if not index:
             continue
         try:
@@ -136,6 +143,9 @@ def _plan_tv(ctx):
 
 def _plan_movies(ctx):
     movies = ctx.radarr.get_all_movies(strict=True) or []
+    if not movies:
+        raise RuntimeError('Radarr returned no movies — refusing to plan (an empty answer '
+                           'would make every folder look foreign)')
     by_id = {m['id']: m for m in movies}
     removals, protected = dd.plan_arr_movies(ctx.radarr, ctx.local_movies, ctx.pairs)
     owned = {os.path.basename(m['path']) for m in movies if m.get('path')}
@@ -228,7 +238,7 @@ def _manifest_path(ctx):
 
 def _apply_group(ctx, kind, group, manifest, protected, snapshot):
     root = ctx.local_tv if kind == 'tv' else ctx.local_movies
-    done = dd.apply_removals(group, manifest, root, protected)
+    done = dd.apply_removals(group, manifest, root, protected, pairs=ctx.pairs)
     result = {}
     if ctx.plex and done:
         result = dd.reconcile_plex(ctx.plex, kind, done, snapshot, root, touch=True)
@@ -341,10 +351,13 @@ def _rename_one(ctx, movie_id, plan_rows, manifest):
     old_path = movie['path']
     old_folder = os.path.basename(old_path)
     root = movie.get('rootFolderPath') or os.path.dirname(old_path)
+    # Only rows today's plan still lists (the plan file may be days old).
+    live_rows, _r, _p = build_plan(ctx, ('movie',))
+    live = {(r['path'], r['target']) for r in live_rows if r['action'] in ('defer', 'remove')}
     deferred = [Removal(r['path'], r['target'], r['kind'], r['detail'] or 'foreign-folder',
                         r['keep'], r['title'])
                 for r in plan_rows
-                if r['action'] == 'defer' and r['keep']
+                if r['action'] == 'defer' and r['keep'] and (r['path'], r['target']) in live
                 and os.path.basename(os.path.dirname(r['keep'])) == old_folder]
 
     # The Plex item that carries the restored date added: the one holding
@@ -359,14 +372,16 @@ def _rename_one(ctx, movie_id, plan_rows, manifest):
                 for r in deferred if dd.rel_to_root(r.path, ctx.local_movies) in by_rel}
 
     done = dd.apply_removals(deferred, manifest, ctx.local_movies,
-                             {os.path.realpath(os.path.join(ctx.local_movies, old_folder))})
+                             {os.path.realpath(os.path.join(ctx.local_movies, old_folder))},
+                             pairs=ctx.pairs)
     try:
-        ctx.radarr.move_movies([movie_id], root)
-        moved = _wait_path_change(ctx, movie_id, old_path)
+        moved = None
+        if ctx.radarr.move_movies([movie_id], root) is not None:
+            moved = _wait_path_change(ctx, movie_id, old_path)
         if moved is None:
             target = os.path.join(root, expected_folder(movie))
-            if os.path.basename(target) != old_folder:
-                ctx.radarr.set_movie_path(movie, target)
+            if (os.path.basename(target) != old_folder
+                    and ctx.radarr.set_movie_path(movie, target) is not None):
                 moved = _wait_path_change(ctx, movie_id, old_path)
     except Exception as e:
         print(f'STOPPED: Radarr error renaming {old_folder!r}: {e}')

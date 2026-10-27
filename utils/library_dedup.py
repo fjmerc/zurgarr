@@ -13,6 +13,7 @@ and the one-time clean-up script (``scripts/dedup_library.py``).
 import csv
 import os
 import re
+import shutil
 import time
 from dataclasses import dataclass
 
@@ -26,6 +27,10 @@ _EPISODE_RE = re.compile(
     r'(?<![A-Za-z0-9])S(\d{1,2})E(\d{1,3})((?:E\d{1,3})+|-E?\d{1,3}(?!\d))?',
     re.IGNORECASE)
 _EXTRA_EP_RE = re.compile(r'E(\d{1,3})', re.IGNORECASE)
+# Another episode number right after the first group in a form we don't
+# parse ("S01E01-S01E02", "S01E01.E02", "S01E01+E02"): the name may claim
+# more episodes than we can read, so it is treated as unknown.
+_MORE_EPISODES_RE = re.compile(r'[\s._+-]*(?:S\d{1,2})?E\d{1,3}(?!\d)', re.IGNORECASE)
 # A range tail only counts when it moves forward by at most this many
 # episodes — "S01E01 1080p-264" style tails must never read as a range.
 _MAX_RANGE_SPAN = 5
@@ -39,7 +44,10 @@ def parse_episode_numbers(filename):
     """Return every ``(season, episode)`` a filename claims, in order.
 
     Handles multi-episode forms (``S02E18E19``, ``S01E01-E02``,
-    ``S01E01-02``).  Only the first SxxEyy group in the name is used.
+    ``S01E01-02``).  A name that may claim more episodes than these forms
+    express (a backwards or very long range, "S01E01.E02", "S01E01-S01E02")
+    returns ``[]`` — unknown, so it is never treated as a duplicate of only
+    its first episode.
     """
     m = _EPISODE_RE.search(filename)
     if not m:
@@ -51,10 +59,13 @@ def parse_episode_numbers(filename):
     if tail:
         if tail.startswith('-'):
             last = int(tail.lstrip('-').lstrip('Ee'))
-            if 0 < last - first <= _MAX_RANGE_SPAN:
-                episodes.extend(range(first + 1, last + 1))
+            if not 0 < last - first <= _MAX_RANGE_SPAN:
+                return []
+            episodes.extend(range(first + 1, last + 1))
         else:
             episodes.extend(int(e) for e in _EXTRA_EP_RE.findall(tail))
+    if _MORE_EPISODES_RE.match(filename, m.end()):
+        return []
     return [(season, e) for e in episodes]
 
 
@@ -69,7 +80,9 @@ def episode_index(series_dir):
     Scans the series dir and its direct subdirectories (season folders).
     Uses directory entries only, never ``exists`` — a broken symlink still
     counts as present (after a mount outage the arr's links are broken but
-    the episode is not missing).  A missing *series_dir* yields ``{}``.
+    the episode is not missing).  A missing *series_dir* yields ``{}``; any
+    other read error (stale NFS handle, I/O error) yields ``None`` — unknown,
+    callers must not act on it.
     """
     index = {}
     dirs = [series_dir]
@@ -78,15 +91,19 @@ def episode_index(series_dir):
             for entry in it:
                 if entry.is_dir(follow_symlinks=False):
                     dirs.append(entry.path)
-    except OSError:
+    except FileNotFoundError:
         return index
+    except OSError:
+        return None
     for d in dirs:
         try:
             with os.scandir(d) as it:
                 names = [(e.name, e.path) for e in it
                          if not e.is_dir(follow_symlinks=False)]
-        except OSError:
+        except FileNotFoundError:
             continue
+        except OSError:
+            return None
         for name, path in names:
             if not _is_media_name(name):
                 continue
@@ -135,7 +152,10 @@ def resolve_link_target(link_path, pairs):
         return None
     for prefix, mount in pairs:
         if target.startswith(prefix):
-            return os.path.join(mount, target[len(prefix):])
+            real = os.path.normpath(os.path.join(mount, target[len(prefix):]))
+            if real != mount and not real.startswith(mount.rstrip(os.sep) + os.sep):
+                return None
+            return real
     return None
 
 
@@ -160,6 +180,7 @@ class Removal:
     keep: str
     title: str
     owner: str = ''    # sidecars: the video removal they belong to
+    keeps: tuple = ()  # every kept copy this one duplicates (one per episode)
 
 
 def kept_copy_ok(path, pairs):
@@ -253,7 +274,8 @@ def plan_series_duplicates(series_dir, tracked, pairs, title):
         if not eps or not all(kept_copy_ok(tracked.get(ep), pairs) for ep in eps):
             continue
         removals.append(Removal(path, target, 'tv', 'arr-folder-untracked',
-                                tracked[eps[0]], title))
+                                tracked[eps[0]], title,
+                                keeps=tuple(sorted({tracked[ep] for ep in eps}))))
     return removals + sidecars_for(removals, tracked_paths)
 
 
@@ -333,12 +355,12 @@ def plan_foreign_folders(root, kind, owned, maps, tracked_by_entry, pairs,
                 report.append(dict(row, rule='has-real-files',
                                    detail=', '.join(n for n, _p in files)))
                 continue
-            if any(_removable_link(p, pairs) is None for _n, p in files):
+            targets = [(p, _removable_link(p, pairs)) for _n, p in files]
+            if any(t is None for _p, t in targets):
                 report.append(dict(row, rule='has-other-links',
                                    detail=', '.join(n for n, _p in files)))
                 continue
-            removals += [Removal(p, os.readlink(p), kind, 'empty-folder', '', name)
-                         for _n, p in files]
+            removals += [Removal(p, t, kind, 'empty-folder', '', name) for p, t in targets]
             removals.append(Removal(folder, '', kind, 'empty-folder', '', name))
             report.append(dict(row, rule='empty-folder', detail=''))
             continue
@@ -383,14 +405,19 @@ def plan_foreign_folders(root, kind, owned, maps, tracked_by_entry, pairs,
         planned, uncovered = [], []
         if is_tv:
             tracked = tracked or {}
-            arr_index = episode_index(os.path.join(root, info['folder']))
+            arr_index = episode_index(arr_folder)
+            if arr_index is None:
+                report.append(dict(row, rule='arr-error',
+                                   detail=f"{info['folder']!r} can't be read"))
+                continue
             for n, p in media:
                 eps = eps_of[p]
                 keeps = [_keep_for_episode(ep, tracked, arr_index, pairs) for ep in eps]
                 if (eps and all(keeps) and _removable_link(p, pairs) is not None
                         and not any(os.path.normpath(k) == os.path.normpath(p) for k in keeps)):
                     planned.append(Removal(p, os.readlink(p), kind, rule,
-                                           keeps[0], info['folder']))
+                                           keeps[0], info['folder'],
+                                           keeps=tuple(sorted(set(keeps)))))
                 else:
                     uncovered.append((n, p))
         else:
@@ -445,7 +472,13 @@ def _prune_empty_parents(path, library_root, protected):
         d = os.path.dirname(d)
 
 
-def apply_removals(removals, manifest_path, library_root, protected):
+def _quarantine_path(manifest_path, library_root, path):
+    """Where a removed sidecar subtitle is kept (beside the manifest) so
+    ``undo_manifest`` can put it back — real files are never deleted."""
+    return os.path.join(manifest_path + '.quarantine', os.path.relpath(path, library_root))
+
+
+def apply_removals(removals, manifest_path, library_root, protected, pairs=None):
     """Carry out planned removals; return the ones actually done.
 
     Each item is re-checked right before acting (a link must still be a
@@ -453,6 +486,9 @@ def apply_removals(removals, manifest_path, library_root, protected):
     subtitle sidecar), and its manifest row is written first.  *protected*
     holds real paths of arr-owned folders, which are never removed even
     when they end up empty — the arr fails when its folder disappears.
+    With *pairs*, every kept copy a row duplicates must still play right
+    now (plans can be minutes or days old).  Sidecar subtitles — real files
+    — are moved to a quarantine folder beside the manifest, not deleted.
     """
     done = []
     removed_videos = set()
@@ -480,12 +516,26 @@ def apply_removals(removals, manifest_path, library_root, protected):
                     or not os.path.isfile(r.path) or not r.path.lower().endswith('.srt')
                     or _stem_has_video(r.owner)):
                 continue
-        else:
+            dest = _quarantine_path(manifest_path, library_root, r.path)
             try:
-                if not os.path.islink(r.path) or os.readlink(r.path) != r.target:
-                    continue
-            except OSError:
+                _append_manifest(manifest_path, Removal(
+                    r.path, dest, r.kind, r.rule, r.keep, r.title), 'quarantine')
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                shutil.move(r.path, dest)
+            except OSError as e:
+                logger.warning("[dedup] Could not move subtitle %r aside: %s", r.path, e)
                 continue
+            done.append(r)
+            continue
+        try:
+            if not os.path.islink(r.path) or os.readlink(r.path) != r.target:
+                continue
+        except OSError:
+            continue
+        if pairs is not None and r.keep and not all(
+                kept_copy_ok(k, pairs) for k in (r.keeps or (r.keep,))):
+            logger.info("[dedup] Kept copy for %r no longer plays — not removing it", r.path)
+            continue
         try:
             _append_manifest(manifest_path, r, 'remove')
             os.unlink(r.path)
@@ -523,27 +573,31 @@ def restore_removals(done):
 
 
 def undo_manifest(manifest_path):
-    """Recreate every link a manifest recorded as removed (where nothing sits
-    at its path now) and folders it recorded as removed.  Sidecar subtitles
-    can't be recreated and are only logged.  Returns links restored."""
-    restored = 0
+    """Put back everything a manifest recorded: removed links (where nothing
+    sits at their path now), removed folders, and quarantined subtitles.
+    Best effort per row — a row that can't be restored is logged and the
+    rest still are.  Returns links restored."""
+    restored = failed = 0
     with open(manifest_path, newline='') as f:
         rows = list(csv.DictReader(f, delimiter='\t'))
     for row in rows:
-        path, target = row['path'], row['target']
-        if row['action'] == 'rmdir':
-            os.makedirs(path, exist_ok=True)
-            continue
-        if row['action'] != 'remove':
-            continue
-        if not target:
-            logger.info("[dedup] Undo: sidecar %r was a real file — not restorable", path)
-            continue
-        if os.path.lexists(path):
-            continue
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        os.symlink(target, path)
-        restored += 1
+        path, target, action = row['path'], row['target'], row['action']
+        try:
+            if action == 'rmdir':
+                os.makedirs(path, exist_ok=True)
+            elif action == 'quarantine':
+                if not os.path.lexists(path) and os.path.exists(target):
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    shutil.move(target, path)
+            elif action == 'remove' and target and not os.path.lexists(path):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                os.symlink(target, path)
+                restored += 1
+        except OSError as e:
+            failed += 1
+            logger.warning("[dedup] Undo: could not restore %r: %s", path, e)
+    if failed:
+        logger.warning("[dedup] Undo: %d row(s) could not be restored", failed)
     return restored
 
 
@@ -561,18 +615,17 @@ def _touch_dir(path):
 def snapshot_plex(plex, kind, rel_paths):
     """``{rel_path: PartRef}`` for the given paths — taken BEFORE removing,
     so the item's ratingKey and date added are known even after Plex moves
-    or drops the part.  A path present in two Plex sections of the kind is
-    left out (whichever item it means is ambiguous)."""
+    or drops the part.  A path held by two Plex items (two sections, or a
+    multi-folder section) is left out — which item it means is ambiguous."""
     from utils.plex_versions import section_type
     wanted = set(rel_paths)
-    snap, sections = {}, {}
+    snap, owners = {}, {}
     for p in plex.list_parts(section_type(kind)):
         if p.rel_path in wanted:
-            sections.setdefault(p.rel_path, set()).add(p.section)
+            owners.setdefault(p.rel_path, set()).add((p.section, p.rating_key))
             snap.setdefault(p.rel_path, p)
-    ambiguous = [rel for rel, secs in sections.items() if len(secs) > 1]
-    for rel in ambiguous:
-        logger.warning("[dedup] %r is in more than one Plex section — not reconciled", rel)
+    for rel in [rel for rel, o in owners.items() if len(o) > 1]:
+        logger.warning("[dedup] %r belongs to more than one Plex item — not reconciled", rel)
         snap.pop(rel, None)
     return snap
 
@@ -605,7 +658,16 @@ def plex_items(removed, snapshot, library_root):
             continue
         it = items.setdefault(ref.rating_key, {
             'rating_key': ref.rating_key, 'section': ref.section, 'added_at': ref.added_at,
-            'removed': [], 'keep': [], 'keep_dirs': [], 'drop_ok': True})
+            'removed': [], 'keep': [], 'keep_dirs': [], 'drop_ok': True,
+            'same_target': False})
+        try:
+            if r.keep and os.path.islink(r.keep) and os.readlink(r.keep) == r.target:
+                # Plex keeps ONE part for two links to one file — maybe only
+                # under the removed path; the kept path must show up in Plex
+                # before anything of this item is deleted.
+                it['same_target'] = True
+        except OSError:
+            it['same_target'] = True
         it['removed'] = sorted(set(it['removed']) | {rel})
         if r.keep:
             it['keep'] = sorted(set(it['keep']) | {rel_to_root(r.keep, library_root)})
@@ -648,6 +710,10 @@ def reconcile_items(plex, kind, items, library_root, touch):
         by_section.setdefault(it['section'], []).append(it)
     for section, its in sorted(by_section.items()):
         try:
+            if touch:
+                for d in sorted({d for it in its if it.get('same_target')
+                                 for d in it['keep_dirs']}):
+                    _touch_dir(d)
             for rel_dir in sorted({os.path.dirname(rel) for it in its
                                    for rel in it['removed'] + it['keep']}):
                 plex.scan_path(section, rel_dir)
@@ -671,7 +737,9 @@ def reconcile_items(plex, kind, items, library_root, touch):
 
 
 def _split_status(status, removed):
-    gone = [m for m in status if set(m.rel_paths) & removed and not m.exists]
+    # A version is "gone" only when ALL its parts were removed: deleting a
+    # stacked version (cd1/cd2) would also delete its surviving part.
+    gone = [m for m in status if m.rel_paths and set(m.rel_paths) <= removed and not m.exists]
     still = [m for m in status if set(m.rel_paths) & removed and m.exists]
     playing = [m for m in status if m.exists and not set(m.rel_paths) & removed]
     return gone, still, playing
@@ -702,6 +770,11 @@ def _reconcile_item(plex, kind, it, library_root, touch, out, state):
         renamed = any(set(m.rel_paths) & keep for m in playing)
     if renamed:
         out['renamed'].append(rk)
+    if (gone and it.get('same_target') and not it['drop_ok']
+            and not any(set(m.rel_paths) & keep for m in playing)):
+        if rk not in out['stranded']:
+            out['stranded'].append(rk)
+        return
     if gone and (playing or it['drop_ok']):
         if 'deletion_allowed' not in state:
             state['deletion_allowed'] = plex.media_deletion_allowed()
@@ -784,7 +857,11 @@ def plan_arr_tv(client, local_tv, pairs):
             continue
         local_dir = os.path.join(local_tv, folder)
         _protect(local_dir, protected)
-        if not any(len(paths) > 1 for paths in episode_index(local_dir).values()):
+        index = episode_index(local_dir)
+        if index is None:
+            logger.warning("[dedup] Skipping %r — its folder can't be read", s.get('title'))
+            continue
+        if not any(len(paths) > 1 for paths in index.values()):
             continue
         try:
             tracked = sonarr_tracked(client, s, local_dir)
