@@ -1220,3 +1220,50 @@ class TestBugHunterPass2:
         L.file('Show (2020)/Season 01/Show.S01E01.mp4')          # arrived after planning
         apply_removals(plan, str(tmp_path / 'm.tsv'), str(L.lib), set(), pairs=L.pairs)
         assert os.path.isfile(sub)
+
+
+class TestKeptCopyIsAnotherTitle:
+    """Radarr can hold the wrong film ("Obsession (2026)" tracking "Obsession
+    2025"): when the extra copy and the kept copy name different years, the
+    extra copy may be the right one — never remove it."""
+
+    def test_movie_years_conflict_kept(self, tmp_path):
+        from utils.library_dedup import plan_movie_duplicates
+        L = _Lib(tmp_path)
+        kept = L.link('Obsession (2026)/Obsession 2025 1080p MA WEB-DL.mkv', 'A/a.mkv')
+        L.link('Obsession (2026)/Obsession 2026 1080p AMZN WEB-DL.mkv', 'B/b.mkv')
+        assert plan_movie_duplicates(str(L.lib / 'Obsession (2026)'), kept, L.pairs, 'Obsession') == []
+
+    def test_tv_years_conflict_kept(self, tmp_path):
+        from utils.library_dedup import plan_series_duplicates
+        L = _Lib(tmp_path)
+        kept = L.link('The Bridge (2013)/Season 01/The Bridge (2011) - S01E01.mkv', 'A/a.mkv')
+        L.link('The Bridge (2013)/Season 01/The.Bridge.2013.S01E01.mkv', 'B/b.mkv')
+        assert plan_series_duplicates(str(L.lib / 'The Bridge (2013)'), {(1, 1): kept},
+                                      L.pairs, 'The Bridge') == []
+
+    def test_foreign_years_conflict_kept(self, tmp_path):
+        L = _Lib(tmp_path)
+        kept = L.link('Film ITA (2020)/Film 2019 1080p.mkv', 'A/a.mkv')
+        L.link('Film (2020)/Film 2020 1080p.mkv', 'B/b.mkv')
+        movies = [{'title': 'Film', 'year': 2020, 'path': '/m/Film ITA (2020)', 'id': 1,
+                   'tmdbId': None, 'hasFile': True}]
+        rem, rep = TestPlanForeignFolders()._plan(L, 'movie', movies, lambda info: kept)
+        assert rem == []
+
+    def test_resolution_and_matching_years_still_removed(self, tmp_path):
+        from utils.library_dedup import plan_movie_duplicates
+        L = _Lib(tmp_path)
+        kept = L.link('Film (2020)/Film (2020) 2160p.mkv', 'A/a.mkv')
+        extra = L.link('Film (2020)/Film.2020.1080p.mkv', 'B/b.mkv')
+        out = plan_movie_duplicates(str(L.lib / 'Film (2020)'), kept, L.pairs, 'Film')
+        assert [r.path for r in out] == [extra]
+
+    def test_foreign_tv_years_conflict_kept(self, tmp_path):
+        L = _Lib(tmp_path)
+        kept = L.link('The Bridge (2013)/Season 01/The Bridge (2013) - S01E01.mkv', 'A/a.mkv')
+        L.link('The Bridge/Season 01/The.Bridge.2011.S01E01.mkv', 'B/b.mkv')
+        shows = [{'title': 'The Bridge', 'year': 2013, 'path': '/t/The Bridge (2013)', 'id': 1,
+                  'tmdbId': None}]
+        rem, _ = TestPlanForeignFolders()._plan(L, 'tv', shows, lambda info: {(1, 1): kept})
+        assert rem == []

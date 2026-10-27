@@ -207,6 +207,24 @@ class Removal:
     keeps: tuple = ()  # every kept copy this one duplicates (one per episode)
 
 
+_NAME_YEAR_RE = re.compile(r'(?<!\d)(19\d\d|20\d\d)(?!\d)')
+
+
+def _name_year(path):
+    """First 19xx/20xx year in a file name (resolutions like 2160 don't
+    match), or None."""
+    m = _NAME_YEAR_RE.search(os.path.basename(path or ''))
+    return m.group(1) if m else None
+
+
+def years_conflict(path, keep):
+    """True when the extra copy and the kept copy name different years — the
+    arr may hold the wrong title ("Obsession (2026)" tracking "Obsession
+    2025"), so the extra copy could be the right one."""
+    a, b = _name_year(path), _name_year(keep)
+    return bool(a and b and a != b)
+
+
 def kept_copy_ok(path, pairs):
     """True when the copy we'd keep actually plays: a real file, or a link
     whose debrid file exists on the mount.  Anything else — broken link,
@@ -314,6 +332,9 @@ def plan_series_duplicates(series_dir, tracked, pairs, title):
         eps = parse_episode_numbers(name)
         if not eps or not all(kept_copy_ok(tracked.get(ep), pairs) for ep in eps):
             continue
+        if any(years_conflict(path, tracked[ep]) for ep in eps):
+            logger.info("[dedup] Keeping %r — its year differs from the tracked copy's", path)
+            continue
         removals.append(Removal(path, target, 'tv', 'arr-folder-untracked',
                                 tracked[eps[0]], title,
                                 keeps=tuple(sorted({tracked[ep] for ep in eps}))))
@@ -337,6 +358,9 @@ def plan_movie_duplicates(movie_dir, tracked_path, pairs, title):
             continue
         target = _removable_link(path, pairs)
         if target is None:
+            continue
+        if years_conflict(path, tracked_path):
+            logger.info("[dedup] Keeping %r — its year differs from the tracked copy's", path)
             continue
         removals.append(Removal(path, target, 'movie', 'arr-folder-untracked', tracked_path, title))
     return removals + sidecars_for(removals, [tracked_path])
@@ -469,7 +493,8 @@ def plan_foreign_folders(root, kind, owned, maps, tracked_by_entry, pairs,
                 eps = eps_of[p]
                 keeps = [_keep_for_episode(ep, tracked, arr_index, pairs) for ep in eps]
                 if (eps and all(keeps) and _removable_link(p, pairs) is not None
-                        and not any(os.path.normpath(k) == os.path.normpath(p) for k in keeps)):
+                        and not any(os.path.normpath(k) == os.path.normpath(p) for k in keeps)
+                        and not any(years_conflict(p, k) for k in keeps)):
                     planned.append(Removal(p, os.readlink(p), kind, rule,
                                            keeps[0], info['folder'],
                                            keeps=tuple(sorted(set(keeps)))))
@@ -479,7 +504,8 @@ def plan_foreign_folders(root, kind, owned, maps, tracked_by_entry, pairs,
             ok = kept_copy_ok(tracked, pairs)
             for n, p in media:
                 if (ok and _removable_link(p, pairs) is not None
-                        and os.path.normpath(tracked) != os.path.normpath(p)):
+                        and os.path.normpath(tracked) != os.path.normpath(p)
+                        and not years_conflict(p, tracked)):
                     planned.append(Removal(p, os.readlink(p), kind, rule,
                                            tracked, info['folder']))
                 else:
