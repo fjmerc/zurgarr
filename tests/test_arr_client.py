@@ -2427,6 +2427,7 @@ class TestStrictLookups:
         ('radarr', 'get_movie_releases', (5,)),
         ('sonarr', 'get_episode_id', ('Show', 1, 2)),
         ('sonarr', 'get_episodes', (3,)),
+        ('sonarr', 'get_episode_files', (3,)),
     ]
 
     @staticmethod

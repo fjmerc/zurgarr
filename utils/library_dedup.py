@@ -12,6 +12,7 @@ and the one-time clean-up script (``scripts/dedup_library.py``).
 
 import os
 import re
+from dataclasses import dataclass
 
 from utils.logger import get_logger
 
@@ -139,3 +140,120 @@ def link_resolves(link_path, pairs):
     if real is None:
         return None
     return os.path.exists(real)
+
+
+@dataclass(frozen=True)
+class Removal:
+    """One planned removal.  ``target`` is the ``os.readlink`` value (''
+    for a sidecar); ``keep`` is the tracked copy this one duplicates."""
+    path: str
+    target: str
+    kind: str          # 'tv' | 'movie'
+    rule: str          # 'arr-folder-untracked' | 'foreign-folder' | 'no-arr-title'
+                       # | 'empty-folder' | 'sidecar'
+    keep: str
+    title: str
+
+
+def kept_copy_ok(path, pairs):
+    """True when the copy we'd keep actually plays: a real file, or a link
+    whose debrid file exists on the mount.  Anything else — broken link,
+    unknown target, missing path — is not good enough to delete beside."""
+    if not path:
+        return False
+    if os.path.islink(path):
+        return link_resolves(path, pairs) is True
+    return os.path.isfile(path)
+
+
+def _media_entries(folder):
+    """``[(name, path)]`` of media-named non-directories in *folder* and its
+    direct subdirectories (season folders)."""
+    out = []
+    dirs = [folder]
+    try:
+        with os.scandir(folder) as it:
+            dirs += [e.path for e in it if e.is_dir(follow_symlinks=False)]
+    except OSError:
+        return out
+    for d in dirs:
+        try:
+            with os.scandir(d) as it:
+                out += [(e.name, e.path) for e in it
+                        if not e.is_dir(follow_symlinks=False) and _is_media_name(e.name)]
+        except OSError:
+            continue
+    return out
+
+
+def _removable_link(path, pairs):
+    """The readlink target when *path* is a debrid symlink we may remove."""
+    if not os.path.islink(path) or resolve_link_target(path, pairs) is None:
+        return None
+    return os.readlink(path)
+
+
+def sidecars_for(removals, kept_paths):
+    """Subtitle sidecars (``<stem>.srt``, ``<stem>.<tags>.srt``) of removed
+    videos.  A sidecar that also belongs to a kept video (its name starts
+    with a kept video's stem + '.') is never included."""
+    out = []
+    kept_stems = [os.path.splitext(os.path.basename(k))[0] + '.' for k in kept_paths if k]
+    seen = set()
+    for r in removals:
+        d = os.path.dirname(r.path)
+        stem = os.path.splitext(os.path.basename(r.path))[0]
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for name in names:
+            if not name.lower().endswith('.srt'):
+                continue
+            if not (name == stem + '.srt' or name.startswith(stem + '.')):
+                continue
+            if any(name.startswith(k) and len(k) > len(stem) + 1 for k in kept_stems):
+                continue
+            p = os.path.join(d, name)
+            if p in seen:
+                continue
+            seen.add(p)
+            out.append(Removal(p, '', r.kind, 'sidecar', r.keep, r.title))
+    return out
+
+
+def plan_series_duplicates(series_dir, tracked, pairs, title):
+    """Extra links in a Sonarr series folder: untracked debrid symlinks whose
+    every claimed episode has a tracked copy that plays.  *tracked* maps
+    ``(season, episode)`` → local path of Sonarr's tracked file."""
+    tracked_paths = {os.path.normpath(p) for p in tracked.values() if p}
+    removals = []
+    for name, path in _media_entries(series_dir):
+        if os.path.normpath(path) in tracked_paths:
+            continue
+        target = _removable_link(path, pairs)
+        if target is None:
+            continue
+        eps = parse_episode_numbers(name)
+        if not eps or not all(kept_copy_ok(tracked.get(ep), pairs) for ep in eps):
+            continue
+        removals.append(Removal(path, target, 'tv', 'arr-folder-untracked',
+                                tracked[eps[0]], title))
+    return removals + sidecars_for(removals, tracked_paths)
+
+
+def plan_movie_duplicates(movie_dir, tracked_path, pairs, title):
+    """Extra debrid symlinks in a Radarr movie folder, when Radarr's own
+    tracked file plays."""
+    if not kept_copy_ok(tracked_path, pairs):
+        return []
+    keep = os.path.normpath(tracked_path)
+    removals = []
+    for _name, path in _media_entries(movie_dir):
+        if os.path.normpath(path) == keep:
+            continue
+        target = _removable_link(path, pairs)
+        if target is None:
+            continue
+        removals.append(Removal(path, target, 'movie', 'arr-folder-untracked', tracked_path, title))
+    return removals + sidecars_for(removals, [tracked_path])

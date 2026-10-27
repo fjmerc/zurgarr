@@ -1575,6 +1575,14 @@ class SonarrClient(_ArrClientBase):
         return _as_list(self._get('/api/v3/episode', {'seriesId': series_id}, strict=strict),
                         strict, 'sonarr', 'episode list')
 
+    def get_episode_files(self, series_id, strict=False):
+        """Get all episode files (with their ``path``) for a series.
+
+        *strict*: raise ArrUnavailable when Sonarr doesn't answer.
+        """
+        return _as_list(self._get('/api/v3/episodefile', {'seriesId': series_id}, strict=strict),
+                        strict, 'sonarr', 'episode file list')
+
     _MEDIA_ID_KEY = 'seriesId'
     _QUEUE_UNKNOWN_PARAM = 'includeUnknownSeriesItems'
 
