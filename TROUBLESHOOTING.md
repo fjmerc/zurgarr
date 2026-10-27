@@ -19,6 +19,7 @@ isn't here, open a [GitHub issue](https://github.com/fjmerc/zurgarr/issues).
 - [Plex not seeing debrid content](#plex-not-seeing-debrid-content)
 - [New shows/movies only appear in Plex after a manual scan](#new-showsmovies-only-appear-in-plex-after-a-manual-scan)
 - [A download for one show is stuck under a same-name show in Sonarr ("Not an upgrade")](#a-download-for-one-show-is-stuck-under-a-same-name-show-in-sonarr-not-an-upgrade)
+- [Plex shows the same episode or movie two or more times](#plex-shows-the-same-episode-or-movie-two-or-more-times)
 - [Blackhole: symlinks created but broken](#blackhole-symlinks-created-but-broken)
 - [Stuck ffprobe processes](#stuck-ffprobe-processes)
 - [Dashboard buttons fail with "cross-origin request rejected" behind a reverse proxy](#dashboard-buttons-fail-with-cross-origin-request-rejected-behind-a-reverse-proxy)
@@ -370,6 +371,29 @@ delete that episode file in Sonarr and the right show's missing-episode
 search picks it up again. Downloads zurgarr handled before upgrading to
 this version, multi-season packs split into per-season folders, and imports
 made while zurgarr was stopped aren't covered.
+
+## Plex shows the same episode or movie two or more times
+
+Symptom: an episode (or movie) in Plex has several versions — the same
+thumbnail repeated, or "2 versions" — and the extra copies sit in the
+show's folder under the raw release name, or in a second folder named
+like the show without its year (`Ted Lasso` beside `Ted Lasso (2020)`).
+
+Cause: before this version, zurgarr linked debrid content it thought was
+missing by file name only. Sonarr/Radarr rename what they import, so
+zurgarr added a second link beside the arr's copy, and made its own folder
+when it couldn't match a title (or couldn't reach the arr).
+
+Fix: zurgarr now links an episode or movie only when Sonarr/Radarr say it
+has no file and the folder holds no copy, and never for a title the arr
+doesn't have. To clear duplicates that already exist, set
+`LIBRARY_DUPLICATE_TIDY=true`: every 6 hours it removes debrid links that
+duplicate the copy the arr tracks (only symlinks, only when the kept copy
+plays) and removes the leftover version in Plex. Every removal is written
+to `/config/duplicate_tidy_manifest.tsv`; `scripts/dedup_library.py undo
+--manifest <file>` puts them back. Copies in folders the arr doesn't own
+are handled by the one-time `scripts/dedup_library.py` clean-up (preview
+with `plan` first).
 
 ## Blackhole: symlinks created but broken
 

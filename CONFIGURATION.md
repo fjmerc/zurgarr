@@ -257,6 +257,7 @@ Sweep cadences (`DEBRID_HEALTH_INTERVAL`, default 12h; `DEBRID_QUOTA_INTERVAL`, 
 | `BLOCKLIST_AUTO_ADD` | Auto-blocklist torrents that hit terminal debrid errors, disc-rip rejection, or uncached-timeout failures | `true` |
 | `BLOCKLIST_EXPIRY_DAYS` | Auto-expire auto-added blocklist entries after N days (0=never). Manual entries kept forever | `0` |
 | `LIBRARY_PREFERENCE_AUTO_ENFORCE` | Auto-switch sources when content arrives matching a stored preference | `false` |
+| `LIBRARY_DUPLICATE_TIDY` | Every 6h, remove debrid links in Sonarr/Radarr folders that duplicate the copy the arr tracks (Plex showed the same episode/movie twice). Only removes symlinks, only when the kept copy plays; every removal goes to `/config/duplicate_tidy_manifest.tsv` and Plex's leftover version is removed. Read on every run (no restart needed) | `false` |
 | `DEBRID_UNAVAILABLE_THRESHOLD_DAYS` | Days of failed searches before marking content debrid-unavailable | `3` |
 | `FORCE_GRAB_MAX_ATTEMPTS` | Force-grabs of a debrid release for one stuck title before giving up (marks debrid-unavailable). Each force-grab re-arms TorBox's abuse cooldown, so this caps the self-inflicted churn. Persists across restarts; resets when the title lands on debrid or after 30 idle days | `12` |
 | `PENDING_WARNING_HOURS` | Hours before `pending_warning` notification for stuck items (0 disables) | `24` |

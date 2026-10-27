@@ -729,6 +729,95 @@ def verify_symlinks():
 # Task: Enforce Source Preferences (Priority 2)
 # ---------------------------------------------------------------------------
 
+_DUPLICATE_TIDY_MANIFEST = '/config/duplicate_tidy_manifest.tsv'
+_DUPLICATE_TIDY_INTERVAL = 6 * 3600
+
+
+def library_duplicate_tidy():
+    """Remove debrid links that duplicate a copy Sonarr/Radarr track.
+
+    Opt-in (``LIBRARY_DUPLICATE_TIDY=true``, read on every run).  A link
+    zurgarr made while the arr had no file becomes a duplicate Plex version
+    once the arr imports its own release; the arr never touches files it
+    doesn't track.  Every removal is written to an undo manifest first, and
+    Plex is reconciled per item (``library_dedup.reconcile_plex``).
+    """
+    if os.environ.get('LIBRARY_DUPLICATE_TIDY', 'false').lower() != 'true':
+        return {'status': 'disabled', 'message': 'LIBRARY_DUPLICATE_TIDY is off'}
+    from utils import library_dedup
+    from utils.arr_client import get_download_service
+    from utils.plex_versions import PlexLibrary
+
+    pairs = library_dedup.target_mount_pairs()
+    live = False
+    for _prefix, mount in pairs:
+        try:
+            live = live or bool(_listdir_with_timeout(mount, 15))
+        except (OSError, TimeoutError):
+            continue
+    if not live:
+        logger.warning("[dedup] Duplicate tidy skipped — no debrid mount is readable")
+        return {'status': 'skipped', 'message': 'No debrid mount readable'}
+
+    plex = PlexLibrary.from_env()
+    total = 0
+    for kind, media_type, env_key, planner in (
+            ('tv', 'show', 'BLACKHOLE_LOCAL_LIBRARY_TV', 'plan_arr_tv'),
+            ('movie', 'movie', 'BLACKHOLE_LOCAL_LIBRARY_MOVIES', 'plan_arr_movies')):
+        root = os.environ.get(env_key, '').strip()
+        client, svc = get_download_service(media_type)
+        if not root or not os.path.isdir(root) or not client:
+            continue
+        try:
+            removals, protected = getattr(library_dedup, planner)(client, root, pairs)
+        except Exception as e:
+            logger.warning("[dedup] Duplicate tidy skipped %s — %s unavailable: %s", kind, svc, e)
+            continue
+        if not removals:
+            continue
+        snapshot, plex_ok = {}, False
+        if plex:
+            try:
+                snapshot = library_dedup.snapshot_plex(
+                    plex, kind, {library_dedup.rel_to_root(r.path, root) for r in removals})
+            except Exception as e:
+                logger.warning("[dedup] Plex snapshot failed (%s); removing without "
+                               "Plex reconciliation", e)
+            else:
+                plex_ok = True
+        done = library_dedup.apply_removals(removals, _DUPLICATE_TIDY_MANIFEST, root, protected)
+        total += len(done)
+        _log_duplicate_removals(done, kind)
+        if plex_ok and done:
+            try:
+                result = library_dedup.reconcile_plex(plex, kind, done, snapshot, root, touch=True)
+            except Exception as e:
+                logger.warning("[dedup] Plex reconciliation failed: %s", e)
+                continue
+            for bucket in ('stranded', 'date_failed', 'deletion_disabled'):
+                if result.get(bucket):
+                    logger.warning("[dedup] Plex %s after duplicate removal: %s",
+                                   bucket.replace('_', ' '), ', '.join(result[bucket]))
+    return {'status': 'success', 'message': f'Removed {total} duplicate link(s)'}
+
+
+def _log_duplicate_removals(done, kind):
+    """One history event per title for the links (not sidecars) removed."""
+    from utils import history
+    by_title = {}
+    for r in done:
+        if r.rule != 'sidecar' and r.target:
+            by_title.setdefault(r.title, []).append(r)
+    for title, rs in by_title.items():
+        history.log_event('duplicate_removed', title, source='library', meta={
+            'cause': history.CAUSE_DUPLICATE_LINK_REMOVED,
+            'file': os.path.basename(rs[0].path),
+            'keep_file': os.path.basename(rs[0].keep) if rs[0].keep else '',
+            'count': len(rs),
+            'media_type': 'show' if kind == 'tv' else 'movie',
+        })
+
+
 def enforce_source_preferences():
     """Enforce prefer-debrid/prefer-local preferences across the library."""
     from utils.library import get_scanner
@@ -1524,6 +1613,18 @@ def register_all():
             interval_seconds=_get_interval('SYMLINK_VERIFY_INTERVAL'),
             description='Check debrid symlinks and remove broken ones',
             initial_delay=600,  # 10 min
+        )
+
+        # Duplicate-link tidy — registered whenever symlinks are enabled;
+        # the LIBRARY_DUPLICATE_TIDY gate is read on every run so a SIGHUP
+        # reload switches it on/off without a restart.
+        scheduler.register(
+            'duplicate_tidy',
+            library_duplicate_tidy,
+            interval_seconds=_DUPLICATE_TIDY_INTERVAL,
+            description='Remove duplicate debrid links Sonarr/Radarr have replaced '
+                        '(LIBRARY_DUPLICATE_TIDY)',
+            initial_delay=1800,  # 30 min
         )
 
     # Priority 2 — Medium

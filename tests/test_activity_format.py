@@ -289,6 +289,23 @@ def test_import_redirect_causes_mirrored_in_js():
     assert 'import_misfiled:' in FORMATTER_JS
 
 
+def test_duplicate_link_removed_names_both_files():
+    ev = _ev('duplicate_link_removed', file='Show.S01E01.mkv',
+             keep_file='Show (2020) - S01E01.mkv', count=1)
+    s = format_event(ev)['short']
+    assert s == 'Removed duplicate link: Show.S01E01.mkv (kept Show (2020) - S01E01.mkv)'
+
+
+def test_duplicate_link_removed_counts_several():
+    ev = _ev('duplicate_link_removed', file='a.mkv', keep_file='b.mkv', count=3)
+    assert format_event(ev)['short'] == 'Removed 3 duplicate links, e.g. a.mkv (kept b.mkv)'
+
+
+def test_duplicate_link_removed_mirrored_in_js():
+    from utils.activity_format import FORMATTER_JS
+    assert 'duplicate_link_removed:' in FORMATTER_JS
+
+
 def test_terminal_error_shows_status():
     ev = _ev('terminal_error', provider='realdebrid', status='magnet_error')
     assert 'Failed on realdebrid: magnet_error' == format_event(ev)['short']

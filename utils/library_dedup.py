@@ -580,3 +580,84 @@ def reconcile_plex(plex, kind, removed, snapshot, library_root, touch):
                 ok = plex.get_added_at(rk) == it['added_at']
                 out['date_fixed' if ok else 'date_failed'].append(rk)
     return out
+
+
+def _protect(folder, protected):
+    """Add an arr-owned folder and its direct subfolders (season dirs) —
+    whether or not they exist yet — to *protected* (real paths)."""
+    protected.add(os.path.realpath(folder))
+    try:
+        with os.scandir(folder) as it:
+            for e in it:
+                if e.is_dir(follow_symlinks=False):
+                    protected.add(os.path.realpath(e.path))
+    except OSError:
+        pass
+
+
+def _local_path(arr_path, arr_root, local_root):
+    """Rebase an arr-side file path onto the local library folder."""
+    return os.path.join(local_root, os.path.relpath(arr_path, arr_root))
+
+
+def sonarr_tracked(client, series, local_dir):
+    """``{(season, episode): local path of Sonarr's tracked file}`` for one
+    series.  Raises when Sonarr doesn't answer (strict calls)."""
+    files = {f['id']: f.get('path', '')
+             for f in client.get_episode_files(series['id'], strict=True) or []}
+    tracked = {}
+    for e in client.get_episodes(series['id'], strict=True) or []:
+        path = files.get(e.get('episodeFileId'))
+        if path:
+            tracked[(e.get('seasonNumber'), e.get('episodeNumber'))] = _local_path(
+                path, series['path'], local_dir)
+    return tracked
+
+
+def radarr_tracked(movie, local_dir):
+    """Local path of Radarr's tracked file for one movie, or None."""
+    path = (movie.get('movieFile') or {}).get('path')
+    if not movie.get('hasFile') or not path:
+        return None
+    return _local_path(path, movie['path'], local_dir)
+
+
+def plan_arr_tv(client, local_tv, pairs):
+    """Plan duplicate removals across every Sonarr series folder.
+
+    Returns ``(removals, protected)`` — *protected* holds every Sonarr
+    folder and season dir.  Sonarr is only asked about series whose folder
+    holds more than one copy of some episode; a series Sonarr doesn't
+    answer for is skipped.  ``get_all_series`` failing raises.
+    """
+    removals, protected = [], set()
+    for s in client.get_all_series(strict=True) or []:
+        if not s.get('path'):
+            continue
+        local_dir = os.path.join(local_tv, os.path.basename(s['path']))
+        _protect(local_dir, protected)
+        if not any(len(paths) > 1 for paths in episode_index(local_dir).values()):
+            continue
+        try:
+            tracked = sonarr_tracked(client, s, local_dir)
+        except Exception as e:
+            logger.warning("[dedup] Skipping %r — Sonarr episode data unavailable: %s",
+                           s.get('title'), e)
+            continue
+        removals += plan_series_duplicates(local_dir, tracked, pairs, s.get('title', ''))
+    return removals, protected
+
+
+def plan_arr_movies(client, local_movies, pairs):
+    """Radarr counterpart of ``plan_arr_tv``."""
+    removals, protected = [], set()
+    for m in client.get_all_movies(strict=True) or []:
+        if not m.get('path'):
+            continue
+        local_dir = os.path.join(local_movies, os.path.basename(m['path']))
+        _protect(local_dir, protected)
+        if len(_media_entries(local_dir)) < 2:
+            continue
+        removals += plan_movie_duplicates(local_dir, radarr_tracked(m, local_dir),
+                                          pairs, m.get('title', ''))
+    return removals, protected

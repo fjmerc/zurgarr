@@ -55,6 +55,7 @@ SOFT_RELOAD = {
     # (NOTIFICATION_LEVEL/EVENTS are read by notifications.init() — not soft)
     'DUPLICATE_CLEANUP', 'CLEANUP_INTERVAL', 'DUPLICATE_CLEANUP_KEEP',
     'PLEX_REFRESH', 'SKIP_VALIDATION', 'LIBRARY_PREFERENCE_AUTO_ENFORCE',
+    'LIBRARY_DUPLICATE_TIDY',
     'BLOCKLIST_AUTO_ADD', 'GAP_FILL_ENABLED',
     # Quality compromise (plan 33): all nine toggles are read fresh
     # from os.environ on each blackhole retry cycle via `_compromise_enabled`,

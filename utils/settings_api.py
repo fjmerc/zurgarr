@@ -87,6 +87,7 @@ ENV_SCHEMA = [
             ('RADARR_URL', 'Radarr URL', 'url', False, 'Radarr base URL (e.g. http://radarr:7878). Used for downloads, rescans, and folder naming'),
             ('RADARR_API_KEY', 'Radarr API Key', 'secret', False, 'Radarr API key (Settings > General in Radarr)'),
             ('LIBRARY_PREFERENCE_AUTO_ENFORCE', 'Auto-Enforce Preferences', 'boolean', False, 'Automatically switch sources when content arrives matching a stored preference'),
+            ('LIBRARY_DUPLICATE_TIDY', 'Remove Duplicate Links', 'boolean', False, 'Every 6h, remove debrid links that duplicate a copy Sonarr/Radarr hold (Plex shows the same episode or movie twice). Logged with an undo manifest. Enable after running the one-time clean-up (default: off)'),
             ('ROUTING_AUTO_TAG_UNTAGGED', 'Auto-Tag Untagged Media', 'boolean', False, 'During the 6h routing audit, auto-apply the debrid tag to monitored Sonarr series / Radarr movies that have no routing tag. Self-heals Overseerr requests that arrive with empty tags and silently fail with "0 active indexers" (default: true)'),
             ('PENDING_WARNING_HOURS', 'Pending Warning After (hours)', 'number:0-168', False, 'Hours before sending a warning notification for stuck pending items (default: 24, 0 to disable)'),
         ],

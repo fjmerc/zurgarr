@@ -417,6 +417,18 @@ def _fmt_import_redirected(ev, meta):
     return msg, msg
 
 
+def _fmt_duplicate_link_removed(ev, meta):
+    f = meta.get('file') or '?'
+    keep = meta.get('keep_file')
+    kept = f' (kept {keep})' if keep else ''
+    n = meta.get('count') or 1
+    if n > 1:
+        msg = f'Removed {n} duplicate links, e.g. {f}{kept}'
+    else:
+        msg = f'Removed duplicate link: {f}{kept}'
+    return msg, msg
+
+
 def _fmt_import_misfiled(ev, meta):
     arr = {'sonarr': 'Sonarr', 'radarr': 'Radarr'}.get(
         str(meta.get('arr_service', '')).lower(), 'arr')
@@ -606,6 +618,7 @@ _CAUSE_FORMATTERS = {
     'blocklisted_hash': _fmt_blocklisted_hash,
     'arr_feedback_blocklisted': _fmt_arr_feedback_blocklisted,
     'import_redirected': _fmt_import_redirected,
+    'duplicate_link_removed': _fmt_duplicate_link_removed,
     'import_misfiled': _fmt_import_misfiled,
     'disc_rip_rejected': _fmt_disc_rip_rejected,
     'debrid_add_failed': _fmt_debrid_add_failed,
@@ -820,6 +833,13 @@ FORMATTER_JS = r"""
     import_redirected: function(ev,m){
       var arr = m.arr_service === 'sonarr' ? 'Sonarr' : (m.arr_service === 'radarr' ? 'Radarr' : 'arr');
       return arr + ' filed it under ' + (m.from_title || '?') + ' — imported into ' + (m.to_title || '?');
+    },
+    duplicate_link_removed: function(ev,m){
+      var f = m.file || '?';
+      var kept = m.keep_file ? ' (kept ' + m.keep_file + ')' : '';
+      var n = m.count || 1;
+      return n > 1 ? 'Removed ' + n + ' duplicate links, e.g. ' + f + kept
+                   : 'Removed duplicate link: ' + f + kept;
     },
     import_misfiled: function(ev,m){
       var arr = m.arr_service === 'sonarr' ? 'Sonarr' : (m.arr_service === 'radarr' ? 'Radarr' : 'arr');

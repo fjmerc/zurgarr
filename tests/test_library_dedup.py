@@ -616,3 +616,60 @@ class TestReconcilePlex:
         snap = library_dedup.snapshot_plex(plex, 'movie', {'Amazing Films 12/Oppenheimer.mp4'})
         library_dedup.reconcile_plex(plex, 'movie', [r], snap, str(L.lib), touch=False)
         assert plex.deleted == [('30', '5')] and '30' in plex.items
+
+
+# ---------------------------------------------------------------------------
+# Walking Sonarr/Radarr libraries (shared by the scheduled tidy and the script)
+# ---------------------------------------------------------------------------
+
+class TestPlanArrLibraries:
+
+    def test_plan_arr_tv_maps_sonarr_paths_and_protects_folders(self, tmp_path):
+        from unittest.mock import MagicMock
+        from utils.library_dedup import plan_arr_tv
+        L = _Lib(tmp_path)
+        kept = L.link('Show (2020)/Season 01/Show (2020) - S01E01.mkv', 'A/a.mkv')
+        extra = L.link('Show (2020)/Season 01/Show.S01E01.mkv', 'B/b.mkv')
+        L.link('Solo (2021)/Season 01/Solo S01E01.mkv', 'C/c.mkv')
+        c = MagicMock()
+        c.get_all_series.return_value = [
+            {'id': 1, 'title': 'Show', 'path': '/data/media/tv/Show (2020)'},
+            {'id': 2, 'title': 'Solo', 'path': '/data/media/tv/Solo (2021)'}]
+        c.get_episodes.return_value = [{'seasonNumber': 1, 'episodeNumber': 1, 'episodeFileId': 9}]
+        c.get_episode_files.return_value = [
+            {'id': 9, 'path': '/data/media/tv/Show (2020)/Season 01/Show (2020) - S01E01.mkv'}]
+        removals, protected = plan_arr_tv(c, str(L.lib), L.pairs)
+        assert [r.path for r in removals] == [extra]
+        assert removals[0].keep == kept
+        # Solo has one copy per episode: no API calls needed for it
+        assert [call.args[0] for call in c.get_episodes.call_args_list] == [1]
+        assert os.path.realpath(L.lib / 'Show (2020)') in protected
+        assert os.path.realpath(L.lib / 'Show (2020)' / 'Season 01') in protected
+        assert os.path.realpath(L.lib / 'Solo (2021)') in protected
+
+    def test_plan_arr_tv_series_error_skips_that_series(self, tmp_path):
+        from unittest.mock import MagicMock
+        from utils.library_dedup import plan_arr_tv
+        L = _Lib(tmp_path)
+        L.link('Show (2020)/Season 01/Show (2020) - S01E01.mkv', 'A/a.mkv')
+        L.link('Show (2020)/Season 01/Show.S01E01.mkv', 'B/b.mkv')
+        c = MagicMock()
+        c.get_all_series.return_value = [{'id': 1, 'title': 'Show', 'path': '/x/Show (2020)'}]
+        c.get_episodes.side_effect = RuntimeError('timeout')
+        removals, protected = plan_arr_tv(c, str(L.lib), L.pairs)
+        assert removals == [] and protected
+
+    def test_plan_arr_movies(self, tmp_path):
+        from unittest.mock import MagicMock
+        from utils.library_dedup import plan_arr_movies
+        L = _Lib(tmp_path)
+        kept = L.link('Film (2020)/Film (2020).mkv', 'A/a.mkv')
+        extra = L.link('Film (2020)/Film.2020.1080p.mkv', 'B/b.mkv')
+        c = MagicMock()
+        c.get_all_movies.return_value = [
+            {'id': 1, 'title': 'Film', 'path': '/data/media/movies/Film (2020)', 'hasFile': True,
+             'movieFile': {'path': '/data/media/movies/Film (2020)/Film (2020).mkv'}},
+            {'id': 2, 'title': 'Nofile', 'path': '/data/media/movies/Nofile (1999)', 'hasFile': False}]
+        removals, protected = plan_arr_movies(c, str(L.lib), L.pairs)
+        assert [(r.path, r.keep) for r in removals] == [(extra, kept)]
+        assert os.path.realpath(L.lib / 'Nofile (1999)') in protected
