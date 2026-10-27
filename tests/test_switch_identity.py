@@ -104,6 +104,12 @@ class TestVerifySwitchIdentity:
                           '/data/zurgarr/movies/Dune.1984.1080p.BluRay.x264/Dune.mkv', 'movie')
         assert not ok and '1984' in why
 
+    def test_extras_only_release_refused(self, arr):
+        """The swap would replace the local film with a featurette."""
+        ok, why = _verify(LUCKY, '/data/torbox/Lucky.2017.EXTRAS.1080p.BluRay-RMXTRAS/'
+                                 'a.featurette.mkv', 'movie')
+        assert not ok and 'extras' in why
+
     def test_off_by_one_year_allowed(self, arr):
         ok, why = _verify(LUCKY, '/data/torbox/Lucky (2018) [1080p] [YTS]/Lucky.mp4', 'movie')
         assert ok, why

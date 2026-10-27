@@ -581,6 +581,36 @@ class TestCreateDebridSymlinksMovies:
         folder = self._two_copies(tmp_dir, monkeypatch, [])
         assert os.listdir(folder) == ['The.Big.Sick.2017.1080p.BluRay.x264-[YTS.AG].mp4']
 
+    def test_other_debrids_copy_of_another_year_is_never_linked(self, tmp_dir, monkeypatch):
+        """Movies merge by bare title: Dune (1984) must not stand in for an
+        empty Dune (2021) copy."""
+        mount = os.path.join(tmp_dir, 'mount')
+        local_movies = os.path.join(tmp_dir, 'movies')
+        os.makedirs(local_movies)
+        primary = os.path.join(mount, 'movies', 'Dune.2021.1080p.WEB')
+        os.makedirs(primary)
+        alt = os.path.join(mount, 'torbox', 'Dune.1984.1080p.BluRay')
+        _touch(os.path.join(alt, 'Dune.1984.1080p.BluRay.mkv'))
+        _setup_env(monkeypatch, mount, '/mnt/debrid')
+        scanner = _make_scanner(mount, None, monkeypatch, local_movies_path=local_movies)
+        scanner._create_debrid_symlinks([_LOCAL_SHOW], [{
+            'title': 'Dune', 'year': 2021, 'source': 'debrid', 'type': 'movie',
+            'path': primary, 'alt_path': alt}], {})
+        assert not os.path.exists(os.path.join(local_movies, 'Dune (2021)'))
+
+    def test_film_with_extras_included_is_linked(self, tmp_dir, monkeypatch):
+        mount = os.path.join(tmp_dir, 'mount')
+        local_movies = os.path.join(tmp_dir, 'movies')
+        os.makedirs(local_movies)
+        film = os.path.join(mount, 'movies', 'Heat.1995.1080p.BluRay.x264.Incl.Extras-GRP')
+        _touch(os.path.join(film, 'Heat.1995.1080p.mkv'))
+        _setup_env(monkeypatch, mount, '/mnt/debrid')
+        scanner = _make_scanner(mount, None, monkeypatch, local_movies_path=local_movies)
+        scanner._create_debrid_symlinks([_LOCAL_SHOW], [{
+            'title': 'Heat', 'year': 1995, 'source': 'debrid', 'type': 'movie',
+            'path': film}], {})
+        assert os.listdir(os.path.join(local_movies, 'Heat (1995)')) == ['Heat.1995.1080p.mkv']
+
     def test_extras_only_release_alone_is_not_linked(self, tmp_dir, monkeypatch):
         mount = os.path.join(tmp_dir, 'mount')
         local_movies = os.path.join(tmp_dir, 'movies')
@@ -1288,6 +1318,18 @@ def _film(has_file, path='/data/media/movies/Film (2020) ITA'):
 @pytest.mark.usefixtures('_fresh_arr_caches')
 class TestRadarrAuthorityGates:
 
+    def test_extras_only_copy_still_asks_radarr_to_rescan_a_missing_file(self, tmp_dir,
+                                                                         monkeypatch):
+        """Radarr lists a file the folder lacks: the rescan request doesn't
+        depend on which debrid release the scan found."""
+        scanner, local_movies, movies = _movie_fixture(tmp_dir, monkeypatch)
+        extras = movies[0]['path'].replace('Film.2020.1080p', 'Film.2020.EXTRAS.1080p')
+        os.rename(movies[0]['path'], extras)
+        movies[0]['path'] = extras
+        client = _radarr(_film(True))
+        _run_movie(scanner, client, movies)
+        assert client.rescan_movie.called
+
     def test_radarr_hasfile_true_blocks_link(self, tmp_dir, monkeypatch):
         scanner, local_movies, movies = _movie_fixture(tmp_dir, monkeypatch)
         _run_movie(scanner, _radarr(_film(True)), movies)
@@ -1395,6 +1437,14 @@ def test_dir_has_media_name_missing_dir_is_empty(tmp_path):
     ('The.Extras.Club.2019.1080p', False),
     ('Bonus.Track.2020.1080p', False),
     ('Movie.2010.1080p.BluRay.x264-EXTRASMALL', False),
+    # A film with its extras bundled in is the film
+    ('Fight Club (1999) AI UHD - 10th Anniversary Edition + Extras (PROPER) FIX', False),
+    ('Movie.2010.1080p.BluRay.With.Extras', False),
+    ('Movie.2010.1080p.BluRay.x264.Incl.Extras-GRP', False),
+    ('Movie (2010) [+ Special Features]', False),
+    ('Movie 2019 (with extras)', False),
+    ('Movie.2019.1080p.extras-included', False),
+    ('Movie.2019.Extended.Bonus.Features.Included', False),
 ])
 def test_is_extras_release(name, expected):
     from utils.library import _is_extras_release

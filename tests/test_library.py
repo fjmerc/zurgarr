@@ -4221,6 +4221,27 @@ class TestCleanupDiscRips:
         assert cleaned == 1
         assert len(movies) == 0  # Removed from list
 
+    def test_disc_rip_with_a_copy_on_the_other_debrid_keeps_that_copy(self, scanner, tmp_dir,
+                                                                       monkeypatch):
+        rip_path = self._make_disc_rip_folder(tmp_dir, 'Why.Him.2016')
+        alt = self._make_media_folder(tmp_dir, 'Why Him (2016) [1080p]')
+        movies = [{'title': 'Why Him', 'year': 2016, 'source': 'debrid', 'size_bytes': 0,
+                   'path': rip_path, 'alt_path': alt, 'quality': {}}]
+        mock_client = type('MockClient', (), {
+            'find_torrents_by_title': lambda self, n, target_year=None: [
+                {'id': 'T1', 'filename': 'Why.Him.2016', 'hash': 'AABBCCDD', 'year': 2016}],
+            'delete_torrent': lambda self, tid: True,
+        })()
+        monkeypatch.setattr('utils.debrid_client.get_debrid_client',
+                            lambda service=None, api_key=None: (mock_client, 'realdebrid'))
+        import utils.library as _lib
+        monkeypatch.setattr(_lib, '_blocklist', type('MockBL', (), {
+            'add': lambda self, *a, **kw: 'id1'})())
+        monkeypatch.setenv('BLOCKLIST_AUTO_ADD', 'true')
+        monkeypatch.setattr(_lib, '_history', None)
+        assert scanner._cleanup_disc_rips(movies) == 1
+        assert [m['path'] for m in movies] == [alt] and 'alt_path' not in movies[0]
+
     def test_only_the_disc_rips_own_torrent_deleted(self, scanner, tmp_dir, monkeypatch):
         """Other copies of the same title (a good 1080p) match by name too;
         only the torrent behind the disc-rip folder is deleted/blocklisted."""
@@ -7612,6 +7633,14 @@ class TestPhase4DualDebridMerge:
               'source_debrid': 'torbox', 'path': '/data/torbox/TB'}], [])
         assert len(m) == 1 and m[0]['alt_path'] == '/data/torbox/TB'
 
+    def test_other_year_on_alt_debrid_is_not_kept_as_alt_path(self):
+        m, _s = library.LibraryScanner._merge_alt_debrid_items(
+            [{'title': 'Dune', 'year': 2021, 'source': 'debrid', 'type': 'movie',
+              'path': '/data/zurgarr/movies/Dune.2021'}], [],
+            [{'title': 'Dune', 'year': 1984, 'source': 'debrid', 'type': 'movie',
+              'path': '/data/torbox/Dune.1984'}], [])
+        assert 'alt_path' not in m[0]
+
     def test_movie_on_both_flagged_with_alt_source(self):
         """Same movie on both → keep ONE entry, flag with alt-source."""
         primary_movies = [
@@ -10891,3 +10920,29 @@ class TestSeerrNormalizedTitleFallback:
             years={}, radarr_map_norm={norm_key: {'tmdb_id': 911430}})
         assert out == [{'title': 'F1: The Movie', 'tmdb_id': 911430,
                         'media_type': 'movie'}]
+
+
+
+class TestExtrasReleaseChoice:
+
+    def test_replaces_extras_keeps_a_known_year(self):
+        group = {'title': 'The Big Sick', 'year': 2017,
+                 'path': '/m/The.Big.Sick.2017.EXTRAS.1080p'}
+        assert library._replaces_extras(group, '/m/The Big Sick [1080p]')
+        assert not library._replaces_extras(group, '/m/The.Big.Sick.2017.Featurettes')
+        assert not library._replaces_extras({'path': '/m/The.Big.Sick.2017.1080p'},
+                                            '/m/The Big Sick (2017)')
+        new = library._extras_replacement(group, 'The Big Sick', None, '/m/The Big Sick [1080p]')
+        assert new['year'] == 2017 and new['path'] == '/m/The Big Sick [1080p]'
+
+    def test_tmdb_dedup_prefers_the_film_over_an_extras_release(self):
+        items = [
+            {'title': 'The Big Sick', 'year': 2017, 'type': 'movie', 'source': 'debrid',
+             'path': '/m/The.Big.Sick.2017.EXTRAS.1080p'},
+            {'title': 'Big Sick', 'year': None, 'type': 'movie', 'source': 'debrid',
+             'path': '/m/Big Sick 1080p'},
+        ]
+        aliases = {'the big sick': {'big sick'}, 'big sick': {'the big sick'}}
+        [merged] = library.LibraryScanner._dedup_by_tmdb(items, aliases)
+        assert merged['path'] == '/m/Big Sick 1080p'
+        assert merged['year'] == 2017
