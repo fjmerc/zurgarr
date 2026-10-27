@@ -225,3 +225,29 @@ def test_tidy_skips_paths_plex_holds_in_two_sections(env, monkeypatch):
                                     PartRef('1', 'c', 'Film (2020)/Film (2020).mkv', 5, '1')]
     _run_movies(env, monkeypatch, plex, r)
     assert os.path.islink(link)
+
+
+def test_lost_kept_copy_halts_the_tidy_until_cleared(env, monkeypatch):
+    """A kept copy vanishing is never routine: the tidy stops, reports an
+    error, and stays stopped until someone has looked."""
+    halt = env / 'halted.json'
+    monkeypatch.setattr(scheduled_tasks, '_DUPLICATE_TIDY_HALT', str(halt))
+    link = env / 'tv' / 'Show (2020)' / 'Season 01' / 'Show.S01E01.mkv'
+    kept = _playable_keep(env, env / 'tv' / 'Show (2020)' / 'Season 01' / 'Show - S01E01.mkv')
+    link.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink('/mnt/debrid/K/k.mkv', link)
+    removal = Removal(str(link), '/mnt/debrid/K/k.mkv', 'tv', 'arr-folder-untracked', kept, 'Show')
+    plex = MagicMock()
+    monkeypatch.setattr('utils.plex_versions.PlexLibrary.from_env', classmethod(lambda cls: plex))
+    monkeypatch.setattr('utils.library_dedup.snapshot_plex', lambda *a, **k: {'x': []})
+    monkeypatch.setattr('utils.library_dedup.reconcile_items',
+                        lambda *a, **k: {'keep_lost': ['10'], 'retry': []})
+    monkeypatch.setattr('utils.library_dedup.plex_items', lambda *a, **k: [{'rating_key': '10'}])
+    with patch('utils.library_dedup.plan_arr_tv', return_value=([removal], set())), \
+         patch('utils.library_dedup.plan_arr_movies', return_value=([], set())), \
+         patch('utils.arr_client.get_download_service', _svc(MagicMock(), MagicMock())):
+        out = scheduled_tasks.library_duplicate_tidy()
+    assert out['status'] == 'error' and halt.exists()
+    with patch('utils.library_dedup.plan_arr_tv') as plan:
+        again = scheduled_tasks.library_duplicate_tidy()
+    assert again['status'] == 'error' and not plan.called

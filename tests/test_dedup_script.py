@@ -747,3 +747,15 @@ def test_no_plex_flag_skips_plex_even_when_configured(tmp_path):
     dedup.main(['plan', '--kind', 'tv', '--out', out], ctx=ctx)
     assert dedup.main(['apply', '--plan', out, '--kind', 'tv', '--no-plex'], ctx=ctx) == 0
     assert not os.path.lexists(extra)
+
+
+def test_apply_stops_when_a_kept_copy_is_lost(tmp_path, monkeypatch):
+    L, sonarr, kept, extra = _show_setup(tmp_path)
+    out = str(tmp_path / 'plan.tsv')
+    from utils.plex_versions import PartRef
+    plex = FakePlex([PartRef('10', '2', 'Show (2020)/Season 01/Show.S01E01.mkv', 0, '2')])
+    ctx = _ctx(L, sonarr=sonarr, plex=plex, tmp_path=tmp_path)
+    dedup.main(['plan', '--kind', 'tv', '--out', out], ctx=ctx)
+    monkeypatch.setattr(dedup.dd, 'reconcile_plex',
+                        lambda *a, **k: {'keep_lost': ['10'], 'retry': []})
+    assert dedup.main(['apply', '--plan', out, '--kind', 'tv'], ctx=ctx) == 2

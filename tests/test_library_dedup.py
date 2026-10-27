@@ -647,6 +647,51 @@ class TestReconcilePlex:
         out = self._run(plex, L, r)
         assert plex.deleted == [('10', '2')] and out['deleted'] == ['10']
 
+    def test_kept_copy_lost_during_plex_follow_up_stops_the_run(self, tmp_path):
+        """If a kept copy disappears while Plex is being reconciled (prod:
+        11 High Potential episodes), say so and touch nothing more."""
+        from utils import library_dedup
+        from utils.library_dedup import Removal
+        L, r = self._setup(tmp_path)
+        keep2 = L.link('Other (2020)/Season 01/Other (2020) - S01E01.mkv', 'C/c.mkv')
+        gone2 = str(L.lib / 'Other (2020)' / 'Season 01' / 'Other.S01E01.mkv')
+        r2 = Removal(gone2, '/mnt/debrid_torbox/D/d.mkv', 'tv', 'arr-folder-untracked', keep2, 'Other')
+        plex = FakePlex({'10': [('1', 'Show (2020)/Season 01/Show (2020) - S01E01.mkv', True),
+                                ('2', 'Show (2020)/Season 01/Show.S01E01.mkv', False)],
+                         '20': [('3', 'Other (2020)/Season 01/Other (2020) - S01E01.mkv', True),
+                                ('4', 'Other (2020)/Season 01/Other.S01E01.mkv', False)]})
+        real_delete = plex.delete_media
+
+        def delete_and_lose_keep(rk, mid):
+            real_delete(rk, mid)
+            if rk == '10':
+                os.remove(r.keep)      # whatever did it in prod
+        plex.delete_media = delete_and_lose_keep
+        rels = {library_dedup.rel_to_root(x.path, str(L.lib)) for x in (r, r2)}
+        snap = library_dedup.snapshot_plex(plex, 'tv', rels)
+        out = library_dedup.reconcile_plex(plex, 'tv', [r, r2], snap, str(L.lib), touch=False)
+        assert out['keep_lost'] == ['10']
+        assert ('20', '4') not in plex.deleted          # the rest is left alone
+
+    def test_version_is_re_read_right_before_deleting(self, tmp_path):
+        """Plex may re-point a version between the check and the delete; it
+        is only deleted while it still names exactly the removed link."""
+        from utils import library_dedup
+        L, r = self._setup(tmp_path)
+        plex = FakePlex({'10': [('1', 'Show (2020)/Season 01/Show (2020) - S01E01.mkv', True),
+                                ('2', 'Show (2020)/Season 01/Show.S01E01.mkv', False)]})
+        reads = {'n': 0}
+        real_status = plex.media_status
+
+        def status(rk):
+            reads['n'] += 1
+            if reads['n'] >= 2:   # by the delete, Plex has moved media 2 onto the kept path
+                plex.items[rk] = [('2', 'Show (2020)/Season 01/Show (2020) - S01E01.mkv', True)]
+            return real_status(rk)
+        plex.media_status = status
+        out = self._run(plex, L, r)
+        assert plex.deleted == []
+
     def test_removed_part_still_present_is_not_deleted(self, tmp_path):
         L, r = self._setup(tmp_path)
         plex = FakePlex({'10': [('1', 'Show (2020)/Season 01/Show (2020) - S01E01.mkv', True),

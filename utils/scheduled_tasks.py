@@ -732,6 +732,9 @@ def verify_symlinks():
 _DUPLICATE_TIDY_MANIFEST = '/config/duplicate_tidy_manifest.tsv'
 _DUPLICATE_TIDY_PENDING = '/config/duplicate_tidy_pending.json'
 _DUPLICATE_TIDY_INTERVAL = 6 * 3600
+# Written when a kept copy disappears during a run; the tidy then stays
+# stopped until someone has looked and deleted the file.
+_DUPLICATE_TIDY_HALT = '/config/duplicate_tidy_halted.json'
 
 # Plex "unavailable" rescan: first run 10 min after start (a restart's mount
 # blip is when marks appear), then every 3h; a bounded number of folders,
@@ -789,6 +792,28 @@ def _tidy_plex_warnings(result):
         if result.get(bucket):
             logger.warning("[dedup] Plex %s after duplicate removal: %s",
                            bucket.replace('_', ' '), ', '.join(result[bucket]))
+    if result.get('keep_lost'):
+        _halt_tidy(result['keep_lost'])
+
+
+class _TidyHalted(Exception):
+    """A kept copy disappeared: the tidy stops and stays stopped."""
+
+
+def _halt_tidy(rating_keys):
+    import json
+    from utils.file_utils import atomic_write
+    try:
+        with atomic_write(_DUPLICATE_TIDY_HALT) as f:
+            json.dump({'reason': 'kept copy disappeared during the Plex follow-up',
+                       'plex_items': list(rating_keys),
+                       'at': time.strftime('%Y-%m-%dT%H:%M:%S')}, f)
+    except OSError as e:
+        logger.error("[dedup] Could not write %s: %s", _DUPLICATE_TIDY_HALT, e)
+    logger.error("[dedup] Duplicate tidy STOPPED: a kept copy disappeared (Plex items %s) — "
+                 "check them, then delete %s to resume", ', '.join(rating_keys),
+                 _DUPLICATE_TIDY_HALT)
+    raise _TidyHalted()
 
 
 def library_duplicate_tidy():
@@ -808,6 +833,9 @@ def library_duplicate_tidy():
     """
     if os.environ.get('LIBRARY_DUPLICATE_TIDY', 'false').lower() != 'true':
         return {'status': 'disabled', 'message': 'LIBRARY_DUPLICATE_TIDY is off'}
+    if os.path.exists(_DUPLICATE_TIDY_HALT):
+        return {'status': 'error', 'message': 'Stopped after a kept copy disappeared — check, '
+                                              f'then delete {_DUPLICATE_TIDY_HALT}'}
     from utils import library_dedup
     from utils.arr_client import get_download_service
     from utils.plex_versions import PlexLibrary
@@ -822,23 +850,28 @@ def library_duplicate_tidy():
     plex = PlexLibrary.from_env()
     pending = _load_tidy_pending() if plex else {}
     total = 0
-    for kind, media_type, env_key, planner in (
-            ('tv', 'show', 'BLACKHOLE_LOCAL_LIBRARY_TV', 'plan_arr_tv'),
-            ('movie', 'movie', 'BLACKHOLE_LOCAL_LIBRARY_MOVIES', 'plan_arr_movies')):
-        root = os.environ.get(env_key, '').strip()
-        if not root or not os.path.isdir(root):
-            continue
-        retry = []
-        if plex and pending.get(kind):
-            result = library_dedup.reconcile_items(plex, kind, pending[kind], root, touch=True)
-            _tidy_plex_warnings(result)
-            retry = _retry_list(pending[kind], result)
-        client, svc = get_download_service(media_type)
-        if client and svc in ('sonarr', 'radarr'):
-            total += _tidy_kind(library_dedup, plex, kind, root, client, svc, planner,
-                                pairs, retry)
-        if plex:
-            pending[kind] = retry
+    try:
+        for kind, media_type, env_key, planner in (
+                ('tv', 'show', 'BLACKHOLE_LOCAL_LIBRARY_TV', 'plan_arr_tv'),
+                ('movie', 'movie', 'BLACKHOLE_LOCAL_LIBRARY_MOVIES', 'plan_arr_movies')):
+            root = os.environ.get(env_key, '').strip()
+            if not root or not os.path.isdir(root):
+                continue
+            retry = []
+            if plex and pending.get(kind):
+                result = library_dedup.reconcile_items(plex, kind, pending[kind], root,
+                                                       touch=True)
+                _tidy_plex_warnings(result)
+                retry = _retry_list(pending[kind], result)
+            client, svc = get_download_service(media_type)
+            if client and svc in ('sonarr', 'radarr'):
+                total += _tidy_kind(library_dedup, plex, kind, root, client, svc, planner,
+                                    pairs, retry)
+            if plex:
+                pending[kind] = retry
+    except _TidyHalted:
+        return {'status': 'error', 'message': 'Stopped: a kept copy disappeared — see the log, '
+                                              f'then delete {_DUPLICATE_TIDY_HALT}'}
     if plex:
         _save_tidy_pending(pending)
     return {'status': 'success', 'message': f'Removed {total} duplicate link(s)'}

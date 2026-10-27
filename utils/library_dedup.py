@@ -990,7 +990,7 @@ def _add_item(items, ref, r, rel, library_root):
         it['drop_ok'] = False
 
 
-RECONCILE_BUCKETS = ('deleted', 'renamed', 'stranded', 'date_fixed', 'date_failed',
+RECONCILE_BUCKETS = ('deleted', 'renamed', 'stranded', 'date_fixed', 'date_failed', 'keep_lost',
                      'deletion_disabled', 'timeout', 'failed')
 
 
@@ -1042,13 +1042,27 @@ def reconcile_items(plex, kind, items, library_root, touch, wait=300):
                 out['retry'].append(it)
             continue
         for it in its:
+            kept = [k for k in _keep_paths(it, library_root) if os.path.lexists(k)]
             try:
                 _reconcile_item(plex, kind, it, library_root, touch, out, state)
             except Exception as e:
                 logger.warning("[dedup] Plex item %s not reconciled: %s", it['rating_key'], e)
                 out['failed'].append(it['rating_key'])
                 out['retry'].append(it)
+            lost = [k for k in kept if not os.path.lexists(k)]
+            if lost:
+                # Never routine (prod 10-27: 11 kept High Potential links
+                # vanished after a run) — stop before touching anything else.
+                logger.error("[dedup] Kept copy gone after the Plex follow-up of item %s: %s — "
+                             "stopping", it['rating_key'], ', '.join(lost))
+                out['keep_lost'].append(it['rating_key'])
+                return out
     return out
+
+
+def _keep_paths(it, library_root):
+    """Absolute paths of the copies an item's removals kept."""
+    return [os.path.join(library_root, k) for k in it.get('keep', ())]
 
 
 def _split_status(status, removed):
@@ -1096,9 +1110,21 @@ def _reconcile_item(plex, kind, it, library_root, touch, out, state):
         if not state['deletion_allowed']:
             out['deletion_disabled'].append(rk)
         else:
+            # Re-read right before deleting: Plex may have re-pointed a
+            # version since the check (two links to one file) — delete only a
+            # version still naming exactly removed links, never a kept path.
+            fresh = {m.media_id: m for m in plex.media_status(rk)}
+            deleted = False
             for m in gone:
+                now_m = fresh.get(m.media_id)
+                if (now_m is None or now_m.exists or not now_m.rel_paths
+                        or not set(now_m.rel_paths) <= removed
+                        or set(now_m.rel_paths) & keep):
+                    continue
                 plex.delete_media(rk, m.media_id)
-            out['deleted'].append(rk)
+                deleted = True
+            if deleted:
+                out['deleted'].append(rk)
     if playing and it['added_at']:
         now = plex.get_added_at(rk)
         if now and now != it['added_at']:

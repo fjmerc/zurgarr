@@ -424,6 +424,15 @@ versions itself). Versions whose file is really gone are left for you to
 remove (Plex: Settings → Troubleshooting → Empty Trash). To clear marks straight away,
 run the `plex_unavailable_rescan` task from the System page.
 
+### The duplicate tidy stopped with "a kept copy disappeared"
+
+The tidy found that a copy it had kept (the one Sonarr/Radarr track) no
+longer exists after a run, and stopped so nothing else is touched. The log
+line names the Plex items. Check those titles in Sonarr/Radarr (a rescan
+of the series/movie shows what's missing; the next library scan relinks a
+debrid copy when one exists), then delete
+`/config/duplicate_tidy_halted.json` to let the tidy run again.
+
 ## Sonarr/Radarr requests fail with "Try again" (temporary failure in name resolution)
 
 Symptom: the log shows `[sonarr] Request failed for GET /api/v3/... <urlopen

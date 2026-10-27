@@ -348,8 +348,11 @@ def cmd_apply(ctx, args):
         total += len(done)
         summary = ', '.join(f'{k} {len(v)}' for k, v in result.items() if v)
         print(f'{kind:6} {title}: removed {len(done)}' + (f' — Plex: {summary}' if summary else ''))
-        problem = [rk for b in ('stranded', 'date_failed', 'timeout', 'failed')
+        problem = [rk for b in ('keep_lost', 'stranded', 'date_failed', 'timeout', 'failed')
                    for rk in result.get(b, [])]
+        if result.get('keep_lost'):
+            print(f'STOPPED: a KEPT copy disappeared during the Plex follow-up of item(s) '
+                  f'{result["keep_lost"]} — check that title before running anything else.')
         if problem:
             if result.get('retry'):
                 _save_pending(manifest, kind, result['retry'])
@@ -504,7 +507,7 @@ def _rename_one(ctx, movie_id, plan_rows, manifest, include_review=False, wait=1
     if done:
         result = dd.reconcile_plex(ctx.plex, 'movie', done, snapshot, ctx.local_movies,
                                    touch=False, wait=wait)
-        problem = [rk for b in ('stranded', 'date_failed', 'timeout', 'failed')
+        problem = [rk for b in ('keep_lost', 'stranded', 'date_failed', 'timeout', 'failed')
                    for rk in result.get(b, [])]
         if problem:
             if result.get('retry'):
@@ -574,7 +577,7 @@ def cmd_reconcile(ctx, args):
     _save_pending_replace(args.manifest, args.kind, result.get('retry', []))
     print(f'{len(items)} Plex item(s): ' + ', '.join(
         f'{k} {len(v)}' for k, v in result.items() if v and k != 'retry'))
-    problem = [rk for b in ('stranded', 'date_failed', 'timeout', 'failed')
+    problem = [rk for b in ('keep_lost', 'stranded', 'date_failed', 'timeout', 'failed')
                for rk in result.get(b, [])]
     if problem:
         print(f'Still needing attention: {problem}')
