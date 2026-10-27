@@ -480,6 +480,26 @@ class TestApplyRemovals:
         assert os.path.isfile(L.lib / 'Full' / 'keep.jpg')
         assert [r['path'] for r in self._rows(str(tmp_path / 'm.tsv'))] == [str(L.lib / 'Empty')]
 
+    def test_apply_empty_folder_row_removes_empty_season_folders_too(self, tmp_path):
+        """'Atlanta/Season 01..04' with no file anywhere is the empty folder
+        the plan saw; a file anywhere below keeps the whole tree."""
+        from utils.library_dedup import Removal, apply_removals, undo_manifest
+        L = _Lib(tmp_path)
+        for d in ('Season 01', 'Season 02/Extras'):
+            (L.lib / 'Atlanta' / d).mkdir(parents=True)
+        (L.lib / 'Tulsa King' / 'Season 02').mkdir(parents=True)
+        (L.lib / 'Tulsa King' / 'Season 02' / 'poster.jpg').write_text('')
+        rs = [Removal(str(L.lib / 'Atlanta'), '', 'tv', 'empty-folder', '', 'Atlanta'),
+              Removal(str(L.lib / 'Tulsa King'), '', 'tv', 'empty-folder', '', 'Tulsa King')]
+        manifest = str(tmp_path / 'm.tsv')
+        done = apply_removals(rs, manifest, str(L.lib), set())
+        assert not os.path.exists(L.lib / 'Atlanta')
+        assert os.path.isfile(L.lib / 'Tulsa King' / 'Season 02' / 'poster.jpg')
+        assert [r.path for r in done] == [str(L.lib / 'Atlanta')]
+        undo_manifest(manifest)
+        assert os.path.isdir(L.lib / 'Atlanta' / 'Season 02' / 'Extras')
+        assert os.path.isdir(L.lib / 'Atlanta' / 'Season 01')
+
     def test_undo_restores_links(self, tmp_path):
         from utils.library_dedup import apply_removals, undo_manifest
         L = _Lib(tmp_path)

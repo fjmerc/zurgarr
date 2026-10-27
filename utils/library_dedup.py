@@ -15,7 +15,7 @@ import os
 import re
 import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from utils.logger import get_logger
 
@@ -452,6 +452,19 @@ def plan_movie_duplicates(movie_dir, tracked_path, pairs, title, skipped=None):
     return removals + sidecars_for(removals, [tracked_path])
 
 
+def _empty_tree(folder):
+    """*folder* and every folder below it, deepest first, when none of them
+    holds a file or a link; None otherwise."""
+    def fail(err):
+        raise err
+    dirs = []
+    for dirpath, dirnames, files in os.walk(folder, topdown=False, onerror=fail):
+        if files or any(os.path.islink(os.path.join(dirpath, d)) for d in dirnames):
+            return None
+        dirs.append(dirpath)
+    return dirs
+
+
 def _walk_files(folder):
     """``[(name, path)]`` of every non-directory under *folder*; raises
     ``OSError`` when part of it can't be read (unreadable is not empty)."""
@@ -687,10 +700,13 @@ def apply_removals(removals, manifest_path, library_root, protected, pairs=None)
                     or real in protected or real == root):
                 continue
             try:
-                if os.listdir(r.path):
+                dirs = _empty_tree(r.path)
+                if dirs is None:
+                    logger.info("[dedup] Not removing %r — it isn't empty any more", r.path)
                     continue
-                _append_manifest(manifest_path, r, 'rmdir')
-                os.rmdir(r.path)
+                for d in dirs:   # deepest first; each recorded so undo recreates it
+                    _append_manifest(manifest_path, replace(r, path=d), 'rmdir')
+                    os.rmdir(d)
             except OSError as e:
                 logger.warning("[dedup] Could not remove folder %r: %s", r.path, e)
                 continue
