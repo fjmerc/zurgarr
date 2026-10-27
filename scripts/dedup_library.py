@@ -469,15 +469,27 @@ def _rename_one(ctx, movie_id, plan_rows, manifest, include_review=False, wait=1
               f'{new_folder!r}; check that Plex item {orig.rating_key} is merged with it '
               f'before continuing')
         return False
-    new = next((p for p in ctx.plex.list_parts('movie')
-                if p.rel_path.startswith(new_folder + '/')), None)
-    if new is not None and new.rating_key != orig.rating_key:
-        ctx.plex.merge(orig.rating_key, [new.rating_key])
-    if orig.added_at and ctx.plex.get_added_at(orig.rating_key) != orig.added_at:
-        ctx.plex.set_added_at(orig.section, orig.rating_key, 1, orig.added_at)
-        if ctx.plex.get_added_at(orig.rating_key) != orig.added_at:
-            print(f'STOPPED: could not restore date added on Plex item {orig.rating_key}')
-            return False
+    from utils.plex_versions import PlexError
+    try:
+        new = next((p for p in ctx.plex.list_parts('movie')
+                    if p.rel_path.startswith(new_folder + '/')), None)
+        keep_rk = orig.rating_key
+        if new is not None and new.rating_key != orig.rating_key:
+            if _plex_item_exists(ctx.plex, orig.rating_key):
+                ctx.plex.merge(orig.rating_key, [new.rating_key])
+            else:
+                # Plex dropped the old item and re-added the movie (seen with
+                # Bone Tomahawk): nothing to merge; the new item carries on.
+                print(f'Plex replaced item {orig.rating_key} with {new.rating_key}')
+                keep_rk = new.rating_key
+        if orig.added_at and ctx.plex.get_added_at(keep_rk) != orig.added_at:
+            ctx.plex.set_added_at(orig.section, keep_rk, 1, orig.added_at)
+            if ctx.plex.get_added_at(keep_rk) != orig.added_at:
+                print(f'STOPPED: could not restore date added on Plex item {keep_rk}')
+                return False
+    except PlexError as e:
+        print(f'STOPPED: Plex error after renaming {old_folder!r} to {new_folder!r}: {e}')
+        return False
     if done:
         result = dd.reconcile_plex(ctx.plex, 'movie', done, snapshot, ctx.local_movies,
                                    touch=False, wait=wait)
@@ -490,6 +502,17 @@ def _rename_one(ctx, movie_id, plan_rows, manifest, include_review=False, wait=1
                   f'"reconcile --manifest {manifest} --kind movie"')
             return False
     return True
+
+
+def _plex_item_exists(plex, rating_key):
+    from utils.plex_versions import PlexError
+    try:
+        plex.get_added_at(rating_key)
+        return True
+    except PlexError as e:
+        if 'Not Found' in str(e) or '404' in str(e):
+            return False
+        raise
 
 
 def cmd_radarr_rename(ctx, args):

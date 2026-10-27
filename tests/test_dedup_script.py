@@ -589,3 +589,26 @@ def test_plan_reports_year_conflicts_in_arr_folders(tmp_path):
     out = str(tmp_path / 'plan.tsv')
     dedup.main(['plan', '--kind', 'movie', '--out', out], ctx=_ctx(L, radarr=radarr))
     assert [(r['action'], r['rule']) for r in _read(out)] == [('report', 'year-conflict')]
+
+
+def test_radarr_rename_when_plex_replaced_the_item(tmp_path):
+    """Plex can drop the old item and re-add the movie under a new one
+    (prod: Bone Tomahawk). No merge then — the new item gets the original
+    date added if it changed."""
+    from utils.plex_versions import PartRef, PlexError
+    L, radarr, plex, ctx, out, extra = _rename_setup(tmp_path)
+
+    def merge(keep, others):
+        raise PlexError(f'PUT /library/metadata/{keep}/merge failed: Not Found')
+    plex.merge = merge
+    plex.added = {'300': 777}                     # new item, date bumped; old item gone
+
+    def get_added_at(rk):
+        if rk not in plex.added:
+            raise PlexError(f'GET /library/metadata/{rk} failed: Not Found')
+        return plex.added[rk]
+    plex.get_added_at = get_added_at
+    real_status = plex.media_status
+    plex.media_status = lambda rk: [] if rk not in plex.added else real_status(rk)  # gone item: 404 → []
+    assert dedup.main(['radarr-rename', '--ids', '5', '--plan', out], ctx=ctx) == 0
+    assert plex.added['300'] == 5                 # original date (from item 100) restored
