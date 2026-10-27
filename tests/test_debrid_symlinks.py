@@ -553,6 +553,47 @@ class TestCreateDebridSymlinksMovies:
         assert target.startswith('/mnt/debrid/')
         assert 'Inception.2010.1080p.mkv' in target
 
+    def _two_copies(self, tmp_dir, monkeypatch, primary_files):
+        mount = os.path.join(tmp_dir, 'mount')
+        local_movies = os.path.join(tmp_dir, 'movies')
+        os.makedirs(local_movies)
+        primary = os.path.join(mount, 'movies', 'The.Big.Sick.2017.EXTRAS.1080p.BluRay.H264-RMXTRAS')
+        for f in primary_files:
+            _touch(os.path.join(primary, f))
+        alt = os.path.join(mount, 'torbox', 'The Big Sick (2017) [1080p] [YTS.AG]')
+        _touch(os.path.join(alt, 'The.Big.Sick.2017.1080p.BluRay.x264-[YTS.AG].mp4'))
+        _setup_env(monkeypatch, mount, '/mnt/debrid')
+        scanner = _make_scanner(mount, None, monkeypatch, local_movies_path=local_movies)
+        movies = [{'title': 'The Big Sick', 'year': 2017, 'source': 'debrid', 'type': 'movie',
+                   'path': primary, 'alt_path': alt}]
+        scanner._create_debrid_symlinks([_LOCAL_SHOW], movies, {})
+        return os.path.join(local_movies, 'The Big Sick (2017)')
+
+    def test_extras_only_release_is_not_the_movie_other_copy_is_used(self, tmp_dir, monkeypatch):
+        """An "EXTRAS" release holds featurettes, not the film: the other
+        debrid's copy is linked instead (prod: The Big Sick never linked)."""
+        folder = self._two_copies(tmp_dir, monkeypatch, ['a.personal.journey-rmxtras.mkv'])
+        assert os.listdir(folder) == ['The.Big.Sick.2017.1080p.BluRay.x264-[YTS.AG].mp4']
+
+    def test_copy_without_a_video_falls_back_to_the_other_debrid(self, tmp_dir, monkeypatch):
+        """A broken primary copy (its folder lists no video) must not hide a
+        working copy on the other debrid."""
+        folder = self._two_copies(tmp_dir, monkeypatch, [])
+        assert os.listdir(folder) == ['The.Big.Sick.2017.1080p.BluRay.x264-[YTS.AG].mp4']
+
+    def test_extras_only_release_alone_is_not_linked(self, tmp_dir, monkeypatch):
+        mount = os.path.join(tmp_dir, 'mount')
+        local_movies = os.path.join(tmp_dir, 'movies')
+        os.makedirs(local_movies)
+        primary = os.path.join(mount, 'movies', 'The.Big.Sick.2017.EXTRAS.1080p.BluRay.H264-RMXTRAS')
+        _touch(os.path.join(primary, 'a.personal.journey-rmxtras.mkv'))
+        _setup_env(monkeypatch, mount, '/mnt/debrid')
+        scanner = _make_scanner(mount, None, monkeypatch, local_movies_path=local_movies)
+        scanner._create_debrid_symlinks([_LOCAL_SHOW], [{
+            'title': 'The Big Sick', 'year': 2017, 'source': 'debrid', 'type': 'movie',
+            'path': primary}], {})
+        assert not os.path.exists(os.path.join(local_movies, 'The Big Sick (2017)'))
+
     def test_picks_largest_media_file(self, tmp_dir, monkeypatch):
         """When multiple media files exist, picks the largest."""
         mount = os.path.join(tmp_dir, 'mount')
@@ -1341,3 +1382,20 @@ def test_dir_has_media_name_io_error_counts_as_present(tmp_path, monkeypatch):
 
 def test_dir_has_media_name_missing_dir_is_empty(tmp_path):
     assert library._dir_has_media_name(str(tmp_path / 'nope')) is False
+
+
+@pytest.mark.parametrize('name,expected', [
+    ('The.Big.Sick.2017.EXTRAS.1080p.BluRay.H264-RMXTRAS', True),
+    ('www.UIndex.org    -    The.Big.Sick.2017.EXTRAS.1080p.BluRay.H264-RMXTRAS', True),
+    ('Dune 2021 Featurettes 1080p', True),
+    ('Heat.1995.Bonus.Disc.1080p', True),
+    ('Alien (1979) [Special Features]', True),
+    ('The Big Sick (2017) [1080p] [YTS.AG]', False),
+    ('Extras.2005.1080p.WEB', False),                 # the title, before the year
+    ('The.Extras.Club.2019.1080p', False),
+    ('Bonus.Track.2020.1080p', False),
+    ('Movie.2010.1080p.BluRay.x264-EXTRASMALL', False),
+])
+def test_is_extras_release(name, expected):
+    from utils.library import _is_extras_release
+    assert _is_extras_release(name) is expected

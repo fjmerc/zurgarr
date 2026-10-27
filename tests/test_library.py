@@ -961,6 +961,32 @@ class TestLibraryScannerScanDebrid:
         assert "Inception" in titles
         assert not any("050bd19" in t.lower() for t in titles)
 
+    def test_scan_mount_prefers_the_film_over_an_extras_release(self, tmp_dir, monkeypatch):
+        """Two folders of one title on one debrid: an extras-only release
+        listed first must not hide the film."""
+        extras = os.path.join(tmp_dir, "The.Big.Sick.2017.EXTRAS.1080p.BluRay.H264-RMXTRAS")
+        film = os.path.join(tmp_dir, "The.Big.Sick.2017.1080p.WEB.H264")
+        for d, f in ((extras, "featurette.mkv"), (film, "The.Big.Sick.2017.mkv")):
+            os.makedirs(d)
+            open(os.path.join(d, f), "w").close()
+        real_scandir = os.scandir
+
+        class _Ordered:
+            def __init__(self, path):
+                with real_scandir(path) as it:
+                    self._e = sorted(it, key=lambda e: "EXTRAS" not in e.name)
+            def __enter__(self):
+                return iter(self._e)
+            def __exit__(self, *a):
+                return False
+            def __iter__(self):
+                return iter(self._e)
+        scanner = self._make_scanner(tmp_dir, monkeypatch)
+        monkeypatch.setattr(library.os, "scandir", _Ordered)
+        movies, _shows = scanner._scan_mount(tmp_dir, flat_layout=True, source_debrid='torbox')
+        [m] = [m for m in movies if m["title"] == "The Big Sick"]
+        assert m["path"] == film
+
     def test_scan_result_has_required_keys(self, tmp_dir, monkeypatch):
         os.makedirs(os.path.join(tmp_dir, "movies"))
         scanner = self._make_scanner(tmp_dir, monkeypatch)
@@ -7575,6 +7601,16 @@ class TestPhase4DualDebridMerge:
         # No has_alt_source flag on uniques
         assert 'has_alt_source' not in tb
         assert 'has_alt_source' not in next(x for x in m if x['title'] == 'On RD Only')
+
+    def test_movie_on_both_keeps_the_alt_copys_path(self):
+        """The linker needs the other debrid's folder when the primary copy
+        turns out to hold no film (broken, or an extras-only release)."""
+        m, _s = library.LibraryScanner._merge_alt_debrid_items(
+            [{'title': 'The Big Sick', 'year': 2017, 'source': 'debrid', 'type': 'movie',
+              'source_debrid': 'realdebrid', 'path': '/data/zurgarr/movies/RD'}], [],
+            [{'title': 'The Big Sick', 'year': 2017, 'source': 'debrid', 'type': 'movie',
+              'source_debrid': 'torbox', 'path': '/data/torbox/TB'}], [])
+        assert len(m) == 1 and m[0]['alt_path'] == '/data/torbox/TB'
 
     def test_movie_on_both_flagged_with_alt_source(self):
         """Same movie on both → keep ONE entry, flag with alt-source."""
