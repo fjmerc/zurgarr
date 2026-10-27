@@ -476,3 +476,107 @@ def undo_manifest(manifest_path):
         os.symlink(target, path)
         restored += 1
     return restored
+
+
+def rel_to_root(path, library_root):
+    """*path* relative to the local library root — the same relative path
+    Plex records under its section root (both see the same tree)."""
+    return os.path.relpath(path, library_root)
+
+
+def _touch_dir(path):
+    from utils.plex_versions import touch_dir
+    touch_dir(path)
+
+
+def snapshot_plex(plex, kind, rel_paths):
+    """``{rel_path: PartRef}`` for the given paths — taken BEFORE removing,
+    so the item's ratingKey and date added are known even after Plex moves
+    or drops the part."""
+    from utils.plex_versions import section_type
+    wanted = set(rel_paths)
+    return {p.rel_path: p for p in plex.list_parts(section_type(kind)) if p.rel_path in wanted}
+
+
+def reconcile_plex(plex, kind, removed, snapshot, library_root, touch):
+    """Bring Plex in line after *removed* links are gone.
+
+    Per affected item: rescan the touched folders; delete a removed copy's
+    now-unavailable version only when the item still has another version
+    that plays (titles Sonarr/Radarr don't have at all — rule
+    ``no-arr-title`` — may lose their last version: the owner chose to drop
+    them); if the removed copy was the item's last playable version, wait
+    for Plex to move it to the kept path (it matches files by content), with
+    an optional mtime bump of the kept folder when *touch*; otherwise report
+    it stranded.  Finally put back any changed date added.
+    """
+    from utils.plex_versions import item_type_code
+    out = {k: [] for k in ('deleted', 'renamed', 'stranded', 'date_fixed',
+                           'date_failed', 'deletion_disabled')}
+    items = {}
+    for r in removed:
+        if r.rule == 'sidecar' or not r.target:
+            continue
+        rel = rel_to_root(r.path, library_root)
+        ref = snapshot.get(rel)
+        if ref is None:
+            continue
+        it = items.setdefault(ref.rating_key, {
+            'section': ref.section, 'added_at': ref.added_at, 'removed': set(),
+            'keep': set(), 'keep_dirs': set(), 'drop_ok': True})
+        it['removed'].add(rel)
+        if r.keep:
+            it['keep'].add(rel_to_root(r.keep, library_root))
+            it['keep_dirs'].add(os.path.dirname(r.keep))
+        if r.rule != 'no-arr-title':
+            it['drop_ok'] = False
+    if not items:
+        return out
+
+    sections = {it['section'] for it in items.values()}
+    dirs = {(it['section'], os.path.dirname(rel))
+            for it in items.values() for rel in it['removed'] | it['keep']}
+    for section, rel_dir in sorted(dirs):
+        plex.scan_path(section, rel_dir)
+    for section in sorted(sections):
+        plex.wait_idle(section)
+    deletion_allowed = None
+
+    for rk, it in items.items():
+        status = plex.media_status(rk)
+        gone = [m for m in status if set(m.rel_paths) & it['removed'] and not m.exists]
+        still = [m for m in status if set(m.rel_paths) & it['removed'] and m.exists]
+        playing = [m for m in status if m.exists and not set(m.rel_paths) & it['removed']]
+        if not gone and not still:
+            if any(set(m.rel_paths) & it['keep'] for m in playing):
+                out['renamed'].append(rk)
+        elif gone and (playing or it['drop_ok']):
+            if deletion_allowed is None:
+                deletion_allowed = plex.media_deletion_allowed()
+            if not deletion_allowed:
+                out['deletion_disabled'].append(rk)
+            else:
+                for m in gone:
+                    plex.delete_media(rk, m.media_id)
+                out['deleted'].append(rk)
+        elif gone:
+            renamed = False
+            if touch and it['keep_dirs']:
+                for d in sorted(it['keep_dirs']):
+                    _touch_dir(d)
+                    plex.scan_path(it['section'], rel_to_root(d, library_root))
+                plex.wait_idle(it['section'])
+                status = plex.media_status(rk)
+                renamed = any(m.exists and set(m.rel_paths) & it['keep'] for m in status)
+            out['renamed' if renamed else 'stranded'].append(rk)
+
+        if status and not (it['drop_ok'] and not playing):
+            try:
+                now = plex.get_added_at(rk)
+            except Exception:
+                continue
+            if it['added_at'] and now and now != it['added_at']:
+                plex.set_added_at(it['section'], rk, item_type_code(kind), it['added_at'])
+                ok = plex.get_added_at(rk) == it['added_at']
+                out['date_fixed' if ok else 'date_failed'].append(rk)
+    return out

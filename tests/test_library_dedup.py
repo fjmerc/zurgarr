@@ -445,3 +445,174 @@ class TestApplyRemovals:
         assert undo_manifest(manifest) == 1
         assert os.readlink(p) == r.target
         assert undo_manifest(manifest) == 0   # idempotent: nothing missing
+
+
+# ---------------------------------------------------------------------------
+# Plex reconciliation after removals
+# ---------------------------------------------------------------------------
+
+class FakePlex:
+    """In-memory stand-in for PlexLibrary: items → media → rel paths."""
+
+    def __init__(self, items, added=None, deletion_allowed=True, rename_on_touch=None):
+        # items: {rk: [(media_id, rel, exists)]}
+        self.items = {rk: list(m) for rk, m in items.items()}
+        self.added = dict(added or {rk: 100 for rk in items})
+        self.deleted, self.scans, self.set_dates = [], [], []
+        self.deletion_allowed = deletion_allowed
+        self.rename_on_touch = rename_on_touch or {}   # rk -> (media_id, new_rel)
+        self.date_sticks = True
+        self.touched = False
+
+    def list_parts(self, media_type):
+        from utils.plex_versions import PartRef
+        return [PartRef(rk, mid, rel, self.added[rk], '2')
+                for rk, ms in self.items.items() for mid, rel, _e in ms]
+
+    def media_status(self, rk):
+        from utils.plex_versions import MediaRef
+        if self.touched and rk in self.rename_on_touch:
+            mid, rel = self.rename_on_touch[rk]
+            self.items[rk] = [(m, rel if m == mid else r, True if m == mid else e)
+                              for m, r, e in self.items[rk]]
+        return [MediaRef(m, [r], e) for m, r, e in self.items.get(rk, [])]
+
+    def scan_path(self, section, rel_dir):
+        self.scans.append(rel_dir)
+
+    def wait_idle(self, section, timeout=300, poll=5):
+        return True
+
+    def media_deletion_allowed(self):
+        return self.deletion_allowed
+
+    def delete_media(self, rk, mid):
+        self.deleted.append((rk, mid))
+        self.items[rk] = [x for x in self.items[rk] if x[0] != mid]
+
+    def get_added_at(self, rk):
+        return self.added[rk]
+
+    def set_added_at(self, section, rk, type_code, epoch):
+        self.set_dates.append((rk, epoch))
+        if self.date_sticks:
+            self.added[rk] = epoch
+
+
+class TestReconcilePlex:
+
+    def _setup(self, tmp_path):
+        L = _Lib(tmp_path)
+        keep = L.link('Show (2020)/Season 01/Show (2020) - S01E01.mkv', 'A/a.mkv')
+        gone = str(L.lib / 'Show (2020)' / 'Season 01' / 'Show.S01E01.mkv')
+        from utils.library_dedup import Removal
+        r = Removal(gone, '/mnt/debrid_torbox/B/b.mkv', 'tv', 'arr-folder-untracked', keep, 'Show')
+        return L, r
+
+    def _run(self, plex, L, r, touch=True, monkeypatch=None):
+        from utils import library_dedup
+        snap = library_dedup.snapshot_plex(plex, 'tv', {library_dedup.rel_to_root(r.path, str(L.lib))})
+        return library_dedup.reconcile_plex(plex, 'tv', [r], snap, str(L.lib), touch=touch)
+
+    def test_delete_only_unavailable_media_when_other_exists(self, tmp_path):
+        L, r = self._setup(tmp_path)
+        plex = FakePlex({'10': [('1', 'Show (2020)/Season 01/Show (2020) - S01E01.mkv', True),
+                                ('2', 'Show (2020)/Season 01/Show.S01E01.mkv', False)]})
+        out = self._run(plex, L, r)
+        assert plex.deleted == [('10', '2')] and out['deleted'] == ['10']
+
+    def test_removed_part_still_present_is_not_deleted(self, tmp_path):
+        L, r = self._setup(tmp_path)
+        plex = FakePlex({'10': [('1', 'Show (2020)/Season 01/Show (2020) - S01E01.mkv', True),
+                                ('2', 'Show (2020)/Season 01/Show.S01E01.mkv', True)]})
+        self._run(plex, L, r)
+        assert plex.deleted == []
+
+    def test_last_media_never_deleted_waits_for_rename(self, tmp_path, monkeypatch):
+        from utils import library_dedup
+        L, r = self._setup(tmp_path)
+        plex = FakePlex({'10': [('2', 'Show (2020)/Season 01/Show.S01E01.mkv', False)]},
+                        rename_on_touch={'10': ('2', 'Show (2020)/Season 01/Show (2020) - S01E01.mkv')})
+        monkeypatch.setattr(library_dedup, '_touch_dir', lambda p: setattr(plex, 'touched', True))
+        out = self._run(plex, L, r)
+        assert plex.deleted == [] and out['renamed'] == ['10'] and out['stranded'] == []
+
+    def test_stranded_reported_when_no_rename(self, tmp_path, monkeypatch):
+        from utils import library_dedup
+        L, r = self._setup(tmp_path)
+        plex = FakePlex({'10': [('2', 'Show (2020)/Season 01/Show.S01E01.mkv', False)]})
+        monkeypatch.setattr(library_dedup, '_touch_dir', lambda p: None)
+        out = self._run(plex, L, r)
+        assert plex.deleted == [] and out['stranded'] == ['10']
+
+    def test_auto_rename_by_plex_recorded_as_renamed(self, tmp_path):
+        L, r = self._setup(tmp_path)
+        plex = FakePlex({'10': [('2', 'Show (2020)/Season 01/Show.S01E01.mkv', True)]})
+        from utils import library_dedup
+        snap = library_dedup.snapshot_plex(plex, 'tv', {'Show (2020)/Season 01/Show.S01E01.mkv'})
+        plex.items['10'] = [('2', 'Show (2020)/Season 01/Show (2020) - S01E01.mkv', True)]
+        out = library_dedup.reconcile_plex(plex, 'tv', [r], snap, str(L.lib), touch=False)
+        assert out['renamed'] == ['10'] and plex.deleted == []
+
+    def test_no_touch_means_stranded_without_utime(self, tmp_path, monkeypatch):
+        from utils import library_dedup
+        L, r = self._setup(tmp_path)
+        plex = FakePlex({'10': [('2', 'Show (2020)/Season 01/Show.S01E01.mkv', False)]},
+                        rename_on_touch={'10': ('2', 'x')})
+        called = []
+        monkeypatch.setattr(library_dedup, '_touch_dir', lambda p: called.append(p))
+        out = self._run(plex, L, r, touch=False)
+        assert called == [] and out['stranded'] == ['10']
+
+    def test_added_at_restored_when_changed(self, tmp_path):
+        L, r = self._setup(tmp_path)
+        plex = FakePlex({'10': [('1', 'Show (2020)/Season 01/Show (2020) - S01E01.mkv', True),
+                                ('2', 'Show (2020)/Season 01/Show.S01E01.mkv', False)]},
+                        added={'10': 100})
+        from utils import library_dedup
+        snap = library_dedup.snapshot_plex(plex, 'tv', {'Show (2020)/Season 01/Show.S01E01.mkv'})
+        plex.added['10'] = 999
+        out = library_dedup.reconcile_plex(plex, 'tv', [r], snap, str(L.lib), touch=False)
+        assert plex.set_dates == [('10', 100)] and out['date_fixed'] == ['10']
+
+    def test_added_at_failure_reported(self, tmp_path):
+        L, r = self._setup(tmp_path)
+        plex = FakePlex({'10': [('1', 'Show (2020)/Season 01/Show (2020) - S01E01.mkv', True),
+                                ('2', 'Show (2020)/Season 01/Show.S01E01.mkv', False)]})
+        from utils import library_dedup
+        snap = library_dedup.snapshot_plex(plex, 'tv', {'Show (2020)/Season 01/Show.S01E01.mkv'})
+        plex.added['10'] = 999
+        plex.date_sticks = False
+        out = library_dedup.reconcile_plex(plex, 'tv', [r], snap, str(L.lib), touch=False)
+        assert out['date_failed'] == ['10']
+
+    def test_deletion_disabled_recorded_not_called(self, tmp_path):
+        L, r = self._setup(tmp_path)
+        plex = FakePlex({'10': [('1', 'Show (2020)/Season 01/Show (2020) - S01E01.mkv', True),
+                                ('2', 'Show (2020)/Season 01/Show.S01E01.mkv', False)]},
+                        deletion_allowed=False)
+        out = self._run(plex, L, r)
+        assert plex.deleted == [] and out['deletion_disabled'] == ['10']
+
+    def test_no_arr_title_unavailable_item_removed(self, tmp_path):
+        from utils import library_dedup
+        from utils.library_dedup import Removal
+        L = _Lib(tmp_path)
+        gone = str(L.lib / 'Amazing Films 12' / 'Oppenheimer.mp4')
+        r = Removal(gone, '/mnt/debrid_torbox/B/b.mp4', 'movie', 'no-arr-title', '', 'Amazing Films 12')
+        plex = FakePlex({'30': [('5', 'Amazing Films 12/Oppenheimer.mp4', False)]})
+        snap = library_dedup.snapshot_plex(plex, 'movie', {'Amazing Films 12/Oppenheimer.mp4'})
+        out = library_dedup.reconcile_plex(plex, 'movie', [r], snap, str(L.lib), touch=False)
+        assert out['deleted'] == ['30'] and plex.deleted == [('30', '5')]
+
+    def test_no_arr_title_with_other_available_media_keeps_item(self, tmp_path):
+        from utils import library_dedup
+        from utils.library_dedup import Removal
+        L = _Lib(tmp_path)
+        gone = str(L.lib / 'Amazing Films 12' / 'Oppenheimer.mp4')
+        r = Removal(gone, '/mnt/debrid_torbox/B/b.mp4', 'movie', 'no-arr-title', '', 'Amazing Films 12')
+        plex = FakePlex({'30': [('5', 'Amazing Films 12/Oppenheimer.mp4', False),
+                                ('6', 'Oppenheimer (2023)/Oppenheimer (2023).mkv', True)]})
+        snap = library_dedup.snapshot_plex(plex, 'movie', {'Amazing Films 12/Oppenheimer.mp4'})
+        library_dedup.reconcile_plex(plex, 'movie', [r], snap, str(L.lib), touch=False)
+        assert plex.deleted == [('30', '5')] and '30' in plex.items
