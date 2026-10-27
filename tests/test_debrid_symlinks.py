@@ -1261,6 +1261,19 @@ class TestSonarrAuthorityGates:
         _run_show(scanner, client, shows, pidx)
         assert not os.path.exists(os.path.join(local_tv, 'Show (2025)', 'Season 01'))
 
+    def test_episode_the_blackhole_just_handed_over_is_left_to_sonarr(self, tmp_dir,
+                                                                      monkeypatch):
+        scanner, local_tv, shows, pidx = _show_fixture(tmp_dir, monkeypatch)
+        completed = os.path.join(tmp_dir, 'completed')
+        release = os.path.join(completed, 'Show.S01E01.1080p')
+        os.makedirs(release)
+        os.symlink('/mnt/debrid/shows/Show.S01E01.1080p/Show.S01E01.1080p.mkv',
+                   os.path.join(release, 'Show.S01E01.1080p.mkv'))
+        monkeypatch.setenv('BLACKHOLE_COMPLETED_DIR', completed)
+        client = _sonarr(_SERIES, episodes=[{'seasonNumber': 1, 'episodeNumber': 1, 'hasFile': False}])
+        _run_show(scanner, client, shows, pidx)
+        assert not os.path.exists(os.path.join(local_tv, 'Show (2025)', 'Season 01'))
+
     def test_other_series_in_queue_does_not_block(self, tmp_dir, monkeypatch):
         scanner, local_tv, shows, pidx = _show_fixture(tmp_dir, monkeypatch)
         client = _sonarr(_SERIES, episodes=[{'seasonNumber': 1, 'episodeNumber': 1, 'hasFile': False}])
@@ -1383,6 +1396,39 @@ class TestRadarrAuthorityGates:
         client.queued_movie_ids.side_effect = RuntimeError('radarr down')
         _run_movie(scanner, client, movies)
         assert os.listdir(local_movies) == []
+
+    def test_movie_the_blackhole_just_handed_over_is_left_to_radarr(self, tmp_dir, monkeypatch):
+        """Before Radarr's next queue refresh a fresh hand-off isn't in its
+        queue yet: the blackhole's completed folder says it is coming."""
+        scanner, local_movies, movies = _movie_fixture(tmp_dir, monkeypatch)
+        completed = os.path.join(tmp_dir, 'completed')
+        release = os.path.join(completed, 'Film.2020.1080p')
+        os.makedirs(release)
+        os.symlink('/mnt/debrid/movies/Film.2020.1080p/Film.2020.1080p.mkv',
+                   os.path.join(release, 'Film.2020.1080p.mkv'))
+        monkeypatch.setenv('BLACKHOLE_COMPLETED_DIR', completed)
+        _run_movie(scanner, _radarr(_film(False)), movies)
+        assert os.listdir(local_movies) == []
+
+    def test_old_blackhole_hand_off_does_not_block(self, tmp_dir, monkeypatch):
+        scanner, local_movies, movies = _movie_fixture(tmp_dir, monkeypatch)
+        completed = os.path.join(tmp_dir, 'completed')
+        release = os.path.join(completed, 'Film.2020.1080p')
+        os.makedirs(release)
+        os.symlink('/mnt/debrid/movies/Film.2020.1080p/Film.2020.1080p.mkv',
+                   os.path.join(release, 'Film.2020.1080p.mkv'))
+        os.utime(release, (1, 1))
+        monkeypatch.setenv('BLACKHOLE_COMPLETED_DIR', completed)
+        _run_movie(scanner, _radarr(_film(False)), movies)
+        assert os.listdir(local_movies) == ['Film (2020) ITA']
+
+    def test_unreadable_queue_still_asks_radarr_to_rescan_a_missing_file(self, tmp_dir,
+                                                                       monkeypatch):
+        scanner, local_movies, movies = _movie_fixture(tmp_dir, monkeypatch)
+        client = _radarr(_film(True))
+        client.queued_movie_ids.side_effect = RuntimeError('radarr down')
+        _run_movie(scanner, client, movies)
+        assert client.rescan_movie.called and os.listdir(local_movies) == []
 
     def test_other_movie_in_queue_does_not_block(self, tmp_dir, monkeypatch):
         scanner, local_movies, movies = _movie_fixture(tmp_dir, monkeypatch)

@@ -48,18 +48,39 @@ class ArrUnavailable(Exception):
     path's 404 won't fix itself on a retry)."""
 
 
-# Queue page size for queued_movie_ids / queued_episodes
-_QUEUE_PAGE_SIZE = 1000
-# A queue record still on its way in.  Blocked/failed imports and
+# A queue record still on its way in.  Blocked/failed/failing imports and
 # "download client unavailable" leftovers don't count: they may never import.
+# A warned, paused or queued item only counts for its first hour.
 _QUEUE_ACTIVE_STATES = {'downloading', 'importPending', 'importing'}
 _QUEUE_STUCK_STATUSES = {'failed', 'warning', 'downloadClientUnavailable'}
+_QUEUE_STALLED_STATUSES = {'paused', 'queued'}
+_QUEUE_GRACE_SECONDS = 3600
 
 
 def _queue_active(record):
+    """Whether a queue record is a download the arr will import soon."""
     state = record.get('trackedDownloadState')
-    return ((state is None or state in _QUEUE_ACTIVE_STATES)
-            and record.get('status') not in _QUEUE_STUCK_STATUSES)
+    if state is not None and state not in _QUEUE_ACTIVE_STATES:
+        return False
+    if record.get('status') in _QUEUE_STUCK_STATUSES:
+        return False
+    health = record.get('trackedDownloadStatus')
+    if health == 'error':
+        return False
+    if health == 'warning' or record.get('status') in _QUEUE_STALLED_STATUSES:
+        age = _queue_age(record)
+        return age is not None and age < _QUEUE_GRACE_SECONDS
+    return True
+
+
+def _queue_age(record):
+    """Seconds since the record was added, or None when unknown."""
+    try:
+        added = datetime.datetime.fromisoformat(record['added'].replace('Z', '+00:00'))
+        return (datetime.datetime.now(datetime.timezone.utc) - added).total_seconds()
+    except (KeyError, AttributeError, TypeError, ValueError):
+        return None
+
 
 # HTTP statuses that say "ask again later" rather than "no"
 _TRANSIENT_HTTP = (408, 429)
@@ -689,20 +710,13 @@ class _ArrClientBase:
     _QUEUE_UNKNOWN_PARAM = None   # queue flag that includes unmatched items
 
     def _queue_records(self, extra=None):
-        """Every queue record, all pages.  Raises ArrUnavailable when the arr
-        gives no usable answer — an unread queue is not an empty one."""
-        out, page = [], 1
-        while True:
-            body = self._get('/api/v3/queue',
-                             dict(extra or {}, page=page, pageSize=_QUEUE_PAGE_SIZE),
-                             strict=True)
-            if not isinstance(body, dict):
-                raise ArrUnavailable(f"{self._name} gave no usable answer for the queue")
-            records = body.get('records') or []
-            out += records
-            if not records or len(out) >= int(body.get('totalRecords') or 0):
-                return out
-            page += 1
+        """Every queue record, in one unpaged read (``/queue/details``).
+        Raises ArrUnavailable when the arr gives no usable answer — an unread
+        queue is not an empty one."""
+        body = self._get('/api/v3/queue/details', dict(extra or {}), strict=True)
+        if not isinstance(body, list):
+            raise ArrUnavailable(f"{self._name} gave no usable answer for the queue")
+        return body
 
     def _media_record(self, media_id):
         """The series/movie record, or None."""
@@ -1623,10 +1637,10 @@ class SonarrClient(_ArrClientBase):
                         strict, 'sonarr', 'episode file list')
 
     def queued_episodes(self):
-        """``{(series id, season, episode)}`` of every episode with a download
-        on its way into Sonarr (see ``_queue_active``) — about to be
-        imported, so not to be linked too.
-        Raises ArrUnavailable when Sonarr doesn't answer."""
+        """``{(series id, season, episode)}`` of every episode whose download
+        is on its way into Sonarr (``_queue_active``) — about to be imported,
+        so not to be linked too.  Raises ArrUnavailable when Sonarr doesn't
+        answer."""
         out = set()
         for r in self._queue_records({'includeEpisode': 'true'}):
             if not _queue_active(r):
@@ -2745,9 +2759,9 @@ class RadarrClient(_ArrClientBase):
         return self._put(f'/api/v3/movie/{movie["id"]}?moveFiles=true', dict(movie, path=new_path))
 
     def queued_movie_ids(self):
-        """Ids of movies with a download on its way into Radarr (see
-        ``_queue_active``) — about to be imported, so not to be linked too.  Raises ArrUnavailable when
-        Radarr doesn't answer."""
+        """Ids of movies whose download is on its way into Radarr
+        (``_queue_active``) — about to be imported, so not to be linked too.
+        Raises ArrUnavailable when Radarr doesn't answer."""
         return {r['movieId'] for r in self._queue_records()
                 if r.get('movieId') is not None and _queue_active(r)}
 

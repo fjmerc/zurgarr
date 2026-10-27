@@ -613,6 +613,45 @@ def _film_folder(path, year, title=None):
 _MIN_SWAP_BYTES = 2 * 1024 ** 3
 
 
+# How long after the blackhole hands a download over its files are left to
+# the arr (the arr lists a blackhole item only after its next queue refresh).
+_HANDOFF_GRACE_SECONDS = 1800
+
+
+def _fresh_blackhole_handoffs(mount_target_pairs, max_age=_HANDOFF_GRACE_SECONDS):
+    """Real debrid paths of files the blackhole linked into its completed
+    folder (the arrs' watch folder) in the last *max_age* seconds."""
+    from utils.blackhole import iter_release_dirs
+    from utils.env import completed_dir_from_env
+    completed = completed_dir_from_env()
+    if not completed or not os.path.isdir(completed):
+        return set()
+    out = set()
+    now = time.time()
+    try:
+        releases = list(iter_release_dirs(completed))
+    except OSError:
+        return out
+    for _label, _name, release_path in releases:
+        try:
+            if now - os.lstat(release_path).st_mtime > max_age:
+                continue
+            for dirpath, _dirs, files in os.walk(release_path):
+                for f in files:
+                    link = os.path.join(dirpath, f)
+                    if not os.path.islink(link):
+                        continue
+                    target = os.readlink(link)
+                    for mount, base in mount_target_pairs:
+                        base = (base or '').rstrip('/')
+                        if base and target.startswith(base + '/'):
+                            out.add(os.path.normpath(mount + target[len(base):]))
+                            break
+        except OSError:
+            continue
+    return out
+
+
 def _same_film_year(a, b):
     """Both years known and at most one apart (release years drift)."""
     try:
@@ -7613,6 +7652,10 @@ class LibraryScanner:
         except Exception as e:
             logger.debug(f"[library] TB symlink pair resolution failed: {e}")
 
+        # Debrid files the blackhole handed to Sonarr/Radarr moments ago:
+        # their queue may not list the download yet.
+        fresh_handoffs = _fresh_blackhole_handoffs(_mount_target_pairs)
+
         def _resolve_symlink_target(real_debrid_path):
             """Return host-side symlink target for *real_debrid_path*.
 
@@ -7716,13 +7759,14 @@ class LibraryScanner:
                 if radarr_movies_list is None:
                     radarr_fetch_failed = True
                     radarr_movies_list = []
+                else:
+                    try:
+                        radarr_queued = client.queued_movie_ids()
+                    except Exception as e:
+                        radarr_queued = None
+                        logger.warning(f"[library] Could not read Radarr's queue: {e}")
                 radarr_map, radarr_map_norm, radarr_by_tmdb = arr_title_maps(
                     radarr_movies_list, client, is_tv=False)
-                try:
-                    radarr_queued = client.queued_movie_ids()
-                except Exception as e:
-                    radarr_queued = None
-                    logger.warning(f"[library] Could not read Radarr's queue: {e}")
         except Exception as e:
             radarr_fetch_failed = True
             logger.warning(f"[library] Could not fetch Radarr library: {e}")
@@ -7755,9 +7799,10 @@ class LibraryScanner:
         if self._local_movies_path and radarr_fetch_failed:
             logger.warning("[library] Radarr movie list unavailable — linking no "
                            "movies this scan")
-        elif self._local_movies_path and radarr_queued is None:
-            logger.warning("[library] Radarr queue unavailable — linking no movies this scan")
         elif self._local_movies_path:
+            if radarr_queued is None:
+                logger.warning("[library] Radarr queue unavailable — linking no movies "
+                               "this scan")
             real_movies_root = os.path.realpath(self._local_movies_path)
             unmatched_movies = 0
             for movie in movies:
@@ -7789,9 +7834,9 @@ class LibraryScanner:
                                 os.path.join(self._local_movies_path, movie_dir)):
                             self._rescan_for_missing_file('movie', arr_info, title)
                         continue
-                    if arr_info.get('id') in radarr_queued:
+                    if radarr_queued is None or arr_info.get('id') in radarr_queued:
                         logger.debug("[library] Not linking %r — Radarr is importing a "
-                                     "download of it", title)
+                                     "download of it (or its queue is unreadable)", title)
                         continue
                 elif radarr_configured:
                     unmatched_movies += 1
@@ -7847,6 +7892,8 @@ class LibraryScanner:
                     continue
 
                 real_debrid = os.path.realpath(os.path.join(mount_dir, media_rel))
+                if real_debrid in fresh_handoffs:
+                    continue   # Radarr is about to import the blackhole's hand-off
                 symlink_target = _resolve_symlink_target(real_debrid)
                 if symlink_target is None:
                     continue
@@ -7899,9 +7946,10 @@ class LibraryScanner:
         if self._local_tv_path and sonarr_fetch_failed:
             logger.warning("[library] Sonarr series list unavailable — linking no "
                            "episodes this scan")
-        elif self._local_tv_path and sonarr_queued is None:
-            logger.warning("[library] Sonarr queue unavailable — linking no episodes this scan")
         elif self._local_tv_path:
+            if sonarr_queued is None:
+                logger.warning("[library] Sonarr queue unavailable — linking no episodes "
+                               "this scan")
             real_tv_root = os.path.realpath(self._local_tv_path)
             from utils.library_dedup import episode_index
             episode_file_cache = {}   # series id -> {(s, e): hasFile} | None
@@ -7974,8 +8022,9 @@ class LibraryScanner:
                         if has_file.get((snum, enum)):
                             missing_tracked = True   # Sonarr lists a file the folder lacks
                             continue
-                        if arr_info and (arr_info['id'], snum, enum) in sonarr_queued:
-                            continue   # Sonarr is importing a download of it
+                        if arr_info and (sonarr_queued is None
+                                         or (arr_info['id'], snum, enum) in sonarr_queued):
+                            continue   # Sonarr is importing a download of it (or can't tell)
                         raw_path = path_index.get((norm, snum, enum))
                         if not raw_path:
                             continue
@@ -8036,6 +8085,8 @@ class LibraryScanner:
 
                         # Translate mount path to Sonarr/arr namespace
                         real_debrid = os.path.realpath(debrid_path)
+                        if real_debrid in fresh_handoffs:
+                            continue   # Sonarr is about to import the blackhole's hand-off
                         symlink_target = _resolve_symlink_target(real_debrid)
                         if symlink_target is None:
                             continue
