@@ -1421,3 +1421,24 @@ class TestKeptCopyIsAnotherShow:
         out = plan_series_duplicates(str(L.lib / "Marvel's Daredevil (2015)"), {(1, 4): kept},
                                      L.pairs, "Marvel's Daredevil")
         assert [r.path for r in out] == [extra]
+
+
+@pytest.mark.parametrize('path,name', [
+    (None, ''), ('', ''), ('/', ''), ('.', ''), ('..', ''),
+    ('/d/movies/Heat (1995)', 'Heat (1995)'), ('/d/movies/Heat (1995)/', 'Heat (1995)'),
+    ('/d//movies//Heat (1995)//', 'Heat (1995)'), ('/d/movies/Heat (1995)/..', 'movies'),
+])
+def test_arr_folder_name(path, name):
+    from utils.library_dedup import arr_folder_name
+    assert arr_folder_name(path) == name
+
+
+def test_arr_title_maps_folder_from_path_with_trailing_slash():
+    """Radarr can store '…/Title (Year)/'; the matched folder must still be
+    named, or a title match reads as "the arr doesn't have it"."""
+    from utils.library import arr_title_maps
+    by_title, _n, _t = arr_title_maps([{'title': 'The Devil You Know', 'year': 2022, 'id': 7,
+                                        'path': '/d/movies/The Devil You Know (2022)/'}],
+                                      None, is_tv=False)
+    infos = [i for v in by_title.values() for i in (v if isinstance(v, list) else [v])]
+    assert infos and all(i['folder'] == 'The Devil You Know (2022)' for i in infos)

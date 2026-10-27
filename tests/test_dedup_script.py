@@ -230,10 +230,12 @@ def test_radarr_folders_flags_messy_names(tmp_path):
     assert rows[0]['expected'] == 'Chinatown (1974)'
 
 
-def _rename_setup(tmp_path, moved=True):
+def _rename_setup(tmp_path, moved=True, slash=False):
     from utils.plex_versions import MediaRef, PartRef
     L, radarr, kept, extra, _u = _movie_setup(tmp_path)
     movie = radarr.get_all_movies.return_value[0]
+    if slash:
+        movie['path'] += '/'
     state = {'path': movie['path']}
 
     def get_movie(mid, strict=False):
@@ -661,3 +663,41 @@ def test_radarr_folders_reads_trailing_slash_paths(tmp_path):
     out = str(tmp_path / 'folders.tsv')
     dedup.main(['radarr-folders', '--out', out], ctx=_ctx(L, radarr=radarr))
     assert [r['folder'] for r in _read(out)] == ['Chinatown ITA (1974)']
+
+
+def test_foreign_folder_next_to_trailing_slash_entry_keeps_its_only_copy(tmp_path):
+    """The title match for a foreign folder must find the arr's folder even
+    when the arr's path ends in '/', so the usual checks (is the kept copy
+    there and playing?) apply instead of 'no-arr-title'."""
+    L = Lib(tmp_path)
+    only = L.link(L.movies, 'The Devil You Know 2022 1080p/Devil.mkv', 'D/d.mkv')
+    (L.movies / 'The Devil You Know (2022)').mkdir()
+    radarr = _radarr([{'id': 7, 'title': 'The Devil You Know', 'year': 2022, 'hasFile': False,
+                       'path': '/d/movies/The Devil You Know (2022)/'}])
+    out = str(tmp_path / 'plan.tsv')
+    ctx = _ctx(L, radarr=radarr, tmp_path=tmp_path)
+    dedup.main(['plan', '--kind', 'movie', '--out', out], ctx=ctx)
+    assert not [r for r in _read(out) if r['action'] == 'remove']
+    dedup.main(['apply', '--no-plex', '--plan', out, '--kind', 'movie', '--include-unmatched',
+                '--include-review'], ctx=ctx)
+    assert os.path.islink(only)
+
+
+def test_radarr_rename_with_trailing_slash_path(tmp_path):
+    L, radarr, plex, ctx, out, extra = _rename_setup(tmp_path, slash=True)
+    rc = dedup.main(['radarr-rename', '--ids', '5', '--plan', out], ctx=ctx)
+    assert rc == 0
+    assert radarr.move_movies.call_args[0][1] == '/d/movies'
+    assert not os.path.lexists(extra)
+    assert plex.merged == [('100', ['300'])]
+
+
+def test_radarr_rename_slash_dropped_is_not_a_move(tmp_path):
+    """Radarr saving the same path without its trailing '/' hasn't renamed anything."""
+    L, radarr, plex, ctx, out, extra = _rename_setup(tmp_path, moved=False, slash=True)
+    radarr.move_movies.side_effect = lambda ids, root: radarr.get_movie.__setattr__(
+        'side_effect', lambda mid, strict=False: dict(
+            radarr.get_all_movies.return_value[0], path='/d/movies/Chinatown ITA (1974)'))
+    radarr.set_movie_path.side_effect = lambda m, p: {}
+    rc = dedup.main(['radarr-rename', '--ids', '5', '--plan', out], ctx=ctx)
+    assert rc != 0

@@ -402,7 +402,7 @@ def cmd_radarr_folders(ctx, args):
 def _wait_path_change(ctx, movie_id, old_path):
     for _ in range(_MOVE_POLLS):
         movie = ctx.radarr.get_movie(movie_id, strict=True)
-        if movie and movie.get('path') != old_path:
+        if movie and os.path.normpath(movie.get('path') or '') != os.path.normpath(old_path):
             return movie
         _sleep(_MOVE_POLL_SECONDS)
     return None
@@ -412,8 +412,11 @@ def _rename_one(ctx, movie_id, plan_rows, manifest, include_review=False, wait=1
     from utils.library_dedup import Removal
     movie = ctx.radarr.get_movie(movie_id, strict=True)
     old_path = movie['path']
-    old_folder = os.path.basename(old_path)
-    root = movie.get('rootFolderPath') or os.path.dirname(old_path)
+    old_folder = dd.arr_folder_name(old_path)
+    if not old_folder:
+        print(f'skip {movie_id}: Radarr path {old_path!r} names no folder')
+        return False
+    root = movie.get('rootFolderPath') or os.path.dirname(os.path.normpath(old_path))
     # Only rows today's plan still lists (the plan file may be days old).
     live_rows, _r, _p = build_plan(ctx, ('movie',))
     live = {(r['path'], r['target']) for r in live_rows if r['action'] in ('defer', 'remove')}

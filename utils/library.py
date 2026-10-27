@@ -1604,7 +1604,7 @@ def arr_title_maps(entries, client, is_tv):
             'title': t,
             'year': e.get('year'),
             'family': family.get(_norm_for_matching(_PAREN_YEAR_SUFFIX.sub('', t)), 1),
-            'folder': os.path.basename(p) if p else '',
+            'folder': os.path.basename(os.path.normpath(p)) if p else '',   # Radarr may store '…/X (2022)/'
             'path': p,
             'id': e.get('id'),
             'tmdb_id': e.get('tmdbId'),
