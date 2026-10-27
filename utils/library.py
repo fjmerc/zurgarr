@@ -7453,7 +7453,9 @@ class LibraryScanner:
                                     try:
                                         os.unlink(fpath)
                                         removed += 1
-                                        logger.debug(
+                                        # INFO, like verify_symlinks: a removal
+                                        # must be traceable afterwards
+                                        logger.info(
                                             "[library] Removed broken debrid symlink: %s -> %s",
                                             fpath, target,
                                         )

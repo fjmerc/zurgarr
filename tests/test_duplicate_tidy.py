@@ -1,5 +1,6 @@
 """Tests for the opt-in scheduled duplicate-link tidy (scheduled_tasks.library_duplicate_tidy)."""
 
+import json
 import os
 from unittest.mock import MagicMock, patch
 
@@ -21,6 +22,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr('utils.library_dedup.target_mount_pairs',
                         lambda: [('/mnt/debrid/', str(mount))])
     monkeypatch.setattr('utils.plex_versions.PlexLibrary.from_env', classmethod(lambda cls: None))
+    monkeypatch.setattr(scheduled_tasks, '_tidy_halted', False)
+    monkeypatch.setattr(scheduled_tasks, '_DUPLICATE_TIDY_HALT', str(tmp_path / 'halted.json'))
     return tmp_path
 
 
@@ -231,7 +234,12 @@ def test_lost_kept_copy_halts_the_tidy_until_cleared(env, monkeypatch):
     """A kept copy vanishing is never routine: the tidy stops, reports an
     error, and stays stopped until someone has looked."""
     halt = env / 'halted.json'
+    pending = env / 'pending.json'
     monkeypatch.setattr(scheduled_tasks, '_DUPLICATE_TIDY_HALT', str(halt))
+    monkeypatch.setattr(scheduled_tasks, '_DUPLICATE_TIDY_PENDING', str(pending))
+    monkeypatch.setattr(scheduled_tasks, '_tidy_halted', False)
+    notes = []
+    monkeypatch.setattr('utils.notifications.notify', lambda *a, **k: notes.append(a))
     link = env / 'tv' / 'Show (2020)' / 'Season 01' / 'Show.S01E01.mkv'
     kept = _playable_keep(env, env / 'tv' / 'Show (2020)' / 'Season 01' / 'Show - S01E01.mkv')
     link.parent.mkdir(parents=True, exist_ok=True)
@@ -241,13 +249,27 @@ def test_lost_kept_copy_halts_the_tidy_until_cleared(env, monkeypatch):
     monkeypatch.setattr('utils.plex_versions.PlexLibrary.from_env', classmethod(lambda cls: plex))
     monkeypatch.setattr('utils.library_dedup.snapshot_plex', lambda *a, **k: {'x': []})
     monkeypatch.setattr('utils.library_dedup.reconcile_items',
-                        lambda *a, **k: {'keep_lost': ['10'], 'retry': []})
+                        lambda *a, **k: {'keep_lost': ['10'], 'retry': [{'rating_key': '10'}]})
     monkeypatch.setattr('utils.library_dedup.plex_items', lambda *a, **k: [{'rating_key': '10'}])
     with patch('utils.library_dedup.plan_arr_tv', return_value=([removal], set())), \
          patch('utils.library_dedup.plan_arr_movies', return_value=([], set())), \
          patch('utils.arr_client.get_download_service', _svc(MagicMock(), MagicMock())):
         out = scheduled_tasks.library_duplicate_tidy()
     assert out['status'] == 'error' and halt.exists()
+    assert json.loads(halt.read_text())['plex_items'] == ['10']
+    # this run's removal still gets its Plex follow-up after the halt is cleared
+    assert [it['rating_key'] for it in json.loads(pending.read_text())['tv']] == ['10']
+    assert notes and notes[0][0] == 'health_error'
     with patch('utils.library_dedup.plan_arr_tv') as plan:
         again = scheduled_tasks.library_duplicate_tidy()
     assert again['status'] == 'error' and not plan.called
+
+
+def test_halt_holds_even_when_its_file_cannot_be_written(env, monkeypatch):
+    monkeypatch.setattr(scheduled_tasks, '_DUPLICATE_TIDY_HALT', str(env / 'no' / 'such' / 'h.json'))
+    monkeypatch.setattr(scheduled_tasks, '_tidy_halted', False)
+    monkeypatch.setattr('utils.notifications.notify', lambda *a, **k: None)
+    scheduled_tasks.halt_duplicate_tidy(["10"])
+    with patch('utils.library_dedup.plan_arr_tv') as plan:
+        out = scheduled_tasks.library_duplicate_tidy()
+    assert out['status'] == 'error' and not plan.called

@@ -991,6 +991,7 @@ def _add_item(items, ref, r, rel, library_root):
 
 
 RECONCILE_BUCKETS = ('deleted', 'renamed', 'stranded', 'date_fixed', 'date_failed', 'keep_lost',
+                     'delete_skipped',
                      'deletion_disabled', 'timeout', 'failed')
 
 
@@ -1023,7 +1024,12 @@ def reconcile_items(plex, kind, items, library_root, touch, wait=300):
     by_section = {}
     for it in items:
         by_section.setdefault(it['section'], []).append(it)
-    for section, its in sorted(by_section.items()):
+    sections = sorted(by_section.items())
+    for n, (section, its) in enumerate(sections):
+        # Kept copies as they are before anything here can touch them —
+        # the section rescan included — to see one go missing on the way.
+        kept_by_rk = {it['rating_key']: [k for k in _keep_paths(it, library_root)
+                                         if os.path.lexists(k)] for it in its}
         try:
             if touch:
                 for d in sorted({d for it in its if it.get('same_target')
@@ -1041,21 +1047,22 @@ def reconcile_items(plex, kind, items, library_root, touch, wait=300):
                 out['timeout'].append(it['rating_key'])
                 out['retry'].append(it)
             continue
-        for it in its:
-            kept = [k for k in _keep_paths(it, library_root) if os.path.lexists(k)]
+        for i, it in enumerate(its):
             try:
                 _reconcile_item(plex, kind, it, library_root, touch, out, state)
             except Exception as e:
                 logger.warning("[dedup] Plex item %s not reconciled: %s", it['rating_key'], e)
                 out['failed'].append(it['rating_key'])
                 out['retry'].append(it)
-            lost = [k for k in kept if not os.path.lexists(k)]
+            lost = [k for k in kept_by_rk[it['rating_key']] if not os.path.lexists(k)]
             if lost:
                 # Never routine (prod 10-27: 11 kept High Potential links
-                # vanished after a run) — stop before touching anything else.
+                # vanished after a run) — stop before touching anything else;
+                # what wasn't reached is kept for a later retry.
                 logger.error("[dedup] Kept copy gone after the Plex follow-up of item %s: %s — "
                              "stopping", it['rating_key'], ', '.join(lost))
                 out['keep_lost'].append(it['rating_key'])
+                out['retry'] += its[i + 1:] + [x for _s, rest in sections[n + 1:] for x in rest]
                 return out
     return out
 
@@ -1114,17 +1121,23 @@ def _reconcile_item(plex, kind, it, library_root, touch, out, state):
             # version since the check (two links to one file) — delete only a
             # version still naming exactly removed links, never a kept path.
             fresh = {m.media_id: m for m in plex.media_status(rk)}
-            deleted = False
+            deleted = skipped = False
             for m in gone:
                 now_m = fresh.get(m.media_id)
-                if (now_m is None or now_m.exists or not now_m.rel_paths
-                        or not set(now_m.rel_paths) <= removed
+                if now_m is None:
+                    continue   # already gone from Plex
+                if (now_m.exists or not now_m.rel_paths or not set(now_m.rel_paths) <= removed
                         or set(now_m.rel_paths) & keep):
+                    logger.info("[dedup] Not deleting Plex version %s of item %s — it now "
+                                "names %s", m.media_id, rk, ', '.join(now_m.rel_paths))
+                    skipped = True
                     continue
                 plex.delete_media(rk, m.media_id)
                 deleted = True
             if deleted:
                 out['deleted'].append(rk)
+            if skipped:
+                out['delete_skipped'].append(rk)
     if playing and it['added_at']:
         now = plex.get_added_at(rk)
         if now and now != it['added_at']:

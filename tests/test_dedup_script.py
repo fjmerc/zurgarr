@@ -749,7 +749,7 @@ def test_no_plex_flag_skips_plex_even_when_configured(tmp_path):
     assert not os.path.lexists(extra)
 
 
-def test_apply_stops_when_a_kept_copy_is_lost(tmp_path, monkeypatch):
+def test_apply_stops_when_a_kept_copy_is_lost(tmp_path, monkeypatch, capsys):
     L, sonarr, kept, extra = _show_setup(tmp_path)
     out = str(tmp_path / 'plan.tsv')
     from utils.plex_versions import PartRef
@@ -758,4 +758,11 @@ def test_apply_stops_when_a_kept_copy_is_lost(tmp_path, monkeypatch):
     dedup.main(['plan', '--kind', 'tv', '--out', out], ctx=ctx)
     monkeypatch.setattr(dedup.dd, 'reconcile_plex',
                         lambda *a, **k: {'keep_lost': ['10'], 'retry': []})
+    halt = tmp_path / 'halted.json'
+    monkeypatch.setattr('utils.scheduled_tasks._DUPLICATE_TIDY_HALT', str(halt))
+    monkeypatch.setattr('utils.scheduled_tasks._tidy_halted', False)
+    monkeypatch.setattr('utils.notifications.notify', lambda *a, **k: None)
     assert dedup.main(['apply', '--plan', out, '--kind', 'tv'], ctx=ctx) == 2
+    printed = capsys.readouterr().out
+    assert 'KEPT copy disappeared' in printed and 're-run apply' not in printed
+    assert halt.exists()          # the scheduled tidy stops too

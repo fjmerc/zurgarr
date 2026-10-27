@@ -20,6 +20,7 @@ isn't here, open a [GitHub issue](https://github.com/fjmerc/zurgarr/issues).
 - [New shows/movies only appear in Plex after a manual scan](#new-showsmovies-only-appear-in-plex-after-a-manual-scan)
 - [A download for one show is stuck under a same-name show in Sonarr ("Not an upgrade")](#a-download-for-one-show-is-stuck-under-a-same-name-show-in-sonarr-not-an-upgrade)
 - [Plex shows the same episode or movie two or more times](#plex-shows-the-same-episode-or-movie-two-or-more-times)
+- [Duplicate tidy stopped: "a kept copy disappeared"](#duplicate-tidy-stopped-a-kept-copy-disappeared)
 - [Plex shows episodes or movies as "unavailable" after a restart](#plex-shows-episodes-or-movies-as-unavailable-after-a-restart)
 - [Sonarr/Radarr requests fail with "Try again" (temporary failure in name resolution)](#sonarrradarr-requests-fail-with-try-again-temporary-failure-in-name-resolution)
 - [Blackhole: symlinks created but broken](#blackhole-symlinks-created-but-broken)
@@ -399,6 +400,24 @@ to `/config/duplicate_tidy_manifest.tsv`; `scripts/dedup_library.py undo
 are handled by the one-time `scripts/dedup_library.py` clean-up (preview
 with `plan` first).
 
+## Duplicate tidy stopped: "a kept copy disappeared"
+
+Symptom: the log (and a `health_error` notification) says `Duplicate tidy
+STOPPED: a kept copy disappeared`, and the `duplicate_tidy` task reports an
+error on every run.
+
+Cause: during a clean-up run (the scheduled tidy or
+`scripts/dedup_library.py`), a copy it had kept — the one Sonarr/Radarr
+track — stopped existing. That's never routine, so everything stops before
+anything else is touched. An upgrade or rename by Sonarr/Radarr at that
+moment also looks like this.
+
+Fix: check the titles named in the log line — first Sonarr/Radarr's
+history for an upgrade or rename; then a rescan of the series/movie shows
+what's missing (the next library scan relinks a debrid copy when one
+exists). Then delete `/config/duplicate_tidy_halted.json`; the tidy resumes
+on its next run and finishes the Plex follow-ups it had saved.
+
 ## Plex shows episodes or movies as "unavailable" after a restart
 
 Symptom: after zurgarr restarts (or a debrid mount drops for a moment),
@@ -423,15 +442,6 @@ trash automatically after every scan" is on (with it on, Plex deletes such
 versions itself). Versions whose file is really gone are left for you to
 remove (Plex: Settings → Troubleshooting → Empty Trash). To clear marks straight away,
 run the `plex_unavailable_rescan` task from the System page.
-
-### The duplicate tidy stopped with "a kept copy disappeared"
-
-The tidy found that a copy it had kept (the one Sonarr/Radarr track) no
-longer exists after a run, and stopped so nothing else is touched. The log
-line names the Plex items. Check those titles in Sonarr/Radarr (a rescan
-of the series/movie shows what's missing; the next library scan relinks a
-debrid copy when one exists), then delete
-`/config/duplicate_tidy_halted.json` to let the tidy run again.
 
 ## Sonarr/Radarr requests fail with "Try again" (temporary failure in name resolution)
 

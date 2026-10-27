@@ -304,6 +304,20 @@ def _plex_required(ctx, args):
     return False
 
 
+def _stop_kept_copy_lost(result, manifest, kind):
+    """A kept copy vanished: save what wasn't finished, stop the scheduled
+    tidy too, and stop here."""
+    from utils.scheduled_tasks import halt_duplicate_tidy
+    if result.get('retry'):
+        _save_pending(manifest, kind, result['retry'])
+    halt_duplicate_tidy(result['keep_lost'])
+    print(f'STOPPED: a KEPT copy disappeared during the Plex follow-up of item(s) '
+          f'{result["keep_lost"]} — check those titles (Sonarr/Radarr history: an upgrade or '
+          f'rename?) before running anything else. The scheduled duplicate tidy is stopped '
+          f'too (delete /config/duplicate_tidy_halted.json to resume).')
+    return 2
+
+
 def cmd_apply(ctx, args):
     if not _plex_required(ctx, args):
         return 1
@@ -351,8 +365,7 @@ def cmd_apply(ctx, args):
         problem = [rk for b in ('keep_lost', 'stranded', 'date_failed', 'timeout', 'failed')
                    for rk in result.get(b, [])]
         if result.get('keep_lost'):
-            print(f'STOPPED: a KEPT copy disappeared during the Plex follow-up of item(s) '
-                  f'{result["keep_lost"]} — check that title before running anything else.')
+            return _stop_kept_copy_lost(result, manifest, kind)
         if problem:
             if result.get('retry'):
                 _save_pending(manifest, kind, result['retry'])
@@ -507,6 +520,9 @@ def _rename_one(ctx, movie_id, plan_rows, manifest, include_review=False, wait=1
     if done:
         result = dd.reconcile_plex(ctx.plex, 'movie', done, snapshot, ctx.local_movies,
                                    touch=False, wait=wait)
+        if result.get('keep_lost'):
+            _stop_kept_copy_lost(result, manifest, 'movie')
+            return False
         problem = [rk for b in ('keep_lost', 'stranded', 'date_failed', 'timeout', 'failed')
                    for rk in result.get(b, [])]
         if problem:
@@ -577,7 +593,14 @@ def cmd_reconcile(ctx, args):
     _save_pending_replace(args.manifest, args.kind, result.get('retry', []))
     print(f'{len(items)} Plex item(s): ' + ', '.join(
         f'{k} {len(v)}' for k, v in result.items() if v and k != 'retry'))
-    problem = [rk for b in ('keep_lost', 'stranded', 'date_failed', 'timeout', 'failed')
+    if result.get('keep_lost'):
+        from utils.scheduled_tasks import halt_duplicate_tidy
+        halt_duplicate_tidy(result['keep_lost'])
+        print(f'STOPPED: a KEPT copy disappeared during the Plex follow-up of item(s) '
+              f'{result["keep_lost"]} — check those titles before running anything else '
+              f'(the scheduled duplicate tidy is stopped too).')
+        return 2
+    problem = [rk for b in ('stranded', 'date_failed', 'timeout', 'failed')
                for rk in result.get(b, [])]
     if problem:
         print(f'Still needing attention: {problem}')
