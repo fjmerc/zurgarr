@@ -598,6 +598,23 @@ class TestCreateDebridSymlinksMovies:
             'path': primary, 'alt_path': alt}], {})
         assert not os.path.exists(os.path.join(local_movies, 'Dune (2021)'))
 
+    def test_other_debrids_copy_of_another_title_is_never_linked(self, tmp_dir, monkeypatch):
+        """A fallback folder carried in by a (wrong) alias merge — Logan Lucky
+        for Lucky, same year — must name the film itself."""
+        mount = os.path.join(tmp_dir, 'mount')
+        local_movies = os.path.join(tmp_dir, 'movies')
+        os.makedirs(local_movies)
+        primary = os.path.join(mount, 'movies', 'Lucky.2017.1080p.WEB')
+        os.makedirs(primary)
+        alt = os.path.join(mount, 'torbox', 'Logan.Lucky.2017.1080p.BluRay')
+        _touch(os.path.join(alt, 'Logan.Lucky.2017.1080p.BluRay.mkv'))
+        _setup_env(monkeypatch, mount, '/mnt/debrid')
+        scanner = _make_scanner(mount, None, monkeypatch, local_movies_path=local_movies)
+        scanner._create_debrid_symlinks([_LOCAL_SHOW], [{
+            'title': 'Lucky', 'year': 2017, 'source': 'debrid', 'type': 'movie',
+            'path': primary, 'alt_path': alt}], {})
+        assert not os.path.exists(os.path.join(local_movies, 'Lucky (2017)'))
+
     def test_film_with_extras_included_is_linked(self, tmp_dir, monkeypatch):
         mount = os.path.join(tmp_dir, 'mount')
         local_movies = os.path.join(tmp_dir, 'movies')
@@ -1445,6 +1462,15 @@ def test_dir_has_media_name_missing_dir_is_empty(tmp_path):
     ('Movie 2019 (with extras)', False),
     ('Movie.2019.1080p.extras-included', False),
     ('Movie.2019.Extended.Bonus.Features.Included', False),
+    # ...but an extras-only release that lists what its extras include is not
+    ('The.Big.Sick.2017.Extras.Including.Deleted.Scenes.1080p', True),
+    ('Movie.2010.Special.Features.incl.Commentary.1080p', True),
+    ('Movie.2010.Bonus.Disc.Incl.Making.Of.1080p', True),
+    ('Movie.2010.Bonus.Material.Including.Interviews', True),
+    ('Movie.2010.Extras.Include.Behind.The.Scenes', True),
+    ('Movie.2010.Bonus.Disc.Inclusive', True),
+    ('Movie 2010 Extras & Bonus', True),
+    ('Movie.2010.Bonus.Disc.&.Extras', True),
 ])
 def test_is_extras_release(name, expected):
     from utils.library import _is_extras_release

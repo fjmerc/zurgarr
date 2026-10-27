@@ -505,14 +505,14 @@ _EXTRAS_PATTERN = re.compile(r'\s*\+\s*\w+.*$')
 # the marker comes after the year, so a title like "Extras" is not caught.
 _EXTRAS_RELEASE_RE = re.compile(
     r'(?<!\d)(?:19|20)\d\d(?!\d).*?(?:^|[\s._\-\[(])'
-    r'(?:extras|featurettes?|bonus[\s._\-]?(?:disc|features?|material)|special[\s._\-]features)'
-    r'(?=$|[\s._\-\])])', re.IGNORECASE)
-# ...unless the extras come with the film ("+ Extras", "Incl.Extras",
-# "With.Extras", "extras-included").
-_EXTRAS_INCLUDED_RE = re.compile(
-    r'(?:\b|_)(?:incl?|including|with|plus|w)[\s._\-]+(?:extras|featurettes?|bonus|special)'
-    r'|[+&][\s._\-]*(?:extras|featurettes?|bonus|special)'
-    r'|(?:extras|features?|featurettes?|disc|material)[\s._\-]+incl', re.IGNORECASE)
+    r'(?P<marker>extras|featurettes?|bonus[\s._\-]?(?:disc|features?|material)'
+    r'|special[\s._\-]features)(?=$|[\s._\-\])])', re.IGNORECASE)
+# ...unless the extras come with the film — said right at the marker:
+# "+ Extras", "Incl.Extras", "With.Extras" before it, "Extras.Included" after
+# it.  "Extras.Including.Deleted.Scenes" lists what extras-only holds.
+_EXTRAS_INCLUDED_BEFORE_RE = re.compile(
+    r'(?:(?<![a-z])(?:incl|including|with|plus|w)[\s._\-]+|[+&][\s._\-]*)$', re.IGNORECASE)
+_EXTRAS_INCLUDED_AFTER_RE = re.compile(r'^[\s._\-]+included(?![a-z])', re.IGNORECASE)
 _TRAILING_YEAR_PATTERN = re.compile(r'\s+(\d{4})\s*$')
 _COMPLETE_SUFFIX_PATTERN = re.compile(r'\s+Complete\s*$', re.IGNORECASE)
 
@@ -562,7 +562,11 @@ _BRACKET_YEAR_PATTERN = re.compile(r'\s*\[(\d{4})\]\s*$')
 def _is_extras_release(name):
     """True for a release folder holding only a film's extras."""
     name = name or ''
-    return bool(_EXTRAS_RELEASE_RE.search(name)) and not _EXTRAS_INCLUDED_RE.search(name)
+    m = _EXTRAS_RELEASE_RE.search(name)
+    if not m:
+        return False
+    return not (_EXTRAS_INCLUDED_BEFORE_RE.search(name[:m.start('marker')])
+                or _EXTRAS_INCLUDED_AFTER_RE.match(name[m.end('marker'):]))
 
 
 def _replaces_extras(group, new_path):
@@ -591,14 +595,22 @@ def _movie_debrid_dirs(movie, blocklist=None):
     return out
 
 
-def _film_folder(path, year):
+def _film_folder(path, year, title=None):
     """False for an extras-only release, or one whose folder names another
-    year than the film's (an ``alt_path`` merged by bare title)."""
+    year than the film's (an ``alt_path`` merged by bare title) — or, given
+    *title*, another title (a fallback carried in by an alias merge)."""
     name = os.path.basename(path)
     if _is_extras_release(name):
         return False
-    folder_year = _parse_folder_name(name)[1]
-    return not (folder_year and year and not _same_film_year(folder_year, year))
+    folder_title, folder_year = _parse_folder_name(name)
+    if folder_year and year and not _same_film_year(folder_year, year):
+        return False
+    return title is None or _normalize_title(folder_title or '') == _normalize_title(title)
+
+
+# A debrid file under a quarter of the local film's size AND under this is
+# not the film (prefer-debrid never swaps for it).
+_MIN_SWAP_BYTES = 2 * 1024 ** 3
 
 
 def _same_film_year(a, b):
@@ -3806,13 +3818,15 @@ class LibraryScanner:
                 # Same TMDB id: a year any copy carries is the film's.
                 merged['year'] = next((i['year'] for i in group if i.get('year')), None)
             if merged.get('type') == 'movie' and not merged.get('alt_path'):
-                # Another folder of the same film for the linker to fall back to.
-                merged['alt_path'] = next(
-                    (i.get('alt_path') or i.get('path') for i in films
-                     if i is not best and (i.get('alt_path') or i.get('path'))),
-                    best.get('alt_path'))
-                if not merged['alt_path']:
-                    del merged['alt_path']
+                # Another folder of the same film for the linker to fall back
+                # to — same title only: alias merges can be wrong (Lucky /
+                # Logan Lucky).
+                same = [i for i in films if i is not best
+                        and _normalize_title(i['title']) == _normalize_title(best['title'])]
+                fallback = next((i.get('path') or i.get('alt_path') for i in same
+                                 if i.get('path') or i.get('alt_path')), None)
+                if fallback:
+                    merged['alt_path'] = fallback
 
             # Use earliest date_added from the group (skip 0 = stat failure)
             dates = [item.get('date_added', 0) for item in group if item.get('date_added', 0) > 0]
@@ -4755,10 +4769,10 @@ class LibraryScanner:
         # Remove only successfully cleaned disc rips from the movies list —
         # a film whose other debrid holds a copy keeps that copy.
         if cleaned_paths:
-            for m in movies:
-                if m.get('path') in cleaned_paths and m.get('alt_path'):
-                    m['path'] = m.pop('alt_path')
-            movies[:] = [m for m in movies if m.get('path') not in cleaned_paths]
+            movies[:] = [
+                {k: v for k, v in dict(m, path=m['alt_path']).items() if k != 'alt_path'}
+                if m.get('path') in cleaned_paths and m.get('alt_path') else m
+                for m in movies if m.get('path') not in cleaned_paths or m.get('alt_path')]
 
         return cleaned
 
@@ -4896,7 +4910,9 @@ class LibraryScanner:
                 local_dir = movie.get('local_path')
                 debrid_dirs = [_mount_path_on_disk(d)
                                for d in _movie_debrid_dirs(movie, _blocklist)
-                               if _film_folder(d, movie.get('year'))]
+                               if _film_folder(d, movie.get('year'),
+                                               None if d == movie.get('path')
+                                               else movie['title'])]
                 if not local_dir or not debrid_dirs:
                     continue
 
@@ -4943,6 +4959,13 @@ class LibraryScanner:
                     if debrid_file:
                         break
                 if not debrid_file:
+                    continue
+                # Whatever the release is called, a "copy" a fraction of the
+                # local film's size is a featurette or sample — never swap.
+                if debrid_size < local_size // 4 and debrid_size < _MIN_SWAP_BYTES:
+                    logger.warning(
+                        "[library] Not enforcing prefer-debrid for movie %s: the debrid "
+                        "file %s is far smaller than the local one", movie['title'], debrid_file)
                     continue
 
                 local_fpath = os.path.join(local_dir, local_file)
@@ -7772,7 +7795,8 @@ class LibraryScanner:
                 # film itself (not its extras, not another year) and plays.
                 media_rel = None
                 for listed_dir in candidates:
-                    if not _film_folder(listed_dir, year):
+                    if not _film_folder(listed_dir, year,
+                                        None if listed_dir == movie.get('path') else title):
                         continue
                     mount_dir = _mount_path_on_disk(listed_dir)
                     media_rel, media_size = _find_largest_movie_video(mount_dir)

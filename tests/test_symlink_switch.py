@@ -558,6 +558,34 @@ class TestAutoEnforcement:
         # Checked against Radarr, not Sonarr.
         assert identity_checks == ['movie']
 
+    def test_prefer_debrid_movie_never_swaps_for_a_far_smaller_file(self, tmp_dir, monkeypatch,
+                                                                    identity_checks):
+        """Whatever the release is called, a debrid "copy" a fraction of the
+        local film's size (a featurette, a sample) never replaces it."""
+        local_movies = os.path.join(tmp_dir, 'movies')
+        movie_dir = os.path.join(local_movies, 'Black Adam (2022)')
+        os.makedirs(movie_dir)
+        local_file = os.path.join(movie_dir, 'Black Adam (2022).mkv')
+        with open(local_file, 'w') as f:
+            f.write('x' * 4000)
+        mount = os.path.join(tmp_dir, 'mount')
+        debrid_dir = os.path.join(mount, 'movies', 'Black.Adam.2022.1080p')
+        os.makedirs(debrid_dir)
+        with open(os.path.join(debrid_dir, 'Black.Adam.2022.1080p.mkv'), 'w') as f:
+            f.write('x' * 100)
+        monkeypatch.setenv('BLACKHOLE_RCLONE_MOUNT', mount)
+        monkeypatch.setenv('BLACKHOLE_SYMLINK_TARGET_BASE', '/mnt/debrid')
+        monkeypatch.setenv('LIBRARY_PREFERENCE_AUTO_ENFORCE', 'true')
+        local_tv = os.path.join(tmp_dir, 'tv')
+        os.makedirs(local_tv)
+        scanner = self._make_movie_scanner(local_movies, local_tv, monkeypatch)
+        from utils.library import _normalize_title
+        movie = {'title': 'Black Adam', 'year': 2022, 'source': 'both', 'type': 'movie',
+                 'path': debrid_dir, 'local_path': movie_dir}
+        scanner._enforce_preferences([], [movie], {_normalize_title('Black Adam'): 'prefer-debrid'},
+                                     {}, {})
+        assert not os.path.islink(local_file)
+
     def test_prefer_debrid_ampersand_torbox_movie_switches(self, tmp_dir, monkeypatch):
         """A TorBox movie whose listed folder has '&' (the mount drops it)
         is switched, and the link points at the TorBox target base — not

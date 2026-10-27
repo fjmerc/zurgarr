@@ -4242,6 +4242,28 @@ class TestCleanupDiscRips:
         assert scanner._cleanup_disc_rips(movies) == 1
         assert [m['path'] for m in movies] == [alt] and 'alt_path' not in movies[0]
 
+    def test_disc_rip_promotion_leaves_the_served_item_alone(self, scanner, tmp_dir,
+                                                            monkeypatch):
+        rip_path = self._make_disc_rip_folder(tmp_dir, 'Why.Him.2016')
+        alt = self._make_media_folder(tmp_dir, 'Why Him (2016) [1080p]')
+        served = {'title': 'Why Him', 'year': 2016, 'source': 'debrid', 'size_bytes': 0,
+                  'path': rip_path, 'alt_path': alt, 'quality': {}}
+        movies = [served]
+        mock_client = type('MockClient', (), {
+            'find_torrents_by_title': lambda self, n, target_year=None: [
+                {'id': 'T1', 'filename': 'Why.Him.2016', 'hash': 'AABBCCDD', 'year': 2016}],
+            'delete_torrent': lambda self, tid: True,
+        })()
+        monkeypatch.setattr('utils.debrid_client.get_debrid_client',
+                            lambda service=None, api_key=None: (mock_client, 'realdebrid'))
+        import utils.library as _lib
+        monkeypatch.setattr(_lib, '_blocklist', type('MockBL', (), {
+            'add': lambda self, *a, **kw: 'id1'})())
+        monkeypatch.setenv('BLOCKLIST_AUTO_ADD', 'true')
+        monkeypatch.setattr(_lib, '_history', None)
+        scanner._cleanup_disc_rips(movies)
+        assert served['path'] == rip_path and served['alt_path'] == alt
+
     def test_only_the_disc_rips_own_torrent_deleted(self, scanner, tmp_dir, monkeypatch):
         """Other copies of the same title (a good 1080p) match by name too;
         only the torrent behind the disc-rip folder is deleted/blocklisted."""
@@ -10946,3 +10968,14 @@ class TestExtrasReleaseChoice:
         [merged] = library.LibraryScanner._dedup_by_tmdb(items, aliases)
         assert merged['path'] == '/m/Big Sick 1080p'
         assert merged['year'] == 2017
+
+    def test_tmdb_dedup_carries_a_fallback_only_of_the_same_title(self):
+        items = [
+            {'title': 'Lucky', 'year': 2017, 'type': 'movie', 'source': 'debrid',
+             'path': '/m/Lucky.2017.1080p.WEB'},
+            {'title': 'Logan Lucky', 'year': 2017, 'type': 'movie', 'source': 'debrid',
+             'path': '/m/Logan.Lucky.2017.1080p'},
+        ]
+        aliases = {'lucky': {'logan lucky'}, 'logan lucky': {'lucky'}}
+        [merged] = library.LibraryScanner._dedup_by_tmdb(items, aliases)
+        assert 'alt_path' not in merged

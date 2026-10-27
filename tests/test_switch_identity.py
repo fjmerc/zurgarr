@@ -109,6 +109,9 @@ class TestVerifySwitchIdentity:
         ok, why = _verify(LUCKY, '/data/torbox/Lucky.2017.EXTRAS.1080p.BluRay-RMXTRAS/'
                                  'a.featurette.mkv', 'movie')
         assert not ok and 'extras' in why
+        ok, why = _verify(LUCKY, '/data/torbox/Lucky.2017.Extras.Including.Deleted.Scenes.1080p/'
+                                 'a.featurette.mkv', 'movie')
+        assert not ok and 'extras' in why
 
     def test_off_by_one_year_allowed(self, arr):
         ok, why = _verify(LUCKY, '/data/torbox/Lucky (2018) [1080p] [YTS]/Lucky.mp4', 'movie')
