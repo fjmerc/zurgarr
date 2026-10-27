@@ -14,6 +14,7 @@ translation is needed.  Unlike plex_refresh, failures raise ``PlexError`` —
 callers here must know a write didn't happen.
 """
 
+import http.client
 import json
 import os
 import time
@@ -78,7 +79,7 @@ class PlexLibrary:
         try:
             with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
                 body = resp.read()
-        except (urllib.error.URLError, OSError, ValueError) as e:
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as e:
             raise PlexError(f'{method} {path} failed: {getattr(e, "reason", e)}') from None
         if not body:
             return {}

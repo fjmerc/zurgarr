@@ -56,8 +56,10 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr('utils.library_dedup.target_mount_pairs',
                         lambda: [('/mnt/debrid/', str(mount))])
     scheduled_tasks._plex_rescan_held.clear()
+    scheduled_tasks._plex_rescan_cursor.clear()
     yield tmp_path
     scheduled_tasks._plex_rescan_held.clear()
+    scheduled_tasks._plex_rescan_cursor.clear()
 
 
 def _use(monkeypatch, plex):
@@ -208,7 +210,19 @@ def test_folder_cap_per_run(env, monkeypatch):
     assert len(plex.scans) == 2
 
 
-def test_folder_whose_marks_do_not_clear_waits_and_others_get_a_turn(env, monkeypatch):
+def test_folder_whose_marks_do_not_clear_twice_waits(env, monkeypatch):
+    """One miss may be Plex not having started the scan yet; two in a row
+    hold the folder so it can't take every run's slots."""
+    _link(env, EP1)
+    plex = _use(monkeypatch, FakePlex({'show': [_part(EP1)]}, sticky=[EP1]))
+    scheduled_tasks.plex_unavailable_rescan()
+    scheduled_tasks.plex_unavailable_rescan()
+    assert plex.scans == [('2', SEASON)] * 2
+    scheduled_tasks.plex_unavailable_rescan()
+    assert plex.scans == [('2', SEASON)] * 2
+
+
+def test_folders_past_the_cap_get_the_next_turn(env, monkeypatch):
     rels = [f'Show {i} (2020)/Season 01/Show - S01E01.mkv' for i in range(3)]
     for r in rels:
         _link(env, r)
@@ -219,7 +233,76 @@ def test_folder_whose_marks_do_not_clear_waits_and_others_get_a_turn(env, monkey
     assert [d for _s, d in plex.scans] == ['Show 0 (2020)/Season 01', 'Show 1 (2020)/Season 01']
     plex.scans.clear()
     scheduled_tasks.plex_unavailable_rescan()
-    assert [d for _s, d in plex.scans] == ['Show 2 (2020)/Season 01']
+    assert [d for _s, d in plex.scans][0] == 'Show 2 (2020)/Season 01'
+
+
+def _out_of_time_on(monkeypatch, calls):
+    """Make the time-budget check say "out of time" on the given call numbers."""
+    n = {'i': 0}
+
+    def fake(deadline):
+        n['i'] += 1
+        return n['i'] in calls
+    monkeypatch.setattr(scheduled_tasks, '_out_of_time', fake)
+    return n
+
+
+def test_running_out_of_time_on_tv_still_checks_movies(env, monkeypatch):
+    rel = 'Heat (1995)/Heat (1995).mkv'
+    _link(env, EP1)
+    _link(env, rel, kind='movies')
+    _out_of_time_on(monkeypatch, {1})
+    plex = _use(monkeypatch, FakePlex({'show': [_part(EP1)],
+                                       'movie': [_part(rel, section='1', rk='7')]}))
+    scheduled_tasks.plex_unavailable_rescan()
+    assert plex.scans == [('1', 'Heat (1995)')]
+
+
+def test_running_out_of_time_is_not_reported_as_nothing_to_do(env, monkeypatch):
+    _link(env, EP1)
+    monkeypatch.setattr(scheduled_tasks, '_out_of_time', lambda deadline: True)
+    _use(monkeypatch, FakePlex({'show': [_part(EP1)]}))
+    out = scheduled_tasks.plex_unavailable_rescan()
+    assert 'No unavailable' not in out['message'] and 'next run' in out['message']
+
+
+def test_next_run_continues_where_the_time_budget_stopped(env, monkeypatch):
+    rels = [f'Show {i} (2020)/Season 01/Show - S01E01.mkv' for i in range(3)]
+    for r in rels:
+        _link(env, r)
+    n = _out_of_time_on(monkeypatch, {2, 4})   # one folder checked per run
+    monkeypatch.setenv('BLACKHOLE_LOCAL_LIBRARY_MOVIES', '')
+    plex = _use(monkeypatch, FakePlex({'show': [_part(r, rk=str(i)) for i, r in enumerate(rels)]},
+                                      sticky=rels))
+    scheduled_tasks.plex_unavailable_rescan()
+    scheduled_tasks.plex_unavailable_rescan()
+    assert [d for _s, d in plex.scans] == ['Show 0 (2020)/Season 01', 'Show 1 (2020)/Season 01']
+
+
+def test_unreadable_subfolder_blocks_the_rescan(env, monkeypatch):
+    rel = 'Heat (1995)/Heat (1995).mkv'
+    _link(env, rel, kind='movies')
+    extras = env / 'movies' / 'Heat (1995)' / 'Extras'
+    extras.mkdir()
+    extras.chmod(0)
+    try:
+        plex = _use(monkeypatch, FakePlex({'movie': [_part(rel, section='1')]}))
+        scheduled_tasks.plex_unavailable_rescan()
+        assert plex.scans == []
+    finally:
+        extras.chmod(0o755)
+
+
+def test_version_moved_to_a_new_item_but_still_marked_is_not_cleared(env, monkeypatch):
+    _link(env, EP1)
+
+    class Moving(FakePlex):
+        def scan_path(self, section, rel_dir):
+            self.scans.append((section, rel_dir))
+            self.marked['show'] = [PartRef('99', '1', EP1, 0, '2')]   # same media id
+    _use(monkeypatch, Moving({'show': [_part(EP1, rk='1', mid='1')]}))
+    out = scheduled_tasks.plex_unavailable_rescan()
+    assert 'cleared 0 of 1' in out['message']
 
 
 def test_busy_plex_is_not_recounted_or_reported(env, monkeypatch):

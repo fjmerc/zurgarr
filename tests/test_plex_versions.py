@@ -191,3 +191,15 @@ def test_auto_empty_trash_reads_pref_and_assumes_on_when_missing(value, expected
     plex, fake = _client({('GET', '/:/prefs'): {'MediaContainer': {'Setting': settings}}})
     with patch('urllib.request.urlopen', fake):
         assert plex.auto_empty_trash() is expected
+
+
+def test_reply_cut_off_mid_read_is_a_plex_error():
+    import http.client
+
+    class Cut(_Resp):
+        def read(self):
+            raise http.client.IncompleteRead(b'{"Media', 100)
+    plex = PlexLibrary(BASE, TOKEN)
+    with patch('urllib.request.urlopen', lambda req, timeout=None: Cut(None)):
+        with pytest.raises(PlexError):
+            plex.sections('movie')

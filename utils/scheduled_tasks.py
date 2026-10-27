@@ -740,9 +740,11 @@ _DUPLICATE_TIDY_INTERVAL = 6 * 3600
 _PLEX_RESCAN_INTERVAL = 3 * 3600
 _PLEX_RESCAN_MAX_FOLDERS = 100
 _PLEX_RESCAN_WAIT = 300
-_PLEX_RESCAN_BUDGET = 600        # seconds of file checks per run
-_PLEX_RESCAN_HOLD = 24 * 3600    # a folder whose marks didn't clear waits this long
-_plex_rescan_held = {}           # (section, rel_dir) -> monotonic time it didn't clear
+_PLEX_RESCAN_BUDGET = 600        # seconds of file checks per run, per media type
+_PLEX_RESCAN_HOLD = 24 * 3600    # a folder whose marks didn't clear twice waits this long
+_PLEX_RESCAN_STRIKES = 2         # runs in a row a folder may fail to clear before it waits
+_plex_rescan_held = {}           # (section, rel_dir) -> [runs it didn't clear, held until]
+_plex_rescan_cursor = {}         # media type -> folder key the last run's budget stopped at
 _DUPLICATE_TIDY_MAX_RETRIES = 5
 
 
@@ -933,7 +935,9 @@ def plex_unavailable_rescan():
     mount still down would be marked in turn — and never at all while Plex
     empties its trash after every scan (a missed file would be deleted).
     Only Plex's own recount decides what was cleared; a folder whose marks
-    stay waits ``_PLEX_RESCAN_HOLD`` so it can't take every run's slots.
+    stay ``_PLEX_RESCAN_STRIKES`` runs in a row waits ``_PLEX_RESCAN_HOLD``
+    so it can't take every run's slots (one miss may just be Plex not having
+    started the scan yet).
 
     Gated by ``PLEX_REFRESH`` (read on every run) plus a Plex address and
     token.
@@ -954,11 +958,14 @@ def plex_unavailable_rescan():
             logger.info("[plex] Unavailable-version rescan skipped — Plex empties its trash "
                         "after every scan, so a rescan could delete versions")
             return {'status': 'skipped', 'message': "Plex's empty-trash-after-every-scan is on"}
-        folders = _rescan_candidates(plex, pairs, library_dedup)
+        folders, unfinished = _rescan_candidates(plex, pairs, library_dedup)
     except PlexError as e:
-        logger.warning("[plex] Unavailable-version rescan skipped — Plex unreachable: %s", e)
-        return {'status': 'skipped', 'message': f'Plex unreachable: {e}'}
+        logger.warning("[plex] Unavailable-version rescan skipped — Plex request failed: %s", e)
+        return {'status': 'skipped', 'message': f'Plex request failed: {e}'}
     if not folders:
+        if unfinished:
+            return {'status': 'success', 'message': 'No folder qualified before the file-check '
+                                                    'time ran out — continuing next run'}
         return {'status': 'success', 'message': 'No unavailable Plex versions to rescan'}
 
     scanned, sections = [], []
@@ -981,9 +988,9 @@ def plex_unavailable_rescan():
     versions = sum(len(f.versions) for f in scanned)
     still = None
     try:
-        if all([plex.wait_idle(s, timeout=_PLEX_RESCAN_WAIT) for s in sections]):
+        if all(plex.wait_idle(s, timeout=_PLEX_RESCAN_WAIT) for s in sections):
             media_types = {f.media_type for f in scanned}
-            still = {(p.rating_key, p.media_id)
+            still = {(p.section, p.media_id)
                      for mt in sorted(media_types) for p in plex.unavailable_parts(mt)}
     except PlexError as e:
         logger.info("[plex] Could not recount unavailable versions: %s", e)
@@ -996,13 +1003,17 @@ def plex_unavailable_rescan():
     cleared = []
     now = time.monotonic()
     for folder in scanned:
-        done = [v for v in folder.versions if v not in still]
+        key = (folder.section, folder.rel_dir)
+        done = [m for m in folder.versions if (folder.section, m) not in still]
         if done:
             cleared.append((folder, len(done)))
         if len(done) < len(folder.versions):
-            _plex_rescan_held[(folder.section, folder.rel_dir)] = now
+            entry = _plex_rescan_held.setdefault(key, [0, 0])
+            entry[0] += 1
+            if entry[0] >= _PLEX_RESCAN_STRIKES:
+                entry[1] = now + _PLEX_RESCAN_HOLD
         else:
-            _plex_rescan_held.pop((folder.section, folder.rel_dir), None)
+            _plex_rescan_held.pop(key, None)
     _log_plex_rescans(cleared)
     n_cleared = sum(n for _f, n in cleared)
     msg = (f'Rescanned {len(scanned)} folder(s) holding {versions} unavailable version(s): '
@@ -1013,8 +1024,8 @@ def plex_unavailable_rescan():
 
 class _RescanFolder:
     """One folder to rescan: Plex section, folder relative to its root, the
-    local folder, and the marked versions ``(rating key, media id)`` in it
-    whose files play."""
+    local folder, and the media ids of the marked versions in it whose
+    files play."""
 
     __slots__ = ('section', 'rel_dir', 'local_dir', 'media_type', 'versions')
 
@@ -1024,15 +1035,16 @@ class _RescanFolder:
 
 
 def _rescan_candidates(plex, pairs, library_dedup):
-    """Folders worth a rescan, at most ``_PLEX_RESCAN_MAX_FOLDERS``, found
-    within ``_PLEX_RESCAN_BUDGET`` seconds of file checks.  Raises
-    ``PlexError`` when Plex can't be listed."""
+    """``(folders worth a rescan, unfinished)``: at most
+    ``_PLEX_RESCAN_MAX_FOLDERS`` folders, found within
+    ``_PLEX_RESCAN_BUDGET`` seconds of file checks per media type.
+    *unfinished* says a limit stopped the search; the next run resumes
+    where it stopped.  Raises ``PlexError`` when Plex can't be listed."""
     now = time.monotonic()
-    for key, since in list(_plex_rescan_held.items()):
-        if now - since >= _PLEX_RESCAN_HOLD:
+    for key, (_strikes, until) in list(_plex_rescan_held.items()):
+        if until and until <= now:
             del _plex_rescan_held[key]
-    deadline = now + _PLEX_RESCAN_BUDGET
-    out = []
+    out, unfinished = [], False
     for media_type, env_key in (('show', 'BLACKHOLE_LOCAL_LIBRARY_TV'),
                                 ('movie', 'BLACKHOLE_LOCAL_LIBRARY_MOVIES')):
         root = os.environ.get(env_key, '').strip()
@@ -1045,29 +1057,45 @@ def _rescan_candidates(plex, pairs, library_dedup):
             logger.info("[plex] Not checking %s for unavailable versions — it isn't readable: %s",
                         root, e)
             continue
-        by_folder = {}   # (section, rel_dir) -> {(rating key, media id): [rel paths]}
+        by_folder = {}   # (section, rel_dir) -> {media id: [rel paths]}
         for part in plex.unavailable_parts(media_type):
             rel_dir = os.path.dirname(part.rel_path)
             if not rel_dir:   # loose in the section root: a rescan would cover the whole section
                 continue
             (by_folder.setdefault((part.section, rel_dir), {})
-             .setdefault((part.rating_key, part.media_id), []).append(part.rel_path))
-        for (section, rel_dir), versions in by_folder.items():
-            if len(out) >= _PLEX_RESCAN_MAX_FOLDERS or time.monotonic() > deadline:
+             .setdefault(part.media_id, []).append(part.rel_path))
+        keys = sorted(by_folder)
+        cursor = _plex_rescan_cursor.pop(media_type, None)
+        if cursor is not None:   # resume where the last run stopped, then wrap round
+            keys = [k for k in keys if k >= cursor] + [k for k in keys if k < cursor]
+        deadline = time.monotonic() + _PLEX_RESCAN_BUDGET
+        for key in keys:
+            if len(out) >= _PLEX_RESCAN_MAX_FOLDERS:
+                _plex_rescan_cursor[media_type] = key
                 logger.info("[plex] More folders with unavailable versions are left for the "
                             "next run")
-                return out
-            if (section, rel_dir) in _plex_rescan_held:
+                return out, True
+            if _out_of_time(deadline):
+                _plex_rescan_cursor[media_type] = key
+                logger.info("[plex] File checks for %s ran out of time — the rest is checked "
+                            "next run", media_type)
+                unfinished = True
+                break
+            if _plex_rescan_held.get(key, (0, 0))[1] > now:
                 continue
-            local_dir = _library_file(root, rel_dir)
+            local_dir = _library_file(root, key[1])
             if not local_dir:
                 continue
-            playing = [v for v, rels in versions.items()
+            playing = [m for m, rels in by_folder[key].items()
                        if all(_plays_now(_library_file(root, r), pairs, library_dedup)
                               for r in rels)]
             if playing and _links_all_reachable(local_dir, pairs, library_dedup):
-                out.append(_RescanFolder(section, rel_dir, local_dir, media_type, playing))
-    return out
+                out.append(_RescanFolder(key[0], key[1], local_dir, media_type, playing))
+    return out, unfinished
+
+
+def _out_of_time(deadline):
+    return time.monotonic() > deadline
 
 
 def _library_file(root, rel_path):
@@ -1093,8 +1121,10 @@ def _plays_now(path, pairs, library_dedup):
 def _links_all_reachable(local_dir, pairs, library_dedup):
     """True when every link in the folder (and below) points at a readable
     debrid mount — what Plex sees after the rescan is then what zurgarr sees."""
-    try:
-        for dirpath, dirnames, filenames in os.walk(local_dir):
+    def _raise(e):
+        raise e
+    try:   # a subfolder that can't be read can't be vouched for
+        for dirpath, dirnames, filenames in os.walk(local_dir, onerror=_raise):
             for name in dirnames + filenames:
                 path = os.path.join(dirpath, name)
                 if os.path.islink(path) and \
