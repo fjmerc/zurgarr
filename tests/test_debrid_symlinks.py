@@ -1245,6 +1245,29 @@ class TestSonarrAuthorityGates:
         _run_show(scanner, client, shows, pidx)
         assert sorted(os.listdir(season)) == ['Show (2025) - S01E01 - Pilot [WEBDL-1080p].mkv']
 
+    def test_episode_in_sonarrs_queue_is_left_to_sonarr(self, tmp_dir, monkeypatch):
+        """A grab Sonarr is about to import (blackhole download done, import
+        pending): linking it too made a second, raw-named copy."""
+        scanner, local_tv, shows, pidx = _show_fixture(tmp_dir, monkeypatch)
+        client = _sonarr(_SERIES, episodes=[{'seasonNumber': 1, 'episodeNumber': 1, 'hasFile': False}])
+        client.queued_episodes.return_value = {(7, 1, 1)}
+        _run_show(scanner, client, shows, pidx)
+        assert not os.path.exists(os.path.join(local_tv, 'Show (2025)', 'Season 01'))
+
+    def test_sonarr_queue_unreadable_links_no_episodes(self, tmp_dir, monkeypatch):
+        scanner, local_tv, shows, pidx = _show_fixture(tmp_dir, monkeypatch)
+        client = _sonarr(_SERIES, episodes=[{'seasonNumber': 1, 'episodeNumber': 1, 'hasFile': False}])
+        client.queued_episodes.side_effect = RuntimeError('sonarr down')
+        _run_show(scanner, client, shows, pidx)
+        assert not os.path.exists(os.path.join(local_tv, 'Show (2025)', 'Season 01'))
+
+    def test_other_series_in_queue_does_not_block(self, tmp_dir, monkeypatch):
+        scanner, local_tv, shows, pidx = _show_fixture(tmp_dir, monkeypatch)
+        client = _sonarr(_SERIES, episodes=[{'seasonNumber': 1, 'episodeNumber': 1, 'hasFile': False}])
+        client.queued_episodes.return_value = {(8, 1, 1), (7, 1, 2)}
+        _run_show(scanner, client, shows, pidx)
+        assert os.listdir(os.path.join(local_tv, 'Show (2025)', 'Season 01'))
+
     def test_sonarr_hasfile_true_blocks_link(self, tmp_dir, monkeypatch):
         scanner, local_tv, shows, pidx = _show_fixture(tmp_dir, monkeypatch)
         client = _sonarr(_SERIES, episodes=[{'seasonNumber': 1, 'episodeNumber': 1, 'hasFile': True}])
@@ -1346,6 +1369,27 @@ class TestRadarrAuthorityGates:
         client = _radarr(_film(True))
         _run_movie(scanner, client, movies)
         assert client.rescan_movie.called
+
+    def test_movie_in_radarrs_queue_is_left_to_radarr(self, tmp_dir, monkeypatch):
+        scanner, local_movies, movies = _movie_fixture(tmp_dir, monkeypatch)
+        client = _radarr(_film(False))
+        client.queued_movie_ids.return_value = {3}
+        _run_movie(scanner, client, movies)
+        assert os.listdir(local_movies) == []
+
+    def test_radarr_queue_unreadable_links_no_movies(self, tmp_dir, monkeypatch):
+        scanner, local_movies, movies = _movie_fixture(tmp_dir, monkeypatch)
+        client = _radarr(_film(False))
+        client.queued_movie_ids.side_effect = RuntimeError('radarr down')
+        _run_movie(scanner, client, movies)
+        assert os.listdir(local_movies) == []
+
+    def test_other_movie_in_queue_does_not_block(self, tmp_dir, monkeypatch):
+        scanner, local_movies, movies = _movie_fixture(tmp_dir, monkeypatch)
+        client = _radarr(_film(False))
+        client.queued_movie_ids.return_value = {99}
+        _run_movie(scanner, client, movies)
+        assert os.listdir(local_movies) == ['Film (2020) ITA']
 
     def test_radarr_hasfile_true_blocks_link(self, tmp_dir, monkeypatch):
         scanner, local_movies, movies = _movie_fixture(tmp_dir, monkeypatch)

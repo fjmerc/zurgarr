@@ -3505,3 +3505,52 @@ class TestFolderMoves:
         req = mock_urlopen.call_args[0][0]
         assert req.full_url.endswith('/api/v3/series/7?moveFiles=true')
         assert json.loads(req.data)['path'] == '/t/New (2020)'
+
+
+class TestQueuedItems:
+    """What Sonarr/Radarr are about to import — the library scan leaves those
+    to them instead of linking a second copy."""
+
+    def _pages(self, client, monkeypatch, pages):
+        calls = []
+
+        def get(path, params=None, timeout=None, strict=False):
+            calls.append((path, dict(params or {}), strict))
+            return pages[params.get('page', 1) - 1] if params.get('page', 1) <= len(pages) else None
+        monkeypatch.setattr(client, '_get', get)
+        return calls
+
+    def test_radarr_queued_movie_ids_reads_every_page(self, radarr, monkeypatch):
+        calls = self._pages(radarr, monkeypatch, [
+            {'totalRecords': 3, 'records': [{'movieId': 1}, {'movieId': 2}]},
+            {'totalRecords': 3, 'records': [{'movieId': 5}, {'title': 'unknown item'}]}])
+        monkeypatch.setattr('utils.arr_client._QUEUE_PAGE_SIZE', 2)
+        assert radarr.queued_movie_ids() == {1, 2, 5}
+        assert all(c[0] == '/api/v3/queue' and c[2] for c in calls)
+
+    def test_sonarr_queued_episodes_by_series_season_episode(self, sonarr, monkeypatch):
+        calls = self._pages(sonarr, monkeypatch, [{'totalRecords': 2, 'records': [
+            {'seriesId': 7, 'episode': {'seasonNumber': 1, 'episodeNumber': 2}},
+            {'seriesId': 7, 'seasonNumber': 1, 'episode': {'seasonNumber': 1, 'episodeNumber': 3}},
+        ]}])
+        assert sonarr.queued_episodes() == {(7, 1, 2), (7, 1, 3)}
+        assert calls[0][1].get('includeEpisode') == 'true'
+
+    def test_queue_without_an_answer_raises(self, radarr, monkeypatch):
+        from utils.arr_client import ArrUnavailable
+        monkeypatch.setattr(radarr, '_get', lambda *a, **k: None)
+        with pytest.raises(ArrUnavailable):
+            radarr.queued_movie_ids()
+
+    def test_stuck_queue_items_do_not_count(self, radarr, monkeypatch):
+        """Only a download on its way in counts; a blocked or failed import
+        would otherwise keep the title unlinked forever."""
+        self._pages(radarr, monkeypatch, [{'totalRecords': 5, 'records': [
+            {'movieId': 1, 'status': 'completed', 'trackedDownloadState': 'importPending'},
+            {'movieId': 2, 'status': 'downloading', 'trackedDownloadState': 'downloading'},
+            {'movieId': 3, 'status': 'completed', 'trackedDownloadState': 'importBlocked'},
+            {'movieId': 4, 'status': 'failed', 'trackedDownloadState': 'failedPending'},
+            {'movieId': 5, 'status': 'downloadClientUnavailable',
+             'trackedDownloadState': 'downloading'},
+        ]}])
+        assert radarr.queued_movie_ids() == {1, 2}

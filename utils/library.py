@@ -7678,6 +7678,11 @@ class LibraryScanner:
         # below are the only way a library gets built.
         sonarr_configured = False
         radarr_configured = False
+        # What the arr is about to import (download done or in progress):
+        # linking it too made a second, raw-named copy beside its import.
+        # None = the queue couldn't be read → link nothing of that kind.
+        sonarr_queued = set()
+        radarr_queued = set()
         try:
             client, svc = get_download_service('show')
             if client and svc == 'sonarr':
@@ -7691,6 +7696,11 @@ class LibraryScanner:
                 else:
                     sonarr_map, sonarr_map_norm, sonarr_by_tmdb = arr_title_maps(
                         series_list, client, is_tv=True)
+                    try:
+                        sonarr_queued = client.queued_episodes()
+                    except Exception as e:
+                        sonarr_queued = None
+                        logger.warning(f"[library] Could not read Sonarr's queue: {e}")
         except Exception as e:
             sonarr_fetch_failed = True
             logger.warning(f"[library] Could not fetch Sonarr library: {e}")
@@ -7708,6 +7718,11 @@ class LibraryScanner:
                     radarr_movies_list = []
                 radarr_map, radarr_map_norm, radarr_by_tmdb = arr_title_maps(
                     radarr_movies_list, client, is_tv=False)
+                try:
+                    radarr_queued = client.queued_movie_ids()
+                except Exception as e:
+                    radarr_queued = None
+                    logger.warning(f"[library] Could not read Radarr's queue: {e}")
         except Exception as e:
             radarr_fetch_failed = True
             logger.warning(f"[library] Could not fetch Radarr library: {e}")
@@ -7740,6 +7755,8 @@ class LibraryScanner:
         if self._local_movies_path and radarr_fetch_failed:
             logger.warning("[library] Radarr movie list unavailable — linking no "
                            "movies this scan")
+        elif self._local_movies_path and radarr_queued is None:
+            logger.warning("[library] Radarr queue unavailable — linking no movies this scan")
         elif self._local_movies_path:
             real_movies_root = os.path.realpath(self._local_movies_path)
             unmatched_movies = 0
@@ -7771,6 +7788,10 @@ class LibraryScanner:
                         if not _dir_has_media_name(
                                 os.path.join(self._local_movies_path, movie_dir)):
                             self._rescan_for_missing_file('movie', arr_info, title)
+                        continue
+                    if arr_info.get('id') in radarr_queued:
+                        logger.debug("[library] Not linking %r — Radarr is importing a "
+                                     "download of it", title)
                         continue
                 elif radarr_configured:
                     unmatched_movies += 1
@@ -7878,6 +7899,8 @@ class LibraryScanner:
         if self._local_tv_path and sonarr_fetch_failed:
             logger.warning("[library] Sonarr series list unavailable — linking no "
                            "episodes this scan")
+        elif self._local_tv_path and sonarr_queued is None:
+            logger.warning("[library] Sonarr queue unavailable — linking no episodes this scan")
         elif self._local_tv_path:
             real_tv_root = os.path.realpath(self._local_tv_path)
             from utils.library_dedup import episode_index
@@ -7951,6 +7974,8 @@ class LibraryScanner:
                         if has_file.get((snum, enum)):
                             missing_tracked = True   # Sonarr lists a file the folder lacks
                             continue
+                        if arr_info and (arr_info['id'], snum, enum) in sonarr_queued:
+                            continue   # Sonarr is importing a download of it
                         raw_path = path_index.get((norm, snum, enum))
                         if not raw_path:
                             continue
