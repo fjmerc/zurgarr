@@ -234,6 +234,78 @@ def years_conflict(path, keep):
     return bool(a and b and a != b)
 
 
+_SITE_PREFIX_RE = re.compile(r'^(?:www\.)?[\w-]+\.(?:org|com|net|to|cc|tv)\s*-\s*', re.IGNORECASE)
+_SHOW_STOPWORDS = {'the', 'a', 'an', 'us', 'uk'}
+
+
+def _show_tokens(text):
+    """Normalised words of a series title, years and filler dropped."""
+    text = _NAME_YEAR_RE.sub(' ', text.lower().replace("'", '').replace('’', ''))
+    return tuple(t for t in re.split(r'[^a-z0-9]+', text) if t and t not in _SHOW_STOPWORDS)
+
+
+def _copy_show(path):
+    """Series words a TV copy is named for: the text before its SxxEyy, from
+    the link target's file name (an arr's rename can't change it), else the
+    local name.  None when neither has an episode marker."""
+    try:
+        target = os.readlink(path) if os.path.islink(path) else ''
+    except OSError:
+        target = ''
+    for name in (os.path.basename(target), os.path.basename(path or '')):
+        m = _EPISODE_RE.search(name) if name else None
+        if m and m.start() > 0:
+            return _show_tokens(_SITE_PREFIX_RE.sub('', name[:m.start()]))
+    return None
+
+
+_EP_TITLE_STOP_RE = re.compile(
+    r'^(?:\d{3,4}p|4k|uhd|hdr|dv|web|webrip|webdl|web-dl|bluray|bdrip|brrip|hdtv|remux|'
+    r'x264|x265|h264|h265|hevc|avc|av1|repack\d?|proper|internal|multi|ita|eng|dual|'
+    r'dsnp|amzn|atvp|nf|hmax|max|pcok|hulu|pmtp|ddp5|ddp|dd5|dd|aac|ac3|eac3|atmos|'
+    r'10bit|mkv|mp4|avi|m4v|ts)$', re.IGNORECASE)
+
+
+def _episode_title(path):
+    """Words of the episode title after the SxxEyy marker (target name first,
+    then local name), stopping at the first quality/source tag; () if none."""
+    try:
+        target = os.readlink(path) if os.path.islink(path) else ''
+    except OSError:
+        target = ''
+    for name in (os.path.basename(target), os.path.basename(path or '')):
+        m = _EPISODE_RE.search(name) if name else None
+        if not m:
+            continue
+        rest = re.split(r'[\[(]', name[m.end():], maxsplit=1)[0]
+        words = []
+        for w in re.split(r'[^A-Za-z0-9]+', rest.replace("'", '').replace('’', '')):
+            if not w:
+                continue
+            if _EP_TITLE_STOP_RE.match(w):
+                break
+            words.append(w.lower())
+        if words:
+            return tuple(words)
+    return ()
+
+
+def show_conflict(path, keep, series_title):
+    """True when the extra copy is named for *series_title*, the kept copy is
+    named for another show, and their episode titles don't show them to be
+    the same episode — the arr may track another show's file (Daredevil:
+    Born Again S01E05 tracking the 2015 "Daredevil S01E05 World on Fire"),
+    so the extra copy could be the right one.  The same episode under
+    another show name ("Marvels Daredevil … In the Blood" / "Daredevil …
+    In the Blood") is not a conflict."""
+    series = _show_tokens(series_title or '')
+    a, b = _copy_show(path), _copy_show(keep)
+    if not (series and a == series and b and b != series):
+        return False
+    ta, tb = _episode_title(path), _episode_title(keep)
+    return not (ta and tb and ta == tb)
+
+
 def kept_copy_ok(path, pairs):
     """True when the copy we'd keep actually plays: a real file, or a link
     whose debrid file exists on the mount.  Anything else — broken link,
@@ -341,8 +413,9 @@ def plan_series_duplicates(series_dir, tracked, pairs, title, skipped=None):
         eps = parse_episode_numbers(name)
         if not eps or not all(kept_copy_ok(tracked.get(ep), pairs) for ep in eps):
             continue
-        if any(years_conflict(path, tracked[ep]) for ep in eps):
-            logger.info("[dedup] Keeping %r — its year differs from the tracked copy's", path)
+        if any(years_conflict(path, tracked[ep]) or show_conflict(path, tracked[ep], title)
+               for ep in eps):
+            logger.info("[dedup] Keeping %r — the tracked copy looks like another title", path)
             if skipped is not None:
                 skipped.append((path, tracked[eps[0]]))
             continue
@@ -505,7 +578,9 @@ def plan_foreign_folders(root, kind, owned, maps, tracked_by_entry, pairs,
             for n, p in media:
                 eps = eps_of[p]
                 keeps = [_keep_for_episode(ep, tracked, arr_index, pairs) for ep in eps]
-                if eps and all(keeps) and any(years_conflict(p, k) for k in keeps):
+                if eps and all(keeps) and any(years_conflict(p, k)
+                                              or show_conflict(p, k, info.get('title'))
+                                              for k in keeps):
                     conflicts.append(n)
                     continue
                 if (eps and all(keeps) and _removable_link(p, pairs) is not None
@@ -529,8 +604,8 @@ def plan_foreign_folders(root, kind, owned, maps, tracked_by_entry, pairs,
                     uncovered.append((n, p))
         removals += planned + sidecars_for(planned, [p for _n, p in uncovered])
         if conflicts:
-            report.append(dict(row, rule='year-conflict', detail='%d kept (year differs from '
-                               "%s's copy — the arr may hold another title): %s" % (
+            report.append(dict(row, rule='year-conflict', detail='%d kept (year or show differs '
+                               "from %s's copy — the arr may hold another title): %s" % (
                                    len(conflicts), info['folder'], ', '.join(conflicts[:5]))))
         if uncovered:
             report.append(dict(row, rule='not-covered',

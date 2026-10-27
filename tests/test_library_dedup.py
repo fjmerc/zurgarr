@@ -1361,3 +1361,63 @@ class TestManifestKeeps:
         assert len(manifest_removals(manifest, 'movie')) == 1
         undo_manifest(manifest)
         assert manifest_removals(manifest, 'movie') == []
+
+
+class TestKeptCopyIsAnotherShow:
+    """Sonarr can track another show's file (Daredevil: Born Again S01E05
+    tracked the 2015 "Daredevil S01E05 World on Fire"): when the extra
+    copy is named for the series and the kept copy isn't, keep the extra."""
+
+    def test_kept_copy_of_other_show_keeps_extra(self, tmp_path):
+        from utils.library_dedup import plan_series_duplicates
+        L = _Lib(tmp_path)
+        kept = L.link('Daredevil - Born Again (2025)/Season 01/Daredevil S01E05 World on Fire.mkv',
+                      'Daredevil S01E05 World on Fire 1080p/f.mkv')
+        L.link('Daredevil - Born Again (2025)/Season 01/Daredevil.Born.Again.S01E05.With.Interest.mkv',
+               'Daredevil Born Again S01 2160p/Daredevil.Born.Again.S01E05.With.Interest.mkv')
+        skipped = []
+        out = plan_series_duplicates(str(L.lib / 'Daredevil - Born Again (2025)'), {(1, 5): kept},
+                                     L.pairs, 'Daredevil: Born Again', skipped=skipped)
+        assert out == [] and len(skipped) == 1
+
+    def test_other_show_extra_still_removed(self, tmp_path):
+        from utils.library_dedup import plan_series_duplicates
+        L = _Lib(tmp_path)
+        kept = L.link('Daredevil - Born Again (2025)/Season 02/Daredevil Born Again S02E05.mkv',
+                      'Daredevil Born Again S02 1080p/Daredevil Born Again S02E05.mkv')
+        extra = L.link('Daredevil - Born Again (2025)/Season 02/Daredevil S02E05 Kinbaku.mkv',
+                       'Daredevil S02E05 Kinbaku 1080p/f.mkv')
+        out = plan_series_duplicates(str(L.lib / 'Daredevil - Born Again (2025)'), {(2, 5): kept},
+                                     L.pairs, 'Daredevil: Born Again')
+        assert [r.path for r in out] == [extra]
+
+    def test_same_show_names_unaffected(self, tmp_path):
+        from utils.library_dedup import plan_series_duplicates
+        L = _Lib(tmp_path)
+        kept = L.link('Tulsa King (2022)/Season 01/Tulsa King (2022) - S01E01 - Go West.mkv', 'A/a.mkv')
+        extra = L.link('Tulsa King (2022)/Season 01/Tulsa.King.S01E01.1080p.mkv', 'B/b.mkv')
+        out = plan_series_duplicates(str(L.lib / 'Tulsa King (2022)'), {(1, 1): kept},
+                                     L.pairs, 'Tulsa King')
+        assert [r.path for r in out] == [extra]
+
+    def test_foreign_kept_copy_of_other_show_keeps_extra(self, tmp_path):
+        L = _Lib(tmp_path)
+        kept = L.link('Daredevil - Born Again (2025)/Season 01/Daredevil S01E05 World on Fire.mkv',
+                      'Daredevil S01E05 World on Fire 1080p/f.mkv')
+        L.link('Daredevil Born Again (2025)/Season 01/Daredevil.Born.Again.S01E05.With.Interest.mkv',
+               'Daredevil Born Again S01 2160p/Daredevil.Born.Again.S01E05.With.Interest.mkv')
+        shows = [{'title': 'Daredevil: Born Again', 'year': 2025,
+                  'path': '/t/Daredevil - Born Again (2025)', 'id': 1, 'tmdbId': None}]
+        rem, rep = TestPlanForeignFolders()._plan(L, 'tv', shows, lambda info: {(1, 5): kept})
+        assert rem == [] and [r['rule'] for r in rep] == ['year-conflict']
+
+    def test_same_episode_title_under_another_show_name_is_removed(self, tmp_path):
+        from utils.library_dedup import plan_series_duplicates
+        L = _Lib(tmp_path)
+        kept = L.link("Marvel's Daredevil (2015)/Season 01/Daredevil S01E04 In the Blood 1080p.mkv",
+                      'Daredevil S01E04 In the Blood 1080p DSNP/f.mkv')
+        extra = L.link("Marvel's Daredevil (2015)/Season 01/Marvels Daredevil S01E04 In the Blood (2160p).mkv",
+                       'Marvels Daredevil S01 2160p/Marvels Daredevil S01E04 In the Blood (2160p x265).mkv')
+        out = plan_series_duplicates(str(L.lib / "Marvel's Daredevil (2015)"), {(1, 4): kept},
+                                     L.pairs, "Marvel's Daredevil")
+        assert [r.path for r in out] == [extra]
