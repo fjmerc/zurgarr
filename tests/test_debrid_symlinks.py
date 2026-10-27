@@ -874,6 +874,7 @@ class TestCreateDebridSymlinksMovies:
         assert os.listdir(local_movies) == []
 
 
+@pytest.mark.usefixtures('_fresh_arr_caches')
 class TestYearQualifiedMatching:
     """Year-qualified matching disambiguates same-title different-year series.
 
@@ -1083,3 +1084,122 @@ class TestLocalLibraryEmptyAlerts:
             scanner._create_debrid_symlinks([], [], {})
         assert mock_notify.call_count == 1
         assert mock_notify.call_args.kwargs.get('level') == 'error'
+
+
+# ---------------------------------------------------------------------------
+# Arr-authority gates: never link what Sonarr/Radarr already hold or don't track
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def _fresh_arr_caches():
+    for cache in (library._sonarr_series_cache, library._radarr_movies_cache):
+        cache['data'] = None
+        cache['ts'] = 0.0
+    yield
+    for cache in (library._sonarr_series_cache, library._radarr_movies_cache):
+        cache['data'] = None
+        cache['ts'] = 0.0
+
+
+def _sonarr(series, episodes=None, episodes_exc=None, series_exc=None):
+    client = MagicMock()
+    if series_exc:
+        client.get_all_series.side_effect = series_exc
+    else:
+        client.get_all_series.return_value = series
+    if episodes_exc:
+        client.get_episodes.side_effect = episodes_exc
+    else:
+        client.get_episodes.return_value = episodes or []
+    return client
+
+
+def _run_show(scanner, client, shows, path_index):
+    def svc(media_type):
+        if media_type == 'show':
+            return client, 'sonarr'
+        return None, None
+    with patch('utils.arr_client.get_download_service', svc), \
+         patch('utils.tmdb.get_cached_tmdb_ids', return_value={'movies': {}, 'shows': {}}), \
+         patch('utils.tmdb.find_show_tmdb_id_by_season', return_value=None):
+        scanner._create_debrid_symlinks(shows, [_LOCAL_MOVIE], path_index)
+
+
+_SERIES = [{'title': 'Show', 'path': '/data/media/tv/Show (2025)', 'id': 7,
+            'tvdbId': 1, 'tmdbId': None}]
+
+
+def _show_fixture(tmp_dir, monkeypatch):
+    mount = os.path.join(tmp_dir, 'mount')
+    local_tv = os.path.join(tmp_dir, 'tv')
+    os.makedirs(local_tv)
+    ep_path = os.path.join(mount, 'shows', 'Show.S01E01.1080p', 'Show.S01E01.1080p.mkv')
+    _touch(ep_path)
+    _setup_env(monkeypatch, mount, '/mnt/debrid')
+    scanner = _make_scanner(mount, local_tv, monkeypatch)
+    shows = [{'title': 'Show', 'year': 2025, 'source': 'debrid',
+              'season_data': [{'number': 1, 'episode_count': 1,
+                               'episodes': [{'number': 1, 'file': 'Show.S01E01.1080p.mkv',
+                                             'source': 'debrid'}]}]}]
+    return scanner, local_tv, shows, {('show', 1, 1): ep_path}
+
+
+@pytest.mark.usefixtures('_fresh_arr_caches')
+class TestSonarrAuthorityGates:
+
+    def test_renamed_sonarr_copy_blocks_second_link(self, tmp_dir, monkeypatch):
+        scanner, local_tv, shows, pidx = _show_fixture(tmp_dir, monkeypatch)
+        season = os.path.join(local_tv, 'Show (2025)', 'Season 01')
+        os.makedirs(season)
+        os.symlink('/mnt/debrid/gone/x.mkv',
+                   os.path.join(season, 'Show (2025) - S01E01 - Pilot [WEBDL-1080p].mkv'))
+        client = _sonarr(_SERIES, episodes=[{'seasonNumber': 1, 'episodeNumber': 1, 'hasFile': False}])
+        _run_show(scanner, client, shows, pidx)
+        assert sorted(os.listdir(season)) == ['Show (2025) - S01E01 - Pilot [WEBDL-1080p].mkv']
+
+    def test_sonarr_hasfile_true_blocks_link(self, tmp_dir, monkeypatch):
+        scanner, local_tv, shows, pidx = _show_fixture(tmp_dir, monkeypatch)
+        client = _sonarr(_SERIES, episodes=[{'seasonNumber': 1, 'episodeNumber': 1, 'hasFile': True}])
+        _run_show(scanner, client, shows, pidx)
+        assert not os.path.lexists(os.path.join(local_tv, 'Show (2025)', 'Season 01', 'Show.S01E01.1080p.mkv'))
+
+    def test_sonarr_hasfile_false_links(self, tmp_dir, monkeypatch):
+        scanner, local_tv, shows, pidx = _show_fixture(tmp_dir, monkeypatch)
+        client = _sonarr(_SERIES, episodes=[{'seasonNumber': 1, 'episodeNumber': 1, 'hasFile': False}])
+        _run_show(scanner, client, shows, pidx)
+        assert os.path.islink(os.path.join(local_tv, 'Show (2025)', 'Season 01', 'Show.S01E01.1080p.mkv'))
+
+    def test_unmatched_show_not_linked_when_sonarr_configured(self, tmp_dir, monkeypatch):
+        scanner, local_tv, shows, pidx = _show_fixture(tmp_dir, monkeypatch)
+        client = _sonarr([{'title': 'Other', 'path': '/data/media/tv/Other', 'id': 9,
+                           'tvdbId': 2, 'tmdbId': None}])
+        _run_show(scanner, client, shows, pidx)
+        assert os.listdir(local_tv) == []
+
+    def test_matched_show_with_empty_folder_not_linked(self, tmp_dir, monkeypatch):
+        scanner, local_tv, shows, pidx = _show_fixture(tmp_dir, monkeypatch)
+        client = _sonarr([{'title': 'Show', 'path': '', 'id': 7, 'tvdbId': 1, 'tmdbId': None}])
+        _run_show(scanner, client, shows, pidx)
+        assert os.listdir(local_tv) == []
+
+    def test_sonarr_fetch_failed_links_nothing(self, tmp_dir, monkeypatch):
+        scanner, local_tv, shows, pidx = _show_fixture(tmp_dir, monkeypatch)
+        client = _sonarr(None, series_exc=RuntimeError('down'))
+        _run_show(scanner, client, shows, pidx)
+        assert os.listdir(local_tv) == []
+
+    def test_episode_list_unreachable_skips_show(self, tmp_dir, monkeypatch):
+        scanner, local_tv, shows, pidx = _show_fixture(tmp_dir, monkeypatch)
+        client = _sonarr(_SERIES, episodes_exc=RuntimeError('timeout'))
+        _run_show(scanner, client, shows, pidx)
+        assert not os.path.lexists(os.path.join(local_tv, 'Show (2025)', 'Season 01', 'Show.S01E01.1080p.mkv'))
+
+    def test_download_service_error_links_nothing(self, tmp_dir, monkeypatch):
+        scanner, local_tv, shows, pidx = _show_fixture(tmp_dir, monkeypatch)
+
+        def boom(media_type):
+            raise RuntimeError('config broken')
+        with patch('utils.arr_client.get_download_service', boom), \
+             patch('utils.tmdb.get_cached_tmdb_ids', return_value={'movies': {}, 'shows': {}}):
+            scanner._create_debrid_symlinks(shows, [_LOCAL_MOVIE], pidx)
+        assert os.listdir(local_tv) == []

@@ -1575,6 +1575,25 @@ def _get_sonarr_series_list(client, force_refresh=False):
     return series_list
 
 
+def _sonarr_episode_has_file(client, series_id, cache):
+    """``{(season, episode): hasFile}`` for one Sonarr series, or ``None``
+    when Sonarr didn't answer.  *cache* is a dict scoped to one scan so a
+    series is fetched at most once per scan (``None`` results are cached
+    too — an unreachable Sonarr isn't re-asked for every show)."""
+    if series_id in cache:
+        return cache[series_id]
+    try:
+        episodes = client.get_episodes(series_id, strict=True)
+        result = {(e.get('seasonNumber'), e.get('episodeNumber')): bool(e.get('hasFile'))
+                  for e in episodes or []}
+    except Exception as e:
+        logger.warning("[library] Sonarr episode list for series %s unavailable: %s",
+                       series_id, e)
+        result = None
+    cache[series_id] = result
+    return result
+
+
 def _sonarr_monitored_missing(series):
     """Monitored-aware missing-episode math for a single Sonarr series.
 
@@ -7422,9 +7441,18 @@ class LibraryScanner:
         from utils.arr_client import get_download_service
         sonarr_fetch_failed = False
         radarr_fetch_failed = False
+        # Set when the arr is configured: it is then the authority on what
+        # belongs in its library — nothing is linked for a title it doesn't
+        # have, or for an episode/movie it already holds (a renamed import
+        # never matches the raw debrid filename, so linking it again made a
+        # duplicate Plex version).  Without the arr, the fallback folders
+        # below are the only way a library gets built.
+        sonarr_configured = False
+        radarr_configured = False
         try:
             client, svc = get_download_service('show')
             if client and svc == 'sonarr':
+                sonarr_configured = True
                 # Share the series list with ``_apply_sonarr_monitored_filter``
                 # via the scan-scoped TTL cache — one HTTP round-trip per
                 # scan cycle instead of one per consumer.
@@ -7439,6 +7467,7 @@ class LibraryScanner:
                         p = s.get('path', '')
                         info = {
                             'folder': os.path.basename(p) if p else '',
+                            'path': p,
                             'id': s.get('id'),
                             'tvdb_id': s.get('tvdbId'),
                             'tmdb_id': s.get('tmdbId'),
@@ -7454,6 +7483,7 @@ class LibraryScanner:
         try:
             client, svc = get_download_service('movie')
             if client and svc == 'radarr':
+                radarr_configured = True
                 # Share the movie list with _apply_radarr_wanted_movies
                 # via the scan-scoped TTL cache — one HTTP round-trip
                 # per scan cycle instead of one per consumer. Mirrors
@@ -7645,8 +7675,14 @@ class LibraryScanner:
                     (sd['number'] for sd in sdata if sd.get('number')), default=0,
                 )
 
-        if self._local_tv_path:
+        if self._local_tv_path and sonarr_fetch_failed:
+            logger.warning("[library] Sonarr series list unavailable — linking no "
+                           "episodes this scan")
+        elif self._local_tv_path:
             real_tv_root = os.path.realpath(self._local_tv_path)
+            from utils.library_dedup import episode_index
+            episode_file_cache = {}   # series id -> {(s, e): hasFile} | None
+            unmatched_shows = 0
 
             for show in shows:
                 norm = _show_norm(show)
@@ -7674,8 +7710,29 @@ class LibraryScanner:
                 )
                 if arr_info and arr_info['folder']:
                     show_dir = arr_info['folder']
+                elif sonarr_configured:
+                    unmatched_shows += 1
+                    logger.debug("[library] Not linking %r — Sonarr doesn't have it", title)
+                    continue
                 else:
                     show_dir = f"{title} ({year})" if year else title
+
+                if not any(ep.get('source') == 'debrid'
+                           for sd in show.get('season_data', [])
+                           for ep in sd.get('episodes', [])):
+                    continue
+                # Episodes already in the folder under ANY name (a renamed
+                # Sonarr import, or a link broken by a mount outage) and
+                # episodes Sonarr holds a file for are never linked again.
+                present = episode_index(os.path.join(self._local_tv_path, show_dir))
+                has_file = {}
+                if arr_info:
+                    has_file = _sonarr_episode_has_file(
+                        arr_info['client'], arr_info['id'], episode_file_cache)
+                    if has_file is None:
+                        logger.info("[library] Not linking %r this scan — Sonarr "
+                                    "episode list unavailable", title)
+                        continue
 
                 for sd in show.get('season_data', []):
                     snum = sd['number']
@@ -7684,6 +7741,8 @@ class LibraryScanner:
                         if ep.get('source') != 'debrid':
                             continue
                         enum = ep['number']
+                        if (snum, enum) in present or has_file.get((snum, enum)):
+                            continue
                         raw_path = path_index.get((norm, snum, enum))
                         if not raw_path:
                             continue
@@ -7784,6 +7843,9 @@ class LibraryScanner:
                                 "[library] Failed to create symlink for %r S%02dE%02d: %s",
                                 title, snum, enum, e
                             )
+            if unmatched_shows:
+                logger.info("[library] Skipped linking %d show(s) Sonarr doesn't have",
+                            unmatched_shows)
 
         if phantom_sources > 5:
             logger.warning(
