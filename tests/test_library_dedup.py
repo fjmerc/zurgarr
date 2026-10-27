@@ -1281,3 +1281,83 @@ class TestPlexWait:
         snap = library_dedup.snapshot_plex(plex, 'tv', {'Show (2020)/Season 01/Show.S01E01.mkv'})
         library_dedup.reconcile_plex(plex, 'tv', [r], snap, str(L.lib), touch=False, wait=1800)
         assert waits == [1800]
+
+
+class TestYearGuardReview:
+    """Years come from what a copy really is — its link target (torrent
+    folder + file) — not the local name an arr may have renamed."""
+
+    def test_renamed_kept_file_still_detected(self, tmp_path):
+        from utils.library_dedup import plan_movie_duplicates
+        L = _Lib(tmp_path)
+        kept = L.link('Obsession (2026)/Obsession (2026).mkv', 'Obsession 2025 1080p BYNDR/o.mkv')
+        L.link('Obsession (2026)/Obsession.2026.1080p.mkv', 'Obsession 2026 AMZN KyoGo/o.mkv')
+        assert plan_movie_duplicates(str(L.lib / 'Obsession (2026)'), kept, L.pairs, 'O') == []
+
+    def test_yearless_names_use_link_target_years(self, tmp_path):
+        from utils.library_dedup import plan_series_duplicates
+        L = _Lib(tmp_path)
+        kept = L.link('The Bridge (2013)/Season 01/The Bridge - S01E01 - Pilot.mkv',
+                      'The.Bridge.2013.S01.1080p/e1.mkv')
+        L.link('The Bridge (2013)/Season 01/bridge-s01e01.mkv', 'The.Bridge.2011.S01E01.720p/e1.mkv')
+        assert plan_series_duplicates(str(L.lib / 'The Bridge (2013)'), {(1, 1): kept},
+                                      L.pairs, 'The Bridge') == []
+
+    def test_title_year_does_not_hide_release_year(self, tmp_path):
+        from utils.library_dedup import years_conflict
+        L = _Lib(tmp_path)
+        kept = L.link('1984 (1984)/1984.1956.BluRay.mkv', '1984.1956.BluRay/f.mkv')
+        extra = L.link('1984 (1984)/1984.1984.1080p.mkv', '1984.1984.1080p/f.mkv')
+        assert years_conflict(extra, kept)
+
+    def test_title_with_number_and_same_year_is_no_conflict(self, tmp_path):
+        from utils.library_dedup import years_conflict
+        L = _Lib(tmp_path)
+        kept = L.link('Blade Runner 2049 (2017)/Blade Runner 2049 (2017).mkv', 'Blade Runner 2049 (2017) Remux/b.mkv')
+        extra = L.link('Blade Runner 2049 (2017)/Blade.Runner.2049.2017.mkv', 'Blade.Runner.2049.2017.1080p/b.mkv')
+        assert not years_conflict(extra, kept)
+
+    def test_plan_reports_year_conflicts(self, tmp_path):
+        from utils.library_dedup import plan_movie_duplicates
+        L = _Lib(tmp_path)
+        kept = L.link('Obsession (2026)/Obsession (2026).mkv', 'Obsession 2025 1080p BYNDR/o.mkv')
+        extra = L.link('Obsession (2026)/Obsession.2026.1080p.mkv', 'Obsession 2026 AMZN KyoGo/o.mkv')
+        skipped = []
+        plan_movie_duplicates(str(L.lib / 'Obsession (2026)'), kept, L.pairs, 'O', skipped=skipped)
+        assert skipped == [(extra, kept)]
+
+    def test_foreign_year_conflict_reported_as_such(self, tmp_path):
+        L = _Lib(tmp_path)
+        kept = L.link('Film ITA (2020)/Film.mkv', 'Film 2019 1080p/f.mkv')
+        L.link('Film (2020)/Film.mkv', 'Film 2020 1080p/f.mkv')
+        movies = [{'title': 'Film', 'year': 2020, 'path': '/m/Film ITA (2020)', 'id': 1,
+                   'tmdbId': None, 'hasFile': True}]
+        rem, rep = TestPlanForeignFolders()._plan(L, 'movie', movies, lambda info: kept)
+        assert rem == [] and [r['rule'] for r in rep] == ['year-conflict']
+
+
+class TestManifestKeeps:
+
+    def test_manifest_records_every_kept_copy(self, tmp_path):
+        import csv
+        from utils.library_dedup import Removal, apply_removals, manifest_removals
+        L = _Lib(tmp_path)
+        k1 = L.link('S (2020)/Season 01/S - S01E01.mkv', 'A/a.mkv')
+        k2 = L.link('S (2020)/Season 01/S - S01E02.mkv', 'C/c.mkv')
+        extra = L.link('S (2020)/Season 01/S.S01E01E02.mkv', 'B/b.mkv')
+        manifest = str(tmp_path / 'm.tsv')
+        apply_removals([Removal(extra, '/mnt/debrid_torbox/B/b.mkv', 'tv', 'arr-folder-untracked',
+                                k1, 'S', keeps=(k1, k2))], manifest, str(L.lib), set())
+        (r,) = manifest_removals(manifest, 'tv')
+        assert r.keeps == (k1, k2)
+
+    def test_manifest_removals_skip_restored_links(self, tmp_path):
+        from utils.library_dedup import Removal, apply_removals, manifest_removals, undo_manifest
+        L = _Lib(tmp_path)
+        extra = L.link('S (2020)/x.mkv', 'B/b.mkv')
+        manifest = str(tmp_path / 'm.tsv')
+        apply_removals([Removal(extra, '/mnt/debrid_torbox/B/b.mkv', 'movie', 'foreign-folder',
+                                '', 'S')], manifest, str(L.lib), set())
+        assert len(manifest_removals(manifest, 'movie')) == 1
+        undo_manifest(manifest)
+        assert manifest_removals(manifest, 'movie') == []

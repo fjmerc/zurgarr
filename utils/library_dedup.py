@@ -210,18 +210,27 @@ class Removal:
 _NAME_YEAR_RE = re.compile(r'(?<!\d)(19\d\d|20\d\d)(?!\d)')
 
 
-def _name_year(path):
-    """First 19xx/20xx year in a file name (resolutions like 2160 don't
-    match), or None."""
-    m = _NAME_YEAR_RE.search(os.path.basename(path or ''))
-    return m.group(1) if m else None
+def _copy_years(path):
+    """Every 19xx/20xx year that says what a copy really is: from its link
+    target — torrent folder + file, which an arr's rename never touches —
+    else from its local name.  Resolutions like 2160 don't match."""
+    try:
+        target = os.readlink(path) if os.path.islink(path) else ''
+    except OSError:
+        target = ''
+    if target:
+        years = set(_NAME_YEAR_RE.findall('/'.join(target.split('/')[-2:])))
+        if years:
+            return years
+    return set(_NAME_YEAR_RE.findall(os.path.basename(path or '')))
 
 
 def years_conflict(path, keep):
-    """True when the extra copy and the kept copy name different years — the
+    """True when the extra copy and the kept copy carry different years — the
     arr may hold the wrong title ("Obsession (2026)" tracking "Obsession
-    2025"), so the extra copy could be the right one."""
-    a, b = _name_year(path), _name_year(keep)
+    2025"), so the extra copy could be the right one.  All years are
+    compared, so one in the title ("1984") can't hide the release year."""
+    a, b = _copy_years(path), _copy_years(keep)
     return bool(a and b and a != b)
 
 
@@ -312,7 +321,7 @@ def sidecars_for(removals, kept_paths=()):
     return out
 
 
-def plan_series_duplicates(series_dir, tracked, pairs, title):
+def plan_series_duplicates(series_dir, tracked, pairs, title, skipped=None):
     """Extra links in a Sonarr series folder: untracked debrid symlinks whose
     every claimed episode has a tracked copy that plays.  *tracked* maps
     ``(season, episode)`` → local path of Sonarr's tracked file."""
@@ -334,6 +343,8 @@ def plan_series_duplicates(series_dir, tracked, pairs, title):
             continue
         if any(years_conflict(path, tracked[ep]) for ep in eps):
             logger.info("[dedup] Keeping %r — its year differs from the tracked copy's", path)
+            if skipped is not None:
+                skipped.append((path, tracked[eps[0]]))
             continue
         removals.append(Removal(path, target, 'tv', 'arr-folder-untracked',
                                 tracked[eps[0]], title,
@@ -341,7 +352,7 @@ def plan_series_duplicates(series_dir, tracked, pairs, title):
     return removals + sidecars_for(removals, tracked_paths)
 
 
-def plan_movie_duplicates(movie_dir, tracked_path, pairs, title):
+def plan_movie_duplicates(movie_dir, tracked_path, pairs, title, skipped=None):
     """Extra debrid symlinks in a Radarr movie folder, when Radarr's own
     tracked file plays."""
     if not kept_copy_ok(tracked_path, pairs):
@@ -361,6 +372,8 @@ def plan_movie_duplicates(movie_dir, tracked_path, pairs, title):
             continue
         if years_conflict(path, tracked_path):
             logger.info("[dedup] Keeping %r — its year differs from the tracked copy's", path)
+            if skipped is not None:
+                skipped.append((path, tracked_path))
             continue
         removals.append(Removal(path, target, 'movie', 'arr-folder-untracked', tracked_path, title))
     return removals + sidecars_for(removals, [tracked_path])
@@ -481,7 +494,7 @@ def plan_foreign_folders(root, kind, owned, maps, tracked_by_entry, pairs,
         except Exception as e:
             report.append(dict(row, rule='arr-error', detail=str(e)))
             continue
-        planned, uncovered = [], []
+        planned, uncovered, conflicts = [], [], []
         if is_tv:
             tracked = tracked or {}
             arr_index = episode_index(arr_folder)
@@ -492,9 +505,11 @@ def plan_foreign_folders(root, kind, owned, maps, tracked_by_entry, pairs,
             for n, p in media:
                 eps = eps_of[p]
                 keeps = [_keep_for_episode(ep, tracked, arr_index, pairs) for ep in eps]
+                if eps and all(keeps) and any(years_conflict(p, k) for k in keeps):
+                    conflicts.append(n)
+                    continue
                 if (eps and all(keeps) and _removable_link(p, pairs) is not None
-                        and not any(os.path.normpath(k) == os.path.normpath(p) for k in keeps)
-                        and not any(years_conflict(p, k) for k in keeps)):
+                        and not any(os.path.normpath(k) == os.path.normpath(p) for k in keeps)):
                     planned.append(Removal(p, os.readlink(p), kind, rule,
                                            keeps[0], info['folder'],
                                            keeps=tuple(sorted(set(keeps)))))
@@ -503,14 +518,20 @@ def plan_foreign_folders(root, kind, owned, maps, tracked_by_entry, pairs,
         else:
             ok = kept_copy_ok(tracked, pairs)
             for n, p in media:
+                if ok and years_conflict(p, tracked):
+                    conflicts.append(n)
+                    continue
                 if (ok and _removable_link(p, pairs) is not None
-                        and os.path.normpath(tracked) != os.path.normpath(p)
-                        and not years_conflict(p, tracked)):
+                        and os.path.normpath(tracked) != os.path.normpath(p)):
                     planned.append(Removal(p, os.readlink(p), kind, rule,
                                            tracked, info['folder']))
                 else:
                     uncovered.append((n, p))
         removals += planned + sidecars_for(planned, [p for _n, p in uncovered])
+        if conflicts:
+            report.append(dict(row, rule='year-conflict', detail='%d kept (year differs from '
+                               "%s's copy — the arr may hold another title): %s" % (
+                                   len(conflicts), info['folder'], ', '.join(conflicts[:5]))))
         if uncovered:
             report.append(dict(row, rule='not-covered',
                                detail='%d kept (arr has no playable copy): %s' % (
@@ -518,7 +539,7 @@ def plan_foreign_folders(root, kind, owned, maps, tracked_by_entry, pairs,
     return removals, report
 
 
-MANIFEST_COLUMNS = ('ts', 'action', 'rule', 'kind', 'title', 'path', 'target', 'keep')
+MANIFEST_COLUMNS = ('ts', 'action', 'rule', 'kind', 'title', 'path', 'target', 'keep', 'keeps')
 
 
 def _append_manifest(manifest_path, removal, action):
@@ -531,7 +552,7 @@ def _append_manifest(manifest_path, removal, action):
             w.writerow(MANIFEST_COLUMNS)
         w.writerow((time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), action,
                     removal.rule, removal.kind, removal.title, removal.path,
-                    removal.target, removal.keep))
+                    removal.target, removal.keep, '|'.join(removal.keeps)))
         f.flush()
         os.fsync(f.fileno())
 
@@ -662,6 +683,18 @@ def restore_removals(done):
         except OSError as e:
             logger.warning("[dedup] Could not put back %r: %s", r.path, e)
     return restored
+
+
+def manifest_removals(manifest_path, kind):
+    """The link removals a manifest recorded for *kind* that are still
+    removed (a link put back by ``undo`` or a restore is left out)."""
+    with open(manifest_path, newline='') as f:
+        rows = list(csv.DictReader(f, delimiter='\t'))
+    return [Removal(r['path'], r['target'], r['kind'], r['rule'], r['keep'], r['title'],
+                    keeps=tuple(k for k in (r.get('keeps') or '').split('|') if k))
+            for r in rows
+            if r['action'] == 'remove' and r['kind'] == kind and r['target']
+            and not os.path.lexists(r['path'])]
 
 
 def undo_manifest(manifest_path):
@@ -975,7 +1008,7 @@ def radarr_tracked(movie, local_dir):
     return _local_path(path, movie['path'], local_dir)
 
 
-def plan_arr_tv(client, local_tv, pairs):
+def plan_arr_tv(client, local_tv, pairs, skipped=None):
     """Plan duplicate removals across every Sonarr series folder.
 
     Returns ``(removals, protected)`` — *protected* holds every Sonarr
@@ -1002,11 +1035,12 @@ def plan_arr_tv(client, local_tv, pairs):
             logger.warning("[dedup] Skipping %r — Sonarr episode data unavailable: %s",
                            s.get('title'), e)
             continue
-        removals += plan_series_duplicates(local_dir, tracked, pairs, s.get('title', ''))
+        removals += plan_series_duplicates(local_dir, tracked, pairs, s.get('title', ''),
+                                           skipped=skipped)
     return removals, protected
 
 
-def plan_arr_movies(client, local_movies, pairs):
+def plan_arr_movies(client, local_movies, pairs, skipped=None):
     """Radarr counterpart of ``plan_arr_tv``."""
     removals, protected = [], set()
     for m in client.get_all_movies(strict=True) or []:
@@ -1022,5 +1056,5 @@ def plan_arr_movies(client, local_movies, pairs):
             logger.warning("[dedup] Skipping %r — its folder can't be read: %s", m.get('title'), e)
             continue
         removals += plan_movie_duplicates(local_dir, radarr_tracked(m, local_dir),
-                                          pairs, m.get('title', ''))
+                                          pairs, m.get('title', ''), skipped=skipped)
     return removals, protected

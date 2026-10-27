@@ -438,7 +438,7 @@ def test_apply_stops_on_plex_timeout(tmp_path, monkeypatch):
     ctx = _ctx(L, radarr=radarr, plex=plex, tmp_path=tmp_path)
     dedup.main(['plan', '--kind', 'movie', '--out', out], ctx=ctx)
     monkeypatch.setattr(dedup.dd, 'reconcile_plex',
-                        lambda *a, **k: {'timeout': ['100'], 'retry': [{}]})
+                        lambda *a, **k: {'timeout': ['100'], 'retry': [{'rating_key': '100'}]})
     rc = dedup.main(['apply', '--plan', out, '--kind', 'movie', '--include-unmatched'], ctx=ctx)
     assert rc == 2
     assert sum(not os.path.lexists(p) for p in (extra, unmatched)) == 1
@@ -524,3 +524,68 @@ def test_reconcile_command_finishes_plex_after_a_stopped_run(tmp_path):
     rc = dedup.main(['reconcile', '--manifest', manifest, '--kind', 'tv'],
                     ctx=_ctx(L, plex=plex, tmp_path=tmp_path))
     assert rc == 0 and plex.deleted == [('10', '2')]
+
+
+def test_stopped_apply_saves_pending_and_reconcile_restores_date(tmp_path, monkeypatch):
+    import json
+    from utils.plex_versions import MediaRef, PartRef
+    L, sonarr, kept, extra = _show_setup(tmp_path)
+    out = str(tmp_path / 'plan.tsv')
+    parts = [PartRef('10', '1', 'Show (2020)/Season 01/Show (2020) - S01E01.mkv', 111, '2'),
+             PartRef('10', '2', 'Show (2020)/Season 01/Show.S01E01.mkv', 111, '2')]
+    plex = FakePlex(parts)
+    plex.wait_idle = lambda *a, **k: False             # Plex busy during apply
+    plex.added = {'10': 111}
+    plex.get_added_at = lambda rk: plex.added[rk]
+    plex.set_dates = []
+    plex.set_added_at = lambda s, rk, t, e: plex.set_dates.append((rk, e)) or plex.added.update({rk: e})
+    plex.deleted = []
+    plex.delete_media = lambda rk, mid: plex.deleted.append((rk, mid))
+    ctx = _ctx(L, sonarr=sonarr, plex=plex, tmp_path=tmp_path)
+    dedup.main(['plan', '--kind', 'tv', '--out', out], ctx=ctx)
+    assert dedup.main(['apply', '--plan', out, '--kind', 'tv'], ctx=ctx) == 2
+    manifest = next(str(tmp_path / n) for n in os.listdir(tmp_path)
+                    if n.startswith('dedup_manifest_') and n.endswith('.tsv'))
+    pending = json.load(open(manifest + '.pending.json'))
+    assert [it['added_at'] for it in pending['tv']] == [111]
+    # Plex finishes later and bumps the date; reconcile must put 111 back.
+    plex.wait_idle = lambda *a, **k: True
+    plex.added['10'] = 999
+    plex.list_parts = lambda mt: []                    # removed part already gone from listings
+    plex.media_status = lambda rk: [MediaRef('1', ['Show (2020)/Season 01/Show (2020) - S01E01.mkv'], True),
+                                    MediaRef('2', ['Show (2020)/Season 01/Show.S01E01.mkv'], False)]
+    assert dedup.main(['reconcile', '--manifest', manifest, '--kind', 'tv'], ctx=ctx) == 0
+    assert plex.added['10'] == 111 and plex.deleted == [('10', '2')]
+
+
+def test_reconcile_without_pending_warns_and_reports_empty(tmp_path, capsys):
+    from utils.library_dedup import Removal, apply_removals
+    L = Lib(tmp_path)
+    kept = L.link(L.tv, 'Show (2020)/Season 01/Show (2020) - S01E01.mkv', 'A/a.mkv')
+    extra = L.link(L.tv, 'Show (2020)/Season 01/Show.S01E01.mkv', 'B/b.mkv')
+    manifest = str(tmp_path / 'dedup_manifest_y.tsv')
+    apply_removals([Removal(extra, '/mnt/debrid_torbox/B/b.mkv', 'tv', 'arr-folder-untracked',
+                            kept, 'Show')], manifest, str(L.tv), set())
+    rc = dedup.main(['reconcile', '--manifest', manifest, '--kind', 'tv'],
+                    ctx=_ctx(L, plex=FakePlex([]), tmp_path=tmp_path))
+    text = capsys.readouterr().out
+    assert rc == 1 and 'date added' in text and 'Plex knows none' in text
+
+
+def test_radarr_rename_stops_when_plex_stays_busy(tmp_path):
+    L, radarr, plex, ctx, out, extra = _rename_setup(tmp_path)
+    plex.wait_idle = lambda *a, **k: False
+    assert dedup.main(['radarr-rename', '--ids', '5', '--plan', out], ctx=ctx) == 2
+    assert plex.merged == []
+
+
+def test_plan_reports_year_conflicts_in_arr_folders(tmp_path):
+    L = Lib(tmp_path)
+    L.link(L.movies, 'Obsession (2026)/Obsession (2026).mkv', 'Obsession 2025 BYNDR/o.mkv')
+    L.link(L.movies, 'Obsession (2026)/Obsession.2026.1080p.mkv', 'Obsession 2026 KyoGo/o.mkv')
+    radarr = _radarr([{'id': 1, 'title': 'Obsession', 'year': 2026, 'hasFile': True,
+                       'path': '/d/movies/Obsession (2026)',
+                       'movieFile': {'path': '/d/movies/Obsession (2026)/Obsession (2026).mkv'}}])
+    out = str(tmp_path / 'plan.tsv')
+    dedup.main(['plan', '--kind', 'movie', '--out', out], ctx=_ctx(L, radarr=radarr))
+    assert [(r['action'], r['rule']) for r in _read(out)] == [('report', 'year-conflict')]

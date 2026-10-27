@@ -106,7 +106,8 @@ def _plan_tv(ctx):
         raise RuntimeError('Sonarr returned no series — refusing to plan (an empty answer '
                            'would make every folder look foreign)')
     by_id = {s['id']: s for s in series}
-    removals, protected = dd.plan_arr_tv(ctx.sonarr, ctx.local_tv, ctx.pairs)
+    skipped = []
+    removals, protected = dd.plan_arr_tv(ctx.sonarr, ctx.local_tv, ctx.pairs, skipped=skipped)
     owned = {os.path.basename(s['path']) for s in series if s.get('path')}
 
     def tracked(info):
@@ -116,6 +117,7 @@ def _plan_tv(ctx):
     foreign, report = dd.plan_foreign_folders(
         ctx.local_tv, 'tv', owned, arr_title_maps(series, ctx.sonarr, True), tracked,
         ctx.pairs, cached_tmdb=ids, tmdb_cache=full)
+    report += _year_conflict_rows('tv', ctx.local_tv, skipped)
     # Episodes with copies in Sonarr's folder that Sonarr tracks none of —
     # listed for the owner, never removed.
     for s in series:
@@ -150,7 +152,9 @@ def _plan_movies(ctx):
         raise RuntimeError('Radarr returned no movies — refusing to plan (an empty answer '
                            'would make every folder look foreign)')
     by_id = {m['id']: m for m in movies}
-    removals, protected = dd.plan_arr_movies(ctx.radarr, ctx.local_movies, ctx.pairs)
+    skipped = []
+    removals, protected = dd.plan_arr_movies(ctx.radarr, ctx.local_movies, ctx.pairs,
+                                             skipped=skipped)
     owned = {os.path.basename(m['path']) for m in movies if m.get('path')}
 
     def tracked(info):
@@ -159,6 +163,7 @@ def _plan_movies(ctx):
     foreign, report = dd.plan_foreign_folders(
         ctx.local_movies, 'movie', owned, arr_title_maps(movies, ctx.radarr, False), tracked,
         ctx.pairs, cached_tmdb=ids, tmdb_cache=full)
+    report += _year_conflict_rows('movie', ctx.local_movies, skipped)
     # Movie folders holding copies Radarr tracks none of — listed, never removed.
     for m in movies:
         folder = os.path.basename(os.path.normpath(m.get('path') or ''))
@@ -174,6 +179,15 @@ def _plan_movies(ctx):
             report.append({'kind': 'movie', 'folder': folder, 'rule': 'radarr-accepted-none',
                            'detail': '%d file(s): %s' % (len(names), ', '.join(names[:5]))})
     return removals + foreign, report, protected
+
+
+def _year_conflict_rows(kind, root, skipped):
+    """Report rows for extra copies kept because their year differs from the
+    copy the arr tracks — the arr may hold another title (check it there)."""
+    return [{'kind': kind, 'folder': os.path.relpath(path, root), 'rule': 'year-conflict',
+             'detail': f'kept: year differs from the tracked copy {os.path.basename(keep)!r} '
+                       f'— the arr may hold another title'}
+            for path, keep in skipped]
 
 
 def _deferred_groups(ctx, kind, removals):
@@ -238,6 +252,32 @@ def cmd_plan(ctx, args):
         print(f'{action:7} {kind:6} {rule:24} {n}')
     print(f'plan written to {args.out} — nothing was changed')
     return 0
+
+
+def _pending_path(manifest):
+    return manifest + '.pending.json'
+
+
+def _save_pending(manifest, kind, items):
+    """Keep Plex follow-ups a stopped run couldn't finish — with each item's
+    date added from BEFORE the removal — for ``reconcile``."""
+    import json
+    path = _pending_path(manifest)
+    try:
+        with open(path) as f:
+            pending = json.load(f)
+    except (OSError, ValueError):
+        pending = {}
+    have = {it['rating_key'] for it in pending.get(kind, [])}
+    pending[kind] = pending.get(kind, []) + [it for it in items if it['rating_key'] not in have]
+    if not pending[kind]:
+        pending.pop(kind)
+    if pending:
+        from utils.file_utils import atomic_write
+        with atomic_write(path) as f:
+            json.dump(pending, f)
+    elif os.path.exists(path):
+        os.unlink(path)
 
 
 def _manifest_path(ctx):
@@ -308,9 +348,11 @@ def cmd_apply(ctx, args):
         problem = [rk for b in ('stranded', 'date_failed', 'timeout', 'failed')
                    for rk in result.get(b, [])]
         if problem:
+            if result.get('retry'):
+                _save_pending(manifest, kind, result['retry'])
             print(f'STOPPED: Plex item(s) {problem} need attention before continuing '
-                  f'(Plex busy or unreachable counts too — re-run apply later). '
-                  f'Manifest: {manifest}')
+                  f'(Plex busy or unreachable counts too — finish them with '
+                  f'"reconcile --manifest {manifest} --kind {kind}", then re-run apply).')
             return 2
     print(f'removed {total} item(s); manifest: {manifest if total else "(none written)"}')
     return 0
@@ -422,7 +464,11 @@ def _rename_one(ctx, movie_id, plan_rows, manifest, include_review=False, wait=1
     if not ctx.plex or orig is None:
         return True
     ctx.plex.scan_path(orig.section, new_folder)
-    ctx.plex.wait_idle(orig.section, timeout=wait)
+    if not ctx.plex.wait_idle(orig.section, timeout=wait):
+        print(f'STOPPED: Plex still busy after {wait}s — Radarr renamed {old_folder!r} to '
+              f'{new_folder!r}; check that Plex item {orig.rating_key} is merged with it '
+              f'before continuing')
+        return False
     new = next((p for p in ctx.plex.list_parts('movie')
                 if p.rel_path.startswith(new_folder + '/')), None)
     if new is not None and new.rating_key != orig.rating_key:
@@ -433,8 +479,16 @@ def _rename_one(ctx, movie_id, plan_rows, manifest, include_review=False, wait=1
             print(f'STOPPED: could not restore date added on Plex item {orig.rating_key}')
             return False
     if done:
-        dd.reconcile_plex(ctx.plex, 'movie', done, snapshot, ctx.local_movies, touch=False,
-                          wait=wait)
+        result = dd.reconcile_plex(ctx.plex, 'movie', done, snapshot, ctx.local_movies,
+                                   touch=False, wait=wait)
+        problem = [rk for b in ('stranded', 'date_failed', 'timeout', 'failed')
+                   for rk in result.get(b, [])]
+        if problem:
+            if result.get('retry'):
+                _save_pending(manifest, 'movie', result['retry'])
+            print(f'STOPPED: Plex item(s) {problem} need attention — finish with '
+                  f'"reconcile --manifest {manifest} --kind movie"')
+            return False
     return True
 
 
@@ -452,20 +506,38 @@ def cmd_radarr_rename(ctx, args):
 
 def cmd_reconcile(ctx, args):
     """Finish Plex's side for a manifest whose run stopped (Plex busy or
-    unreachable): delete the now-unavailable versions of removed copies
-    where the item still plays, wait for moved parts — same rules as apply.
-    Removed parts stay listed in Plex until then, so they can be found."""
+    unreachable).  Uses the follow-ups the run saved (with each item's date
+    added from before the removal); without them, rebuilds from the
+    manifest — then a changed date added can't be noticed.  Links put back
+    since (undo) are left out.  Same deletion rules as apply."""
+    import json
     if not ctx.plex:
         print('Plex is not configured — nothing to reconcile')
         return 1
     root = ctx.local_tv if args.kind == 'tv' else ctx.local_movies
-    removed = [dd.Removal(r['path'], r['target'], r['kind'], r['rule'], r['keep'], r['title'])
-               for r in _read_rows(args.manifest)
-               if r['action'] == 'remove' and r['kind'] == args.kind and r['target']]
-    rels = {dd.rel_to_root(p, root) for r in removed for p in (r.path, r.keep) if p}
-    snapshot = dd.snapshot_plex(ctx.plex, args.kind, rels)
-    items = dd.plex_items(removed, snapshot, root)
+    try:
+        with open(_pending_path(args.manifest)) as f:
+            items = json.load(f).get(args.kind, [])
+        still_removed = {r.path for r in dd.manifest_removals(args.manifest, args.kind)}
+        removed_rels = {dd.rel_to_root(p, root) for p in still_removed}
+        items = [dict(it, removed=[x for x in it['removed'] if x in removed_rels])
+                 for it in items]
+        items = [it for it in items if it['removed']]
+        print(f'Using {len(items)} saved Plex follow-up(s)')
+    except (OSError, ValueError):
+        print('No saved follow-ups for this manifest — rebuilding from it; a date added '
+              'changed since the removal cannot be noticed')
+        removed = dd.manifest_removals(args.manifest, args.kind)
+        rels = {dd.rel_to_root(p, root) for r in removed
+                for p in (r.path, r.keep, *r.keeps) if p}
+        snapshot = dd.snapshot_plex(ctx.plex, args.kind, rels)
+        if removed and not snapshot:
+            print(f'Plex knows none of the {len(rels)} affected paths — already handled, or '
+                  f'the Plex library is rooted somewhere other than {root}. Nothing done.')
+            return 1
+        items = dd.plex_items(removed, snapshot, root)
     result = dd.reconcile_items(ctx.plex, args.kind, items, root, touch=True, wait=args.plex_wait)
+    _save_pending_replace(args.manifest, args.kind, result.get('retry', []))
     print(f'{len(items)} Plex item(s): ' + ', '.join(
         f'{k} {len(v)}' for k, v in result.items() if v and k != 'retry'))
     problem = [rk for b in ('stranded', 'date_failed', 'timeout', 'failed')
@@ -474,6 +546,26 @@ def cmd_reconcile(ctx, args):
         print(f'Still needing attention: {problem}')
         return 2
     return 0
+
+
+def _save_pending_replace(manifest, kind, items):
+    """Replace *kind*'s saved follow-ups with *items* (drops the file when
+    nothing is left)."""
+    import json
+    path = _pending_path(manifest)
+    try:
+        with open(path) as f:
+            pending = json.load(f)
+    except (OSError, ValueError):
+        pending = {}
+    pending.pop(kind, None)
+    with_items = dict(pending, **({kind: items} if items else {}))
+    if with_items:
+        from utils.file_utils import atomic_write
+        with atomic_write(path) as f:
+            json.dump(with_items, f)
+    elif os.path.exists(path):
+        os.unlink(path)
 
 
 def cmd_plex_check(ctx, args):
