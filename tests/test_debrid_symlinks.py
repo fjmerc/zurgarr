@@ -1203,3 +1203,86 @@ class TestSonarrAuthorityGates:
              patch('utils.tmdb.get_cached_tmdb_ids', return_value={'movies': {}, 'shows': {}}):
             scanner._create_debrid_symlinks(shows, [_LOCAL_MOVIE], pidx)
         assert os.listdir(local_tv) == []
+
+
+def _radarr(movies, exc=None):
+    client = MagicMock()
+    if exc:
+        client.get_all_movies.side_effect = exc
+    else:
+        client.get_all_movies.return_value = movies
+    return client
+
+
+def _movie_fixture(tmp_dir, monkeypatch):
+    mount = os.path.join(tmp_dir, 'mount')
+    local_movies = os.path.join(tmp_dir, 'movies')
+    os.makedirs(local_movies)
+    movie_dir = os.path.join(mount, 'movies', 'Film.2020.1080p')
+    _touch(os.path.join(movie_dir, 'Film.2020.1080p.mkv'))
+    _setup_env(monkeypatch, mount, '/mnt/debrid')
+    scanner = _make_scanner(mount, None, monkeypatch, local_movies_path=local_movies)
+    movies = [{'title': 'Film', 'year': 2020, 'source': 'debrid', 'type': 'movie',
+               'path': movie_dir}]
+    return scanner, local_movies, movies
+
+
+def _run_movie(scanner, client, movies, svc_exc=None):
+    def svc(media_type):
+        if svc_exc:
+            raise svc_exc
+        if media_type == 'movie':
+            return client, 'radarr'
+        return None, None
+    with patch('utils.arr_client.get_download_service', svc), \
+         patch('utils.tmdb.get_cached_tmdb_ids', return_value={'movies': {}, 'shows': {}}):
+        scanner._create_debrid_symlinks([_LOCAL_SHOW], movies, {})
+
+
+def _film(has_file, path='/data/media/movies/Film (2020) ITA'):
+    return [{'title': 'Film', 'year': 2020, 'path': path, 'id': 3, 'tmdbId': None,
+             'hasFile': has_file}]
+
+
+@pytest.mark.usefixtures('_fresh_arr_caches')
+class TestRadarrAuthorityGates:
+
+    def test_radarr_hasfile_true_blocks_link(self, tmp_dir, monkeypatch):
+        scanner, local_movies, movies = _movie_fixture(tmp_dir, monkeypatch)
+        _run_movie(scanner, _radarr(_film(True)), movies)
+        assert os.listdir(local_movies) == []
+
+    def test_radarr_folder_with_broken_link_blocks_link(self, tmp_dir, monkeypatch):
+        scanner, local_movies, movies = _movie_fixture(tmp_dir, monkeypatch)
+        d = os.path.join(local_movies, 'Film (2020) ITA')
+        os.makedirs(d)
+        os.symlink('/mnt/debrid/gone/old.mkv', os.path.join(d, 'Film (2020).mkv'))
+        _run_movie(scanner, _radarr(_film(False)), movies)
+        assert os.listdir(d) == ['Film (2020).mkv']
+
+    def test_radarr_hasfile_false_empty_folder_links(self, tmp_dir, monkeypatch):
+        scanner, local_movies, movies = _movie_fixture(tmp_dir, monkeypatch)
+        _run_movie(scanner, _radarr(_film(False)), movies)
+        assert os.path.islink(os.path.join(local_movies, 'Film (2020) ITA', 'Film.2020.1080p.mkv'))
+
+    def test_unmatched_movie_not_linked_when_radarr_configured(self, tmp_dir, monkeypatch):
+        scanner, local_movies, movies = _movie_fixture(tmp_dir, monkeypatch)
+        other = [{'title': 'Other', 'year': 1999, 'path': '/data/media/movies/Other (1999)',
+                  'id': 4, 'tmdbId': None, 'hasFile': False}]
+        _run_movie(scanner, _radarr(other), movies)
+        assert os.listdir(local_movies) == []
+
+    def test_matched_movie_with_empty_folder_not_linked(self, tmp_dir, monkeypatch):
+        scanner, local_movies, movies = _movie_fixture(tmp_dir, monkeypatch)
+        _run_movie(scanner, _radarr(_film(False, path='')), movies)
+        assert os.listdir(local_movies) == []
+
+    def test_radarr_fetch_failed_links_no_movies(self, tmp_dir, monkeypatch):
+        scanner, local_movies, movies = _movie_fixture(tmp_dir, monkeypatch)
+        _run_movie(scanner, _radarr(None, exc=RuntimeError('down')), movies)
+        assert os.listdir(local_movies) == []
+
+    def test_download_service_error_links_no_movies(self, tmp_dir, monkeypatch):
+        scanner, local_movies, movies = _movie_fixture(tmp_dir, monkeypatch)
+        _run_movie(scanner, None, movies, svc_exc=RuntimeError('config broken'))
+        assert os.listdir(local_movies) == []

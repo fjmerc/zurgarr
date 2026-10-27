@@ -1575,6 +1575,21 @@ def _get_sonarr_series_list(client, force_refresh=False):
     return series_list
 
 
+def _dir_has_media_name(path):
+    """True when *path* holds any media-named entry, resolving or not.
+
+    Unlike ``LibraryScanner._has_media_files`` a broken link counts: it is
+    the arr's copy during a mount outage, and linking beside it would make a
+    duplicate once the mount returns.  A missing directory holds nothing.
+    """
+    try:
+        with os.scandir(path) as it:
+            return any(os.path.splitext(e.name)[1].lower() in MEDIA_EXTENSIONS
+                       and not e.is_dir(follow_symlinks=False) for e in it)
+    except OSError:
+        return False
+
+
 def _sonarr_episode_has_file(client, series_id, cache):
     """``{(season, episode): hasFile}`` for one Sonarr series, or ``None``
     when Sonarr didn't answer.  *cache* is a dict scoped to one scan so a
@@ -7499,6 +7514,8 @@ class LibraryScanner:
                     p = m.get('path', '')
                     info = {
                         'folder': os.path.basename(p) if p else '',
+                        'path': p,
+                        'has_file': bool(m.get('hasFile')),
                         'id': m.get('id'),
                         'tmdb_id': m.get('tmdbId'),
                         'client': client,
@@ -7549,8 +7566,12 @@ class LibraryScanner:
         from utils.blackhole import is_obfuscated_name as _is_obfuscated_name
 
         # --- Movies ---
-        if self._local_movies_path:
+        if self._local_movies_path and radarr_fetch_failed:
+            logger.warning("[library] Radarr movie list unavailable — linking no "
+                           "movies this scan")
+        elif self._local_movies_path:
             real_movies_root = os.path.realpath(self._local_movies_path)
+            unmatched_movies = 0
             for movie in movies:
                 if movie.get('source') not in ('debrid', 'both'):
                     continue
@@ -7587,17 +7608,21 @@ class LibraryScanner:
                 )
                 if arr_info and arr_info['folder']:
                     movie_dir = arr_info['folder']
+                    if arr_info.get('has_file'):
+                        continue
+                elif radarr_configured:
+                    unmatched_movies += 1
+                    logger.debug("[library] Not linking %r — Radarr doesn't have it", title)
+                    continue
                 else:
                     movie_dir = f"{title} ({year})" if year else title
 
-                # For source='both', only create a symlink if Radarr's folder
-                # has no media files.  This handles wrong-dir symlinks (the
-                # movie lives in a differently-named dir) without creating
-                # duplicates alongside real local files.
-                if movie.get('source') == 'both':
-                    target_dir = os.path.join(self._local_movies_path, movie_dir)
-                    if os.path.isdir(target_dir) and self._has_media_files(target_dir):
-                        continue
+                # Only link into a folder with no media at all — any name,
+                # broken links included (a renamed Radarr import never
+                # matches the debrid filename, so a second link would be a
+                # duplicate Plex version).
+                if _dir_has_media_name(os.path.join(self._local_movies_path, movie_dir)):
+                    continue
 
                 # Find the largest media file in the torrent folder.  Searches
                 # one level deep so nested-folder torrents (video tucked inside
@@ -7664,6 +7689,10 @@ class LibraryScanner:
                         "[library] Failed to create movie symlink for %r: %s",
                         title, e
                     )
+
+            if unmatched_movies:
+                logger.info("[library] Skipped linking %d movie(s) Radarr doesn't have",
+                            unmatched_movies)
 
         # --- TV Shows ---
         # Pre-compute max season per title for season-aware TMDB fallback
