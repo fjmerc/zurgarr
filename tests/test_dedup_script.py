@@ -701,3 +701,17 @@ def test_radarr_rename_slash_dropped_is_not_a_move(tmp_path):
     radarr.set_movie_path.side_effect = lambda m, p: {}
     rc = dedup.main(['radarr-rename', '--ids', '5', '--plan', out], ctx=ctx)
     assert rc != 0
+
+
+def test_radarr_rename_needs_include_unmatched_for_unmatched_deferred_rows(tmp_path):
+    L, radarr, plex, ctx, out, extra = _rename_setup(tmp_path)
+    rows = _read(out)
+    for r in rows:
+        if r['action'] == 'defer':
+            r['detail'] = 'no-arr-title'
+    with open(out, 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]), delimiter='\t')
+        w.writeheader()
+        w.writerows(rows)
+    rc = dedup.main(['radarr-rename', '--ids', '5', '--plan', out], ctx=ctx)
+    assert rc != 0 and os.path.islink(extra)

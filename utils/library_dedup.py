@@ -195,12 +195,13 @@ def link_resolves(link_path, pairs):
 @dataclass(frozen=True)
 class Removal:
     """One planned removal.  ``target`` is the ``os.readlink`` value (''
-    for a sidecar); ``keep`` is the tracked copy this one duplicates."""
+    for a sidecar); ``keep`` is the tracked copy this one duplicates — for a
+    ``no-arr-title`` row, an arr folder's link to the same file, if any."""
     path: str
     target: str
     kind: str          # 'tv' | 'movie'
-    rule: str          # 'arr-folder-untracked' | 'foreign-folder' | 'no-arr-title'
-                       # | 'empty-folder' | 'sidecar'
+    rule: str          # 'arr-folder-untracked' | 'foreign-folder' | 'foreign-folder-review'
+                       # | 'no-arr-title' | 'empty-folder' | 'sidecar'
     keep: str
     title: str
     owner: str = ''    # sidecars: the video removal they belong to
@@ -452,14 +453,15 @@ def plan_movie_duplicates(movie_dir, tracked_path, pairs, title, skipped=None):
     return removals + sidecars_for(removals, [tracked_path])
 
 
-def _empty_tree(folder):
+def _empty_tree(folder, protected=frozenset()):
     """*folder* and every folder below it, deepest first, when none of them
-    holds a file or a link; None otherwise."""
+    holds a file or a link and none is *protected*; None otherwise."""
     def fail(err):
         raise err
     dirs = []
     for dirpath, dirnames, files in os.walk(folder, topdown=False, onerror=fail):
-        if files or any(os.path.islink(os.path.join(dirpath, d)) for d in dirnames):
+        if (files or any(os.path.islink(os.path.join(dirpath, d)) for d in dirnames)
+                or os.path.realpath(dirpath) in protected):
             return None
         dirs.append(dirpath)
     return dirs
@@ -490,13 +492,16 @@ def _keep_for_episode(ep, tracked, arr_index, pairs):
 
 
 def plan_foreign_folders(root, kind, owned, maps, tracked_by_entry, pairs,
-                         cached_tmdb=None, tmdb_cache=None):
+                         cached_tmdb=None, tmdb_cache=None, exclude=frozenset()):
     """Plan removals in top-level folders of *root* that no arr entry owns.
 
     *maps* is ``library.arr_title_maps(...)``; the folder name is resolved
     with ``library._match_arr_entry`` (the single title-match cascade).
     *tracked_by_entry(info)* returns the tracked local path(s) for a matched
     entry: ``{(s, e): path}`` for TV, a path (or None) for movies.
+
+    *exclude* holds link paths already planned for removal (``plan_arr_*``);
+    they are never chosen as a kept copy.
 
     Returns ``(removals, report_rows)``; report rows are dicts with
     ``kind``, ``folder``, ``rule`` and ``detail``.  A folder holding any real
@@ -556,14 +561,32 @@ def plan_foreign_folders(root, kind, owned, maps, tracked_by_entry, pairs,
             # A link to the very file an arr folder links (the title is there
             # under another name) keeps that copy: Plex may hold the item under
             # either path, and must move it rather than drop it.
-            if owned_links is None:
-                owned_links = _links_by_target(root, owned)
-            planned = []
-            for _n, p in media:
-                if _removable_link(p, pairs) is not None:
-                    target = os.readlink(p)
-                    planned.append(Removal(p, target, kind, 'no-arr-title',
-                                           owned_links.get(target, ''), name))
+            removable = [(p, os.readlink(p)) for _n, p in media
+                         if _removable_link(p, pairs) is not None]
+            if removable and owned_links is None:
+                try:
+                    owned_links = _links_by_target(root, owned)
+                except OSError as e:
+                    owned_links = e
+            if removable and isinstance(owned_links, OSError):
+                report.append(dict(row, rule='arr-error',
+                                   detail=f"an arr folder can't be read ({owned_links}) — "
+                                          f"can't tell whether these links share its files"))
+                continue
+            planned, held = [], []
+            for p, target in removable:
+                shared = owned_links.get(os.path.normpath(target), [])
+                keeps = [k for k in shared if k not in exclude]
+                if shared and not keeps:
+                    held.append(os.path.basename(p))
+                    continue
+                planned.append(Removal(p, target, kind, 'no-arr-title',
+                                       keeps[0] if keeps else '', name))
+            if held:
+                report.append(dict(row, rule='no-arr-title',
+                                   detail="left for now — the arr folder's link to the same "
+                                          "file is being removed this run (re-plan): "
+                                          + ', '.join(held)))
             removals += planned + sidecars_for(planned, [])
             report.append(dict(row, rule='no-arr-title',
                                detail=', '.join(n for n, _p in media)))
@@ -689,6 +712,8 @@ def apply_removals(removals, manifest_path, library_root, protected, pairs=None)
     With *pairs*, every kept copy a row duplicates must still play right
     now (plans can be minutes or days old).  Sidecar subtitles — real files
     — are moved to a quarantine folder beside the manifest, not deleted.
+    An ``empty-folder`` row removes its whole all-empty tree: one manifest
+    row per folder (deepest first) but one entry in the result.
     """
     done = []
     removed_videos = set()
@@ -700,9 +725,10 @@ def apply_removals(removals, manifest_path, library_root, protected, pairs=None)
                     or real in protected or real == root):
                 continue
             try:
-                dirs = _empty_tree(r.path)
+                dirs = _empty_tree(r.path, protected)
                 if dirs is None:
-                    logger.info("[dedup] Not removing %r — it isn't empty any more", r.path)
+                    logger.info("[dedup] Not removing %r — it holds a file, a link or an arr "
+                                "folder", r.path)
                     continue
                 for d in dirs:   # deepest first; each recorded so undo recreates it
                     _append_manifest(manifest_path, replace(r, path=d), 'rmdir')
@@ -909,17 +935,22 @@ def split_titles(snapshot, removals, library_root):
 
 
 def _links_by_target(root, folder_names):
-    """``{link target: link path}`` for the links inside *root*'s folders
-    named *folder_names* (unreadable folders are skipped)."""
+    """``{normalised link target: [link paths]}`` for the links inside
+    *root*'s folders named *folder_names*.  Raises ``OSError`` when one of
+    them can't be read (a folder that doesn't exist yet is skipped)."""
+    def fail(err):
+        raise err
     out = {}
     for name in sorted(folder_names):
-        for dirpath, _dirs, files in os.walk(os.path.join(root, name)):
-            for f in files:
+        top = os.path.join(root, name)
+        if not os.path.lexists(top):
+            continue
+        for dirpath, dirs, files in os.walk(top, onerror=fail):
+            dirs.sort()
+            for f in sorted(files):
                 path = os.path.join(dirpath, f)
-                try:
-                    out.setdefault(os.readlink(path), path)
-                except OSError:
-                    continue
+                if os.path.islink(path):
+                    out.setdefault(os.path.normpath(os.readlink(path)), []).append(path)
     return out
 
 
@@ -944,7 +975,8 @@ def _add_item(items, ref, r, rel, library_root):
     keeps = [k for k in (r.keeps or (r.keep,)) if k]
     for k in keeps:
         try:
-            if os.path.islink(k) and os.readlink(k) == r.target:
+            if (os.path.islink(k)
+                    and os.path.normpath(os.readlink(k)) == os.path.normpath(r.target)):
                 # Plex keeps ONE part for two links to one file — maybe only
                 # under the removed path; the kept path must show up in Plex
                 # before anything of this item is deleted.

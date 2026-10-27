@@ -348,6 +348,51 @@ class TestPlanForeignFolders:
         rem, _rep = self._plan(L, 'tv', dark, lambda info: {(1, 1): arr_copy})
         assert [(r.path, r.rule, r.keep) for r in rem] == [(extra, 'no-arr-title', arr_copy)]
 
+    _DARK = [{'title': 'Dark', 'path': '/data/media/tv/Dark', 'id': 1, 'tmdbId': None}]
+
+    def test_unreadable_arr_folder_holds_unmatched_rows(self, tmp_path):
+        """If an arr folder can't be read, whether an unmatched link shares
+        its file is unknown — never fall back to dropping the Plex item."""
+        L = _Lib(tmp_path)
+        L.link('Dark/Season 01/Dark - S01E01.mkv', 'A/a.mkv')
+        L.link('Dark Shadows/Dark S01E01 Secrets.mkv', 'A/a.mkv')
+        season = L.lib / 'Dark' / 'Season 01'
+        season.chmod(0)
+        try:
+            rem, rep = self._plan(L, 'tv', self._DARK, lambda info: {})
+        finally:
+            season.chmod(0o755)
+        assert rem == []
+        assert any(r['rule'] == 'arr-error' and r['folder'] == 'Dark Shadows' for r in rep)
+
+    def test_kept_copy_is_never_a_link_planned_for_removal(self, tmp_path):
+        from utils.library_dedup import plan_foreign_folders
+        from utils.library import arr_title_maps
+        L = _Lib(tmp_path)
+        tracked = L.link('Dark/Season 01/Dark - S01E01.mkv', 'A/a.mkv')
+        raw = L.link('Dark/Season 01/Dark.S01E01.raw.mkv', 'A/a.mkv')
+        extra = L.link('Dark Shadows/Dark S01E01 Secrets.mkv', 'A/a.mkv')
+        maps = arr_title_maps(self._DARK, None, is_tv=True)
+        rem, _rep = plan_foreign_folders(str(L.lib), 'tv', {'Dark'}, maps, lambda i: {},
+                                         L.pairs, cached_tmdb={}, tmdb_cache={},
+                                         exclude={raw})
+        assert [(r.path, r.keep) for r in rem] == [(extra, tracked)]
+        rem, rep = plan_foreign_folders(str(L.lib), 'tv', {'Dark'}, maps, lambda i: {},
+                                        L.pairs, cached_tmdb={}, tmdb_cache={},
+                                        exclude={raw, tracked})
+        assert rem == [] and any(r['folder'] == 'Dark Shadows' and 'removed' in r['detail']
+                                 for r in rep)
+
+    def test_same_file_written_two_ways_still_matches(self, tmp_path):
+        L = _Lib(tmp_path)
+        L.link('Dark/Season 01/Dark - S01E01.mkv', 'A/a.mkv')
+        arr_copy = str(L.lib / 'Dark' / 'Season 01' / 'Dark - S01E01.mkv')
+        os.remove(arr_copy)
+        os.symlink('/mnt/debrid_torbox/./A//a.mkv', arr_copy)
+        extra = L.link('Dark Shadows/Dark S01E01 Secrets.mkv', 'A/a.mkv')
+        rem, _rep = self._plan(L, 'tv', self._DARK, lambda info: {})
+        assert [(r.path, r.keep) for r in rem] == [(extra, arr_copy)]
+
     def test_unmatched_folder_reported_as_no_arr_title(self, tmp_path):
         L = _Lib(tmp_path)
         link = L.link('Amazing Films 12/Oppenheimer (2023) 1080p.mp4', 'B/b.mp4')
@@ -500,6 +545,23 @@ class TestApplyRemovals:
         assert os.path.isdir(L.lib / 'Atlanta' / 'Season 02' / 'Extras')
         assert os.path.isdir(L.lib / 'Atlanta' / 'Season 01')
 
+    def test_apply_empty_tree_order_symlinks_and_protected_subfolders(self, tmp_path):
+        from utils.library_dedup import Removal, apply_removals
+        L = _Lib(tmp_path)
+        (L.lib / 'Atlanta' / 'Season 01').mkdir(parents=True)
+        (L.lib / 'Linked').mkdir()
+        os.symlink(str(L.mount), L.lib / 'Linked' / 'dir-link')
+        (L.lib / 'Arr Show' / 'Season 01').mkdir(parents=True)
+        protected = {os.path.realpath(L.lib / 'Arr Show' / 'Season 01')}
+        rs = [Removal(str(L.lib / n), '', 'tv', 'empty-folder', '', n)
+              for n in ('Atlanta', 'Linked', 'Arr Show')]
+        manifest = str(tmp_path / 'm.tsv')
+        apply_removals(rs, manifest, str(L.lib), protected)
+        assert [r['path'] for r in self._rows(manifest)] == [
+            str(L.lib / 'Atlanta' / 'Season 01'), str(L.lib / 'Atlanta')]
+        assert os.path.islink(L.lib / 'Linked' / 'dir-link')
+        assert os.path.isdir(L.lib / 'Arr Show' / 'Season 01')
+
     def test_undo_restores_links(self, tmp_path):
         from utils.library_dedup import apply_removals, undo_manifest
         L = _Lib(tmp_path)
@@ -642,6 +704,20 @@ class TestReconcilePlex:
         snap = library_dedup.snapshot_plex(plex, 'tv', {'Dark Shadows/Dark S01E01 Secrets.mkv'})
         out = library_dedup.reconcile_plex(plex, 'tv', [r], snap, str(L.lib), touch=True)
         assert plex.deleted == [] and out['stranded'] == ['10']
+
+    def test_same_target_detected_when_written_two_ways(self, tmp_path):
+        from utils import library_dedup
+        from utils.library_dedup import Removal
+        L = _Lib(tmp_path)
+        keep = str(L.lib / 'Dark' / 'Season 01' / 'Dark - S01E01.mkv')
+        os.makedirs(os.path.dirname(keep))
+        os.symlink('/mnt/debrid_torbox/./A/a.mkv', keep)
+        gone = str(L.lib / 'Dark Shadows' / 'x.mkv')
+        r = Removal(gone, '/mnt/debrid_torbox/A/a.mkv', 'tv', 'no-arr-title', keep, 'Dark Shadows')
+        plex = FakePlex({'10': [('2', 'Dark Shadows/x.mkv', False)]})
+        snap = library_dedup.snapshot_plex(plex, 'tv', {'Dark Shadows/x.mkv'})
+        [it] = library_dedup.plex_items([r], snap, str(L.lib))
+        assert it['same_target'] and not it['drop_ok']
 
     def test_added_at_restored_when_changed(self, tmp_path):
         L, r = self._setup(tmp_path)

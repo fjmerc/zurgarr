@@ -15,7 +15,7 @@ Subcommands (run inside the zurgarr container):
     reconcile --manifest MANIFEST.tsv --kind tv|movie   finish Plex after a stopped run
     undo --manifest MANIFEST.tsv
     radarr-folders --out FOLDERS.tsv [--plan PLAN.tsv]
-    radarr-rename --ids 1,2,3 --plan PLAN.tsv
+    radarr-rename --ids 1,2,3 --plan PLAN.tsv [--include-review] [--include-unmatched]
     plex-check
 
     docker exec -i -w / zurgarr /venv/bin/python /scripts/dedup_library.py plan --out /config/dedup_plan.tsv
@@ -116,7 +116,7 @@ def _plan_tv(ctx):
     ids, full = _tmdb_context('tv')
     foreign, report = dd.plan_foreign_folders(
         ctx.local_tv, 'tv', owned, arr_title_maps(series, ctx.sonarr, True), tracked,
-        ctx.pairs, cached_tmdb=ids, tmdb_cache=full)
+        ctx.pairs, cached_tmdb=ids, tmdb_cache=full, exclude={r.path for r in removals})
     report += _year_conflict_rows('tv', ctx.local_tv, skipped)
     # Episodes with copies in Sonarr's folder that Sonarr tracks none of —
     # listed for the owner, never removed.
@@ -163,7 +163,7 @@ def _plan_movies(ctx):
     ids, full = _tmdb_context('movie')
     foreign, report = dd.plan_foreign_folders(
         ctx.local_movies, 'movie', owned, arr_title_maps(movies, ctx.radarr, False), tracked,
-        ctx.pairs, cached_tmdb=ids, tmdb_cache=full)
+        ctx.pairs, cached_tmdb=ids, tmdb_cache=full, exclude={r.path for r in removals})
     report += _year_conflict_rows('movie', ctx.local_movies, skipped)
     # Movie folders holding copies Radarr tracks none of — listed, never removed.
     for m in movies:
@@ -408,7 +408,8 @@ def _wait_path_change(ctx, movie_id, old_path):
     return None
 
 
-def _rename_one(ctx, movie_id, plan_rows, manifest, include_review=False, wait=1800):
+def _rename_one(ctx, movie_id, plan_rows, manifest, include_review=False, wait=1800,
+                include_unmatched=False):
     from utils.library_dedup import Removal
     movie = ctx.radarr.get_movie(movie_id, strict=True)
     old_path = movie['path']
@@ -430,6 +431,10 @@ def _rename_one(ctx, movie_id, plan_rows, manifest, include_review=False, wait=1
                                   for r in plan_rows):
         print(f'{old_folder!r}: zurgarr folder matched only by alias/yearless title — '
               f'review it, then pass --include-review; not merging Plex items')
+        return False
+    if not include_unmatched and any(r.rule in _UNMATCHED_RULES for r in deferred):
+        print(f'{old_folder!r}: a folder whose title Radarr doesn\'t have shares its copy — '
+              f'review it, then pass --include-unmatched; not merging Plex items')
         return False
 
     # The Plex item that carries the restored date added: the one holding
@@ -526,7 +531,7 @@ def cmd_radarr_rename(ctx, args):
     manifest = _manifest_path(ctx)
     for movie_id in [int(x) for x in args.ids.split(',') if x.strip()]:
         if not _rename_one(ctx, movie_id, plan_rows, manifest, args.include_review,
-                           args.plex_wait):
+                           args.plex_wait, args.include_unmatched):
             return 2
     return 0
 
@@ -637,6 +642,8 @@ def main(argv=None, ctx=None):
     p.add_argument('--plan', required=True)
     p.add_argument('--include-review', action='store_true',
                    help='also act on foreign-folder-review rows (and merge their Plex items)')
+    p.add_argument('--include-unmatched', action='store_true',
+                   help='also act on rows of folders whose title Radarr does not have')
     p.add_argument('--no-plex', action='store_true', help='run without Plex reconciliation')
     p.add_argument('--plex-wait', type=int, default=1800)
     sub.add_parser('plex-check')
