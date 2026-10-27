@@ -18,6 +18,7 @@ isn't here, open a [GitHub issue](https://github.com/fjmerc/zurgarr/issues).
 - [Docker Desktop: mount propagation error](#docker-desktop-mount-propagation-error)
 - [Plex not seeing debrid content](#plex-not-seeing-debrid-content)
 - [New shows/movies only appear in Plex after a manual scan](#new-showsmovies-only-appear-in-plex-after-a-manual-scan)
+- [A download for one show is stuck under a same-name show in Sonarr ("Not an upgrade")](#a-download-for-one-show-is-stuck-under-a-same-name-show-in-sonarr-not-an-upgrade)
 - [Blackhole: symlinks created but broken](#blackhole-symlinks-created-but-broken)
 - [Stuck ffprobe processes](#stuck-ffprobe-processes)
 - [Dashboard buttons fail with "cross-origin request rejected" behind a reverse proxy](#dashboard-buttons-fail-with-cross-origin-request-rejected-behind-a-reverse-proxy)
@@ -344,6 +345,31 @@ and the arr rescan trigger, giving the cache time to invalidate.
 Local-filesystem arr-side libraries don't need this (the file is visible
 immediately) — keep the default `0`. Clamped to `[0, 300]` so a typo
 can't stall the scan loop indefinitely.
+
+## A download for one show is stuck under a same-name show in Sonarr ("Not an upgrade")
+
+Symptom: Sonarr's Activity queue shows a blackhole download as import
+blocked, filed under a different show with the same name — e.g. a
+"Dark.Matter.S02E07…" release grabbed for *Dark Matter (2024)* sitting
+under *Dark Matter (2015)* with "Not an upgrade for existing episode
+file(s)". The episode stays missing and Sonarr keeps re-grabbing it.
+
+Cause: Sonarr ties a Torrent Blackhole download to its grab by re-reading
+the release name, and a name without a year matches the older show.
+
+Fix: nothing to do — every 15 minutes zurgarr re-imports such a download
+into the show Sonarr grabbed it for (Activity: "Import Redirected"), the
+same for Radarr movies. It only acts when the grabbed show or movie has
+the same name as the one the download was filed under and the files are
+named for it, and never replaces an episode or movie that already has a
+file (nor touches a show that uses scene numbering); those stay in the
+queue for you to import or remove. When Sonarr/Radarr
+already imported the download into the wrong show without complaint,
+zurgarr can't undo it and shows a "Misfiled Import" warning instead —
+delete that episode file in Sonarr and the right show's missing-episode
+search picks it up again. Downloads zurgarr handled before upgrading to
+this version, multi-season packs split into per-season folders, and imports
+made while zurgarr was stopped aren't covered.
 
 ## Blackhole: symlinks created but broken
 

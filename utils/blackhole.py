@@ -520,6 +520,21 @@ def is_obfuscated_name(name):
     return bool(_OBFUSCATED_STEM_RE.match(stem))
 
 
+def _completed_link_name(release_name, display_name, file_scope):
+    """Name of the completed dir ``_create_symlinks`` makes for a release.
+
+    The mount folder name, except for an obfuscated or TB-alt-substituted
+    payload, which is named after the release the arr grabbed
+    (*display_name*).  A multi-season pack split into per-season dirs uses
+    constructed names instead.
+    """
+    if (display_name and display_name != release_name
+            and (file_scope or is_obfuscated_name(release_name))
+            and _is_safe_mount_name(display_name)):
+        return display_name
+    return release_name
+
+
 # Label routing: subdir names in watch_dir that are NOT labels
 # (retry staging and alt-retry staging — handled by dedicated logic)
 _RESERVED_LABELS = {'failed', '.alt_pending'}
@@ -2450,16 +2465,11 @@ class BlackholeWatcher:
             logger.error(f"[blackhole] Refusing symlink creation for unsafe release_name: {release_name!r}")
             return 0
 
-        # Obfuscated or TB-alt-substituted payload: name the completed dir
-        # after the real (grabbed) release.
-        link_name = release_name
-        if (display_name and display_name != release_name
-                and (file_scope or is_obfuscated_name(release_name))
-                and _is_safe_mount_name(display_name)):
+        link_name = _completed_link_name(release_name, display_name, file_scope)
+        if link_name != release_name:
             kind = 'Substituted' if file_scope else 'Obfuscated'
             logger.info(f"[blackhole] {kind} payload {release_name!r}: "
                         f"naming completed symlinks {display_name!r}")
-            link_name = display_name
 
         is_multi, _, _ = _is_multi_season_pack(link_name)
 
@@ -3516,12 +3526,24 @@ class BlackholeWatcher:
                 logger.info(f"[blackhole] Created {count} symlink(s) for {release_name}")
                 if _history:
                     _mt, _ep = _enrich_for_history(filename)
+                    # info_hash + folder let the queue sweep tie the arr's
+                    # queue item (keyed by folder) to its grab (keyed by
+                    # hash) — see redirect_misfiled_imports.
+                    try:
+                        _hash = self._extract_hash_from_info(info, debrid=debrid)
+                    except Exception:
+                        _hash = ''
                     _history.log_event('symlink_created', filename, episode=_ep, source='blackhole',
                                        detail=f'{count} symlink(s) for {release_name}',
                                        meta={'cause': 'blackhole_new_import',
                                              'provider': debrid,
                                              'count': count,
-                                             'release': release_name},
+                                             'release': release_name,
+                                             'folder': _completed_link_name(
+                                                 matched_name,
+                                                 os.path.splitext(filename)[0],
+                                                 file_scope),
+                                             'info_hash': _hash},
                                        media_title=_mt)
                 try:
                     from utils.metrics import metrics

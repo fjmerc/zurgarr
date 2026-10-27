@@ -76,6 +76,8 @@ __NAV_HTML__
         <option value="blocklisted">Blocklisted</option>
         <option value="blocklist_added">Auto-Blocked</option>
         <option value="arr_feedback">Reported to Arr</option>
+        <option value="import_redirected">Import Redirected</option>
+        <option value="import_misfiled">Misfiled Import</option>
       </optgroup>
       <optgroup label="Health">
         <option value="debrid">Debrid Health</option>

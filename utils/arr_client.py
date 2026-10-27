@@ -19,6 +19,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -226,6 +227,93 @@ def _iter_allowed_qualities(profile_items):
         label = _resolution_label(q)
         if label is not None:
             yield label, (q or {}).get('name')
+
+
+# ---------------------------------------------------------------------------
+# Misfiled blackhole imports — module state + helpers
+# ---------------------------------------------------------------------------
+
+# Grab history read back this far (the blackhole's folder -> hash map covers
+# 7 days), a page of 1000 at a time, at most this many pages.
+_GRAB_LOOKBACK = 8 * 86400
+_GRAB_HISTORY_PAGE_SIZE = 1000
+_GRAB_HISTORY_MAX_PAGES = 10
+_IMPORT_HISTORY_PAGE_SIZE = 250
+# How long to wait for an arr ManualImport command to finish.
+_COMMAND_WAIT = 60
+_COMMAND_POLL = 2
+# A download whose checks keep failing (arr not answering, grab not found
+# yet) is retried this many sweeps, then left alone.
+_REDIRECT_MAX_ATTEMPTS = 4
+# Downloads decided / warned about, as (kind, service, key) -> monotonic
+# time; attempts as (service, key) -> count.  Module-level: the queue
+# sweep builds fresh clients every run.
+_REDIRECT_MEMO_TTL = 7 * 86400
+_redirect_memo = {}
+_redirect_attempts = {}   # (service, key) -> (count, monotonic time of last)
+_redirect_memo_lock = threading.Lock()
+
+
+def _memo_has(kind, service, key):
+    with _redirect_memo_lock:
+        now = time.monotonic()
+        for k, t in list(_redirect_memo.items()):
+            if now - t > _REDIRECT_MEMO_TTL:
+                del _redirect_memo[k]
+        for k, (_n, t) in list(_redirect_attempts.items()):
+            if now - t > _REDIRECT_MEMO_TTL:
+                del _redirect_attempts[k]
+        return (kind, service, key) in _redirect_memo
+
+
+def _memo_set(kind, service, key):
+    with _redirect_memo_lock:
+        _redirect_memo[(kind, service, key)] = time.monotonic()
+        _redirect_attempts.pop((service, key), None)
+
+
+def _redirect_failed_attempt(service, key):
+    """Count a failed check of a download; after ``_REDIRECT_MAX_ATTEMPTS``
+    it is decided (left alone)."""
+    with _redirect_memo_lock:
+        n = _redirect_attempts.get((service, key), (0, 0))[0] + 1
+        _redirect_attempts[(service, key)] = (n, time.monotonic())
+    if n >= _REDIRECT_MAX_ATTEMPTS:
+        _memo_set('redirect', service, key)
+
+
+def _path_parts(path):
+    """Components of an arr-side path (POSIX or Windows)."""
+    return [p for p in re.split(r'[\\/]', str(path or '')) if p]
+
+
+def _path_basename(path):
+    parts = _path_parts(path)
+    return parts[-1] if parts else ''
+
+
+def _norm_title(title):
+    """Lower-case ASCII letters and digits only: "Dark.Matter" == "Dark
+    Matter", "Shōgun" == "Shogun"."""
+    folded = unicodedata.normalize('NFKD', str(title or '')).encode(
+        'ascii', 'ignore').decode('ascii')
+    return re.sub(r'[^0-9a-z]+', '', folded.lower())
+
+
+_PAREN_YEAR_RE = re.compile(r'\s*\((?:19|20)\d{2}\)\s*$')
+
+
+def _norm_ids(data):
+    """Non-empty external ids of a record or grab: {('imdb', '4159076'), ...}."""
+    out = set()
+    for kind, key in (('imdb', 'imdbId'), ('tvdb', 'tvdbId'), ('tmdb', 'tmdbId')):
+        v = str((data or {}).get(key) or '').strip().lower()
+        if kind == 'imdb':
+            v = v[2:] if v.startswith('tt') else v
+        v = v.lstrip('0')
+        if v:
+            out.add((kind, v))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -574,6 +662,343 @@ class _ArrClientBase:
             f"[{self._name}] Marked grab-history record failed: "
             f"{str(newest.get('sourceTitle', '?'))[:70]}")
         return True
+
+    # -- Misfiled blackhole imports (shared, Sonarr/Radarr parity) ---------
+    #
+    # A Torrent Blackhole grab records no downloadId, so the arr ties the
+    # finished download to a show/movie by parsing its name again — and a
+    # yearless release of a reboot ("Dark.Matter.S02E07") parses as the
+    # older namesake.  The grab record still says what was grabbed; it is
+    # found by the grab's torrent hash, which the blackhole records per
+    # completed folder (*folder_hashes*: folder name -> info hash).
+
+    _MEDIA_ID_KEY = None          # 'seriesId' / 'movieId'
+    _QUEUE_UNKNOWN_PARAM = None   # queue flag that includes unmatched items
+
+    def _media_record(self, media_id):
+        """The series/movie record, or None."""
+        raise NotImplementedError
+
+    def _display_title(self, record, media_id):
+        raise NotImplementedError
+
+    def _redirect_files(self, output_path, download_id, target, bases, grabs):
+        """ManualImport ``files`` placing the download under *target* (its
+        record); *bases* are its normalised titles.
+
+        None when the arr didn't answer (retried later); [] when the
+        download can't be placed safely (left alone).
+        """
+        raise NotImplementedError
+
+    def _grabs_by_hash(self, since):
+        """Grab records since epoch *since*, keyed by upper-case
+        ``torrentInfoHash``; None when the arr didn't answer."""
+        out = {}
+        for page in range(1, _GRAB_HISTORY_MAX_PAGES + 1):
+            resp = self._get('/api/v3/history',
+                             {'eventType': 1, 'page': page,
+                              'pageSize': _GRAB_HISTORY_PAGE_SIZE,
+                              'sortKey': 'date', 'sortDirection': 'descending'})
+            if not isinstance(resp, dict):
+                return None
+            records = resp.get('records') or []
+            older = False
+            for rec in records:
+                if not isinstance(rec, dict):
+                    continue
+                when = self._history_epoch(rec)
+                if when is not None and when < since:
+                    older = True
+                    continue
+                data = rec.get('data') if isinstance(rec.get('data'), dict) else {}
+                h = str(data.get('torrentInfoHash') or '').strip().upper()
+                if h:
+                    out.setdefault(h, []).append(rec)
+            if older or len(records) < _GRAB_HISTORY_PAGE_SIZE:
+                break
+        return out
+
+    def _grab_target(self, grabs):
+        """The single series/movie id *grabs* were made for, else None."""
+        ids = {g.get(self._MEDIA_ID_KEY) for g in grabs or ()
+               if g.get(self._MEDIA_ID_KEY) is not None}
+        return ids.pop() if len(ids) == 1 else None
+
+    @staticmethod
+    def _base_titles(record, alternates=True):
+        """Normalised title (+ alternate titles) of a series/movie record,
+        each also without a "(YYYY)" suffix or the record's own trailing
+        year — "Dark Matter (2024)" -> {'darkmatter2024', 'darkmatter'};
+        "Blade Runner 2049" (2017) never becomes "Blade Runner"."""
+        year = str(record.get('year') or '')
+        out = set()
+        alts = record.get('alternateTitles') if alternates else None
+        for t in [record.get('title')] + [
+                a.get('title') for a in alts or [] if isinstance(a, dict)]:
+            n = _norm_title(t)
+            if not n:
+                continue
+            out.add(n)
+            # A "(YYYY)" suffix is a disambiguator whatever the year;
+            # a bare one only when it is the record's own.
+            bare = _norm_title(_PAREN_YEAR_RE.sub('', str(t)))
+            if bare and bare != n:
+                out.add(bare)
+            elif year and n.endswith(year) and len(n) > len(year):
+                out.add(n[:-len(year)])
+        return out
+
+    def _import_landed(self, target, files):
+        """True when the arr now has a file for everything *files* placed,
+        False when it doesn't, None when it didn't answer."""
+        raise NotImplementedError
+
+    def _await_command(self, command):
+        """Final status of an arr command, or its last one after
+        ``_COMMAND_WAIT`` seconds."""
+        cmd_id = command.get('id') if isinstance(command, dict) else None
+        if cmd_id is None:
+            return None
+        deadline = time.monotonic() + _COMMAND_WAIT
+        status = None
+        while True:
+            st = self._get(f'/api/v3/command/{cmd_id}')
+            status = st.get('status') if isinstance(st, dict) else status
+            if status in ('completed', 'failed', 'aborted', 'cancelled'):
+                return status
+            if time.monotonic() >= deadline:
+                return status
+            time.sleep(_COMMAND_POLL)
+
+    def redirect_misfiled_imports(self, folder_hashes, max_per_run=5):
+        """Import blackhole downloads the arr blocked under a same-name title.
+
+        Only an ``importBlocked`` queue item from a Torrent Blackhole client
+        is touched, and only when its grab names a different series/movie
+        that shares a title with the one the arr filed it under (the
+        reboot case) — a rejection within the grabbed title ("not an
+        upgrade") stands, and a release the arr couldn't place at all,
+        placed under an unrelated title, or that the grab's indexer said is
+        the title it was filed under, is never moved.  Left alone too
+        when the grab is ambiguous or ``_redirect_files`` can't place every
+        file.  Each download is decided once a week (and again after a
+        restart); one whose checks keep failing (arr not answering, grab not
+        found) is retried for ``_REDIRECT_MAX_ATTEMPTS`` sweeps.
+
+        Returns a list of ``{'title', 'from_title', 'to_title'}`` dicts for
+        the imports the arr completed.
+        """
+        if not self.configured or not folder_hashes:
+            return []
+        clients = self._get('/api/v3/downloadclient')
+        bh_names = {c.get('name') for c in clients or []
+                    if isinstance(c, dict)
+                    and str(c.get('implementation') or '').lower()
+                    == 'torrentblackhole'}
+        if not bh_names:
+            return []
+        queue = self._get('/api/v3/queue',
+                          {'pageSize': 1000, self._QUEUE_UNKNOWN_PARAM: 'true'})
+        # One record per episode for a multi-episode download.
+        downloads = {}
+        for r in (queue or {}).get('records') or []:
+            if (not isinstance(r, dict)
+                    or r.get('downloadClient') not in bh_names
+                    or r.get('trackedDownloadState') != 'importBlocked'
+                    or not r.get('downloadId') or not r.get('outputPath')):
+                continue
+            h = folder_hashes.get(_path_basename(r['outputPath']))
+            if h:
+                d = downloads.setdefault(r['downloadId'],
+                                         {'rec': r, 'hash': h, 'from': set()})
+                d['from'].add(r.get(self._MEDIA_ID_KEY))
+        downloads = {did: d for did, d in downloads.items()
+                     if not _memo_has('redirect', self._name, did)}
+        if not downloads:
+            return []
+
+        by_hash = self._grabs_by_hash(time.time() - _GRAB_LOOKBACK)
+        if by_hash is None:
+            return []
+        sent = []
+        attempted = 0
+        for did, d in downloads.items():
+            if attempted >= max_per_run:
+                break
+            try:
+                outcome = self._redirect_one(did, d, by_hash.get(d['hash']) or [])
+            except Exception as e:
+                logger.warning(f"[{self._name}] Misfiled-import check failed for "
+                               f"{str(d['rec'].get('title') or '?')[:70]}: {e}")
+                _redirect_failed_attempt(self._name, did)
+                outcome = 'attempted'
+            if outcome == 'skipped':
+                continue
+            attempted += 1
+            if isinstance(outcome, dict):
+                sent.append(outcome)
+        return sent
+
+    def _redirect_one(self, did, d, grabs):
+        """One blocked download: 'skipped' (decided without API calls), the
+        sent-import dict, or 'attempted'."""
+        rec = d['rec']
+        title = str(rec.get('title') or '?')
+        if not grabs:
+            # Not found within the lookback: may still turn up (the arr
+            # writes the grab before the drop); give up after a few sweeps.
+            _redirect_failed_attempt(self._name, did)
+            return 'skipped'
+        target = self._grab_target(grabs)
+        from_ids = d['from'] - {None}
+        if target is None or target in d['from'] or len(from_ids) != 1:
+            # Ambiguous grab, the right title already, or a release the arr
+            # couldn't place at all: its own verdict stands.
+            _memo_set('redirect', self._name, did)
+            return 'skipped'
+        from_id = from_ids.pop()
+        from_rec = self._media_record(from_id)
+        target_rec = self._media_record(target)
+        if from_rec is None or target_rec is None:
+            _redirect_failed_attempt(self._name, did)
+            return 'attempted'
+        bases = self._base_titles(target_rec)
+        grab_ids = set().union(*(_norm_ids(g.get('data') if isinstance(g.get('data'), dict)
+                                           else {}) for g in grabs))
+        # Main titles only: alternate-title lists hold junk ("2", "Lego")
+        # that would make unrelated titles look alike.
+        unrelated = not (self._base_titles(from_rec, alternates=False)
+                         & self._base_titles(target_rec, alternates=False))
+        if unrelated or (grab_ids & _norm_ids(from_rec)
+                         and not grab_ids & _norm_ids(target_rec)):
+            # Not a same-name title, or the indexer said the release is the
+            # title it was filed under — the grab matched it to the wrong
+            # one; never move it.
+            _memo_set('redirect', self._name, did)
+            logger.info(f"[{self._name}] Not redirecting {title[:70]}: grabbed for "
+                        f"{self._display_title(target_rec, target)}, but "
+                        f"{'filed under the unrelated' if unrelated else 'the indexer says it is'} "
+                        f"{self._display_title(from_rec, from_id)}")
+            return 'skipped'
+        files = self._redirect_files(rec['outputPath'], did, target_rec, bases, grabs)
+        if files is None:
+            _redirect_failed_attempt(self._name, did)
+            return 'attempted'
+        # Decided before sending: a timed-out POST may still import.
+        _memo_set('redirect', self._name, did)
+        if not files:
+            logger.info(f"[{self._name}] Not redirecting misfiled import "
+                        f"{title[:70]}: its files can't be placed safely")
+            return 'attempted'
+        status = self._await_command(
+            self._post('/api/v3/command', {'name': 'ManualImport', 'files': files,
+                                           'importMode': 'auto'}))
+        item = {'title': title,
+                'from_title': self._display_title(from_rec, from_id),
+                'to_title': self._display_title(target_rec, target)}
+        if status != 'completed':
+            logger.warning(f"[{self._name}] Import of misfiled {title[:70]} into "
+                           f"{item['to_title']} did not complete "
+                           f"({status or 'not accepted'})")
+            return 'attempted'
+        # A completed command can still have skipped files (destination
+        # exists, path gone) — only the arr's records say what landed.
+        landed = self._import_landed(target_rec, files)
+        if not landed:
+            time.sleep(_COMMAND_POLL)
+            landed = self._import_landed(target_rec, files)
+        if not landed:
+            logger.warning(f"[{self._name}] Import of misfiled {title[:70]} into "
+                           f"{item['to_title']} finished, but "
+                           + ("its files aren't there" if landed is False
+                              else "the result couldn't be checked"))
+            return 'attempted'
+        logger.info(f"[{self._name}] Redirected misfiled import {title[:70]}: "
+                    f"{item['from_title']} -> {item['to_title']}")
+        if _history:
+            _history.log_event(
+                'import_redirected', title, source='scheduler',
+                meta={'cause': 'import_redirected',
+                      'arr_service': self._name,
+                      'from_title': item['from_title'],
+                      'to_title': item['to_title']})
+        return item
+
+    def find_misfiled_imports(self, folder_hashes, since):
+        """Warn about blackhole downloads already imported under the wrong
+        title (epoch *since* onward) — the silent case of
+        ``redirect_misfiled_imports``, when nothing blocked the import.
+        Report-only: the files stay where the arr put them.  One warning
+        per download.
+
+        Returns a list of ``{'title', 'imported_title', 'grabbed_title'}``,
+        or None when the arr didn't answer (the window should be re-read).
+        """
+        if not self.configured or not folder_hashes:
+            return []
+        records = []
+        for page in range(1, _GRAB_HISTORY_MAX_PAGES + 1):
+            resp = self._get('/api/v3/history',
+                             {'eventType': 3, 'page': page,
+                              'pageSize': _IMPORT_HISTORY_PAGE_SIZE,
+                              'sortKey': 'date', 'sortDirection': 'descending'})
+            if not isinstance(resp, dict):
+                return None
+            page_records = [r for r in resp.get('records') or [] if isinstance(r, dict)]
+            records.extend(page_records)
+            oldest = self._history_epoch(page_records[-1]) if page_records else None
+            if (len(page_records) < _IMPORT_HISTORY_PAGE_SIZE
+                    or (oldest is not None and oldest < since)):
+                break
+        todo = {}
+        for rec in records:
+            if rec.get('id') is None:
+                continue
+            when = self._history_epoch(rec)
+            if when is None or when < since:
+                continue
+            data = rec.get('data') if isinstance(rec.get('data'), dict) else {}
+            # The release dir is the dropped file's parent, or further up
+            # when the release nests its files.
+            h = next((folder_hashes[p] for p in reversed(
+                _path_parts(data.get('droppedPath'))[:-1]) if p in folder_hashes), None)
+            key = rec.get('downloadId') or f"import:{rec['id']}"
+            if h and key not in todo and not _memo_has('warned', self._name, key):
+                todo[key] = (rec, h)
+        if not todo:
+            return []
+        by_hash = self._grabs_by_hash(time.time() - _GRAB_LOOKBACK)
+        if by_hash is None:
+            return None
+        found = []
+        for key, (rec, h) in todo.items():
+            grabs = by_hash.get(h)
+            if not grabs:
+                continue
+            _memo_set('warned', self._name, key)
+            target = self._grab_target(grabs)
+            imported = rec.get(self._MEDIA_ID_KEY)
+            if target is None or target == imported:
+                continue
+            title = str(rec.get('sourceTitle') or '?')
+            item = {'title': title,
+                    'imported_title': self._display_title(
+                        self._media_record(imported), imported),
+                    'grabbed_title': self._display_title(
+                        self._media_record(target), target)}
+            found.append(item)
+            logger.warning(f"[{self._name}] {title[:70]} was grabbed for "
+                           f"{item['grabbed_title']} but imported into "
+                           f"{item['imported_title']}")
+            if _history:
+                _history.log_event(
+                    'import_misfiled', title, source='scheduler',
+                    meta={'cause': 'import_misfiled',
+                          'arr_service': self._name,
+                          'imported_title': item['imported_title'],
+                          'grabbed_title': item['grabbed_title']})
+        return found
 
 
 # ---------------------------------------------------------------------------
@@ -1149,6 +1574,84 @@ class SonarrClient(_ArrClientBase):
         """
         return _as_list(self._get('/api/v3/episode', {'seriesId': series_id}, strict=strict),
                         strict, 'sonarr', 'episode list')
+
+    _MEDIA_ID_KEY = 'seriesId'
+    _QUEUE_UNKNOWN_PARAM = 'includeUnknownSeriesItems'
+
+    def _media_record(self, media_id):
+        return self.get_series(media_id) if media_id is not None else None
+
+    def _display_title(self, record, media_id):
+        if not record:
+            return f'series {media_id}'
+        # Sonarr titles a reboot "Dark Matter (2024)" itself.
+        title = record.get('title') or f'series {media_id}'
+        year = record.get('year')
+        return title if not year or f'({year})' in title else f'{title} ({year})'
+
+    def _import_landed(self, target, files):
+        episodes = self._get('/api/v3/episode', {'seriesId': target.get('id')})
+        if not isinstance(episodes, list):
+            return None
+        has = {e.get('id') for e in episodes if isinstance(e, dict) and e.get('hasFile')}
+        return all(i in has for f in files for i in f['episodeIds'])
+
+    def _redirect_files(self, output_path, download_id, target, bases, grabs):
+        """Every file must be named for the grabbed series (*bases*, and its
+        year when the name has one) and parse to grabbed episodes that have
+        no file yet, each episode once —
+        a ManualImport skips Sonarr's upgrade checks, so it must never
+        replace a file.  Scene-numbered series are left alone: their file
+        numbers needn't be Sonarr's."""
+        if target.get('useSceneNumbering'):
+            return []
+        wanted = {g.get('episodeId') for g in grabs
+                  if g.get('seriesId') == target.get('id')
+                  and g.get('episodeId') is not None}
+        episodes = self._get('/api/v3/episode', {'seriesId': target.get('id')})
+        if not isinstance(episodes, list):
+            return None
+        by_number = {(e.get('seasonNumber'), e.get('episodeNumber')): e
+                     for e in episodes if isinstance(e, dict)}
+        candidates = self._get('/api/v3/manualimport',
+                               {'folder': output_path, 'filterExistingFiles': 'false'},
+                               timeout=_RELEASE_TIMEOUT)
+        if not isinstance(candidates, list):
+            return None
+        files = []
+        seen = set()
+        for c in candidates:
+            if not isinstance(c, dict) or not c.get('path'):
+                return []
+            # Parsed by name alone: the candidate's own episodes belong to
+            # the series it was misfiled under, which may lack this season.
+            parsed = self._get('/api/v3/parse', {'title': _path_basename(c['path'])})
+            if parsed is None:
+                return None
+            info = parsed.get('parsedEpisodeInfo') if isinstance(parsed, dict) else None
+            info = info if isinstance(info, dict) else {}
+            numbers = info.get('episodeNumbers') or []
+            name = info.get('seriesTitleInfo') if isinstance(info.get('seriesTitleInfo'), dict) else {}
+            year = name.get('year') or 0
+            if (_norm_title(name.get('titleWithoutYear') or info.get('seriesTitle')) not in bases
+                    or (year and target.get('year') and year != target['year'])
+                    or info.get('seasonNumber') is None or not numbers):
+                return []
+            ids = []
+            for n in numbers:
+                ep = by_number.get((info['seasonNumber'], n))
+                if (ep is None or ep.get('id') not in wanted or ep.get('hasFile')
+                        or ep.get('id') in seen):
+                    return []
+                seen.add(ep['id'])
+                ids.append(ep['id'])
+            files.append({'path': c['path'], 'seriesId': target.get('id'),
+                          'episodeIds': ids,
+                          'quality': c.get('quality'),
+                          'languages': c.get('languages') or [],
+                          'releaseGroup': c.get('releaseGroup'),
+                          'downloadId': download_id})
+        return files
 
     def get_episode_releases(self, episode_id, strict=False):
         """Fetch available releases for an episode from all indexers.
@@ -2152,6 +2655,56 @@ class RadarrClient(_ArrClientBase):
         *strict*: raise ArrUnavailable when Radarr doesn't answer.
         """
         return self._get(f'/api/v3/movie/{movie_id}', strict=strict)
+
+    _MEDIA_ID_KEY = 'movieId'
+    _QUEUE_UNKNOWN_PARAM = 'includeUnknownMovieItems'
+
+    def _media_record(self, media_id):
+        return self.get_movie(media_id) if media_id is not None else None
+
+    def _display_title(self, record, media_id):
+        if not record:
+            return f'movie {media_id}'
+        title = record.get('title') or f'movie {media_id}'
+        year = record.get('year')
+        return f'{title} ({year})' if year else title
+
+    def _import_landed(self, target, files):
+        movie = self.get_movie(target.get('id'))
+        if not isinstance(movie, dict):
+            return None
+        return bool(movie.get('hasFile'))
+
+    def _redirect_files(self, output_path, download_id, target, bases, grabs):
+        """A single file named for the grabbed movie (*bases*, and within a
+        year of its year when the name has one), and only into a movie with
+        no file yet — a ManualImport skips Radarr's upgrade checks."""
+        if target.get('hasFile'):
+            return []
+        candidates = self._get('/api/v3/manualimport',
+                               {'folder': output_path, 'filterExistingFiles': 'false'},
+                               timeout=_RELEASE_TIMEOUT)
+        if not isinstance(candidates, list):
+            return None
+        if (len(candidates) != 1 or not isinstance(candidates[0], dict)
+                or not candidates[0].get('path')):
+            return []
+        c = candidates[0]
+        parsed = self._get('/api/v3/parse', {'title': _path_basename(c['path'])})
+        if parsed is None:
+            return None
+        info = parsed.get('parsedMovieInfo') if isinstance(parsed, dict) else None
+        info = info if isinstance(info, dict) else {}
+        names = info.get('movieTitles') or [info.get('movieTitle')]
+        year = info.get('year') or 0
+        if (not any(_norm_title(n) in bases for n in names)
+                or (year and target.get('year') and abs(year - target['year']) > 1)):
+            return []
+        return [{'path': c['path'], 'movieId': target.get('id'),
+                 'quality': c.get('quality'),
+                 'languages': c.get('languages') or [],
+                 'releaseGroup': c.get('releaseGroup'),
+                 'downloadId': download_id}]
 
     def get_profile_id_for_movie(self, movie_id):
         """Return the quality profile ID assigned to a movie, or None.

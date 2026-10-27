@@ -61,6 +61,11 @@ CAUSE_BLOCKLISTED_HASH = 'blocklisted_hash'
 # blocklist rejecting an incoming drop) — this is the outbound feedback that
 # breaks the silent delete → identical re-grab loop.
 CAUSE_ARR_FEEDBACK_BLOCKLISTED = 'arr_feedback_blocklisted'
+# A blackhole download the arr filed under the wrong title (a yearless name
+# of a reboot parses as its older namesake): re-imported under the title the
+# grab was for when the arr blocked it, reported when it already imported.
+CAUSE_IMPORT_REDIRECTED = 'import_redirected'
+CAUSE_IMPORT_MISFILED = 'import_misfiled'
 CAUSE_DEBRID_UNAVAILABLE_MARKED = 'debrid_unavailable_marked'
 CAUSE_DEBRID_ADD_VIA_SEARCH = 'debrid_add_via_search'
 # A "Wanted" library ghost (monitored, no file) that the arr never grabbed was

@@ -1109,3 +1109,56 @@ class TestPreexistingTorrentProtection:
                             lambda tid, fn, **kw: captured.append((tid, kw.get('preexisting'))))
         w._resume_pending_monitors()
         assert captured == [('T9', True)]
+
+
+class TestImportEventRecordsGrabIdentity:
+    """The queue sweep ties an arr queue item (keyed by completed folder) to
+    its grab (keyed by torrent hash) through the import history event."""
+
+    def _watcher(self, release_name, mount_name):
+        import threading
+        from utils.blackhole import BlackholeWatcher
+        w = BlackholeWatcher.__new__(BlackholeWatcher)
+        w.debrid_service = 'realdebrid'
+        w.debrid_api_key = 'k'
+        w.mount_poll_timeout = 60
+        w.mount_poll_interval = 1
+        w._stop_event = threading.Event()
+        w._api_key_for = MagicMock(return_value='k')
+        w._remove_pending = MagicMock()
+        w._load_pending = MagicMock(return_value={})
+        w._check_realdebrid_status = MagicMock(
+            return_value=('downloaded', {'hash': 'ab' * 20, 'filename': release_name}))
+        w._is_torrent_ready = MagicMock(return_value=True)
+        w._is_terminal_error = MagicMock(return_value=False)
+        w._extract_release_name = MagicMock(return_value=release_name)
+        w._has_usable_media_files = MagicMock(return_value=True)
+        w._extract_filenames_from_info = MagicMock(return_value=None)
+        w._find_on_mount = MagicMock(return_value=('/mnt/rd/' + mount_name, '', mount_name))
+        w._create_symlinks = MagicMock(return_value=1)
+        w._audit_release_completeness = MagicMock()
+        return w
+
+    def _meta(self, w, filename, **kw):
+        hist = MagicMock()
+        with patch('utils.blackhole._history', hist), \
+             patch('utils.blackhole._coalesced_root_refresh'), \
+             patch('utils.blackhole._notify', None), \
+             patch('utils.blackhole._enrich_for_history', return_value=(None, None)):
+            w._monitor_and_symlink('T1', filename, label='sonarr', **kw)
+        metas = [c.kwargs['meta'] for c in hist.log_event.call_args_list
+                 if c.kwargs.get('meta', {}).get('cause') == 'blackhole_new_import']
+        assert len(metas) == 1
+        return metas[0]
+
+    def test_records_hash_and_mount_folder(self):
+        w = self._watcher('Dark.Matter.S02E07-G66', 'Dark.Matter.S02E07-G66')
+        meta = self._meta(w, 'Dark.Matter.S02E07-G66.mkv.magnet')
+        assert meta['info_hash'] == 'AB' * 20
+        assert meta['folder'] == 'Dark.Matter.S02E07-G66'
+
+    def test_obfuscated_payload_records_display_folder(self):
+        hexname = 'a1' * 16
+        w = self._watcher(hexname, hexname)
+        meta = self._meta(w, 'Show.S01E01.1080p.magnet')
+        assert meta['folder'] == 'Show.S01E01.1080p'

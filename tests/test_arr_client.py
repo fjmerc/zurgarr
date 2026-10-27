@@ -2773,6 +2773,610 @@ class TestMarkDownloadFailed:
         assert RadarrClient.mark_download_failed is SonarrClient.mark_download_failed
 
 
+class TestMisfiledImports:
+    """Torrent Blackhole grabs carry no downloadId, so the arr re-parses the
+    finished download's name — a yearless reboot release ("Dark.Matter.
+    S02E07") lands on the older namesake.  The grab record (matched by torrent
+    hash via the blackhole's folder -> hash map) says what was grabbed."""
+
+    HASH = 'C0' * 20
+    FOLDER = 'Dark.Matter.S02E07.The.Pyramid.1080p.ATVP.WEB-DL-G66'
+    OUT = '/completed/sonarr/' + FOLDER
+    DL = 'RD (Blackhole)_' + FOLDER + '_639286714006488598'
+    SERIES = {103: {'id': 103, 'title': 'Dark Matter (2024)', 'year': 2024},
+              214: {'id': 214, 'title': 'Dark Matter', 'year': 2015},
+              300: {'id': 300, 'title': 'Some Other Show', 'year': 2020}}
+
+    @pytest.fixture(autouse=True)
+    def _fresh(self, monkeypatch):
+        import utils.arr_client as ac
+        monkeypatch.setattr(ac, '_redirect_memo', {})
+        monkeypatch.setattr(ac, '_redirect_attempts', {})
+        monkeypatch.setattr(ac, '_COMMAND_POLL', 0)
+        self.hist = MagicMock()
+        monkeypatch.setattr(ac, '_history', self.hist)
+
+    def _queue_item(self, **kw):
+        item = {'id': 1, 'title': self.FOLDER, 'downloadId': self.DL,
+                'downloadClient': 'RD (Blackhole)', 'outputPath': self.OUT,
+                'trackedDownloadState': 'importBlocked',
+                'seriesId': 214, 'episodeId': 26666}
+        item.update(kw)
+        return item
+
+    def _wire(self, client, monkeypatch, queue=None, grabs=None, episodes=None,
+              candidates=None, parse=None, imports=None, series=None,
+              movies=None, post_result=None, command_status='completed',
+              impl='TorrentBlackhole', grab_pages=None, landed=True):
+        calls = {'get': [], 'post': []}
+        series = self.SERIES if series is None else series
+
+        def fake_get(path, params=None, timeout=None, strict=False):
+            calls['get'].append((path, params))
+            params = params or {}
+            if path == '/api/v3/downloadclient':
+                return [{'name': 'RD (Blackhole)', 'implementation': impl}]
+            if path == '/api/v3/queue':
+                return {'records': queue or []}
+            if path == '/api/v3/history':
+                if params.get('eventType') == 1:
+                    if grab_pages is not None:
+                        return grab_pages(params['page'])
+                    return {'records': (grabs or []) if params.get('page', 1) == 1 else []}
+                if params.get('eventType') == 3:
+                    return {'records': imports or []}
+            if path == '/api/v3/episode':
+                # After an import the episodes it placed have files.
+                placed = {i for _, b in calls['post'] for f in b.get('files', [])
+                          for i in f.get('episodeIds', [])} if landed else set()
+                return [dict(e, hasFile=True) if e['id'] in placed else e
+                        for e in (episodes or {}).get(params.get('seriesId'), [])]
+            if path == '/api/v3/manualimport':
+                return candidates
+            if path == '/api/v3/parse':
+                return (parse or {}).get(params.get('title'))
+            if path.startswith('/api/v3/command/'):
+                return {'status': command_status}
+            if path.startswith('/api/v3/series/'):
+                return series.get(int(path.rsplit('/', 1)[1]))
+            if path.startswith('/api/v3/movie/'):
+                mid = int(path.rsplit('/', 1)[1])
+                m = (movies or {}).get(mid)
+                placed = {f.get('movieId') for _, b in calls['post']
+                          for f in b.get('files', [])} if landed else set()
+                return dict(m, hasFile=True) if m and mid in placed else m
+            return None
+
+        def fake_post(path, body=None):
+            calls['post'].append((path, body))
+            return {'id': 99} if post_result is None else post_result
+
+        monkeypatch.setattr(client, '_get', fake_get)
+        monkeypatch.setattr(client, '_post', fake_post)
+        return calls
+
+    def _grab(self, series_id=103, episode_id=17251, h=None, age=3600):
+        return {'id': 5, 'eventType': 'grabbed', 'seriesId': series_id,
+                'episodeId': episode_id, 'date': _iso_ago(age),
+                'data': {'torrentInfoHash': (h or self.HASH).lower()}}
+
+    def _ep(self, ep_id, number, has_file=False):
+        return {'id': ep_id, 'seasonNumber': 2, 'episodeNumber': number,
+                'hasFile': has_file}
+
+    def _parsed(self, *numbers, title='Dark Matter'):
+        return {'parsedEpisodeInfo': {'seriesTitle': title, 'seasonNumber': 2,
+                                      'episodeNumbers': list(numbers)}}
+
+    def _sonarr_wire(self, sonarr, monkeypatch, **kw):
+        kw.setdefault('queue', [self._queue_item()])
+        kw.setdefault('grabs', [self._grab()])
+        kw.setdefault('episodes', {103: [self._ep(17251, 7)]})
+        kw.setdefault('candidates', [{'path': self.OUT + '/e07.mkv',
+                                      'quality': {'quality': {'name': 'WEBDL-1080p'}},
+                                      'languages': [{'id': 1}], 'releaseGroup': 'G66'}])
+        kw.setdefault('parse', {'e07.mkv': self._parsed(7)})
+        return self._wire(sonarr, monkeypatch, **kw)
+
+    def _redirect(self, client, folders=None):
+        return client.redirect_misfiled_imports(folders or {self.FOLDER: self.HASH})
+
+    def test_sonarr_blocked_import_reimported_under_grabbed_series(self, sonarr, monkeypatch):
+        calls = self._sonarr_wire(sonarr, monkeypatch)
+        sent = self._redirect(sonarr)
+        assert sent == [{'title': self.FOLDER, 'from_title': 'Dark Matter (2015)',
+                         'to_title': 'Dark Matter (2024)'}]
+        assert len(calls['post']) == 1
+        path, body = calls['post'][0]
+        assert path == '/api/v3/command'
+        assert body['name'] == 'ManualImport'
+        assert body['importMode'] == 'auto'
+        assert body['files'] == [{
+            'path': self.OUT + '/e07.mkv', 'seriesId': 103, 'episodeIds': [17251],
+            'quality': {'quality': {'name': 'WEBDL-1080p'}},
+            'languages': [{'id': 1}], 'releaseGroup': 'G66', 'downloadId': self.DL}]
+        args, kwargs = self.hist.log_event.call_args
+        assert args[0] == 'import_redirected'
+        assert kwargs['meta']['cause'] == 'import_redirected'
+        assert kwargs['meta']['to_title'] == 'Dark Matter (2024)'
+
+    def test_import_that_does_not_complete_is_not_reported_done(self, sonarr, monkeypatch):
+        calls = self._sonarr_wire(sonarr, monkeypatch, command_status='failed')
+        assert self._redirect(sonarr) == []
+        assert len(calls['post']) == 1
+        self.hist.log_event.assert_not_called()
+        self._redirect(sonarr)
+        assert len(calls['post']) == 1   # not sent twice
+
+    def test_completed_import_that_placed_nothing_not_reported_done(self, sonarr, monkeypatch):
+        # ManualImport finishes "completed" even when it skipped the file.
+        calls = self._sonarr_wire(sonarr, monkeypatch, landed=False)
+        assert self._redirect(sonarr) == []
+        assert len(calls['post']) == 1
+        self.hist.log_event.assert_not_called()
+
+    def test_indexer_naming_the_filed_under_show_blocks_redirect(self, sonarr, monkeypatch):
+        # The grab matched a 2015 release to the 2024 show; Sonarr's re-parse
+        # filed it where the indexer said it belongs.
+        series = dict(self.SERIES)
+        series[214] = dict(series[214], imdbId='tt4159076')
+        series[103] = dict(series[103], imdbId='tt19231492')
+        grab = self._grab()
+        grab['data']['imdbId'] = 'tt4159076'
+        calls = self._sonarr_wire(sonarr, monkeypatch, series=series, grabs=[grab])
+        assert self._redirect(sonarr) == []
+        assert calls['post'] == []
+
+    def test_indexer_naming_the_grabbed_show_allows_redirect(self, sonarr, monkeypatch):
+        series = dict(self.SERIES)
+        series[214] = dict(series[214], imdbId='tt4159076')
+        series[103] = dict(series[103], imdbId='tt19231492')
+        grab = self._grab()
+        grab['data'].update(imdbId='tt19231492', tvdbId='0')
+        self._sonarr_wire(sonarr, monkeypatch, series=series, grabs=[grab])
+        assert len(self._redirect(sonarr)) == 1
+
+    def test_file_naming_another_year_blocks_redirect(self, sonarr, monkeypatch):
+        parsed = self._parsed(7)
+        parsed['parsedEpisodeInfo']['seriesTitleInfo'] = {
+            'title': 'Dark Matter 2015', 'titleWithoutYear': 'Dark Matter', 'year': 2015}
+        calls = self._sonarr_wire(sonarr, monkeypatch, parse={'e07.mkv': parsed})
+        assert self._redirect(sonarr) == []
+        assert calls['post'] == []
+
+    def test_file_naming_the_grabbed_year_redirects(self, sonarr, monkeypatch):
+        parsed = self._parsed(7, title='Dark Matter 2024')
+        parsed['parsedEpisodeInfo']['seriesTitleInfo'] = {
+            'title': 'Dark Matter 2024', 'titleWithoutYear': 'Dark Matter', 'year': 2024}
+        self._sonarr_wire(sonarr, monkeypatch, parse={'e07.mkv': parsed})
+        assert len(self._redirect(sonarr)) == 1
+
+    def test_rejection_within_grabbed_series_stands(self, sonarr, monkeypatch):
+        calls = self._sonarr_wire(sonarr, monkeypatch,
+                                  queue=[self._queue_item(seriesId=103, episodeId=17251)])
+        assert self._redirect(sonarr) == []
+        assert calls['post'] == []
+
+    def test_unrelated_series_never_redirected(self, sonarr, monkeypatch):
+        # A grab matched by an indexer's (wrong) id: the files are another
+        # show's, filed under that show — not a same-name mix-up.
+        calls = self._sonarr_wire(sonarr, monkeypatch,
+                                  queue=[self._queue_item(seriesId=300)])
+        assert self._redirect(sonarr) == []
+        assert calls['post'] == []
+
+    def test_release_the_arr_could_not_place_never_redirected(self, sonarr, monkeypatch):
+        calls = self._sonarr_wire(sonarr, monkeypatch,
+                                  queue=[self._queue_item(seriesId=None, episodeId=None)])
+        assert self._redirect(sonarr) == []
+        assert self._redirect(sonarr) == []
+        assert calls['post'] == []
+        # Decided on the first sweep, not retried.
+        assert len([q for p, q in calls['get']
+                    if p == '/api/v3/history' and q.get('eventType') == 1]) == 1
+
+    def test_file_named_for_another_show_blocks_redirect(self, sonarr, monkeypatch):
+        calls = self._sonarr_wire(sonarr, monkeypatch, parse={
+            'e07.mkv': self._parsed(7, title='Some Other Show')})
+        assert self._redirect(sonarr) == []
+        assert calls['post'] == []
+
+    def test_shared_alternate_title_is_not_the_same_name(self, sonarr, monkeypatch):
+        # Live Radarr/Sonarr alternate titles include junk ("2", "Lego");
+        # only main titles decide whether two entries are namesakes.
+        series = dict(self.SERIES)
+        series[214] = {'id': 214, 'title': 'Materia Oscura', 'year': 2015,
+                       'alternateTitles': [{'title': 'Dark Matter'}]}
+        calls = self._sonarr_wire(sonarr, monkeypatch, series=series)
+        assert self._redirect(sonarr) == []
+        assert calls['post'] == []
+
+    def test_file_may_use_the_grabbed_shows_alternate_title(self, sonarr, monkeypatch):
+        series = dict(self.SERIES)
+        series[103] = dict(series[103], alternateTitles=[{'title': 'Materia Oscura'}])
+        self._sonarr_wire(sonarr, monkeypatch, series=series,
+                          parse={'e07.mkv': self._parsed(7, title='Materia Oscura')})
+        assert len(self._redirect(sonarr)) == 1
+
+    def test_scene_numbered_series_left_alone(self, sonarr, monkeypatch):
+        series = dict(self.SERIES)
+        series[103] = dict(series[103], useSceneNumbering=True)
+        calls = self._sonarr_wire(sonarr, monkeypatch, series=series)
+        assert self._redirect(sonarr) == []
+        assert calls['post'] == []
+
+    def test_never_replaces_an_existing_episode_file(self, sonarr, monkeypatch):
+        calls = self._sonarr_wire(sonarr, monkeypatch,
+                                  episodes={103: [self._ep(17251, 7, has_file=True)]})
+        assert self._redirect(sonarr) == []
+        assert calls['post'] == []
+
+    def test_two_files_for_one_episode_left_alone(self, sonarr, monkeypatch):
+        calls = self._sonarr_wire(
+            sonarr, monkeypatch,
+            candidates=[{'path': self.OUT + '/a.mkv'}, {'path': self.OUT + '/b.mkv'}],
+            parse={'a.mkv': self._parsed(7), 'b.mkv': self._parsed(7)})
+        assert self._redirect(sonarr) == []
+        assert calls['post'] == []
+
+    def test_file_for_an_episode_not_grabbed_blocks_redirect(self, sonarr, monkeypatch):
+        calls = self._sonarr_wire(sonarr, monkeypatch,
+                                  episodes={103: [self._ep(17251, 7), self._ep(17252, 8)]},
+                                  parse={'e07.mkv': self._parsed(8)})
+        assert self._redirect(sonarr) == []
+        assert calls['post'] == []
+
+    def test_unparseable_file_blocks_redirect(self, sonarr, monkeypatch):
+        calls = self._sonarr_wire(sonarr, monkeypatch,
+                                  parse={'e07.mkv': {'parsedEpisodeInfo': None}})
+        assert self._redirect(sonarr) == []
+        assert calls['post'] == []
+
+    def test_pack_imports_every_grabbed_episode(self, sonarr, monkeypatch):
+        grabs = [self._grab(episode_id=17251), self._grab(episode_id=17252)]
+        candidates = [{'path': self.OUT + '/e07.mkv'}, {'path': self.OUT + '/e08.mkv'}]
+        parse = {'e07.mkv': self._parsed(7), 'e08.mkv': self._parsed(8)}
+        queue = [self._queue_item(), self._queue_item(id=2, episodeId=26667)]
+        calls = self._sonarr_wire(sonarr, monkeypatch, queue=queue, grabs=grabs,
+                                  episodes={103: [self._ep(17251, 7), self._ep(17252, 8)]},
+                                  candidates=candidates, parse=parse)
+        assert len(self._redirect(sonarr)) == 1
+        files = calls['post'][0][1]['files']
+        assert [f['episodeIds'] for f in files] == [[17251], [17252]]
+
+    def test_ambiguous_grab_left_alone(self, sonarr, monkeypatch):
+        calls = self._sonarr_wire(sonarr, monkeypatch,
+                                  grabs=[self._grab(), self._grab(series_id=300)])
+        assert self._redirect(sonarr) == []
+        assert calls['post'] == []
+
+    def test_missing_grab_retried_then_given_up(self, sonarr, monkeypatch):
+        import utils.arr_client as ac
+        calls = self._sonarr_wire(sonarr, monkeypatch, grabs=[self._grab(h='D1' * 20)])
+        for _ in range(ac._REDIRECT_MAX_ATTEMPTS + 2):
+            assert self._redirect(sonarr) == []
+        history_reads = [q for p, q in calls['get']
+                         if p == '/api/v3/history' and q.get('eventType') == 1]
+        assert len(history_reads) == ac._REDIRECT_MAX_ATTEMPTS
+        assert calls['post'] == []
+
+    def test_grab_found_on_a_later_history_page(self, sonarr, monkeypatch):
+        import utils.arr_client as ac
+        monkeypatch.setattr(ac, '_GRAB_HISTORY_PAGE_SIZE', 1)
+        pages = {1: [self._grab(h='D1' * 20)], 2: [self._grab()]}
+        self._sonarr_wire(sonarr, monkeypatch,
+                          grab_pages=lambda n: {'records': pages.get(n, [])})
+        assert len(self._redirect(sonarr)) == 1
+
+    def test_grab_history_paging_stops_at_lookback(self, sonarr, monkeypatch):
+        import utils.arr_client as ac
+        monkeypatch.setattr(ac, '_GRAB_HISTORY_PAGE_SIZE', 1)
+        pages = {1: [self._grab(h='D1' * 20, age=ac._GRAB_LOOKBACK + 60)],
+                 2: [self._grab()]}
+        calls = self._sonarr_wire(sonarr, monkeypatch,
+                                  grab_pages=lambda n: {'records': pages.get(n, [])})
+        assert self._redirect(sonarr) == []
+        assert [q['page'] for p, q in calls['get']
+                if p == '/api/v3/history' and q.get('eventType') == 1] == [1]
+
+    def test_only_blackhole_clients(self, sonarr, monkeypatch):
+        calls = self._sonarr_wire(sonarr, monkeypatch, impl='QBittorrent')
+        assert self._redirect(sonarr) == []
+        assert not any(p == '/api/v3/queue' for p, _ in calls['get'])
+
+    def test_only_blocked_imports(self, sonarr, monkeypatch):
+        calls = self._sonarr_wire(sonarr, monkeypatch, queue=[
+            self._queue_item(trackedDownloadState='importPending')])
+        assert self._redirect(sonarr) == []
+        assert calls['post'] == []
+
+    def test_unknown_folder_ignored(self, sonarr, monkeypatch):
+        calls = self._sonarr_wire(sonarr, monkeypatch)
+        assert self._redirect(sonarr, {'Other.Folder': self.HASH}) == []
+        assert calls['post'] == []
+
+    def test_each_download_decided_once(self, sonarr, monkeypatch):
+        calls = self._sonarr_wire(sonarr, monkeypatch)
+        self._redirect(sonarr)
+        self._redirect(sonarr)
+        assert len(calls['post']) == 1
+
+    def test_failed_post_not_resent(self, sonarr, monkeypatch):
+        # A timed-out POST may still have imported.
+        calls = self._sonarr_wire(sonarr, monkeypatch)
+        monkeypatch.setattr(sonarr, '_post', lambda path, body=None: (
+            calls['post'].append((path, body)) or None))
+        assert self._redirect(sonarr) == []
+        self._redirect(sonarr)
+        assert len(calls['post']) == 1
+
+    def test_arr_not_answering_retried_next_sweep(self, sonarr, monkeypatch):
+        calls = self._sonarr_wire(sonarr, monkeypatch, candidates=None)
+        assert self._redirect(sonarr) == []
+        assert calls['post'] == []
+        self._sonarr_wire(sonarr, monkeypatch)
+        assert len(self._redirect(sonarr)) == 1
+
+    def test_episode_list_not_answering_retried(self, sonarr, monkeypatch):
+        self._sonarr_wire(sonarr, monkeypatch)
+        real_get = sonarr._get
+        monkeypatch.setattr(sonarr, '_get', lambda path, params=None, **kw: (
+            None if path == '/api/v3/episode' else real_get(path, params, **kw)))
+        assert self._redirect(sonarr) == []
+        monkeypatch.setattr(sonarr, '_get', real_get)
+        assert len(self._redirect(sonarr)) == 1
+
+    def test_deleted_target_retried_then_given_up(self, sonarr, monkeypatch):
+        import utils.arr_client as ac
+        series = {214: self.SERIES[214]}   # grabbed series since deleted
+        calls = self._sonarr_wire(sonarr, monkeypatch, series=series)
+        for _ in range(ac._REDIRECT_MAX_ATTEMPTS + 2):
+            self._redirect(sonarr)
+        series_reads = [p for p, _ in calls['get'] if p == '/api/v3/series/103']
+        assert len(series_reads) == ac._REDIRECT_MAX_ATTEMPTS
+
+    def test_unexpected_reply_does_not_stop_other_downloads(self, sonarr, monkeypatch):
+        queue = [self._queue_item(downloadId='bad', outputPath='/completed/sonarr/BAD'),
+                 self._queue_item()]
+        self._sonarr_wire(sonarr, monkeypatch, queue=queue)
+        real_get = sonarr._get
+
+        def flaky(path, params=None, **kw):
+            if path == '/api/v3/manualimport' and params['folder'].endswith('BAD'):
+                return 42   # not a list: raises inside the check
+            return real_get(path, params, **kw)
+        monkeypatch.setattr(sonarr, '_get', flaky)
+        sent = self._redirect(sonarr, {'BAD': self.HASH, self.FOLDER: self.HASH})
+        assert len(sent) == 1
+
+    def test_per_run_cap(self, sonarr, monkeypatch):
+        hashes = [f'{i:02d}' * 20 for i in range(3)]
+        queue = [self._queue_item(id=i, downloadId=f'dl{i}',
+                                  outputPath=f'/completed/sonarr/F{i}')
+                 for i in range(3)]
+        grabs = [self._grab(episode_id=17251 + i, h=hashes[i]) for i in range(3)]
+        episodes = {103: [self._ep(17251 + i, 7 + i) for i in range(3)]}
+        parse = {f'e{i}.mkv': self._parsed(7 + i) for i in range(3)}
+        calls = self._sonarr_wire(sonarr, monkeypatch, queue=queue, grabs=grabs,
+                                  episodes=episodes, parse=parse, candidates=None)
+        real_get = sonarr._get
+        monkeypatch.setattr(sonarr, '_get', lambda path, params=None, **kw: (
+            [{'path': params['folder'] + f"/e{params['folder'][-1]}.mkv"}]
+            if path == '/api/v3/manualimport' else real_get(path, params, **kw)))
+        folders = {f'F{i}': hashes[i] for i in range(3)}
+        assert len(sonarr.redirect_misfiled_imports(folders, max_per_run=1)) == 1
+        # The rest wait for the next sweep.
+        assert len(sonarr.redirect_misfiled_imports(folders, max_per_run=5)) == 2
+        assert [b['files'][0]['episodeIds'] for _, b in calls['post']] == \
+            [[17251], [17252], [17253]]
+
+    # -- Radarr --------------------------------------------------------------
+
+    def _radarr_wire(self, radarr, monkeypatch, movies=None, candidates=None,
+                     parse=None, from_movie=5):
+        queue = [{'id': 1, 'title': 'Lucky.2017.1080p', 'downloadId': 'dl',
+                  'downloadClient': 'RD (Blackhole)',
+                  'outputPath': '/completed/radarr/Lucky.2017.1080p',
+                  'trackedDownloadState': 'importBlocked', 'movieId': from_movie}]
+        grabs = [{'id': 3, 'movieId': 9, 'date': _iso_ago(60),
+                  'data': {'torrentInfoHash': self.HASH}}]
+        if movies is None:
+            movies = {5: {'id': 5, 'title': 'Lucky', 'year': 2011, 'hasFile': True},
+                      9: {'id': 9, 'title': 'Lucky', 'year': 2017, 'hasFile': False},
+                      7: {'id': 7, 'title': 'Logan Lucky', 'year': 2017, 'hasFile': True}}
+        if candidates is None:
+            candidates = [{'path': '/completed/radarr/Lucky.2017.1080p/l.mkv',
+                           'releaseGroup': 'X'}]
+        if parse is None:
+            parse = {'l.mkv': {'parsedMovieInfo': {'movieTitles': ['Lucky']}}}
+        return self._wire(radarr, monkeypatch, queue=queue, grabs=grabs, movies=movies,
+                          candidates=candidates, parse=parse)
+
+    def test_radarr_blocked_import_reimported_under_grabbed_movie(self, radarr, monkeypatch):
+        calls = self._radarr_wire(radarr, monkeypatch)
+        sent = radarr.redirect_misfiled_imports({'Lucky.2017.1080p': self.HASH})
+        assert sent == [{'title': 'Lucky.2017.1080p', 'from_title': 'Lucky (2011)',
+                         'to_title': 'Lucky (2017)'}]
+        f = calls['post'][0][1]['files'][0]
+        assert f['movieId'] == 9 and f['downloadId'] == 'dl'
+        assert 'seriesId' not in f
+
+    def test_radarr_unrelated_movie_never_redirected(self, radarr, monkeypatch):
+        calls = self._radarr_wire(radarr, monkeypatch, from_movie=7)
+        assert radarr.redirect_misfiled_imports({'Lucky.2017.1080p': self.HASH}) == []
+        assert calls['post'] == []
+
+    def test_radarr_title_ending_in_a_number_is_not_the_same_title(self, radarr, monkeypatch):
+        # "Blade Runner 2049" is not "Blade Runner" with a year.
+        movies = {5: {'id': 5, 'title': 'Blade Runner 2049', 'year': 2017},
+                  9: {'id': 9, 'title': 'Blade Runner', 'year': 1982, 'hasFile': False}}
+        calls = self._radarr_wire(radarr, monkeypatch, movies=movies, parse={
+            'l.mkv': {'parsedMovieInfo': {'movieTitles': ['Blade Runner 2049'], 'year': 2017}}})
+        assert radarr.redirect_misfiled_imports({'Lucky.2017.1080p': self.HASH}) == []
+        assert calls['post'] == []
+
+    def test_radarr_file_of_another_year_left_alone(self, radarr, monkeypatch):
+        calls = self._radarr_wire(radarr, monkeypatch, parse={
+            'l.mkv': {'parsedMovieInfo': {'movieTitles': ['Lucky'], 'year': 2011}}})
+        assert radarr.redirect_misfiled_imports({'Lucky.2017.1080p': self.HASH}) == []
+        assert calls['post'] == []
+
+    def test_radarr_import_that_placed_nothing_not_reported(self, radarr, monkeypatch):
+        calls = self._radarr_wire(radarr, monkeypatch)
+        monkeypatch.setattr(radarr, '_import_landed', lambda target, files: False)
+        assert radarr.redirect_misfiled_imports({'Lucky.2017.1080p': self.HASH}) == []
+        assert len(calls['post']) == 1
+        self.hist.log_event.assert_not_called()
+
+    def test_radarr_file_named_for_another_movie_left_alone(self, radarr, monkeypatch):
+        calls = self._radarr_wire(radarr, monkeypatch, parse={
+            'l.mkv': {'parsedMovieInfo': {'movieTitles': ['Logan Lucky']}}})
+        assert radarr.redirect_misfiled_imports({'Lucky.2017.1080p': self.HASH}) == []
+        assert calls['post'] == []
+
+    def test_radarr_never_replaces_an_existing_movie_file(self, radarr, monkeypatch):
+        movies = {5: {'id': 5, 'title': 'Lucky', 'year': 2011},
+                  9: {'id': 9, 'title': 'Lucky', 'year': 2017, 'hasFile': True}}
+        calls = self._radarr_wire(radarr, monkeypatch, movies=movies)
+        assert radarr.redirect_misfiled_imports({'Lucky.2017.1080p': self.HASH}) == []
+        assert calls['post'] == []
+
+    def test_radarr_multi_file_download_left_alone(self, radarr, monkeypatch):
+        calls = self._radarr_wire(radarr, monkeypatch,
+                                  candidates=[{'path': '/a.mkv'}, {'path': '/b.mkv'}])
+        assert radarr.redirect_misfiled_imports({'Lucky.2017.1080p': self.HASH}) == []
+        assert calls['post'] == []
+
+    def test_radarr_target_not_answering_retried(self, radarr, monkeypatch):
+        movies = {5: {'id': 5, 'title': 'Lucky', 'year': 2011}}
+        self._radarr_wire(radarr, monkeypatch, movies=movies)
+        assert radarr.redirect_misfiled_imports({'Lucky.2017.1080p': self.HASH}) == []
+        self._radarr_wire(radarr, monkeypatch)
+        assert len(radarr.redirect_misfiled_imports({'Lucky.2017.1080p': self.HASH})) == 1
+
+    # -- find_misfiled_imports (report-only) ------------------------------
+
+    def _import(self, series_id=214, age=60, folder=None, dropped=None, rec_id=77,
+                download_id='dlA'):
+        return {'id': rec_id, 'eventType': 'downloadFolderImported', 'seriesId': series_id,
+                'sourceTitle': 'Dark.Matter.S02E07', 'date': _iso_ago(age),
+                'downloadId': download_id,
+                'data': {'droppedPath': dropped or
+                         f'/completed/sonarr/{folder or self.FOLDER}/e07.mkv'}}
+
+    def _find(self, client, folders=None):
+        return client.find_misfiled_imports(folders or {self.FOLDER: self.HASH},
+                                            time.time() - 900)
+
+    def test_silent_wrong_series_import_reported_once(self, sonarr, monkeypatch):
+        self._wire(sonarr, monkeypatch, imports=[self._import()], grabs=[self._grab()])
+        found = self._find(sonarr)
+        assert found == [{'title': 'Dark.Matter.S02E07',
+                          'imported_title': 'Dark Matter (2015)',
+                          'grabbed_title': 'Dark Matter (2024)'}]
+        args, kwargs = self.hist.log_event.call_args
+        assert args[0] == 'import_misfiled'
+        assert kwargs['meta']['cause'] == 'import_misfiled'
+        assert self._find(sonarr) == []
+
+    def test_misfiled_pack_reported_once(self, sonarr, monkeypatch):
+        imports = [self._import(rec_id=77), self._import(rec_id=78)]
+        self._wire(sonarr, monkeypatch, imports=imports, grabs=[self._grab()])
+        assert len(self._find(sonarr)) == 1
+
+    def test_nested_release_file_found(self, sonarr, monkeypatch):
+        self._wire(sonarr, monkeypatch, grabs=[self._grab()], imports=[self._import(
+            dropped=f'/completed/sonarr/{self.FOLDER}/Season 2/e07.mkv')])
+        assert len(self._find(sonarr)) == 1
+
+    def test_correct_series_import_not_reported(self, sonarr, monkeypatch):
+        self._wire(sonarr, monkeypatch, imports=[self._import(series_id=103)],
+                   grabs=[self._grab()])
+        assert self._find(sonarr) == []
+        self.hist.log_event.assert_not_called()
+
+    def test_import_without_grab_not_reported(self, sonarr, monkeypatch):
+        self._wire(sonarr, monkeypatch, imports=[self._import()],
+                   grabs=[self._grab(h='D1' * 20)])
+        assert self._find(sonarr) == []
+
+    def test_imports_before_window_ignored(self, sonarr, monkeypatch):
+        calls = self._wire(sonarr, monkeypatch, imports=[self._import(age=3600)],
+                           grabs=[self._grab()])
+        assert self._find(sonarr) == []
+        assert not any(p == '/api/v3/history' and (q or {}).get('eventType') == 1
+                       for p, q in calls['get'])
+
+    def test_radarr_silent_wrong_movie_import_reported(self, radarr, monkeypatch):
+        imports = [{'id': 5, 'movieId': 7, 'sourceTitle': 'Lucky.2017', 'date': _iso_ago(60),
+                    'downloadId': 'dl',
+                    'data': {'droppedPath': '/completed/radarr/Lucky.2017/l.mkv'}}]
+        grabs = [{'id': 3, 'movieId': 9, 'date': _iso_ago(600),
+                  'data': {'torrentInfoHash': self.HASH}}]
+        movies = {9: {'id': 9, 'title': 'Lucky', 'year': 2017},
+                  7: {'id': 7, 'title': 'Logan Lucky', 'year': 2017}}
+        self._wire(radarr, monkeypatch, imports=imports, grabs=grabs, movies=movies)
+        assert self._find(radarr, {'Lucky.2017': self.HASH}) == [{
+            'title': 'Lucky.2017', 'imported_title': 'Logan Lucky (2017)',
+            'grabbed_title': 'Lucky (2017)'}]
+
+    def test_memo_entries_expire(self, monkeypatch):
+        import utils.arr_client as ac
+        ac._memo_set('redirect', 'sonarr', 'dl')
+        assert ac._memo_has('redirect', 'sonarr', 'dl')
+        ac._redirect_memo[('redirect', 'sonarr', 'dl')] -= ac._REDIRECT_MEMO_TTL + 1
+        assert not ac._memo_has('redirect', 'sonarr', 'dl')
+        assert ac._redirect_memo == {}
+
+    def test_base_titles_strip_only_the_records_own_year(self):
+        from utils.arr_client import _ArrClientBase as B
+        assert B._base_titles({'title': 'Dark Matter (2024)', 'year': 2024}) == \
+            {'darkmatter2024', 'darkmatter'}
+        assert B._base_titles({'title': 'Blade Runner 2049', 'year': 2017}) == \
+            {'bladerunner2049'}
+        assert B._base_titles({'title': '1923', 'year': 2022}) == {'1923'}
+        assert B._base_titles({'title': 'X', 'year': 2020,
+                               'alternateTitles': [{'title': 'Y (2020)'}]}) == {'x', 'y2020', 'y'}
+
+    def test_base_titles_disambiguating_year_and_accents(self):
+        from utils.arr_client import _ArrClientBase as B, _norm_title
+        assert 'battlestargalactica' in B._base_titles(
+            {'title': 'Battlestar Galactica (2003)', 'year': 2004})
+        assert _norm_title('Shogun') in B._base_titles({'title': 'Shōgun (2024)', 'year': 2024})
+
+    def test_import_check_unanswered_is_retried_once(self, sonarr, monkeypatch):
+        answers = iter([None, True])
+        self._sonarr_wire(sonarr, monkeypatch)
+        monkeypatch.setattr(sonarr, '_import_landed', lambda t, f: next(answers))
+        assert len(self._redirect(sonarr)) == 1
+
+    def test_misfiled_report_returns_none_when_arr_silent(self, sonarr, monkeypatch):
+        self._wire(sonarr, monkeypatch, imports=[self._import()], grabs=[self._grab()])
+        monkeypatch.setattr(sonarr, '_get', lambda path, params=None, **kw: None)
+        assert self._find(sonarr) is None
+
+    def test_misfiled_report_reads_older_import_pages(self, sonarr, monkeypatch):
+        import utils.arr_client as ac
+        monkeypatch.setattr(ac, '_IMPORT_HISTORY_PAGE_SIZE', 1)
+        pages = {1: [self._import(rec_id=1, download_id='other', folder='Other')],
+                 2: [self._import(rec_id=2)]}
+        calls = self._wire(sonarr, monkeypatch, grabs=[self._grab()])
+        real_get = sonarr._get
+        monkeypatch.setattr(sonarr, '_get', lambda path, params=None, **kw: (
+            {'records': pages.get(params['page'], [])}
+            if path == '/api/v3/history' and params.get('eventType') == 3
+            else real_get(path, params, **kw)))
+        assert len(self._find(sonarr)) == 1
+
+    def test_attempt_counts_expire(self, monkeypatch):
+        import utils.arr_client as ac
+        ac._redirect_failed_attempt('sonarr', 'gone')
+        n, t = ac._redirect_attempts[('sonarr', 'gone')]
+        ac._redirect_attempts[('sonarr', 'gone')] = (n, t - ac._REDIRECT_MEMO_TTL - 1)
+        ac._memo_has('redirect', 'sonarr', 'x')
+        assert ac._redirect_attempts == {}
+
+
 class TestOverseerrWriteback:
     """Status-writeback additions: list requests, mark media available,
     decline a request."""

@@ -101,15 +101,66 @@ def audit_download_routing():
 # Task: Clean Stale Queue Items (Priority 1)
 # ---------------------------------------------------------------------------
 
+def _blackhole_folder_hashes(days=7):
+    """Completed-folder name -> grab torrent hash for recent blackhole
+    imports, from the ``blackhole_new_import`` history events.
+
+    A TB-alt substitute is linked under the grabbed release's name but is a
+    different torrent; its ``tb_cached_alt_grabbed`` event maps it back to
+    the hash the arr grabbed.  A folder seen with two different grabs is
+    left out — which one a queue item is can't be told.
+    """
+    if _history is None:
+        return {}
+    start = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec='seconds')
+    events = _history.events_since(start)
+    # Keyed by (substitute hash, drop name): one cached pack can stand in
+    # for several grabs.  Both events are titled with the drop's name.
+    grabbed_as = {}
+    for ev in events:
+        meta = ev.get('meta') or {}
+        if (meta.get('cause') == 'tb_cached_alt_grabbed'
+                and meta.get('info_hash') and meta.get('rejected_info_hash')):
+            grabbed_as[(str(meta['info_hash']).upper(), ev.get('title'))] = \
+                str(meta['rejected_info_hash']).upper()
+    seen = {}
+    for ev in events:
+        meta = ev.get('meta') or {}
+        if (meta.get('cause') == 'blackhole_new_import'
+                and meta.get('folder') and meta.get('info_hash')):
+            h = str(meta['info_hash']).upper()
+            seen.setdefault(meta['folder'], set()).add(
+                grabbed_as.get((h, ev.get('title')), h))
+    return {folder: next(iter(hashes)) for folder, hashes in seen.items()
+            if len(hashes) == 1}
+
+
+# Per arr, the start (epoch) of the last misfiled-import check that got an
+# answer; the next check reads imports from there, so a long sweep or an arr
+# that didn't answer leaves no gap.
+_last_misfiled_check = {}
+
+
 def clean_stale_queue_items():
-    """Remove downloadClientUnavailable queue items older than 2 minutes."""
-    from utils.arr_client import SonarrClient, RadarrClient
+    """Remove downloadClientUnavailable queue items older than 2 minutes,
+    and re-import (or report) blackhole downloads the arr filed under the
+    wrong title."""
+    from utils.arr_client import SonarrClient, RadarrClient, _GRAB_LOOKBACK
+
+    clients = [(c, name) for c, name in ((SonarrClient(), 'sonarr'),
+                                         (RadarrClient(), 'radarr'))
+               if c.configured]
+    folder_hashes = {}
+    if clients:
+        try:
+            folder_hashes = _blackhole_folder_hashes()
+        except Exception as e:
+            logger.error(f"[scheduler] Could not read blackhole imports from history: {e}")
+    now = time.time()
 
     total_removed = 0
-    for ClientClass, name in [(SonarrClient, 'sonarr'), (RadarrClient, 'radarr')]:
-        client = ClientClass()
-        if not client.configured:
-            continue
+    total_redirected = 0
+    for client, name in clients:
         try:
             removed = client.clean_all_stale_queue_items(max_age_seconds=120)
             total_removed += removed
@@ -117,8 +168,23 @@ def clean_stale_queue_items():
                 logger.info(f"[scheduler] Cleaned {removed} stale queue items from {name}")
         except Exception as e:
             logger.error(f"[scheduler] Queue cleanup failed for {name}: {e}")
+        try:
+            total_redirected += len(client.redirect_misfiled_imports(folder_hashes))
+        except Exception as e:
+            logger.error(f"[scheduler] Misfiled-import redirect failed for {name}: {e}")
+        last = _last_misfiled_check.get(name)
+        since = (max(last - 60, now - _GRAB_LOOKBACK) if last is not None
+                 else now - 2 * _get_interval('QUEUE_CLEANUP_INTERVAL'))
+        try:
+            if client.find_misfiled_imports(folder_hashes, since) is not None:
+                _last_misfiled_check[name] = now
+        except Exception as e:
+            logger.error(f"[scheduler] Misfiled-import check failed for {name}: {e}")
 
-    return {'status': 'success', 'message': f'Removed {total_removed} stale items', 'items': total_removed}
+    message = f'Removed {total_removed} stale items'
+    if total_redirected:
+        message += f', redirected {total_redirected} misfiled import(s)'
+    return {'status': 'success', 'message': message, 'items': total_removed + total_redirected}
 
 
 # ---------------------------------------------------------------------------
@@ -1434,7 +1500,7 @@ def register_all():
             'clean_stale_queue',
             clean_stale_queue_items,
             interval_seconds=_get_interval('QUEUE_CLEANUP_INTERVAL'),
-            description='Remove stale downloadClientUnavailable queue items',
+            description='Remove stale downloadClientUnavailable queue items; fix misfiled blackhole imports',
             initial_delay=120,  # 2 min after startup
         )
 

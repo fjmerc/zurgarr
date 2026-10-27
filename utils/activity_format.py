@@ -409,6 +409,22 @@ def _fmt_arr_feedback_blocklisted(ev, meta):
     return msg, msg
 
 
+def _fmt_import_redirected(ev, meta):
+    arr = {'sonarr': 'Sonarr', 'radarr': 'Radarr'}.get(
+        str(meta.get('arr_service', '')).lower(), 'arr')
+    msg = (f"{arr} filed it under {meta.get('from_title') or '?'} — "
+           f"imported into {meta.get('to_title') or '?'}")
+    return msg, msg
+
+
+def _fmt_import_misfiled(ev, meta):
+    arr = {'sonarr': 'Sonarr', 'radarr': 'Radarr'}.get(
+        str(meta.get('arr_service', '')).lower(), 'arr')
+    msg = (f"Grabbed for {meta.get('grabbed_title') or '?'} but {arr} "
+           f"imported it into {meta.get('imported_title') or '?'}")
+    return msg, msg
+
+
 def _fmt_disc_rip_rejected(ev, meta):
     return 'Rejected — disc rip (no usable media files)', 'Rejected — disc rip (no usable media files)'
 
@@ -589,6 +605,8 @@ _CAUSE_FORMATTERS = {
     'duplicate_linked': _fmt_duplicate_linked,
     'blocklisted_hash': _fmt_blocklisted_hash,
     'arr_feedback_blocklisted': _fmt_arr_feedback_blocklisted,
+    'import_redirected': _fmt_import_redirected,
+    'import_misfiled': _fmt_import_misfiled,
     'disc_rip_rejected': _fmt_disc_rip_rejected,
     'debrid_add_failed': _fmt_debrid_add_failed,
     'debrid_add_via_search': _fmt_debrid_add_via_search,
@@ -798,6 +816,14 @@ FORMATTER_JS = r"""
       var msg = 'Reported failed to ' + arr + ' — release blocklisted, new search triggered';
       if (m.strikes && m.max_strikes) msg += ' (strike ' + m.strikes + '/' + m.max_strikes + ')';
       return msg;
+    },
+    import_redirected: function(ev,m){
+      var arr = m.arr_service === 'sonarr' ? 'Sonarr' : (m.arr_service === 'radarr' ? 'Radarr' : 'arr');
+      return arr + ' filed it under ' + (m.from_title || '?') + ' — imported into ' + (m.to_title || '?');
+    },
+    import_misfiled: function(ev,m){
+      var arr = m.arr_service === 'sonarr' ? 'Sonarr' : (m.arr_service === 'radarr' ? 'Radarr' : 'arr');
+      return 'Grabbed for ' + (m.grabbed_title || '?') + ' but ' + arr + ' imported it into ' + (m.imported_title || '?');
     },
     disc_rip_rejected: function(){ return 'Rejected — disc rip (no usable media files)'; },
     debrid_add_failed: function(ev,m){ return 'Debrid add failed — ' + (m.error || 'unknown error'); },

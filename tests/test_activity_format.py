@@ -269,6 +269,26 @@ def test_arr_feedback_blocklisted_radarr_without_strikes():
     assert 'strike' not in s
 
 
+def test_import_redirected_names_both_titles():
+    ev = _ev('import_redirected', arr_service='sonarr',
+             from_title='Dark Matter (2015)', to_title='Dark Matter (2024)')
+    s = format_event(ev)['short']
+    assert s == 'Sonarr filed it under Dark Matter (2015) — imported into Dark Matter (2024)'
+
+
+def test_import_misfiled_names_both_titles():
+    ev = _ev('import_misfiled', arr_service='radarr',
+             grabbed_title='Lucky (2017)', imported_title='Logan Lucky (2017)')
+    s = format_event(ev)['short']
+    assert s == 'Grabbed for Lucky (2017) but Radarr imported it into Logan Lucky (2017)'
+
+
+def test_import_redirect_causes_mirrored_in_js():
+    from utils.activity_format import FORMATTER_JS
+    assert 'import_redirected:' in FORMATTER_JS
+    assert 'import_misfiled:' in FORMATTER_JS
+
+
 def test_terminal_error_shows_status():
     ev = _ev('terminal_error', provider='realdebrid', status='magnet_error')
     assert 'Failed on realdebrid: magnet_error' == format_event(ev)['short']
