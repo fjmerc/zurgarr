@@ -86,3 +86,56 @@ def episode_index(series_dir):
             for key in parse_episode_numbers(name):
                 index.setdefault(key, []).append(path)
     return index
+
+
+def target_mount_pairs():
+    """``[(symlink-target prefix + '/', real mount path)]`` for each debrid.
+
+    Library links point at ``BLACKHOLE_SYMLINK_TARGET_BASE*`` — the path the
+    arr/Plex containers see — which usually doesn't exist inside zurgarr.
+    These pairs translate a link target back to the zurgarr-side mount so it
+    can be checked (same mapping as ``scheduled_tasks.verify_symlinks``).
+    The TorBox pair is included only when its mount is up.
+    """
+    from utils.env import env_or_default
+    pairs = []
+    rd_base = os.environ.get('BLACKHOLE_SYMLINK_TARGET_BASE', '').strip()
+    if rd_base:
+        rd_mount = os.path.realpath(env_or_default('BLACKHOLE_RCLONE_MOUNT', '/data'))
+        pairs.append((os.path.normpath(rd_base) + '/', rd_mount))
+    try:
+        from utils.debrid_routing import TORBOX, symlink_target_base_for_debrid
+        from utils.library import LibraryScanner
+        tb_base = (symlink_target_base_for_debrid(TORBOX) or '').strip()
+        tb_mount = LibraryScanner._discover_torbox_mount()
+        if tb_base and tb_mount:
+            pairs.append((os.path.normpath(tb_base) + '/', os.path.realpath(tb_mount)))
+    except Exception as e:
+        logger.debug("[dedup] TorBox target/mount pair unavailable: %s", e)
+    return pairs
+
+
+def resolve_link_target(link_path, pairs):
+    """Zurgarr-side mount path a library symlink points at, or ``None``.
+
+    ``None`` when *link_path* is not a symlink or its target is under no
+    known debrid prefix — callers must treat that as "unknown", never as
+    "missing".
+    """
+    try:
+        target = os.readlink(link_path)
+    except OSError:
+        return None
+    for prefix, mount in pairs:
+        if target.startswith(prefix):
+            return os.path.join(mount, target[len(prefix):])
+    return None
+
+
+def link_resolves(link_path, pairs):
+    """True/False whether the link's debrid file exists on the mount;
+    ``None`` when the target is unknown (see ``resolve_link_target``)."""
+    real = resolve_link_target(link_path, pairs)
+    if real is None:
+        return None
+    return os.path.exists(real)
