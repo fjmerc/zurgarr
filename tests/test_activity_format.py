@@ -465,3 +465,14 @@ def test_seerr_causes_in_js_table():
     from utils.activity_format import FORMATTER_JS
     assert 'seerr_marked_available:' in FORMATTER_JS
     assert 'seerr_request_declined:' in FORMATTER_JS
+
+
+def test_plex_unavailable_rescan_counts_versions():
+    ev = _ev('plex_unavailable_rescan', count=1)
+    assert format_event(ev)['short'] == ('Plex rescan — 1 version marked unavailable '
+                                         'during a mount outage is back')
+    ev = _ev('plex_unavailable_rescan', count=12)
+    assert format_event(ev)['short'] == ('Plex rescan — 12 versions marked unavailable '
+                                         'during a mount outage are back')
+    from utils.activity_format import FORMATTER_JS
+    assert 'plex_unavailable_rescan:' in FORMATTER_JS

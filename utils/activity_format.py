@@ -435,6 +435,13 @@ def _fmt_duplicate_link_removed(ev, meta):
     return msg, msg
 
 
+def _fmt_plex_unavailable_rescan(ev, meta):
+    n = meta.get('count') or 1
+    msg = (f"Plex rescan — {n} version{'s' if n != 1 else ''} marked unavailable "
+           f"during a mount outage {'are' if n != 1 else 'is'} back")
+    return msg, msg
+
+
 def _fmt_import_misfiled(ev, meta):
     arr = {'sonarr': 'Sonarr', 'radarr': 'Radarr'}.get(
         str(meta.get('arr_service', '')).lower(), 'arr')
@@ -626,6 +633,7 @@ _CAUSE_FORMATTERS = {
     'arr_feedback_blocklisted': _fmt_arr_feedback_blocklisted,
     'import_redirected': _fmt_import_redirected,
     'duplicate_link_removed': _fmt_duplicate_link_removed,
+    'plex_unavailable_rescan': _fmt_plex_unavailable_rescan,
     'import_misfiled': _fmt_import_misfiled,
     'disc_rip_rejected': _fmt_disc_rip_rejected,
     'debrid_add_failed': _fmt_debrid_add_failed,
@@ -848,6 +856,10 @@ FORMATTER_JS = r"""
       var n = m.count || 1;
       return n > 1 ? 'Removed ' + n + ' duplicate links, e.g. ' + f + kept
                    : 'Removed duplicate link: ' + f + kept;
+    },
+    plex_unavailable_rescan: function(ev,m){
+      var n = m.count || 1;
+      return 'Plex rescan — ' + n + ' version' + (n !== 1 ? 's' : '') + ' marked unavailable during a mount outage ' + (n !== 1 ? 'are' : 'is') + ' back';
     },
     import_misfiled: function(ev,m){
       var arr = m.arr_service === 'sonarr' ? 'Sonarr' : (m.arr_service === 'radarr' ? 'Radarr' : 'arr');

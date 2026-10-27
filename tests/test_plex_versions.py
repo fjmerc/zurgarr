@@ -90,6 +90,34 @@ def test_list_parts_rel_paths_relative_to_section_root():
                      PartRef('11', '2', 'Show (2020)/Season 01/b.mkv', 100, '2')]
 
 
+def test_unavailable_parts_marked_at_media_or_part_level():
+    def page(q):
+        ok = _ep('10', 1, '/plex/tv/Show (2020)/Season 01/a.mkv')
+        media_mark = _ep('11', 2, '/plex/tv/Show (2020)/Season 01/b.mkv')
+        media_mark['Media'][0]['deletedAt'] = 1700000000
+        part_mark = _ep('12', 3, '/plex/tv/Show (2020)/Season 02/c.mkv')
+        part_mark['Media'][0]['Part'][0]['deletedAt'] = 1700000000
+        return {'MediaContainer': {'totalSize': 3, 'Metadata': [ok, media_mark, part_mark]}}
+    plex, fake = _client({('GET', '/library/sections'): SECTIONS,
+                          ('GET', '/library/sections/2/all'): page})
+    with patch('urllib.request.urlopen', fake):
+        parts = plex.unavailable_parts('show')
+    assert parts == [PartRef('11', '2', 'Show (2020)/Season 01/b.mkv', 100, '2'),
+                     PartRef('12', '3', 'Show (2020)/Season 02/c.mkv', 100, '2')]
+
+
+def test_unavailable_parts_skips_sections_with_several_folders():
+    """A part's path is relative to whichever of the section's folders held
+    it — ambiguous when a section has more than one, so leave those alone."""
+    sections = {'MediaContainer': {'Directory': [
+        {'key': '1', 'type': 'movie',
+         'Location': [{'path': '/plex/movies'}, {'path': '/plex/movies4k'}]}]}}
+    plex, fake = _client({('GET', '/library/sections'): sections})
+    with patch('urllib.request.urlopen', fake):
+        assert plex.unavailable_parts('movie') == []
+    assert [urlparse(r.full_url).path for r in fake.requests] == ['/library/sections']
+
+
 def test_media_status_exists_from_checkfiles():
     meta = {'MediaContainer': {'Metadata': [{'ratingKey': '10', 'Media': [
         {'id': 1, 'Part': [{'file': '/plex/tv/S/a.mkv', 'exists': True}]},

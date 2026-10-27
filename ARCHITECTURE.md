@@ -635,6 +635,7 @@ All tasks registered in `scheduled_tasks.register_all()`, executed by `task_sche
 | `library_scan` | 1h | 2min | Status UI enabled | Enforces preferences, escalates stuck pending, warns stalled (24h+), creates symlinks, triggers arr rescans, TMDB API calls |
 | `verify_symlinks` | 6h | 10min | Blackhole symlinks enabled | Deletes/repairs broken symlinks, cleans empty dirs, optionally triggers arr re-search |
 | `duplicate_tidy` | 6h | 30min | Blackhole symlinks enabled; acts only with `LIBRARY_DUPLICATE_TIDY=true` | Removes debrid symlinks duplicating the arr's tracked file (manifest `/config/duplicate_tidy_manifest.tsv`), deletes the now-unavailable Plex version, restores a changed Plex date added |
+| `plex_unavailable_rescan` | 3h | 10min | Always registered; acts only with `PLEX_REFRESH=true` and a Plex address/token | Touches and partial-scans (up to 100 per run) the folders of versions Plex marked unavailable (`deletedAt`) whose file plays again — the marks a scan during a mount outage leaves; logs `plex_rescan` |
 | `enforce_preferences` | 6h | 6h | Status UI + `LIBRARY_PREFERENCE_AUTO_ENFORCE` | Deletes debrid torrents or local files based on preferences |
 | `housekeeping` | 24h | 1h | Always | Cleans stale pending state, empty dirs, old .meta files, rotates history.jsonl |
 | `config_backup` | 24h | 5min | Always | Copies .env, settings, preferences, blocklist, history to /config/backups/, prunes >7 |

@@ -135,7 +135,7 @@ changes to its settings take effect at the next container start.
 
 | Variable | Description | Default |
 |---|---|---|
-| `PLEX_REFRESH` | Auto-refresh Plex libraries. Enables both Zurg's `on_library_update` hook (RealDebrid content) and the library scanner's Plex section refresh after it symlinks new debrid content (covers TorBox/scanner-delivered titles). Requires `PLEX_ADDRESS` and `PLEX_TOKEN`. | `false` |
+| `PLEX_REFRESH` | Auto-refresh Plex libraries. Enables both Zurg's `on_library_update` hook (RealDebrid content) and the library scanner's Plex section refresh after it symlinks new debrid content (covers TorBox/scanner-delivered titles), plus a rescan (10 min after start, then every 3h) of folders Plex marked unavailable while a debrid mount was down, once their files are back. Requires `PLEX_ADDRESS` and `PLEX_TOKEN`. | `false` |
 | `PLEX_MOUNT_DIR` | Mount path as Plex sees it (for Zurg's own library-refresh hook — not used in NFS mode; takes effect at container start) | |
 | `DUPLICATE_CLEANUP` | Automated Plex duplicate detection + cleanup. Off applies at once; on at container start | `false` |
 | `CLEANUP_INTERVAL` | Hours between duplicate cleanup runs. Takes effect at container start | `24` |

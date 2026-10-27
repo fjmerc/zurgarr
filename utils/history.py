@@ -96,6 +96,9 @@ CAUSE_POST_SYMLINK_RESCAN = 'post_symlink_rescan'
 CAUSE_POST_GRAB_RESCAN = 'post_grab_rescan'
 CAUSE_USER_TRIGGERED_RESCAN = 'user_triggered_rescan'
 CAUSE_MISSING_FILE_RESCAN = 'missing_file_rescan'
+# Plex marked versions unavailable during a debrid-mount outage; their files
+# are back, so zurgarr asked Plex to rescan the folder.
+CAUSE_PLEX_UNAVAILABLE_RESCAN = 'plex_unavailable_rescan'
 CAUSE_USER_TRIGGERED_SEARCH = 'user_triggered_search'
 CAUSE_ROUTING_AUDIT_RETRY = 'routing_audit_retry'
 CAUSE_STALE_GRAB_RETRY = 'stale_grab_retry'

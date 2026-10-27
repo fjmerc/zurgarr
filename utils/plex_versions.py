@@ -1,4 +1,5 @@
-"""Per-item Plex library calls for the duplicate-link tidy.
+"""Per-item Plex library calls for the duplicate-link tidy and the
+"unavailable" rescan (``scheduled_tasks.plex_unavailable_rescan``).
 
 Removing a duplicate debrid link leaves Plex holding that copy as an
 "unavailable" version (auto-empty-trash is deliberately off), so the tidy
@@ -106,28 +107,44 @@ class PlexLibrary:
                 return file[len(root) + 1:]
         return file
 
+    def _iter_parts(self, key, media_type):
+        """``(item, media, part)`` for every part in one section, paged."""
+        start = 0
+        while True:
+            mc = self._request('GET', f'/library/sections/{key}/all', {
+                'type': _ITEM_TYPE[media_type],
+                'X-Plex-Container-Start': start,
+                'X-Plex-Container-Size': _PAGE_SIZE,
+            }).get('MediaContainer', {})
+            items = mc.get('Metadata', [])
+            for it in items:
+                for media in it.get('Media', []):
+                    for part in media.get('Part', []):
+                        yield it, media, part
+            start += len(items)
+            if not items or start >= int(mc.get('totalSize') or 0):
+                break
+
+    def _part_ref(self, key, it, media, part):
+        return PartRef(str(it['ratingKey']), str(media['id']),
+                       self._rel(part.get('file', '')), int(it.get('addedAt') or 0), key)
+
     def list_parts(self, media_type):
         """Every part in the movie or episode sections, paged."""
-        out = []
-        for key, _roots in self.sections(media_type):
-            start = 0
-            while True:
-                mc = self._request('GET', f'/library/sections/{key}/all', {
-                    'type': _ITEM_TYPE[media_type],
-                    'X-Plex-Container-Start': start,
-                    'X-Plex-Container-Size': _PAGE_SIZE,
-                }).get('MediaContainer', {})
-                items = mc.get('Metadata', [])
-                for it in items:
-                    for media in it.get('Media', []):
-                        for part in media.get('Part', []):
-                            out.append(PartRef(str(it['ratingKey']), str(media['id']),
-                                               self._rel(part.get('file', '')),
-                                               int(it.get('addedAt') or 0), key))
-                start += len(items)
-                if not items or start >= int(mc.get('totalSize') or 0):
-                    break
-        return out
+        return [self._part_ref(key, it, media, part)
+                for key, _roots in self.sections(media_type)
+                for it, media, part in self._iter_parts(key, media_type)]
+
+    def unavailable_parts(self, media_type):
+        """Parts Plex has marked unavailable (``deletedAt`` on the version or
+        the part) — what a scan during a mount outage leaves behind.
+
+        Sections with more than one folder are skipped: a part's relative
+        path can't say which of them it is under."""
+        return [self._part_ref(key, it, media, part)
+                for key, roots in self.sections(media_type) if len(roots) == 1
+                for it, media, part in self._iter_parts(key, media_type)
+                if media.get('deletedAt') or part.get('deletedAt')]
 
     def media_status(self, rating_key):
         """The item's media with on-disk presence (``checkFiles=1``); ``[]``

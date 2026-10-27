@@ -236,7 +236,7 @@ ENV_SCHEMA = [
         'name': 'Plex Library',
         'description': 'Plex library maintenance features',
         'fields': [
-            ('PLEX_REFRESH', 'Auto Refresh Library', 'boolean', False, 'Automatically refresh Plex libraries after mount changes. The library scanner follows a change right away; Zurg\'s own refresh hook (Real-Debrid/AllDebrid content) when the container starts.'),
+            ('PLEX_REFRESH', 'Auto Refresh Library', 'boolean', False, 'Automatically refresh Plex libraries after mount changes. The library scanner follows a change right away; Zurg\'s own refresh hook (Real-Debrid/AllDebrid content) when the container starts. Also rescans folders Plex marked unavailable while a debrid mount was down, once their files are back.'),
             ('PLEX_MOUNT_DIR', 'Plex Mount Directory', 'string', False, 'Path where Plex sees the rclone mount (used by Zurg\'s refresh hook — takes effect when the container starts).'),
             ('DUPLICATE_CLEANUP', 'Duplicate Cleanup', 'boolean', False, 'Automatically remove duplicate media entries. Switching it off applies right away; switching it on takes effect when the container starts.'),
             ('CLEANUP_INTERVAL', 'Cleanup Interval (hours)', 'number:1-168', False, 'How often to run duplicate cleanup. Takes effect when the container starts.'),

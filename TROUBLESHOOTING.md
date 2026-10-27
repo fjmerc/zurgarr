@@ -20,6 +20,7 @@ isn't here, open a [GitHub issue](https://github.com/fjmerc/zurgarr/issues).
 - [New shows/movies only appear in Plex after a manual scan](#new-showsmovies-only-appear-in-plex-after-a-manual-scan)
 - [A download for one show is stuck under a same-name show in Sonarr ("Not an upgrade")](#a-download-for-one-show-is-stuck-under-a-same-name-show-in-sonarr-not-an-upgrade)
 - [Plex shows the same episode or movie two or more times](#plex-shows-the-same-episode-or-movie-two-or-more-times)
+- [Plex shows episodes or movies as "unavailable" after a restart](#plex-shows-episodes-or-movies-as-unavailable-after-a-restart)
 - [Sonarr/Radarr requests fail with "Try again" (temporary failure in name resolution)](#sonarrradarr-requests-fail-with-try-again-temporary-failure-in-name-resolution)
 - [Blackhole: symlinks created but broken](#blackhole-symlinks-created-but-broken)
 - [Stuck ffprobe processes](#stuck-ffprobe-processes)
@@ -397,6 +398,27 @@ to `/config/duplicate_tidy_manifest.tsv`; `scripts/dedup_library.py undo
 --manifest <file>` puts them back. Copies in folders the arr doesn't own
 are handled by the one-time `scripts/dedup_library.py` clean-up (preview
 with `plan` first).
+
+## Plex shows episodes or movies as "unavailable" after a restart
+
+Symptom: after zurgarr restarts (or a debrid mount drops for a moment),
+some episodes or movies in Plex show as unavailable, or an item lists an
+unavailable version, although the file plays fine from the folder.
+
+Cause: Plex scanned while the debrid mount was down — a restart briefly
+unmounts it — and marked what it couldn't see. With Plex's "Empty trash
+automatically after every scan" off, nothing is deleted, but the mark stays
+until Plex rescans that folder, and its scanner skips folders it thinks
+haven't changed.
+
+Fix: with `PLEX_REFRESH=true`, zurgarr checks Plex 10 minutes after it
+starts and every 3 hours after that. For each version Plex marks
+unavailable whose file is back (a debrid link whose file is on a mount that
+answers, or a real file), it bumps the folder's modified time and asks Plex
+to rescan just that folder — up to 100 folders a run; Activity shows "Plex
+rescan". Versions whose file is really gone are left for you to remove (Plex:
+Settings → Troubleshooting → Empty Trash). To clear marks straight away,
+run the `plex_unavailable_rescan` task from the System page.
 
 ## Sonarr/Radarr requests fail with "Try again" (temporary failure in name resolution)
 
