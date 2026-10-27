@@ -108,7 +108,7 @@ def _plan_tv(ctx):
     by_id = {s['id']: s for s in series}
     skipped = []
     removals, protected = dd.plan_arr_tv(ctx.sonarr, ctx.local_tv, ctx.pairs, skipped=skipped)
-    owned = {os.path.basename(s['path']) for s in series if s.get('path')}
+    owned = {dd.arr_folder_name(s['path']) for s in series if s.get('path')}
 
     def tracked(info):
         return dd.sonarr_tracked(ctx.sonarr, by_id[info['id']],
@@ -121,9 +121,10 @@ def _plan_tv(ctx):
     # Episodes with copies in Sonarr's folder that Sonarr tracks none of —
     # listed for the owner, never removed.
     for s in series:
-        if not s.get('path'):
+        folder = dd.arr_folder_name(s.get('path'))
+        if not folder:
             continue
-        local_dir = os.path.join(ctx.local_tv, os.path.basename(s['path']))
+        local_dir = os.path.join(ctx.local_tv, folder)
         index = dd.episode_index(local_dir)
         if index is None:
             report.append({'kind': 'tv', 'folder': os.path.basename(local_dir),
@@ -155,7 +156,7 @@ def _plan_movies(ctx):
     skipped = []
     removals, protected = dd.plan_arr_movies(ctx.radarr, ctx.local_movies, ctx.pairs,
                                              skipped=skipped)
-    owned = {os.path.basename(m['path']) for m in movies if m.get('path')}
+    owned = {dd.arr_folder_name(m['path']) for m in movies if m.get('path')}
 
     def tracked(info):
         return dd.radarr_tracked(by_id[info['id']], os.path.join(ctx.local_movies, info['folder']))
@@ -166,7 +167,7 @@ def _plan_movies(ctx):
     report += _year_conflict_rows('movie', ctx.local_movies, skipped)
     # Movie folders holding copies Radarr tracks none of — listed, never removed.
     for m in movies:
-        folder = os.path.basename(os.path.normpath(m.get('path') or ''))
+        folder = dd.arr_folder_name(m.get('path'))
         if not folder or m.get('hasFile'):
             continue
         try:
@@ -383,7 +384,7 @@ def cmd_radarr_folders(ctx, args):
                     os.path.basename(os.path.dirname(r['path'])))
     rows = []
     for m in ctx.radarr.get_all_movies(strict=True) or []:
-        folder = os.path.basename(m.get('path', ''))
+        folder = dd.arr_folder_name(m.get('path'))
         if not folder or folder == expected_folder(m):
             continue
         rows.append({'id': m['id'], 'title': m.get('title', ''), 'year': m.get('year', ''),
@@ -459,7 +460,7 @@ def _rename_one(ctx, movie_id, plan_rows, manifest, include_review=False, wait=1
         print(f'STOPPED: Radarr did not rename {old_folder!r} — put back {restored} link(s) '
               f'removed for it (manifest: {manifest})')
         return False
-    new_folder = os.path.basename(moved['path'])
+    new_folder = dd.arr_folder_name(moved['path'])
     print(f'renamed {old_folder!r} -> {new_folder!r}')
     if not ctx.plex or orig is None:
         return True

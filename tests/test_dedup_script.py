@@ -622,3 +622,42 @@ def test_main_installs_dns_retry(tmp_path, monkeypatch):
     L = Lib(tmp_path)
     dedup.main(['plex-check'], ctx=_ctx(L, plex=FakePlex([])))
     assert calls == [1]
+
+
+def test_arr_folder_path_with_trailing_slash_is_still_the_arrs(tmp_path):
+    """Radarr can store a path as '…/Title (Year)/'; its folder must still
+    count as Radarr's, never as an unmatched title to remove."""
+    L = Lib(tmp_path)
+    tracked = L.link(L.movies, 'The Devil You Know (2022)/Devil.mkv', 'D/d.mkv')
+    radarr = _radarr([{'id': 7, 'title': 'The Devil You Know', 'year': 2022, 'hasFile': True,
+                       'path': '/d/movies/The Devil You Know (2022)/',
+                       'movieFile': {'path': '/d/movies/The Devil You Know (2022)/Devil.mkv'}}])
+    out = str(tmp_path / 'plan.tsv')
+    ctx = _ctx(L, radarr=radarr, tmp_path=tmp_path)
+    dedup.main(['plan', '--kind', 'movie', '--out', out], ctx=ctx)
+    assert not [r for r in _read(out) if r['action'] == 'remove']
+    dedup.main(['apply', '--no-plex', '--plan', out, '--kind', 'movie', '--include-unmatched',
+                '--include-review'], ctx=ctx)
+    assert os.path.islink(tracked)
+
+
+def test_series_path_with_trailing_slash_is_still_the_arrs(tmp_path):
+    L = Lib(tmp_path)
+    tracked = L.link(L.tv, 'Show (2020)/Season 01/Show (2020) - S01E01.mkv', 'A/a.mkv')
+    sonarr = _sonarr([{'id': 1, 'title': 'Show', 'path': '/d/tv/Show (2020)/'}],
+                     {1: [{'seasonNumber': 1, 'episodeNumber': 1, 'episodeFileId': 9}]},
+                     {1: [{'id': 9, 'path': '/d/tv/Show (2020)/Season 01/Show (2020) - S01E01.mkv'}]})
+    out = str(tmp_path / 'plan.tsv')
+    dedup.main(['plan', '--kind', 'tv', '--out', out], ctx=_ctx(L, sonarr=sonarr))
+    rows = _read(out)
+    assert not [r for r in rows if r['action'] == 'remove']
+    assert not [r for r in rows if r['rule'] == 'arr-error']
+
+
+def test_radarr_folders_reads_trailing_slash_paths(tmp_path):
+    L = Lib(tmp_path)
+    radarr = _radarr([{'id': 1, 'title': 'Chinatown', 'year': 1974,
+                       'path': '/d/m/Chinatown ITA (1974)/'}])
+    out = str(tmp_path / 'folders.tsv')
+    dedup.main(['radarr-folders', '--out', out], ctx=_ctx(L, radarr=radarr))
+    assert [r['folder'] for r in _read(out)] == ['Chinatown ITA (1974)']

@@ -1055,7 +1055,7 @@ def _local_path(arr_path, arr_root, local_root):
     return os.path.join(local_root, rel)
 
 
-def _folder_name(arr_path):
+def arr_folder_name(arr_path):
     """Basename of an arr folder path ('' for a root-like path)."""
     name = os.path.basename(os.path.normpath(arr_path or ''))
     return '' if name in ('', '.', '..') else name
@@ -1093,7 +1093,7 @@ def plan_arr_tv(client, local_tv, pairs, skipped=None):
     """
     removals, protected = [], set()
     for s in client.get_all_series(strict=True) or []:
-        folder = _folder_name(s.get('path'))
+        folder = arr_folder_name(s.get('path'))
         if not folder:
             continue
         local_dir = os.path.join(local_tv, folder)
@@ -1119,7 +1119,7 @@ def plan_arr_movies(client, local_movies, pairs, skipped=None):
     """Radarr counterpart of ``plan_arr_tv``."""
     removals, protected = [], set()
     for m in client.get_all_movies(strict=True) or []:
-        folder = _folder_name(m.get('path'))
+        folder = arr_folder_name(m.get('path'))
         if not folder:
             continue
         local_dir = os.path.join(local_movies, folder)
