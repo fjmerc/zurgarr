@@ -494,6 +494,7 @@ def plan_foreign_folders(root, kind, owned, maps, tracked_by_entry, pairs,
     is_tv = kind == 'tv'
     by_title, by_norm, by_tmdb = maps
     removals, report = [], []
+    owned_links = None   # link target -> a link to it in an arr folder (built on demand)
     try:
         names = sorted(os.listdir(root))
     except OSError:
@@ -539,8 +540,17 @@ def plan_foreign_folders(root, kind, owned, maps, tracked_by_entry, pairs,
                                     cached_tmdb or {}, is_tv=is_tv, max_season=max_season,
                                     _tmdb_cache=tmdb_cache or {})
         if not info or not info.get('folder'):
-            planned = [Removal(p, os.readlink(p), kind, 'no-arr-title', '', name)
-                       for _n, p in media if _removable_link(p, pairs) is not None]
+            # A link to the very file an arr folder links (the title is there
+            # under another name) keeps that copy: Plex may hold the item under
+            # either path, and must move it rather than drop it.
+            if owned_links is None:
+                owned_links = _links_by_target(root, owned)
+            planned = []
+            for _n, p in media:
+                if _removable_link(p, pairs) is not None:
+                    target = os.readlink(p)
+                    planned.append(Removal(p, target, kind, 'no-arr-title',
+                                           owned_links.get(target, ''), name))
             removals += planned + sidecars_for(planned, [])
             report.append(dict(row, rule='no-arr-title',
                                detail=', '.join(n for n, _p in media)))
@@ -882,6 +892,21 @@ def split_titles(snapshot, removals, library_root):
     return out
 
 
+def _links_by_target(root, folder_names):
+    """``{link target: link path}`` for the links inside *root*'s folders
+    named *folder_names* (unreadable folders are skipped)."""
+    out = {}
+    for name in sorted(folder_names):
+        for dirpath, _dirs, files in os.walk(os.path.join(root, name)):
+            for f in files:
+                path = os.path.join(dirpath, f)
+                try:
+                    out.setdefault(os.readlink(path), path)
+                except OSError:
+                    continue
+    return out
+
+
 def plex_items(removed, snapshot, library_root):
     """Plex items affected by *removed* links, as JSON-safe dicts (so a run
     can persist the ones it couldn't finish and retry them later)."""
@@ -913,7 +938,7 @@ def _add_item(items, ref, r, rel, library_root):
     it['removed'] = sorted(set(it['removed']) | {rel})
     it['keep'] = sorted(set(it['keep']) | {rel_to_root(k, library_root) for k in keeps})
     it['keep_dirs'] = sorted(set(it['keep_dirs']) | {os.path.dirname(k) for k in keeps})
-    if r.rule != 'no-arr-title':
+    if r.rule != 'no-arr-title' or keeps:
         it['drop_ok'] = False
 
 
@@ -932,7 +957,8 @@ def reconcile_items(plex, kind, items, library_root, touch, wait=300):
     """Per affected item: rescan the touched folders; delete a removed
     copy's now-unavailable version only when the item keeps a version that
     plays (titles Sonarr/Radarr don't have — rule ``no-arr-title`` — may
-    lose their last one: the owner chose to drop them); if the removed copy
+    lose their last one: the owner chose to drop them — unless the link
+    shares its file with a copy in an arr folder); if the removed copy
     was its last playable version, wait for Plex to move it to the kept path
     (Plex matches files by content), bumping the kept folder's mtime first
     when *touch*; otherwise report it stranded.  Finally put back a changed

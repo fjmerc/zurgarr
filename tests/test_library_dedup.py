@@ -337,6 +337,17 @@ class TestPlanForeignFolders:
         assert rem == []
         assert [r['rule'] for r in rep if r['folder'] == 'Thor The Dark World (2013)'] == ['has-real-files']
 
+    def test_unmatched_folder_linking_an_arr_folders_file_keeps_that_copy(self, tmp_path):
+        """'Dark Shadows' (no arr title) linked the very files Sonarr's 'Dark'
+        folder links: Plex may hold them under either path, so the arr's
+        copy is the kept one — never a drop."""
+        L = _Lib(tmp_path)
+        arr_copy = L.link('Dark/Season 01/Dark - S01E01.mkv', 'A/a.mkv')
+        extra = L.link('Dark Shadows/Dark S01E01 Secrets.mkv', 'A/a.mkv')
+        dark = [{'title': 'Dark', 'path': '/data/media/tv/Dark', 'id': 1, 'tmdbId': None}]
+        rem, _rep = self._plan(L, 'tv', dark, lambda info: {(1, 1): arr_copy})
+        assert [(r.path, r.rule, r.keep) for r in rem] == [(extra, 'no-arr-title', arr_copy)]
+
     def test_unmatched_folder_reported_as_no_arr_title(self, tmp_path):
         L = _Lib(tmp_path)
         link = L.link('Amazing Films 12/Oppenheimer (2023) 1080p.mp4', 'B/b.mp4')
@@ -596,6 +607,21 @@ class TestReconcilePlex:
         monkeypatch.setattr(library_dedup, '_touch_dir', lambda p: called.append(p))
         out = self._run(plex, L, r, touch=False)
         assert called == [] and out['stranded'] == ['10']
+
+    def test_no_arr_title_sharing_an_arr_copys_file_is_never_dropped(self, tmp_path,
+                                                                          monkeypatch):
+        from utils import library_dedup
+        from utils.library_dedup import Removal
+        L = _Lib(tmp_path)
+        keep = L.link('Dark/Season 01/Dark - S01E01.mkv', 'A/a.mkv')
+        gone = str(L.lib / 'Dark Shadows' / 'Dark S01E01 Secrets.mkv')
+        r = Removal(gone, '/mnt/debrid_torbox/A/a.mkv', 'tv', 'no-arr-title', keep, 'Dark Shadows')
+        # Plex hasn't moved the item onto the kept path (yet): never delete it.
+        plex = FakePlex({'10': [('2', 'Dark Shadows/Dark S01E01 Secrets.mkv', False)]})
+        monkeypatch.setattr(library_dedup, '_touch_dir', lambda p: None)
+        snap = library_dedup.snapshot_plex(plex, 'tv', {'Dark Shadows/Dark S01E01 Secrets.mkv'})
+        out = library_dedup.reconcile_plex(plex, 'tv', [r], snap, str(L.lib), touch=True)
+        assert plex.deleted == [] and out['stranded'] == ['10']
 
     def test_added_at_restored_when_changed(self, tmp_path):
         L, r = self._setup(tmp_path)
