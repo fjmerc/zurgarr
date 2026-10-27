@@ -856,11 +856,16 @@ def _tidy_kind(library_dedup, plex, kind, root, client, svc, planner, pairs, ret
         except Exception as e:
             logger.warning("[dedup] Duplicate tidy skipped %s — Plex unavailable: %s", kind, e)
             return 0
-        if not snapshot:
+        if not snapshot and not getattr(snapshot, 'ambiguous', ()):
             logger.warning("[dedup] Duplicate tidy skipped %s — Plex knows none of the %d "
                            "affected paths (is the Plex library rooted elsewhere?)",
                            kind, len(rels))
             return 0
+        for _kind, title in sorted(library_dedup.unreconcilable(snapshot, removals, root)):
+            logger.warning("[dedup] Not removing %r duplicates — Plex holds the file in more "
+                           "than one library section", title)
+        skip = library_dedup.unreconcilable(snapshot, removals, root)
+        removals = [r for r in removals if (r.kind, r.title) not in skip]
         split = library_dedup.split_titles(snapshot, removals, root)
         for _kind, title in sorted(split):
             logger.warning("[dedup] Not removing %r duplicates — the kept copy is a separate "

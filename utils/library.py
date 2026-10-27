@@ -1592,14 +1592,14 @@ def arr_title_maps(entries, client, is_tv):
     by_title, by_norm, by_tmdb = {}, {}, {}
     family = {}
     for e in entries or []:
-        k = _norm_for_matching(_PAREN_YEAR_SUFFIX.sub('', e.get('title', '')))
+        k = _norm_for_matching(_PAREN_YEAR_SUFFIX.sub('', e.get('title') or ''))
         if k:
             family[k] = family.get(k, 0) + 1
     for e in entries or []:
-        t = e.get('title', '')
+        t = e.get('title') or ''
         if not t:
             continue
-        p = e.get('path', '')
+        p = e.get('path') or ''
         info = {
             'title': t,
             'year': e.get('year'),

@@ -427,3 +427,66 @@ def test_apply_refuses_when_plex_knows_none_of_the_paths(tmp_path):
     dedup.main(['plan', '--kind', 'tv', '--out', out], ctx=ctx)
     assert dedup.main(['apply', '--plan', out, '--kind', 'tv'], ctx=ctx) == 1
     assert os.path.islink(extra)
+
+
+def test_apply_stops_on_plex_timeout(tmp_path, monkeypatch):
+    from utils.plex_versions import PartRef
+    L, radarr, kept, extra, unmatched = _movie_setup(tmp_path)
+    out = str(tmp_path / 'plan.tsv')
+    plex = FakePlex([PartRef('100', '1', 'Chinatown (1974)/Chinatown 1974.mkv', 5, '1'),
+                     PartRef('300', '3', 'Amazing Films 12/Oppenheimer (2023).mp4', 5, '1')])
+    ctx = _ctx(L, radarr=radarr, plex=plex, tmp_path=tmp_path)
+    dedup.main(['plan', '--kind', 'movie', '--out', out], ctx=ctx)
+    monkeypatch.setattr(dedup.dd, 'reconcile_plex',
+                        lambda *a, **k: {'timeout': ['100'], 'retry': [{}]})
+    rc = dedup.main(['apply', '--plan', out, '--kind', 'movie', '--include-unmatched'], ctx=ctx)
+    assert rc == 2
+    assert sum(not os.path.lexists(p) for p in (extra, unmatched)) == 1
+
+
+def test_plan_rows_carry_sidecar_owner(tmp_path):
+    L, radarr, kept, extra, _u = _movie_setup(tmp_path)
+    (L.movies / 'Chinatown (1974)' / 'Chinatown 1974.en.srt').write_text('x')
+    out = str(tmp_path / 'plan.tsv')
+    dedup.main(['plan', '--kind', 'movie', '--out', out], ctx=_ctx(L, radarr=radarr))
+    rows = [r for r in _read(out) if r['rule'] == 'sidecar']
+    assert [r['owner'] for r in rows] == [extra]
+
+
+def test_radarr_rename_moves_subtitle_with_its_link(tmp_path):
+    L, radarr, plex, ctx, out, extra = _rename_setup(tmp_path)
+    # plan again now that a subtitle sits beside zurgarr's copy
+    sub = L.movies / 'Chinatown (1974)' / 'Chinatown 1974.en.srt'
+    sub.write_text('x')
+    dedup.main(['plan', '--kind', 'movie', '--out', out], ctx=ctx)
+    assert dedup.main(['radarr-rename', '--ids', '5', '--plan', out], ctx=ctx) == 0
+    assert not os.path.exists(sub)
+
+
+def test_radarr_rename_skips_review_rows_without_flag(tmp_path):
+    L, radarr, plex, ctx, out, extra = _rename_setup(tmp_path)
+    rows = _read(out)
+    for r in rows:
+        if r['path'] == extra:
+            r['detail'] = 'foreign-folder-review'
+    dedup._write_rows(out, rows)
+    dedup.main(['radarr-rename', '--ids', '5', '--plan', out], ctx=ctx)
+    assert plex.merged == []
+
+
+def test_plan_reports_unreadable_radarr_folder(tmp_path, monkeypatch):
+    import errno
+    L = Lib(tmp_path)
+    L.link(L.movies, 'Film (2020)/Film.2020.mkv', 'A/a.mkv')
+    radarr = _radarr([{'id': 1, 'title': 'Film', 'year': 2020, 'hasFile': False,
+                       'path': '/d/movies/Film (2020)'}])
+    real = os.scandir
+
+    def scandir(path):
+        if str(path).endswith('Film (2020)'):
+            raise OSError(errno.EIO, 'I/O error')
+        return real(path)
+    monkeypatch.setattr(dedup.dd.os, 'scandir', scandir)
+    out = str(tmp_path / 'plan.tsv')
+    dedup.main(['plan', '--kind', 'movie', '--out', out], ctx=_ctx(L, radarr=radarr))
+    assert [r['rule'] for r in _read(out)] == ['arr-error']

@@ -214,3 +214,14 @@ def test_tidy_rechecks_kept_copy_at_apply(env, monkeypatch):
          patch('utils.scheduled_tasks._DUPLICATE_TIDY_MANIFEST', str(env / 'm.tsv')):
         scheduled_tasks.library_duplicate_tidy()
     assert calls and calls[0].get('pairs')
+
+
+def test_tidy_skips_paths_plex_holds_in_two_sections(env, monkeypatch):
+    from utils.plex_versions import PartRef
+    link, r = _movie_removal(env)
+    plex = MagicMock()
+    plex.list_parts.return_value = [PartRef('1', 'a', 'Film (2020)/Film.mkv', 5, '1'),
+                                    PartRef('9', 'b', 'Film (2020)/Film.mkv', 5, '7'),
+                                    PartRef('1', 'c', 'Film (2020)/Film (2020).mkv', 5, '1')]
+    _run_movies(env, monkeypatch, plex, r)
+    assert os.path.islink(link)

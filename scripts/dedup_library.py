@@ -41,7 +41,7 @@ sys.path.insert(0, '/')
 from utils import library_dedup as dd  # noqa: E402
 from utils.library import arr_title_maps  # noqa: E402
 
-PLAN_COLUMNS = ('action', 'rule', 'kind', 'title', 'path', 'target', 'keep', 'detail')
+PLAN_COLUMNS = ('action', 'rule', 'kind', 'title', 'path', 'target', 'keep', 'owner', 'detail')
 _UNMATCHED_RULES = {'no-arr-title', 'empty-folder'}
 _REVIEW_RULES = {'foreign-folder-review'}
 _MOVE_POLLS = 40
@@ -88,7 +88,8 @@ def _tmdb_context(kind):
 
 def _row(r, action, detail=''):
     return {'action': action, 'rule': r.rule, 'kind': r.kind, 'title': r.title,
-            'path': r.path, 'target': r.target, 'keep': r.keep, 'detail': detail}
+            'path': r.path, 'target': r.target, 'keep': r.keep, 'owner': r.owner,
+            'detail': detail}
 
 
 def _kinds(arg):
@@ -161,7 +162,12 @@ def _plan_movies(ctx):
         folder = os.path.basename(os.path.normpath(m.get('path') or ''))
         if not folder or m.get('hasFile'):
             continue
-        names = [n for n, _p in dd._media_entries(os.path.join(ctx.local_movies, folder))]
+        try:
+            names = [n for n, _p in dd._media_entries(os.path.join(ctx.local_movies, folder))]
+        except OSError as e:
+            report.append({'kind': 'movie', 'folder': folder, 'rule': 'arr-error',
+                           'detail': f"folder can't be read: {e}"})
+            continue
         if names:
             report.append({'kind': 'movie', 'folder': folder, 'rule': 'radarr-accepted-none',
                            'detail': '%d file(s): %s' % (len(names), ', '.join(names[:5]))})
@@ -177,7 +183,8 @@ def _deferred_groups(ctx, kind, removals):
         return set()
     root = ctx.local_tv if kind == 'tv' else ctx.local_movies
     rels = {dd.rel_to_root(p, root) for r in removals for p in (r.path, r.keep) if p}
-    return dd.split_titles(dd.snapshot_plex(ctx.plex, kind, rels), removals, root)
+    snap = dd.snapshot_plex(ctx.plex, kind, rels)
+    return dd.split_titles(snap, removals, root) | dd.unreconcilable(snap, removals, root)
 
 
 def build_plan(ctx, kinds):
@@ -203,7 +210,7 @@ def build_plan(ctx, kinds):
         for rep in report:
             rows.append({'action': 'report', 'rule': rep['rule'], 'kind': rep['kind'],
                          'title': rep['folder'], 'path': os.path.join(root, rep['folder']),
-                         'target': '', 'keep': '', 'detail': rep['detail']})
+                         'target': '', 'keep': '', 'owner': '', 'detail': rep['detail']})
     return rows, removals, protected
 
 
@@ -283,18 +290,25 @@ def cmd_apply(ctx, args):
             rels = {dd.rel_to_root(p, root) for (k, _t), rs in groups.items()
                     if k == kind for r in rs for p in (r.path, r.keep) if p}
             snapshots[kind] = dd.snapshot_plex(ctx.plex, kind, rels)
-            if not snapshots[kind]:
+            if not snapshots[kind] and not getattr(snapshots[kind], 'ambiguous', ()):
                 print(f'STOPPED: Plex knows none of the {len(rels)} affected {kind} paths — is '
-                      f'the Plex library rooted somewhere other than {root}? Nothing removed.')
+                      f'the Plex library rooted somewhere other than {root}? Nothing more '
+                      f'removed ({total} removed before this).')
                 return 1
+        if (kind, title) in dd.unreconcilable(snapshots.get(kind, {}), group, root):
+            print(f'{kind:6} {title}: skipped — Plex holds it in more than one section')
+            continue
         done, result = _apply_group(ctx, kind, group, manifest, protected,
                                     snapshots.get(kind, {}))
         total += len(done)
         summary = ', '.join(f'{k} {len(v)}' for k, v in result.items() if v)
         print(f'{kind:6} {title}: removed {len(done)}' + (f' — Plex: {summary}' if summary else ''))
-        if result.get('stranded') or result.get('date_failed'):
-            print(f'STOPPED: Plex item(s) {result.get("stranded") or result.get("date_failed")} '
-                  f'need attention before continuing. Manifest: {manifest}')
+        problem = [rk for b in ('stranded', 'date_failed', 'timeout', 'failed')
+                   for rk in result.get(b, [])]
+        if problem:
+            print(f'STOPPED: Plex item(s) {problem} need attention before continuing '
+                  f'(Plex busy or unreachable counts too — re-run apply later). '
+                  f'Manifest: {manifest}')
             return 2
     print(f'removed {total} item(s); manifest: {manifest if total else "(none written)"}')
     return 0
@@ -349,7 +363,7 @@ def _wait_path_change(ctx, movie_id, old_path):
     return None
 
 
-def _rename_one(ctx, movie_id, plan_rows, manifest):
+def _rename_one(ctx, movie_id, plan_rows, manifest, include_review=False):
     from utils.library_dedup import Removal
     movie = ctx.radarr.get_movie(movie_id, strict=True)
     old_path = movie['path']
@@ -359,10 +373,16 @@ def _rename_one(ctx, movie_id, plan_rows, manifest):
     live_rows, _r, _p = build_plan(ctx, ('movie',))
     live = {(r['path'], r['target']) for r in live_rows if r['action'] in ('defer', 'remove')}
     deferred = [Removal(r['path'], r['target'], r['kind'], r['detail'] or 'foreign-folder',
-                        r['keep'], r['title'])
+                        r['keep'], r['title'], owner=r.get('owner') or '')
                 for r in plan_rows
                 if r['action'] == 'defer' and r['keep'] and (r['path'], r['target']) in live
                 and os.path.basename(os.path.dirname(r['keep'])) == old_folder]
+    if not include_review and any(r['action'] == 'defer' and r['detail'] in _REVIEW_RULES
+                                  and os.path.basename(os.path.dirname(r['keep'])) == old_folder
+                                  for r in plan_rows):
+        print(f'{old_folder!r}: zurgarr folder matched only by alias/yearless title — '
+              f'review it, then pass --include-review; not merging Plex items')
+        return False
 
     # The Plex item that carries the restored date added: the one holding
     # zurgarr's copy (it has the original metadata), else Radarr's own.
@@ -421,7 +441,7 @@ def cmd_radarr_rename(ctx, args):
     plan_rows = _read_rows(args.plan)
     manifest = _manifest_path(ctx)
     for movie_id in [int(x) for x in args.ids.split(',') if x.strip()]:
-        if not _rename_one(ctx, movie_id, plan_rows, manifest):
+        if not _rename_one(ctx, movie_id, plan_rows, manifest, args.include_review):
             return 2
     return 0
 
@@ -460,6 +480,8 @@ def main(argv=None, ctx=None):
     p = sub.add_parser('radarr-rename')
     p.add_argument('--ids', required=True)
     p.add_argument('--plan', required=True)
+    p.add_argument('--include-review', action='store_true',
+                   help='also act on foreign-folder-review rows (and merge their Plex items)')
     p.add_argument('--no-plex', action='store_true', help='run without Plex reconciliation')
     sub.add_parser('plex-check')
     args = ap.parse_args(argv)

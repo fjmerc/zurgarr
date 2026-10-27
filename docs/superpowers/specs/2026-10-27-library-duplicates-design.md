@@ -368,3 +368,28 @@ These refine the parts above. The code is authoritative.
   none (its link was cleaned up), the scan requests an arr rescan, at most daily
   per title (Activity: "rescan — its file is gone from the folder"). It doesn't
   link straight away: a copy under a name we can't parse would get a duplicate.
+
+### Second bug-hunter pass (review-fix commits)
+
+- **Subtitle ownership:**
+  - A subtitle belongs to the video whose stem it carries most specifically
+    (`x.proper.en.srt` → `x.proper.mkv`).
+  - It moves only with that video, and never while a video that could own it
+    remains.
+  - Quarantined copies never overwrite each other.
+  - An emptied foreign folder is pruned after its subtitle moves.
+- **Multi-episode files in Plex** are one part on each episode's item.
+  - The snapshot keeps every item per path.
+  - Only a path in two *sections* is ambiguous, and those removals are skipped
+    by the tidy and the script.
+- **The script stops on Plex timeouts or failures**, as well as on stranded or
+  date failures.
+- **`radarr-rename`:**
+  - It refuses review-class folders unless `--include-review`.
+  - Plan rows carry the subtitle's owner, so subtitles move with their link.
+- **Unreadable folders** are reported as `arr-error` in the clean-up, never
+  planned as empty.
+- **Small fixes:**
+  - one missing kept folder no longer stalls a Plex section;
+  - `restore_removals` is best effort per link;
+  - a Sonarr/Radarr entry with no title no longer breaks title indexing.
