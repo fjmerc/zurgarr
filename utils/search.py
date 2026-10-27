@@ -32,12 +32,17 @@ _SEARCH_TIMEOUT = 10
 _ADD_TIMEOUT = 15
 
 # Quality tiers — higher score = better
+# An explicit resolution wins over a "4K"/"UHD" tag ("Akira.4K.Remastered.
+# 1080p" is 1080p); the tag counts only when no resolution is named.
 _QUALITY_PATTERNS = [
-    (re.compile(r'(?:2160p|4k|uhd)', re.IGNORECASE), '2160p', 4),
+    (re.compile(r'2160p', re.IGNORECASE), '2160p', 4),
     (re.compile(r'1080p', re.IGNORECASE), '1080p', 3),
     (re.compile(r'720p', re.IGNORECASE), '720p', 2),
     (re.compile(r'480p', re.IGNORECASE), '480p', 1),
+    (re.compile(r'4k|uhd', re.IGNORECASE), '2160p', 4),
 ]
+# Score of every resolution label parse_quality can give (besides 'Unknown').
+RESOLUTION_SCORES = {label: score for _, label, score in _QUALITY_PATTERNS}
 
 # Hash validation — 40-char hex
 _HASH_RE = re.compile(r'^[a-fA-F0-9]{40}$')

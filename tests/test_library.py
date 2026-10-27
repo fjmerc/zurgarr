@@ -4376,6 +4376,7 @@ class TestApplySonarrMonitoredFilter:
         with _fake_sonarr(series):
             matched = _apply_sonarr_monitored_filter(shows)
         assert shows[0]['missing_episodes'] is None
+        assert '_profile_id' not in shows[0]
         assert 'monitored_episodes' not in shows[0]
         assert matched == set()
 
@@ -4385,7 +4386,7 @@ class TestApplySonarrMonitoredFilter:
         shows = [{'title': "Grey's Anatomy", 'year': None, 'missing_episodes': 300}]
         series = [{
             'title': "Grey's Anatomy",
-            'tmdbId': 1416,
+            'tmdbId': 1416, 'qualityProfileId': 8,
             'seasons': [
                 {'seasonNumber': 1, 'monitored': False,
                  'statistics': {'episodeCount': 9, 'episodeFileCount': 9}},
@@ -4397,6 +4398,7 @@ class TestApplySonarrMonitoredFilter:
             _apply_sonarr_monitored_filter(shows)
         assert shows[0]['missing_episodes'] == 1
         assert shows[0]['unmonitored_seasons'] == [1]
+        assert shows[0]['_profile_id'] == 8   # Wanted recovery's ceiling
 
     def test_missing_is_monitored_minus_file_count(self):
         """Sum ``episodeCount - episodeFileCount`` across monitored seasons.
@@ -4641,7 +4643,7 @@ class TestApplyRadarrWantedMovies:
         from utils.library import _apply_radarr_wanted_movies
         movies = []
         radarr_movies = [
-            {'id': 1, 'tmdbId': 100, 'title': 'Wanted Movie',
+            {'id': 1, 'tmdbId': 100, 'title': 'Wanted Movie', 'qualityProfileId': 4,
              'year': 2023, 'monitored': True, 'hasFile': False},
         ]
         with _fake_radarr(radarr_movies):
@@ -4656,6 +4658,7 @@ class TestApplyRadarrWantedMovies:
         assert ghost['size_bytes'] == 0
         assert ghost['_radarr_id'] == 1
         assert ghost['_radarr_tmdb_id'] == 100
+        assert ghost['_profile_id'] == 4
         # Regression for the TMDB cache-poisoning bug — the detail-view
         # fetch JS uses item.type to build /api/library/metadata?type=...
         # Without the type field the URL serialised type=undefined and
@@ -4932,7 +4935,7 @@ class TestApplySonarrWantedShows:
         shows = []
         series = [{
             'id': 5, 'tmdbId': 100, 'imdbId': 'tt123', 'title': 'Absent Show',
-            'year': 2022, 'monitored': True,
+            'year': 2022, 'monitored': True, 'qualityProfileId': 8,
             'seasons': [{'seasonNumber': 1, 'monitored': True,
                          'statistics': {'episodeCount': 8, 'episodeFileCount': 0}}],
         }]
@@ -4951,6 +4954,7 @@ class TestApplySonarrWantedShows:
         assert ghost['season_data'] == []
         assert ghost['_episodes'] == {}
         assert ghost['_sonarr_id'] == 5
+        assert ghost['_profile_id'] == 8
         assert ghost['imdb_id'] == 'tt123'
         assert ghost['tmdb_id'] == 100
 
@@ -8482,6 +8486,161 @@ class TestRecoverWantedViaTorbox:
                    'imdb_id': 'tt1', 'is_available': True}]
         sc._recover_wanted_via_debrid([], movies, {})
         assert [a['info_hash'] for a in wire['adds']] == ['b' * 40]
+
+    def _profile(self, monkeypatch, tiers, svc='radarr'):
+        """Arr whose profile ids map to resolution tier lists."""
+        import utils.arr_client as ac
+        client = MagicMock()
+        client.get_tier_order.side_effect = lambda pid: tiers.get(pid, [])
+        monkeypatch.setattr(ac, 'get_download_service',
+                            lambda kind: (client, svc))
+        return client
+
+    def test_release_above_profile_not_recovered(self, wire, monkeypatch, caplog):
+        import logging
+        # Prod 2026-10-27: a WEB-1080p show got three 2160p adds Sonarr
+        # never adopted next to its 1080p files.
+        wire['torrentio'] = [
+            {'info_hash': 'a' * 40, 'title': 'The.Substance.2024.2160p.WEB-DL',
+             'seeds': 90, 'quality': {'label': '2160p', 'score': 200}},
+            {'info_hash': 'b' * 40, 'title': 'The.Substance.2024.1080p.WEB-DL',
+             'seeds': 5, 'quality': {'label': '1080p', 'score': 100}},
+        ]
+        client = self._profile(monkeypatch, {4: ['1080p']})
+        sc = self._scanner()
+        movies = [{'title': 'The Substance', 'source': 'wanted', '_profile_id': 4,
+                   'imdb_id': 'tt1', 'is_available': True}]
+        with caplog.at_level(logging.INFO):
+            sc._recover_wanted_via_debrid([], movies, {})
+        assert [a['info_hash'] for a in wire['adds']] == ['b' * 40]
+        client.get_tier_order.assert_called_once_with(4)
+        assert ("dropped 1/2 result(s) above the quality profile (1080p) "
+                "for 'The Substance'") in caplog.text
+
+    def test_release_below_profile_kept(self, wire, monkeypatch):
+        # The arr imports a lower copy into an empty slot and upgrades later.
+        wire['torrentio'] = [
+            {'info_hash': 'b' * 40, 'title': 'The.Substance.2024.720p.WEB-DL',
+             'seeds': 5, 'quality': {'label': '720p', 'score': 2}}]
+        self._profile(monkeypatch, {4: ['1080p']})
+        sc = self._scanner()
+        movies = [{'title': 'The Substance', 'source': 'wanted', '_profile_id': 4,
+                   'imdb_id': 'tt1', 'is_available': True}]
+        sc._recover_wanted_via_debrid([], movies, {})
+        assert [a['info_hash'] for a in wire['adds']] == ['b' * 40]
+
+    def test_nothing_within_profile_adds_nothing(self, wire, monkeypatch):
+        wire['torrentio'] = [
+            {'info_hash': 'a' * 40, 'title': 'The.Substance.2024.2160p.WEB-DL',
+             'seeds': 90, 'quality': {'label': '2160p', 'score': 200}}]
+        self._profile(monkeypatch, {4: ['1080p', '720p']})
+        sc = self._scanner()
+        monkeypatch.setattr(sc, '_prowlarr_fallback_candidates', lambda *a, **k: [])
+        movies = [{'title': 'The Substance', 'source': 'wanted', '_profile_id': 4,
+                   'imdb_id': 'tt1', 'is_available': True}]
+        sc._recover_wanted_via_debrid([], movies, {})
+        assert wire['adds'] == []
+
+    def test_release_without_resolution_kept(self, wire, monkeypatch):
+        wire['torrentio'] = [
+            {'info_hash': 'a' * 40, 'title': 'The.Substance.2024.2160p.WEB-DL',
+             'seeds': 90, 'quality': {'label': '2160p', 'score': 200}},
+            {'info_hash': 'c' * 40, 'title': 'The.Substance.2024.WEB-DL',
+             'seeds': 9, 'quality': {'label': 'Unknown', 'score': 0}}]
+        self._profile(monkeypatch, {4: ['1080p']})
+        sc = self._scanner()
+        movies = [{'title': 'The Substance', 'source': 'wanted', '_profile_id': 4,
+                   'imdb_id': 'tt1', 'is_available': True}]
+        sc._recover_wanted_via_debrid([], movies, {})
+        assert [a['info_hash'] for a in wire['adds']] == ['c' * 40]
+
+    def test_profile_resolutions_names_never_carry_filter_nothing(self, wire, monkeypatch):
+        wire['torrentio'] = [
+            {'info_hash': 'a' * 40, 'title': 'The.Substance.2024.1080p.WEB-DL',
+             'seeds': 90, 'quality': {'label': '1080p', 'score': 100}}]
+        self._profile(monkeypatch, {4: ['576p']})
+        sc = self._scanner()
+        movies = [{'title': 'The Substance', 'source': 'wanted', '_profile_id': 4,
+                   'imdb_id': 'tt1', 'is_available': True}]
+        sc._recover_wanted_via_debrid([], movies, {})
+        assert len(wire['adds']) == 1
+
+    def test_all_torrentio_outside_profile_falls_back_to_prowlarr(self, wire, monkeypatch):
+        wire['torrentio'] = [
+            {'info_hash': 'a' * 40, 'title': 'The.Substance.2024.2160p.WEB-DL',
+             'seeds': 90, 'quality': {'label': '2160p', 'score': 200}}]
+        self._profile(monkeypatch, {4: ['1080p']})
+        sc = self._scanner()
+        monkeypatch.setattr(sc, '_prowlarr_fallback_candidates', lambda *a, **k: [
+            {'info_hash': 'b' * 40, 'title': 'The.Substance.2024.2160p.REMUX',
+             'seeds': 50, 'quality': {'label': '2160p', 'score': 200}},
+            {'info_hash': 'c' * 40, 'title': 'The.Substance.2024.1080p.WEB-DL',
+             'seeds': 9, 'quality': {'label': '1080p', 'score': 100}}])
+        movies = [{'title': 'The Substance', 'source': 'wanted', '_profile_id': 4,
+                   'imdb_id': 'tt1', 'is_available': True}]
+        sc._recover_wanted_via_debrid([], movies, {})
+        assert [a['info_hash'] for a in wire['adds']] == ['c' * 40]
+
+    def test_show_season_target_uses_sonarr_profile(self, wire, monkeypatch):
+        # Prod 2026-10-27: Dark Matter (2024), WEB-1080p, got 2160p episode adds.
+        wire['torrentio'] = [
+            {'info_hash': 'a' * 40, 'title': 'Show.S02E07.2160p.WEB-DL',
+             'seeds': 90, 'quality': {'label': '2160p', 'score': 200}},
+            {'info_hash': 'b' * 40, 'title': 'Show.S02E07.1080p.WEB-DL',
+             'seeds': 5, 'quality': {'label': '1080p', 'score': 100}}]
+        client = self._profile(monkeypatch, {8: ['1080p']}, svc='sonarr')
+        sc = self._scanner()
+        monkeypatch.setattr(sc, '_compute_missing_episodes', lambda s: [(2, 7)])
+        monkeypatch.setattr(library, '_release_matches_title', lambda *a, **k: True)
+        monkeypatch.setattr(library, '_release_covers_season', lambda *a, **k: 'episode')
+        shows = [{'title': 'Show', 'source': 'debrid', 'imdb_id': 'tt9', '_profile_id': 8,
+                  'missing_episodes': 1}]
+        sc._recover_wanted_via_debrid(shows, [], {})
+        assert [a['info_hash'] for a in wire['adds']] == ['b' * 40]
+        client.get_tier_order.assert_called_once_with(8)
+
+    def test_unknown_profile_filters_nothing(self, wire, monkeypatch):
+        wire['torrentio'] = [
+            {'info_hash': 'a' * 40, 'title': 'The.Substance.2024.2160p.WEB-DL',
+             'seeds': 90, 'quality': {'label': '2160p', 'score': 200}}]
+        self._profile(monkeypatch, {})   # profile unreadable -> []
+        sc = self._scanner()
+        movies = [{'title': 'The Substance', 'source': 'wanted', '_profile_id': 4,
+                   'imdb_id': 'tt1', 'is_available': True}]
+        sc._recover_wanted_via_debrid([], movies, {})
+        assert [a['info_hash'] for a in wire['adds']] == ['a' * 40]
+
+    def test_unreadable_profile_skips_the_title_this_pass(self, wire, monkeypatch):
+        wire['torrentio'] = [
+            {'info_hash': 'a' * 40, 'title': 'The.Substance.2024.2160p.WEB-DL',
+             'seeds': 90, 'quality': {'label': '2160p', 'score': 200}}]
+        client = self._profile(monkeypatch, {4: ['1080p']})
+        client.get_quality_profile.return_value = None   # arr didn't answer
+        sc = self._scanner()
+        movies = [{'title': 'The Substance', 'source': 'wanted', '_profile_id': 4,
+                   'imdb_id': 'tt1', 'is_available': True}]
+        sc._recover_wanted_via_debrid([], movies, {})
+        assert wire['adds'] == []
+        assert sc._wanted_no_results == {}   # tried again next pass
+        client.get_quality_profile.return_value = {'id': 4}
+        wire['torrentio'].append(
+            {'info_hash': 'b' * 40, 'title': 'The.Substance.2024.1080p.WEB-DL',
+             'seeds': 5, 'quality': {'label': '1080p', 'score': 100}})
+        sc._recover_wanted_via_debrid([], movies, {})
+        assert [a['info_hash'] for a in wire['adds']] == ['b' * 40]
+
+    def test_profile_read_from_matching_arr_only(self, wire, monkeypatch):
+        # A movie's profile id is Radarr's — never looked up on Overseerr.
+        wire['torrentio'] = [
+            {'info_hash': 'a' * 40, 'title': 'The.Substance.2024.2160p.WEB-DL',
+             'seeds': 90, 'quality': {'label': '2160p', 'score': 200}}]
+        client = self._profile(monkeypatch, {4: ['1080p']}, svc='overseerr')
+        sc = self._scanner()
+        movies = [{'title': 'The Substance', 'source': 'wanted', '_profile_id': 4,
+                   'imdb_id': 'tt1', 'is_available': True}]
+        sc._recover_wanted_via_debrid([], movies, {})
+        client.get_tier_order.assert_not_called()
+        assert len(wire['adds']) == 1
 
     def test_disabled_flag_noops(self, wire, monkeypatch):
         monkeypatch.setenv('WANTED_TB_RECOVERY_ENABLED', 'false')

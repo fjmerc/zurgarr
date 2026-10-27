@@ -1723,6 +1723,9 @@ def _apply_sonarr_monitored_filter(shows, degraded=None):
         sid = series.get('id')
         if sid is not None:
             matched_ids.add(sid)
+        if series.get('qualityProfileId'):
+            # Wanted recovery only adds releases this profile allows.
+            show['_profile_id'] = series['qualityProfileId']
 
         missing, monitored_total, unmonitored_nums = _sonarr_monitored_missing(series)
         show['missing_episodes'] = missing
@@ -1885,6 +1888,7 @@ def _apply_sonarr_wanted_shows(shows, matched_ids, pending=None, degraded=None):
             '_episodes': {},
             '_sonarr_id': sid,
             '_sonarr_tmdb_id': tmdb_id,
+            '_profile_id': s.get('qualityProfileId'),
         }
         if monitored_total > 0:
             ghost['monitored_episodes'] = monitored_total
@@ -2300,6 +2304,7 @@ def _apply_radarr_wanted_movies(movies, pending=None, degraded=None):
             'is_available': bool(rm.get('isAvailable')),
             '_radarr_id': rm.get('id'),
             '_radarr_tmdb_id': tmdb_id,
+            '_profile_id': rm.get('qualityProfileId'),
         }
         movies.append(ghost)
         injected += 1
@@ -5339,6 +5344,61 @@ class LibraryScanner:
                 f"result(s) for '{media_title}'")
         return kept
 
+    # _profile_resolutions: the profile couldn't be read this time.
+    _PROFILE_UNREADABLE = object()
+
+    @classmethod
+    def _profile_resolutions(cls, media_type, item, cache):
+        """Resolutions the item's arr quality profile allows (e.g.
+        ``{'1080p'}``); None when there is no profile to apply (then
+        nothing is filtered); ``_PROFILE_UNREADABLE`` when the arr didn't
+        answer (the caller skips the item this pass rather than add
+        something the profile may rule out).  *cache* maps (service,
+        profile id) -> result for one pass; failures aren't cached."""
+        pid = item.get('_profile_id')
+        if not pid:
+            return None
+        kind = 'movie' if media_type == 'movie' else 'show'
+        want = 'radarr' if kind == 'movie' else 'sonarr'
+        if (want, pid) in cache:
+            return cache[(want, pid)]
+        try:
+            from utils.arr_client import get_download_service
+            client, svc = get_download_service(kind)
+            if not client or svc != want:
+                return None
+            if client.get_quality_profile(pid) is None:
+                return cls._PROFILE_UNREADABLE
+            allowed = set(client.get_tier_order(pid)) or None
+        except Exception as e:
+            logger.debug(f"[library] Could not read {want} profile {pid}: {e}")
+            return cls._PROFILE_UNREADABLE
+        cache[(want, pid)] = allowed
+        return allowed
+
+    @staticmethod
+    def _drop_outside_profile(results, allowed, media_title, source=''):
+        """*results* without releases above the arr profile's highest
+        resolution — the arr would never grab one, and won't adopt it
+        for an episode/movie that already has a file, so it spends a TorBox
+        add on a file outside the profile.  Lower resolutions stay (the arr
+        upgrades them later), as does a release with no resolution in its
+        name; nothing is dropped for a profile whose resolutions release
+        names don't carry (e.g. only 576p)."""
+        from utils import search as _search
+        scores = _search.RESOLUTION_SCORES
+        ceiling = max((scores[a] for a in allowed or () if a in scores), default=None)
+        if ceiling is None:
+            return results
+        kept = [r for r in results or []
+                if scores.get((r.get('quality') or {}).get('label'), 0) <= ceiling]
+        if len(kept) < len(results or []):
+            logger.info(
+                f"[library] Wanted recovery dropped {len(results) - len(kept)}"
+                f"/{len(results)} {source}result(s) above the quality profile "
+                f"({', '.join(sorted(allowed))}) for '{media_title}'")
+        return kept
+
     def _recover_wanted_via_debrid(self, shows, movies, preferences):
         """Proactively grab debrid-cached copies of "Wanted" media.
 
@@ -5565,6 +5625,9 @@ class LibraryScanner:
         except ImportError:
             _is_blocked = None
 
+        # One profile read per pass: get_download_service builds a fresh
+        # client per call, so the client's own profile cache doesn't carry.
+        profile_cache = {}
         for media_type, item, season, episode in targets:
             tb_active = tb_ok and tb_added < tb_budget
             rd_active = rd_ok and rd_attempts < rd_budget
@@ -5700,6 +5763,15 @@ class LibraryScanner:
                         f"S{season:02d}")
                 results = kept
 
+            # Before the fallback decision: Torrentio results the profile
+            # rules out are as good as none.
+            allowed = self._profile_resolutions(media_type, item, profile_cache)
+            if allowed is self._PROFILE_UNREADABLE:
+                logger.info(f"[library] Wanted recovery skipping '{media_title}' this "
+                            f"pass: its quality profile couldn't be read")
+                continue
+            results = self._drop_outside_profile(results, allowed, media_title)
+
             # ---- Prowlarr fallback (acquisition breadth) -------------
             # Fires only when Torrentio produced nothing usable, or when
             # prior passes recorded give-up strikes for this key (its
@@ -5716,8 +5788,9 @@ class LibraryScanner:
                         exclude_hashes={r['info_hash'] for r in results},
                         season_cls=season_cls,
                         is_blocked=_is_blocked)
-                    results.extend(self._drop_prerelease(
-                        fallback, media_title, source='Prowlarr '))
+                    results.extend(self._drop_outside_profile(
+                        self._drop_prerelease(fallback, media_title, source='Prowlarr '),
+                        allowed, media_title, source='Prowlarr '))
                 except Exception:
                     logger.warning(
                         "[library] Prowlarr fallback failed — continuing "
