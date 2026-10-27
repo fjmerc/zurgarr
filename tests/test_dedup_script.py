@@ -198,9 +198,12 @@ def test_apply_limit_counts_titles(tmp_path):
 
 
 def test_apply_stops_on_stranded(tmp_path, monkeypatch):
+    from utils.plex_versions import PartRef
     L, radarr, kept, extra, unmatched = _movie_setup(tmp_path)
     out = str(tmp_path / 'plan.tsv')
-    ctx = _ctx(L, radarr=radarr, plex=FakePlex(), tmp_path=tmp_path)
+    plex = FakePlex([PartRef('100', '1', 'Chinatown (1974)/Chinatown 1974.mkv', 5, '1'),
+                     PartRef('300', '3', 'Amazing Films 12/Oppenheimer (2023).mp4', 5, '1')])
+    ctx = _ctx(L, radarr=radarr, plex=plex, tmp_path=tmp_path)
     dedup.main(['plan', '--kind', 'movie', '--out', out], ctx=ctx)
     monkeypatch.setattr(dedup.dd, 'reconcile_plex',
                         lambda *a, **k: {'stranded': ['100'], 'date_failed': []})
@@ -414,4 +417,13 @@ def test_apply_rechecks_kept_copy_during_run(tmp_path, monkeypatch):
         return result
     monkeypatch.setattr(dedup, 'build_plan', plan_then_break)
     dedup.main(['apply', '--no-plex', '--plan', out, '--kind', 'tv'], ctx=ctx)
+    assert os.path.islink(extra)
+
+
+def test_apply_refuses_when_plex_knows_none_of_the_paths(tmp_path):
+    L, sonarr, kept, extra = _show_setup(tmp_path)
+    out = str(tmp_path / 'plan.tsv')
+    ctx = _ctx(L, sonarr=sonarr, plex=FakePlex([]), tmp_path=tmp_path)
+    dedup.main(['plan', '--kind', 'tv', '--out', out], ctx=ctx)
+    assert dedup.main(['apply', '--plan', out, '--kind', 'tv'], ctx=ctx) == 1
     assert os.path.islink(extra)

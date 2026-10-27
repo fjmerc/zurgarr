@@ -320,3 +320,51 @@ mount problem can't make an unrelated version look "unavailable". Then re-check:
   `/venv/bin/python` run is fine).
 - Naming of the new cause slug and history type.
 - Report format details beyond the TSV columns above.
+
+## Changes from review (2026-10-27, code-reviewer + bug-hunter)
+
+These refine the parts above. The code is authoritative.
+
+- **Grace period:** a link younger than 15 minutes is never planned. Sonarr/Radarr
+  write a new import before their database records it.
+- **Live re-check:** every kept copy a link duplicates (one per episode of a
+  multi-episode file) is re-checked right before removal. Plans can be minutes or
+  days old.
+- **Multi-episode names we can't fully read** (`S01E01.E02`, `S01E01-S01E02`,
+  ranges over 5) count as unknown: never a duplicate, never "present".
+- **Unreadable folders** (stale NFS handle, I/O error) are unknown, never empty,
+  in both the scanner and the clean-up.
+- **Foreign folders:**
+  - A same-name title of another year is never touched.
+  - These become `foreign-folder-review` and are removed only with
+    `apply --include-review`:
+    - a match by a different title (TMDB alias, prefix);
+    - a yearless folder of a reboot family.
+  - Self-matches and non-debrid links are ignored.
+- **Subtitle sidecars** are moved to a quarantine folder beside the manifest
+  (`<manifest>.quarantine/…`), never deleted, and only after their own video was
+  removed in the same run. `undo` restores them.
+- **Plex:**
+  - Never delete a version that was only partly removed (stacked cd1/cd2).
+  - For two links to one file, the kept path must appear in Plex before
+    anything is deleted.
+  - A path held by two Plex items is not reconciled.
+  - Per-item errors and scan timeouts never abort or delete.
+  - Unfinished follow-ups from the tidy are retried, up to 5 times
+    (`/config/duplicate_tidy_pending.json`).
+- **Tidy fails closed:**
+  - Plex can't be read, or Plex knows none of the affected paths → nothing removed.
+  - Items whose kept copy is another Plex item are skipped.
+  - Only mounts that answer are used.
+  - Only Sonarr/Radarr clients are used.
+- **Script:**
+  - Plex is required for `apply`/`radarr-rename` unless `--no-plex`.
+  - `apply` stops if Plex knows none of the affected paths.
+  - An empty arr library refuses to plan.
+  - `radarr-rename` uses only rows the live plan still lists, stops on a failed
+    move request, and puts removed links back on any stop.
+  - There's a `radarr-accepted-none` report, matching TV.
+- **Scanner, missing file:** when Sonarr/Radarr list a file whose folder holds
+  none (its link was cleaned up), the scan requests an arr rescan, at most daily
+  per title (Activity: "rescan — its file is gone from the folder"). It doesn't
+  link straight away: a copy under a name we can't parse would get a duplicate.

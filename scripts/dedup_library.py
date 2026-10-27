@@ -280,9 +280,13 @@ def cmd_apply(ctx, args):
         group = groups[(kind, title)]
         root = ctx.local_tv if kind == 'tv' else ctx.local_movies
         if ctx.plex and kind not in snapshots:
-            rels = {dd.rel_to_root(r.path, root) for (k, _t), rs in groups.items()
-                    if k == kind for r in rs}
+            rels = {dd.rel_to_root(p, root) for (k, _t), rs in groups.items()
+                    if k == kind for r in rs for p in (r.path, r.keep) if p}
             snapshots[kind] = dd.snapshot_plex(ctx.plex, kind, rels)
+            if not snapshots[kind]:
+                print(f'STOPPED: Plex knows none of the {len(rels)} affected {kind} paths — is '
+                      f'the Plex library rooted somewhere other than {root}? Nothing removed.')
+                return 1
         done, result = _apply_group(ctx, kind, group, manifest, protected,
                                     snapshots.get(kind, {}))
         total += len(done)
