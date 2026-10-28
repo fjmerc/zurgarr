@@ -46,6 +46,24 @@ def _is_truthy(value):
     return str(value).lower() in ('true', '1', 'yes')
 
 
+def _check_comment_values(result):
+    """Warn about settings whose value is really a comment.
+
+    ``KEY=   # note`` reads as the value ``# note`` (python-dotenv and docker
+    compose agree), so a placeholder copied from an old .env.example looks
+    set.  Names the key only: values may be secrets.  A value starting with
+    '#' and no space after it (``#s3cret``) is taken as meant.
+    """
+    from utils.settings_api import _ALL_KEYS     # every setting the Settings page knows
+    for key in sorted(_ALL_KEYS):
+        value = os.environ.get(key)
+        if isinstance(value, str) and re.match(r'#\s', value.lstrip()):
+            result.warn(
+                f"{key} looks like a leftover comment (its value starts with '# '), so it "
+                f"isn't really set. Put the comment on its own line and leave {key}= empty, "
+                f"or quote the value if it really starts with '#'.")
+
+
 def validate_config():
     """Run all validation checks against current config. Returns ValidationResult."""
     from base import config
@@ -279,6 +297,8 @@ def validate_config():
             f"RCLONE_MOUNT_NAME='{RCLONEMN}' contains special characters. "
             f"This may cause issues with mount paths."
         )
+
+    _check_comment_values(result)
 
     return result
 

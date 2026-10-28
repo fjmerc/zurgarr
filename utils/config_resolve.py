@@ -15,14 +15,11 @@ read_env_file): base/ imports it at startup.
 """
 
 import os
-import re
 import threading
 from dataclasses import dataclass
 
 SOURCES = ('locked', 'secret', 'set', 'auto', 'default', 'unset')
 
-# `KEY=   # note`: nothing but whitespace between '=' and the comment
-_COMMENT_ONLY_VALUE = re.compile(r'[ \t]+#')
 
 
 @dataclass(frozen=True)
@@ -171,37 +168,18 @@ def _clean(value):
 
 
 def read_env_file(path):
-    """Read an env file (config/.env) the way every reader here must.
+    """Read an env file (config/.env); a missing file reads as empty.
 
-    Same as ``dotenv_values`` except for one case: python-dotenv returns the
-    comment as the value for ``KEY=   # note`` (an empty value followed by a
-    comment), so a placeholder line like ``.env.example``'s would read as a
-    setting.  Such a key reads as blank.  ``KEY=x  # note`` is already
-    stripped to ``x``, and ``KEY=#x`` (no space before ``#``) keeps ``#x``.
-    Decided per assignment in dotenv's own parse, so the last line for a key
-    wins and a quoted multi-line value is never mistaken for an assignment.
-    A missing file reads as empty.
+    Plain python-dotenv on purpose: docker compose reads the same file the
+    same way, so the two never disagree (``KEY= #x`` is ``#x`` to both, and
+    so is ``KEY=   # note``: write comments on their own line).  A setting
+    that looks like a leftover comment gets a startup warning from
+    utils.config_validator instead of being guessed at here.
     """
     from dotenv import dotenv_values
-    from dotenv.parser import parse_stream
     if not path or not os.path.exists(path):
         return {}
-    values = dotenv_values(path)
-    placeholder = {}
-    try:
-        with open(path, encoding='utf-8') as f:
-            for binding in parse_stream(f):
-                if binding.key is None or binding.error:
-                    continue
-                rest = binding.original.string.split('=', 1)
-                placeholder[binding.key] = (
-                    len(rest) == 2 and _COMMENT_ONLY_VALUE.match(rest[1]) is not None)
-    except (OSError, UnicodeDecodeError):
-        pass       # dotenv_values read the same file above, so this can't really happen
-    for key, blank in placeholder.items():
-        if blank and key in values:
-            values[key] = ''
-    return values
+    return dotenv_values(path)
 
 
 def present_secrets(secrets_dir='/run/secrets'):

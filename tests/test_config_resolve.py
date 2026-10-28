@@ -356,20 +356,19 @@ def test_dry_resolve_reads_environ_and_written_under_the_lock(monkeypatch):
 
 # --- reading config/.env: a comment after an empty value is not the value ---
 
-def test_read_env_file_blanks_comment_only_values(tmp_path):
+def test_read_env_file_reads_like_dotenv_and_compose(tmp_path):
+    """No special cases: zurgarr must agree with docker compose about the
+    same file, and a real value may start with '#'."""
     from utils.config_resolve import read_env_file
     p = tmp_path / '.env'
-    p.write_text('A=   # Required: put your key here\n'
-                 'B= #note\n'
-                 'export C=\t# tab before the comment\n'
+    p.write_text('A= #s3cret\n'
                  'D=value   # trailing comment\n'
                  'E=#starts-with-hash\n'
                  'F="" # quoted empty\n'
                  'G=\n')
     v = read_env_file(str(p))
-    assert v['A'] == '' and v['B'] == '' and v['C'] == ''
-    assert v['D'] == 'value'
-    assert v['E'] == '#starts-with-hash'     # no space before '#': it's the value
+    assert v['A'] == '#s3cret'
+    assert v['D'] == 'value' and v['E'] == '#starts-with-hash'
     assert v['F'] == '' and v['G'] == ''
 
 
@@ -399,16 +398,19 @@ def test_every_env_file_reader_uses_read_env_file():
         assert not re.search(r'(?<!\.)\bdotenv_values\(', src), rel
 
 
-@pytest.mark.parametrize('text, expected', [
-    ('A=  # placeholder\nA=real\n', 'real'),        # later real value wins
-    ('A=real\nA=  # placeholder\n', ''),            # later placeholder wins
-    ('A =  # spaced\n', ''),
-    ('A=  # crlf\r\nB=x\r\n', ''),
-    ("'A'=  # quoted key\n", ''),
-    ('B="line1\nA=  # inside a quoted value\n"\nA=real\n', 'real'),
+# --- a setting that is really a leftover comment gets a startup warning ---
+
+@pytest.mark.parametrize('value, warned', [
+    ('# Required: from https://real-debrid.com/apitoken', True),
+    ('#\tnote', True),
+    ('#s3cret', False),            # a real value may start with '#'
+    ('realkey', False),
 ])
-def test_read_env_file_follows_dotenv_line_order(tmp_path, text, expected):
-    from utils.config_resolve import read_env_file
-    p = tmp_path / '.env'
-    p.write_bytes(text.encode())
-    assert read_env_file(str(p))['A'] == expected
+def test_validator_warns_about_leftover_comment_values(monkeypatch, value, warned):
+    from utils import config_validator
+    monkeypatch.setenv('RD_API_KEY', value)
+    result = config_validator.ValidationResult()
+    config_validator._check_comment_values(result)
+    hits = [w for w in result.warnings if 'RD_API_KEY' in w]
+    assert bool(hits) == warned
+    assert all(value not in w for w in result.warnings)   # never echo the value
