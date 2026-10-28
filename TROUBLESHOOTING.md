@@ -429,10 +429,12 @@ file` (or `Sonarr's file for S05E08 holds S05E07`, or `… is named for
 film or episode, or is missing from Plex.
 
 Cause: the file Sonarr/Radarr has on record for that title looks like
-another title — read from the release name its link points to, which a
-rename doesn't change. The duplicate clean-up keeps the arr's file and
-removes the others, so it leaves this title alone: one of the other copies
-may be the right one.
+another title — read from the release name its link points to (or its
+season pack's folder), which a rename doesn't change. The duplicate
+clean-up keeps the arr's file and removes the others, so it leaves this
+title alone: one of the other copies may be the right one. The warning
+shows once per title until zurgarr restarts; later runs log it at debug
+level.
 
 Fix: in Sonarr/Radarr, open the title and check its file. If it's the
 wrong one: make sure the right copy is still in the folder (or will be
@@ -440,8 +442,9 @@ re-downloaded), delete the wrong file there (for a link this removes only
 the link), rescan the series/movie so the arr picks up the right copy, and
 turn monitoring back on — Radarr unmonitors a movie when its file is
 deleted. Then rescan the folder in Plex. A title that is right as it is
-(a release named with a year the movie database doesn't list) can be left:
-only its duplicates stay.
+(a release named with a year the movie database doesn't list, or under a
+show name Sonarr doesn't list as an alternate title) can be left: only its
+duplicates stay.
 
 ## Plex shows episodes or movies as "unavailable" after a restart
 

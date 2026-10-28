@@ -1702,7 +1702,7 @@ class TestKeptCopyIsNotTheArrsTitle:
         from utils.library_dedup import movie_years
         assert movie_years({'year': 1943, 'secondaryYear': 1942, 'inCinemas': '1943-01-15',
                             'digitalRelease': '1961-09-02', 'physicalRelease': '1989-01-01'}) \
-            == {1943, 1942, 1961}
+            == {1943, 1942}
         assert movie_years({'year': 0}) == set()
 
     def test_wrong_film_held_even_when_extra_copy_has_no_year(self, tmp_path):
@@ -1883,3 +1883,233 @@ class TestKeptCopyIsNotTheArrsTitle:
         L.link('Obsession (2026)/obsession.mkv', 'X/x.mkv')
         assert plan_movie_duplicates(str(L.lib / 'Obsession (2026)'), kept, L.pairs, 'Obsession',
                                      years={2026}) == []
+
+
+class TestArrFileMismatchReviewFixes:
+    """code-reviewer 2026-10-28 on the kept-copy-vs-arr check."""
+
+    def test_later_digital_release_year_does_not_widen(self, tmp_path):
+        """A 2025 film released digitally in 2026: a kept file named 2026 is
+        the one-year-apart remake case, not the film."""
+        from utils.library_dedup import movie_years, plan_movie_duplicates
+        years = movie_years({'year': 2025, 'inCinemas': '2025-12-10', 'digitalRelease': '2026-02-01'})
+        assert years == {2025}
+        L = _Lib(tmp_path)
+        kept = L.link('Film (2025)/Film (2025).mkv', 'Film 2026 WEB/f.mkv')
+        L.link('Film (2025)/film.mkv', 'X/x.mkv')
+        assert plan_movie_duplicates(str(L.lib / 'Film (2025)'), kept, L.pairs, 'Film',
+                                     years=years) == []
+
+    @pytest.mark.parametrize('title,aliases,release', [
+        ("Marvel's Agents of S.H.I.E.L.D.", ('Agents of S.H.I.E.L.D.',), 'Agents.of.SHIELD.S01E05.mkv'),
+        ('Bjørn Bundy', (), 'Bjorn.Bundy.S01E05.mkv'),
+        ('Law & Order', (), 'Law.Order.S01E05.mkv'),
+        ('Ghosts (AU)', (), 'Ghosts.2019.S01E05.mkv'),
+        ('M*A*S*H', (), 'MASH.S01E05.mkv'),
+    ])
+    def test_show_name_spellings_match(self, tmp_path, title, aliases, release):
+        from utils.library_dedup import plan_series_duplicates
+        L = _Lib(tmp_path)
+        kept = L.link('S/Season 01/S - S01E05.mkv', 'Pack/' + release)
+        extra = L.link('S/Season 01/S01E05.mkv', 'X/S01E05.mkv')
+        out = plan_series_duplicates(str(L.lib / 'S'), {(1, 5): kept}, L.pairs, title, aliases=aliases)
+        assert [r.path for r in out] == [extra]
+
+    def test_mismatch_warns_once_then_quietly(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+        from utils import library_dedup
+        log = MagicMock()
+        monkeypatch.setattr(library_dedup, 'logger', log)
+        monkeypatch.setattr(library_dedup, '_WARNED_MISMATCH', set())
+        L = _Lib(tmp_path)
+        kept = L.link('Moana (2026)/Moana (2026).mkv', 'Moana 2016 1080p/m.mkv')
+        L.link('Moana (2026)/moana.mkv', 'X/x.mkv')
+        for _ in range(2):
+            library_dedup.plan_movie_duplicates(str(L.lib / 'Moana (2026)'), kept, L.pairs, 'Moana',
+                                                years={2026})
+        assert log.warning.call_count == 1 and log.debug.call_count == 1
+
+    def test_season_pack_target_reads_folder_for_show(self, tmp_path):
+        """A pack's files often start at SxxEyy: the show name is in its folder."""
+        from utils.library_dedup import plan_series_duplicates
+        L = _Lib(tmp_path)
+        kept = L.link('Daredevil - Born Again (2025)/Season 01/Daredevil Born Again - S01E05.mkv',
+                      'Daredevil.S01.1080p.BluRay/S01E05.World.on.Fire.mkv')
+        L.link('Daredevil - Born Again (2025)/Season 01/S01E05.mkv', 'X/S01E05.mkv')
+        out = plan_series_duplicates(str(L.lib / 'Daredevil - Born Again (2025)'), {(1, 5): kept},
+                                     L.pairs, 'Daredevil: Born Again')
+        assert out == []
+
+    def test_season_pack_of_the_right_show_still_removed(self, tmp_path):
+        from utils.library_dedup import plan_series_duplicates
+        L = _Lib(tmp_path)
+        kept = L.link('Ted Lasso (2020)/Season 01/Ted Lasso (2020) - S01E05.mkv',
+                      'Ted.Lasso.S01.1080p.ATVP/S01E05.mkv')
+        extra = L.link('Ted Lasso (2020)/Season 01/S01E05.mkv', 'X/S01E05.mkv')
+        out = plan_series_duplicates(str(L.lib / 'Ted Lasso (2020)'), {(1, 5): kept}, L.pairs,
+                                     'Ted Lasso')
+        assert [r.path for r in out] == [extra]
+
+    def test_scene_numbered_other_season_not_held(self, tmp_path):
+        """Sonarr maps scene S02E01 to its S01E13 (XEM): another season in the
+        name is not evidence of a wrong file."""
+        from utils.library_dedup import plan_series_duplicates
+        L = _Lib(tmp_path)
+        kept = L.link('Anime (2020)/Season 01/Anime (2020) - S01E13.mkv', 'Anime S02/Anime.S02E01.mkv')
+        extra = L.link('Anime (2020)/Season 01/S01E13.mkv', 'X/S01E13.mkv')
+        out = plan_series_duplicates(str(L.lib / 'Anime (2020)'), {(1, 13): kept}, L.pairs, 'Anime')
+        assert [r.path for r in out] == [extra]
+
+    def test_one_word_episode_title_does_not_excuse_another_show(self, tmp_path):
+        from utils.library_dedup import plan_series_duplicates
+        L = _Lib(tmp_path)
+        kept = L.link('Daredevil - Born Again (2025)/Season 01/x.mkv',
+                      'Daredevil S01/Daredevil.S01E01.Pilot.mkv')
+        L.link('Daredevil - Born Again (2025)/Season 01/S01E01.mkv', 'Y/S01E01.Pilot.mkv')
+        out = plan_series_duplicates(str(L.lib / 'Daredevil - Born Again (2025)'), {(1, 1): kept},
+                                     L.pairs, 'Daredevil: Born Again')
+        assert out == []
+
+    def test_multi_episode_kept_file_covers_both(self, tmp_path):
+        from utils.library_dedup import plan_series_duplicates
+        L = _Lib(tmp_path)
+        kept = L.link('Show (2020)/Season 01/Show - S01E01-E02.mkv', 'Show S01/Show.S01E01E02.mkv')
+        e1 = L.link('Show (2020)/Season 01/Show.S01E01.mkv', 'X/Show.S01E01.mkv')
+        e2 = L.link('Show (2020)/Season 01/Show.S01E02.mkv', 'X/Show.S01E02.mkv')
+        out = plan_series_duplicates(str(L.lib / 'Show (2020)'), {(1, 1): kept, (1, 2): kept},
+                                     L.pairs, 'Show')
+        assert sorted(r.path for r in out) == sorted([e1, e2])
+
+    def test_tv_real_file_kept_copy_not_held(self, tmp_path):
+        from utils.library_dedup import plan_series_duplicates
+        L = _Lib(tmp_path)
+        kept = L.file('Show (2020)/Season 01/Show - S01E01.mkv')
+        extra = L.link('Show (2020)/Season 01/S01E01.mkv', 'X/S01E01.mkv')
+        out = plan_series_duplicates(str(L.lib / 'Show (2020)'), {(1, 1): kept}, L.pairs, 'Show')
+        assert [r.path for r in out] == [extra]
+
+    def test_foreign_tv_uses_record_aliases(self, tmp_path):
+        from utils.library import arr_title_maps
+        from utils.library_dedup import plan_foreign_folders
+        L = _Lib(tmp_path)
+        kept = L.link("Marvel's Daredevil (2015)/Season 01/x - S01E04.mkv",
+                      'Daredevil S01/Daredevil.S01E04.mkv')
+        extra = L.link("Marvel's Daredevil/Season 01/Marvels.Daredevil.S01E04.mkv", 'X/S01E04.mkv')
+        shows = [{'title': "Marvel's Daredevil", 'year': 2015, 'path': "/t/Marvel's Daredevil (2015)",
+                  'id': 1, 'tmdbId': None, 'alternateTitles': [{'title': 'Daredevil'}]}]
+        rem, _ = plan_foreign_folders(str(L.lib), 'tv', {"Marvel's Daredevil (2015)"},
+                                      arr_title_maps(shows, None, is_tv=True),
+                                      lambda info: {(1, 4): kept}, L.pairs, cached_tmdb={},
+                                      tmdb_cache={}, arr_record=lambda info: shows[0])
+        assert [r.path for r in rem] == [extra]
+
+    def test_foreign_young_link_reported_not_covered(self, tmp_path, monkeypatch):
+        """A link too young to remove isn't reported as an arr mismatch."""
+        from utils import library_dedup
+        from utils.library import arr_title_maps
+        monkeypatch.setattr(library_dedup, 'MIN_LINK_AGE', 3600)
+        L = _Lib(tmp_path)
+        kept = L.link('iCarly (2007)/x - S05E07-E08.mkv', 'E/Season 5/iCarly - S05E07 - Part 1.mkv')
+        L.link('iCarly/Season 05/iCarly S05E08.mkv', 'B/iCarly S05E08.mkv')
+        shows = [{'title': 'iCarly', 'year': 2007, 'path': '/t/iCarly (2007)', 'id': 1, 'tmdbId': None}]
+        rem, rep = library_dedup.plan_foreign_folders(
+            str(L.lib), 'tv', {'iCarly (2007)'}, arr_title_maps(shows, None, is_tv=True),
+            lambda info: {(5, 7): kept, (5, 8): kept}, L.pairs, cached_tmdb={}, tmdb_cache={})
+        assert rem == [] and [r['rule'] for r in rep] == ['not-covered']
+
+    def test_foreign_movie_bad_year_value_does_not_crash(self, tmp_path):
+        from utils.library_dedup import plan_foreign_folders
+        L = _Lib(tmp_path)
+        kept = L.link('Film (2020)/Film (2020).mkv', 'Film 2020/f.mkv')
+        L.link('Film/film.mkv', 'X/x.mkv')
+        info = {'title': 'Film', 'year': 'n/a', 'folder': 'Film (2020)', 'id': 1}
+        maps = ({'film': info}, {'film': info}, {})
+        rem, rep = plan_foreign_folders(str(L.lib), 'movie', {'Film (2020)'}, maps,
+                                        lambda i: kept, L.pairs, cached_tmdb={}, tmdb_cache={})
+        assert isinstance(rem, list)
+
+
+class TestArrFileMismatchBugHunterFixes:
+    """bug-hunter 2026-10-28: ways the kept-copy check still let a wrong
+    file win."""
+
+    def test_reboot_series_file_from_other_year_held(self, tmp_path):
+        from utils.library_dedup import plan_series_duplicates
+        L = _Lib(tmp_path)
+        kept = L.link('Dark Matter (2024)/Season 01/Dark Matter (2024) - S01E01.mkv',
+                      'Dark.Matter.2015.S01.1080p/Dark.Matter.2015.S01E01.Episode.One.mkv')
+        L.link('Dark Matter (2024)/Season 01/Dark.Matter.S01E01.mkv', 'X/Dark.Matter.S01E01.mkv')
+        out = plan_series_duplicates(str(L.lib / 'Dark Matter (2024)'), {(1, 1): kept}, L.pairs,
+                                     'Dark Matter (2024)', years={2024})
+        assert out == []
+
+    def test_reboot_year_read_from_pack_folder(self, tmp_path):
+        from utils.library_dedup import plan_series_duplicates
+        L = _Lib(tmp_path)
+        kept = L.link('Dark Matter (2024)/Season 01/x - S01E01.mkv', 'Dark.Matter.2015.S01.1080p/S01E01.mkv')
+        L.link('Dark Matter (2024)/Season 01/Dark.Matter.S01E01.mkv', 'X/Dark.Matter.S01E01.mkv')
+        out = plan_series_duplicates(str(L.lib / 'Dark Matter (2024)'), {(1, 1): kept}, L.pairs,
+                                     'Dark Matter', years={2024})
+        assert out == []
+
+    @pytest.mark.parametrize('title,years,release', [
+        ('1923', {2022}, '1923.S01E01.1080p.mkv'),             # the year is the title
+        ('Ghosts (2021)', {2021}, 'Ghosts.2021.S01E01.mkv'),
+        ('Show', {2020}, 'Show.S01E01.mkv'),                    # no year in the name
+    ])
+    def test_series_years_that_fit_still_removed(self, tmp_path, title, years, release):
+        from utils.library_dedup import plan_series_duplicates, series_years
+        L = _Lib(tmp_path)
+        kept = L.link('S/Season 01/S - S01E01.mkv', 'Pack/' + release)
+        extra = L.link('S/Season 01/S01E01.mkv', 'X/S01E01.mkv')
+        out = plan_series_duplicates(str(L.lib / 'S'), {(1, 1): kept}, L.pairs, title,
+                                     years=series_years({'title': title, 'year': min(years)}))
+        assert [r.path for r in out] == [extra]
+
+    def test_series_years_from_record(self):
+        from utils.library_dedup import series_years
+        assert series_years({'title': '1923', 'year': 2022, 'firstAired': '2022-12-18T00:00:00Z',
+                             'alternateTitles': [{'title': 'Yellowstone 1923'}]}) == {1923, 2022}
+
+    def test_hash_named_file_reads_episode_from_target_folder(self, tmp_path):
+        from utils.library_dedup import plan_series_duplicates
+        L = _Lib(tmp_path)
+        kept = L.link('iCarly (2007)/iCarly (2007) - S05E07-E08 - iStill Psycho.mkv',
+                      'iCarly.S05E07.iStill.Psycho.Part.1/x1y2.mkv')
+        e7 = L.link('iCarly (2007)/Season 05/iCarly S05E07.mkv', 'B/iCarly S05E07.mkv')
+        L.link('iCarly (2007)/Season 05/iCarly S05E08.mkv', 'B/iCarly S05E08.mkv')
+        out = plan_series_duplicates(str(L.lib / 'iCarly (2007)'), {(5, 7): kept, (5, 8): kept},
+                                     L.pairs, 'iCarly')
+        assert [r.path for r in out] == [e7]
+
+    def test_sonarr_rename_never_vouches_for_kept_copy(self, tmp_path):
+        """The local name is Sonarr's own rename: its episode title can't
+        excuse a target named for another show."""
+        from utils.library_dedup import plan_series_duplicates
+        L = _Lib(tmp_path)
+        kept = L.link('DDBA (2025)/Season 01/Daredevil - Born Again - S01E05 - With Interest.mkv',
+                      'Daredevil.S01E05.World.on.Fire.1080p/a8f3c9e1.mkv')
+        L.link('DDBA (2025)/Season 01/x.mkv',
+               'Daredevil.Born.Again.S01/Daredevil.Born.Again.S01E05.With.Interest.mkv')
+        out = plan_series_duplicates(str(L.lib / 'DDBA (2025)'), {(1, 5): kept}, L.pairs,
+                                     'Daredevil: Born Again')
+        assert out == []
+
+    def test_collection_folder_year_range_does_not_vouch(self, tmp_path):
+        from utils.library_dedup import plan_movie_duplicates
+        L = _Lib(tmp_path)
+        kept = L.link('Moana (2026)/Moana (2026).mkv', 'Disney Collection 1937-2026/Moana (2016).mkv')
+        L.link('Moana (2026)/moana.web.mkv', 'X/x.mkv')
+        assert plan_movie_duplicates(str(L.lib / 'Moana (2026)'), kept, L.pairs, 'Moana',
+                                     years={2026}) == []
+
+    def test_release_folder_with_one_year_vouches_for_misnamed_file(self, tmp_path):
+        """prod: Enemy.of.the.State.1998…/enemy.of.the.state.1997.4k-kc.mkv"""
+        from utils.library_dedup import plan_movie_duplicates
+        L = _Lib(tmp_path)
+        kept = L.link('Enemy of the State (1998)/enemy.of.the.state.1997.4k-kc.mkv',
+                      'Enemy.of.the.State.1998.Bluray.2160p-KC/enemy.of.the.state.1997.4k-kc.mkv')
+        extra = L.link('Enemy of the State (1998)/enemy.mkv', 'X/x.mkv')
+        out = plan_movie_duplicates(str(L.lib / 'Enemy of the State (1998)'), kept, L.pairs,
+                                    'Enemy of the State', years={1998})
+        assert [r.path for r in out] == [extra]
