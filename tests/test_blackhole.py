@@ -6127,13 +6127,37 @@ class TestScannerHandoff:
         self._settle(bh)
         assert self.scans == ['library_scan']
 
-    def test_rejected_grabs_start_one_scan_per_window(self, monkeypatch):
+    def test_rejection_inside_the_window_gets_a_scan_when_it_ends(self, monkeypatch):
+        """The scan that just ran read the arrs before this rejection — so a
+        rejection inside the window gets one more scan once it ends, and
+        any further rejections ride on that one."""
         bh, stop = self._wanted_scan(monkeypatch)
+        monkeypatch.setattr(bh, '_WANTED_SCAN_MIN_GAP_S', 0.3)
         bh._request_wanted_scan(stop, retry=0.01)
         self._settle(bh)
-        assert bh._request_wanted_scan(stop, retry=0.01) is False
+        t0 = time.monotonic()
+        assert bh._request_wanted_scan(stop, retry=0.01) is True
+        assert bh._request_wanted_scan(stop, retry=0.01) is False   # rides on it
         self._settle(bh)
+        assert self.scans == ['library_scan'] * 2
+        assert time.monotonic() - t0 >= 0.25
+
+    def test_rejection_scan_waits_out_the_wanted_tb_gap(self, monkeypatch):
+        """A scan inside the Wanted pass's 10-min gap after a TorBox add skips
+        Wanted recovery — wait until it would run."""
+        bh, stop = self._wanted_scan(monkeypatch)
+        import utils.library as lib
+        gaps = [0.2, 0.0]
+        scanner = lib.get_scanner()
+        type(scanner).wanted_tb_gap_left = lambda _s: gaps.pop(0) if len(gaps) > 1 else gaps[0]
+        try:
+            t0 = time.monotonic()
+            bh._request_wanted_scan(stop, retry=0.01)
+            self._settle(bh)
+        finally:
+            del type(scanner).wanted_tb_gap_left
         assert self.scans == ['library_scan']
+        assert time.monotonic() - t0 >= 0.15
 
     def test_rejected_grab_waits_for_a_linking_scan_to_finish(self, monkeypatch):
         bh, stop = self._wanted_scan(monkeypatch)

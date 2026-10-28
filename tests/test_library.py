@@ -8992,6 +8992,13 @@ class TestRecoverWantedViaTorbox:
             self._scanner()._recover_wanted_via_debrid([show], [], {})
         assert wire['adds'] == []
 
+    def test_wanted_tb_gap_left(self, wire):
+        sc = self._scanner()
+        assert sc.wanted_tb_gap_left() == 0
+        sc._recover_wanted_via_debrid([], [{'title': 'The Substance', 'source': 'wanted',
+                                            'imdb_id': 'tt1', 'is_available': True}], {})
+        assert 590 < sc.wanted_tb_gap_left() <= LibraryScanner._WANTED_TB_MIN_GAP_S
+
     def test_tb_leg_waits_between_passes_that_added(self, wire):
         """A late TorBox arrival runs an extra scan; its Wanted pass must not
         stack TorBox adds right after the last pass that added some (TorBox

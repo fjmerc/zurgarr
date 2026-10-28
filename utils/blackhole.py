@@ -272,7 +272,7 @@ _LATE_ARRIVAL_POLL_S = 120
 
 # A grab turned down as uncached leaves its title wanted; the library scan's
 # Wanted pass adds a cached copy.  Start that scan right away instead of at
-# the next hourly run — at most once per this window (each scan reads the
+# the next hourly run — at most one per this window (each scan reads the
 # whole library and the arrs), retrying while another scan is running.
 _WANTED_SCAN_MIN_GAP_S = 600
 _WANTED_SCAN_RETRY_S = 30
@@ -284,24 +284,42 @@ _wanted_scan_pending = False
 
 def _request_wanted_scan(stop_event, *, retry=_WANTED_SCAN_RETRY_S):
     """Run the library scan soon so its Wanted pass looks for a cached copy
-    of a title whose grab was just turned down as uncached.  Starts it from a
-    background thread — waiting while another scan runs or links, up to
-    ``_WANTED_SCAN_TRIES`` tries — and at most once per
-    ``_WANTED_SCAN_MIN_GAP_S``.  True when a request was queued."""
+    of a title whose grab was just turned down as uncached.
+
+    A background thread starts one scan that begins after this call: it
+    waits out ``_WANTED_SCAN_MIN_GAP_S`` since the last one started here and
+    the Wanted pass's own gap after a TorBox add (a scan inside it skips
+    Wanted recovery), then retries while another scan runs or links, up to
+    ``_WANTED_SCAN_TRIES`` times.  Rejections while one is queued ride on
+    it.  True when a scan was queued.
+    """
     global _wanted_scan_pending
+    try:
+        from utils.task_scheduler import scheduler
+        if scheduler.get_task('library_scan') is None:
+            return False
+    except Exception:
+        return False
     with _wanted_scan_lock:
-        if (_wanted_scan_pending
-                or time.monotonic() - _wanted_scan_ts < _WANTED_SCAN_MIN_GAP_S):
+        if _wanted_scan_pending:
             return False
         _wanted_scan_pending = True
-
     stop = stop_event or threading.Event()
 
     def _run():
         global _wanted_scan_pending, _wanted_scan_ts
         try:
             from utils.library import get_scanner
-            from utils.task_scheduler import scheduler
+            while True:
+                scanner = get_scanner()
+                with _wanted_scan_lock:
+                    wait = _wanted_scan_ts + _WANTED_SCAN_MIN_GAP_S - time.monotonic()
+                gap = getattr(scanner, 'wanted_tb_gap_left', None)
+                wait = max(wait, gap() if gap else 0.0)
+                if wait <= 0:
+                    break
+                if stop.wait(wait):
+                    return
             for _ in range(_WANTED_SCAN_TRIES):
                 if scheduler.get_task('library_scan') is None:
                     return

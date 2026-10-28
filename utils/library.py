@@ -4597,6 +4597,13 @@ class LibraryScanner:
         with self._lock:
             return self._effects_running
 
+    def wanted_tb_gap_left(self):
+        """Seconds until Wanted recovery runs again in a scan — it sits out
+        scans within ``_WANTED_TB_MIN_GAP_S`` of a pass that added to
+        TorBox; 0 when the next scan would run it."""
+        return max(0.0, self._WANTED_TB_MIN_GAP_S
+                   - (time.monotonic() - self._wanted_tb_last_add))
+
     def peek_data(self):
         """Return the cached scan payload without ever triggering a scan.
 
