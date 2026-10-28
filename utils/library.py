@@ -6146,7 +6146,9 @@ class LibraryScanner:
                          "added to TorBox under 10 minutes ago")
             return
         if self._wanted_pass_paced():
-            logger.debug("[library] Wanted recovery already ran this scan interval")
+            logger.info(f"[library] Wanted recovery ran "
+                        f"{int((time.monotonic() - self._wanted_last_pass) // 60)} min ago — it "
+                        f"runs once per scan interval (or right after a grab is turned down)")
             return
         # Only a read that started after the request can have the title the
         # turned-down grab was for (a refresh already reading can't).
