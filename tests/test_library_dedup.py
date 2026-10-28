@@ -2207,3 +2207,76 @@ class TestArrFileMismatchBugHunterPass2:
         L.link('Dark Matter (2024)/Season 01/Dark.Matter.S01E01.mkv', 'X/Dark.Matter.S01E01.mkv')
         assert plan_series_duplicates(str(L.lib / 'Dark Matter (2024)'), {(1, 1): kept}, L.pairs,
                                       'Dark Matter (2024)') == []
+
+
+class TestArrFileMismatchBugHunterPass3:
+    """bug-hunter 2026-10-28, third pass."""
+
+    def _plan_tv(self, tmp_path, title, keep_release, extra_release, years=(), ep=(1, 1)):
+        from utils.library_dedup import plan_series_duplicates
+        L = _Lib(tmp_path)
+        kept = L.link('S/Season 01/S - S%02dE%02d - x.mkv' % ep, keep_release)
+        extra = L.link('S/Season 01/extra.S%02dE%02d.mkv' % ep, extra_release)
+        out = plan_series_duplicates(str(L.lib / 'S'), {ep: kept}, L.pairs, title, years=years)
+        return [r.path for r in out], extra
+
+    @pytest.mark.parametrize('title,years,keep', [
+        ('Battlestar Galactica', {1978},
+         'Battlestar.Galactica.1978-2009.Complete.Series/Battlestar.Galactica.2004.S01E01.1080p.mkv'),
+        ('Dark Matter', {2024}, 'Dark.Matter.2024.S01.1080p/Dark.Matter.2015.S01E01.1080p.mkv'),
+        ('Doctor Who', {1963}, 'Doctor.Who.1963-2022.Complete/Doctor.Who.2005.S01E01.Rose.mkv'),
+    ])
+    def test_file_year_beats_folder_year(self, tmp_path, title, years, keep):
+        out, _ = self._plan_tv(tmp_path, title, keep, 'X/S01E01.1080p.WEB.mkv', years=years)
+        assert out == []
+
+    @pytest.mark.parametrize('keep', [
+        'Dark.Matter.2015.Complete.1080p.BluRay/Season 1/Dark.Matter.S01E01.1080p.BluRay.mkv',
+        'Dark Matter (2015) Complete/S01/Dark.Matter.S01E01.mkv',
+    ])
+    def test_release_folder_above_season_folder_is_read(self, tmp_path, keep):
+        out, _ = self._plan_tv(tmp_path, 'Dark Matter', keep, 'X/S01E01.WEB.mkv', years={2024})
+        assert out == []
+
+    @pytest.mark.parametrize('keep', [
+        'Ghosts.AU.S01.1080p.WEB/Ghosts.S01E01.1080p.WEB.mkv',
+        'Ghosts.AU.Complete/Series 1/Ghosts.S01E01.mkv',
+    ])
+    def test_country_tag_on_release_folder_compared(self, tmp_path, keep):
+        out, _ = self._plan_tv(tmp_path, 'Ghosts (US)', keep, 'X/Ghosts.US.S01E01.mkv')
+        assert out == []
+
+    def test_untagged_release_folder_still_removed(self, tmp_path):
+        out, extra = self._plan_tv(tmp_path, 'Ghosts (US)', 'Ghosts.S01.1080p/Ghosts.S01E01.mkv',
+                                   'X/Ghosts.US.S01E01.mkv')
+        assert out == [extra]
+
+    def test_language_tags_are_not_episode_title_words(self, tmp_path):
+        out, _ = self._plan_tv(tmp_path, 'Daredevil: Born Again',
+                               'Daredevil.S01E05.German.DL.1080p/Daredevil.S01E05.German.DL.1080p.mkv',
+                               'X/Daredevil.Born.Again.S01E05.German.DL.1080p.mkv', ep=(1, 5))
+        assert out == []
+
+    def test_untagged_alias_of_a_tagged_sibling_series_dropped(self, tmp_path):
+        from unittest.mock import MagicMock
+        from utils.library_dedup import plan_arr_tv
+        L = _Lib(tmp_path)
+        L.link('Ghosts (US) (2021)/Season 01/Ghosts (US) - S01E05.mkv',
+               'Ghosts.AU.S01E05.WEB/Ghosts.AU.S01E05.WEB.mkv')
+        L.link('Ghosts (US) (2021)/Season 01/S01E05.mkv', 'X/S01E05.mkv')
+        c = MagicMock()
+        c.get_all_series.return_value = [
+            {'id': 1, 'title': 'Ghosts (US)', 'path': '/tv/Ghosts (US) (2021)', 'year': 2021,
+             'alternateTitles': [{'title': 'Ghosts'}]},
+            {'id': 2, 'title': 'Ghosts (AU)', 'path': '/tv/Ghosts (AU) (2019)', 'year': 2019}]
+        c.get_episodes.return_value = [{'seasonNumber': 1, 'episodeNumber': 5, 'episodeFileId': 9}]
+        c.get_episode_files.return_value = [
+            {'id': 9, 'path': '/tv/Ghosts (US) (2021)/Season 01/Ghosts (US) - S01E05.mkv'}]
+        removals, _ = plan_arr_tv(c, str(L.lib), L.pairs)
+        assert removals == []
+
+    def test_filler_words_dont_make_a_title_specific(self, tmp_path):
+        out, _ = self._plan_tv(tmp_path, 'Daredevil: Born Again',
+                               'Daredevil.S01E09.The.End.1080p/Daredevil.S01E09.The.End.1080p.mkv',
+                               'X/Daredevil.Born.Again.S01E09.The.End.1080p.mkv', ep=(1, 9))
+        assert out == []

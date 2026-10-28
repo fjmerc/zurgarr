@@ -225,6 +225,23 @@ def _target_names(path):
     return os.path.basename(target), os.path.basename(os.path.dirname(target))
 
 
+_SEASON_DIR_RE = re.compile(r'^(?:season|series|s)[\s._-]*\d{1,2}$|^specials$', re.IGNORECASE)
+
+
+def _release_folder(path):
+    """Name of the release folder *path*'s link target sits in — one level
+    up when its own folder is just "Season 1" / "S01" / "Specials" (a nested
+    pack: "Dark.Matter.2015.Complete/Season 1/…").  '' for a real file."""
+    try:
+        target = os.readlink(path) if os.path.islink(path) else ''
+    except OSError:
+        target = ''
+    parent = os.path.dirname(target)
+    if _SEASON_DIR_RE.match(os.path.basename(parent)):
+        parent = os.path.dirname(parent)
+    return os.path.basename(parent)
+
+
 def _copy_years(path):
     """Every 19xx/20xx year that says what a copy really is: from its link
     target's file name, else its folder (a collection folder's "1937-2026"
@@ -335,7 +352,9 @@ _EP_TITLE_STOP_RE = re.compile(
     r'^(?:\d{3,4}p|4k|uhd|hdr|dv|web|webrip|webdl|web-dl|bluray|bdrip|brrip|hdtv|remux|'
     r'x264|x265|h264|h265|hevc|avc|av1|repack\d?|proper|internal|multi|ita|eng|dual|'
     r'dsnp|amzn|atvp|nf|hmax|max|pcok|hulu|pmtp|ddp5|ddp|dd5|dd|aac|ac3|eac3|atmos|'
-    r'10bit|mkv|mp4|avi|m4v|ts)$', re.IGNORECASE)
+    r'10bit|mkv|mp4|avi|m4v|ts|'
+    r'german|french|truefrench|spanish|italian|dutch|vostfr|vost|dl|ml|dubbed|subbed|'
+    r'extended|uncut|unrated|remastered|complete)$', re.IGNORECASE)
 
 
 def _episode_title(path, local=True):
@@ -368,11 +387,12 @@ _GENERIC_TITLE_WORDS = {'episode', 'ep', 'part', 'chapter', 'folge', 'capitulo',
 
 def _same_episode_title(a, b):
     """True when extra copy *a* and kept copy *b* name the same episode
-    title with two or more specific words — "Pilot", "Episode 1" or "Part
-    Two" are too common to vouch for a copy.  *b*'s title is read from its
+    title with two or more specific words — "Pilot", "Episode 1", "Part
+    Two" or "The End" are too common to vouch for a copy.  *b*'s title is read from its
     link target only: its local name is the arr's rename."""
     ta, tb = (_episode_title(a) if a else ()), (_episode_title(b, local=False) if b else ())
-    specific = [w for w in ta if not w.isdigit() and w not in _GENERIC_TITLE_WORDS]
+    specific = [w for w in ta if not w.isdigit() and w not in _GENERIC_TITLE_WORDS
+                and w not in _SHOW_STOPWORDS]
     return bool(ta and ta == tb and len(specific) >= 2)
 
 
@@ -386,7 +406,7 @@ def show_conflict(path, keep, series_title, aliases=()):
     Daredevil … In the Blood" / "Daredevil … In the Blood") is not a
     conflict."""
     names = series_names(series_title, aliases)
-    a, b = _copy_show(path), _copy_show(keep, local=False)
+    a, b = _copy_show(path), _kept_show(keep)
     if not (names and a and _named_for(a, names) and b and not _named_for(b, names)):
         return False
     return not _same_episode_title(path, keep)
@@ -460,18 +480,38 @@ def series_names(title, aliases=()):
 
 def _named_years(keep):
     """Years a kept copy's link target names its show with: in its file
-    name before the SxxEyy, and in its folder name before the season marker
-    ("Dark.Matter.2015.S01…/Dark.Matter.S01E01…" is the 2015 show)."""
-    file, folder = _target_names(keep)
-    texts = []
+    name before the SxxEyy, else in its release folder's name before the
+    season marker ("Dark.Matter.2015.S01…/Dark.Matter.S01E01…" is the 2015
+    show).  The file's years win — a "1978-2009 Complete" folder must not
+    vouch for a file named 2004."""
+    file = _target_names(keep)[0]
     m = _EPISODE_RE.search(file)
     if m and m.start() > 0:
-        texts.append(_SITE_PREFIX_RE.sub('', file[:m.start()]))
-    folder = _SITE_PREFIX_RE.sub('', folder)
+        years = {int(y) for y in _NAME_YEAR_RE.findall(_SITE_PREFIX_RE.sub('', file[:m.start()]))}
+        if years:
+            return years
+    folder = _SITE_PREFIX_RE.sub('', _release_folder(keep))
     m = _PACK_SEASON_RE.search(folder) or _EPISODE_RE.search(folder)
     if m and m.start() > 0:
-        texts.append(folder[:m.start()])
-    return {int(y) for t in texts for y in _NAME_YEAR_RE.findall(t)}
+        return {int(y) for y in _NAME_YEAR_RE.findall(folder[:m.start()])}
+    return set()
+
+
+def _kept_show(keep):
+    """Show words of a kept copy, from its link target only (``_copy_show``),
+    taking the release folder's country tag when the file has the same show
+    name without one ("Ghosts.AU.S01…/Ghosts.S01E01…" is Ghosts AU)."""
+    show = _copy_show(keep, local=False)
+    if not show or _show_ident(show)[1]:
+        return show
+    folder = _SITE_PREFIX_RE.sub('', _release_folder(keep))
+    m = _PACK_SHOW_END_RE.search(folder)
+    if m and m.start() > 0:
+        tagged = _show_tokens(folder[:m.start()])
+        key, country = _show_ident(tagged)
+        if country and key == _show_ident(show)[0]:
+            return tagged
+    return show
 
 
 def _scene_numbered(eps, ep):
@@ -508,7 +548,7 @@ def episode_file_mismatch(keep, ep, names, extra=None, years=()):
     if years and named and not named & set(years):
         return "Sonarr's file for %s is from %s, the series from %s" % (
             _ep_label(ep), '/'.join(map(str, sorted(named))), '/'.join(map(str, sorted(years))))
-    show = _copy_show(keep, local=False)
+    show = _kept_show(keep)
     if show and names and not _named_for(show, names):
         if _same_episode_title(extra, keep):
             return None
@@ -1467,13 +1507,16 @@ def sonarr_tracked(client, series, local_dir):
 
 
 def series_aliases(series, taken=frozenset()):
-    """Sonarr's alternate titles for a series record, minus any that name
-    *taken* — other series' title idents (Daredevil: Born Again listed as
-    "Daredevil" must not pass the 2015 show's files as its own)."""
+    """Sonarr's alternate titles for a series record, minus any whose words
+    name one of *taken* — other series' title idents, country tags aside
+    (Daredevil: Born Again listed as "Daredevil" must not pass the 2015
+    show's files as its own, nor "Ghosts (US)" listed as "Ghosts" those of
+    "Ghosts (AU)")."""
+    taken_keys = {k for k, _c in taken}
     out = []
     for a in series.get('alternateTitles') or ():
         t = a.get('title') if isinstance(a, dict) else None
-        if t and _show_ident(_show_tokens(t)) not in taken:
+        if t and _show_ident(_show_tokens(t))[0] not in taken_keys:
             out.append(t)
     return tuple(out)
 
