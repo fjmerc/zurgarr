@@ -3360,6 +3360,8 @@ class BlackholeWatcher:
         """
         label = title or torrent_id
         api_key = self._api_key_for('torbox')
+        if not api_key:      # never let the status check fall back to another key
+            return False
         ready_by = time.monotonic() + self.mount_poll_timeout
         while True:
             try:
@@ -7018,7 +7020,11 @@ def _next_watcher(stopped):
     while not processes._shutting_down:
         w = _watcher
         if w is not None and w is not stopped and not w._stop_event.is_set():
-            return w if getattr(w, 'symlink_enabled', False) else None
+            # Same bar as watch_torbox_add: never let a watcher without a
+            # TorBox key run it (its status check would send another key).
+            if getattr(w, 'symlink_enabled', False) and w._api_key_for('torbox'):
+                return w
+            return None
         if time.monotonic() >= deadline:
             return None
         time.sleep(_RELOAD_HANDOVER_POLL_S)
@@ -7048,8 +7054,8 @@ def watch_torbox_add(torrent_id, title=''):
         current = w
         try:
             while True:
-                current._watch_added_torrent(tid, title)
-                if not current._stop_event.is_set():
+                if current._watch_added_torrent(tid, title) \
+                        or not current._stop_event.is_set():
                     return
                 # Stopped: a settings save restarts the blackhole — carry on
                 # with the new watcher (a container shutdown has none).

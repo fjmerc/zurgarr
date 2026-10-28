@@ -4517,7 +4517,7 @@ class LibraryScanner:
             'arr_degraded': sorted(arr_degraded),
         }
 
-    def _scan_effects(self, data, force_enforce=False):
+    def _scan_effects(self, data, force_enforce=False, read_started=None):
         """Run side effects: preference enforcement, searches, symlinks.
 
         These operations involve external API calls (Sonarr, Radarr, TMDB,
@@ -4535,7 +4535,8 @@ class LibraryScanner:
         changed = self._enforce_preferences(shows, movies, preferences, path_index,
                                               local_path_index, force=force_enforce)
         self._search_for_missing_episodes(shows, movies, preferences)
-        self._recover_wanted_via_debrid(shows, movies, preferences)
+        self._recover_wanted_via_debrid(shows, movies, preferences,
+                                        read_started=read_started)
         self._recover_local_fallback_routing(shows, movies)
         self._clear_resolved_pending(shows, movies)
         self._escalate_stuck_pending()
@@ -4561,7 +4562,7 @@ class LibraryScanner:
                 return data
             self._effects_running = True
         try:
-            changed = self._scan_effects(data, force_enforce)
+            changed = self._scan_effects(data, force_enforce, read_started=read_started)
             self._last_scan_changed = bool(changed)
             if changed:
                 with self._lock:
@@ -4614,15 +4615,16 @@ class LibraryScanner:
             return self._effects_running
 
     def request_wanted_pass(self):
-        """Let the next scan run Wanted recovery even if it ran less than a
-        scan interval ago (a grab was just turned down as uncached)."""
-        self._wanted_pass_requested = True
+        """Let scans run Wanted recovery even if it ran less than a scan
+        interval ago (a grab was just turned down as uncached), until one
+        whose read started after this request has run it."""
+        self._wanted_pass_requested_at = time.monotonic()
 
     def _wanted_pass_paced(self):
         """True when Wanted recovery ran within the last ~scan interval and
         no pass was requested — see ``_wanted_last_pass``.  Never paced when
         the library scan isn't scheduled."""
-        if self._wanted_pass_requested:
+        if self._wanted_pass_requested_at is not None:
             return False
         try:
             from utils.task_scheduler import scheduler
@@ -4684,6 +4686,7 @@ class LibraryScanner:
             try:
                 # Read phase — update cache immediately so UI gets data fast
                 had_mount_before = self._mount_path is not None
+                read_started = time.monotonic()
                 data = self._scan_read()
                 has_mount_now = self._mount_path is not None
                 # Capture index snapshot before another scan can rebind.
@@ -4720,7 +4723,7 @@ class LibraryScanner:
                         run_effects = True
             if run_effects:
                 try:
-                    changed = self._scan_effects(data)
+                    changed = self._scan_effects(data, read_started=read_started)
                     if changed:
                         # Enforcement modified files — invalidate cache so next
                         # UI poll triggers a fresh read with correct source info
@@ -5332,7 +5335,7 @@ class LibraryScanner:
     # arm its create cooldown.  ``request_wanted_pass`` (a grab turned down
     # as uncached) lets the next scan run it anyway.
     _wanted_last_pass = float('-inf')       # monotonic; per instance once set
-    _wanted_pass_requested = False
+    _wanted_pass_requested_at = None        # monotonic ts of an open request
     # RD leg of the Wanted recovery pass.  The ready timeout is short on
     # purpose: cached content reaches ``downloaded`` within seconds of
     # selectFiles; anything still converting/downloading after 20s is an
@@ -6030,7 +6033,7 @@ class LibraryScanner:
                   lambda c: {k[0] for k in c.queued_episodes()}),
         )
 
-    def _recover_wanted_via_debrid(self, shows, movies, preferences):
+    def _recover_wanted_via_debrid(self, shows, movies, preferences, read_started=None):
         """Proactively grab debrid-cached copies of "Wanted" media.
 
         The arr searches its own indexer pool (Prowlarr/Torznab); zurgarr
@@ -6145,7 +6148,11 @@ class LibraryScanner:
         if self._wanted_pass_paced():
             logger.debug("[library] Wanted recovery already ran this scan interval")
             return
-        self._wanted_pass_requested = False
+        # Only a read that started after the request can have the title the
+        # turned-down grab was for (a refresh already reading can't).
+        requested = self._wanted_pass_requested_at
+        if requested is not None and (read_started is None or read_started >= requested):
+            self._wanted_pass_requested_at = None
         self._wanted_last_pass = time.monotonic()
 
         now = time.monotonic()

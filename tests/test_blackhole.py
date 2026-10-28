@@ -6119,6 +6119,55 @@ class TestScannerHandoff:
         monkeypatch.setattr(bh, '_watcher', new)   # ...and starts a new one
         assert on_new.wait(2)
 
+    def test_watch_is_not_handed_to_a_watcher_without_a_torbox_key(
+            self, tmp_dir, monkeypatch):
+        """A settings save that drops TorBox must not get the watch running
+        with the Real-Debrid key sent to TorBox."""
+        import utils.blackhole as bh
+        old = self._make_symlink_watcher(tmp_dir, 'torbox')
+        rd_only = self._make_symlink_watcher(tmp_dir, 'realdebrid')
+        rd_only.debrid_api_keys = {'realdebrid': 'RDKEY'}
+        monkeypatch.setattr(bh, '_watcher', rd_only)
+        old._stop_event.set()
+        monkeypatch.setattr(bh, '_RELOAD_HANDOVER_WAIT_S', 0.05)
+        monkeypatch.setattr(bh, '_RELOAD_HANDOVER_POLL_S', 0.01)
+        assert bh._next_watcher(old) is None
+
+    def test_watch_without_a_torbox_key_never_calls_torbox(self, tmp_dir, monkeypatch):
+        watcher = self._make_symlink_watcher(tmp_dir, 'realdebrid')
+        watcher.debrid_api_keys = {'realdebrid': 'RDKEY'}
+        calls = []
+        monkeypatch.setattr(watcher, '_check_torbox_status',
+                            lambda tid, api_key=None: calls.append(api_key) or ('completed', {}))
+        assert watcher._watch_added_torrent('1') is False
+        assert calls == []
+
+    def test_a_finished_watch_is_not_rerun_after_a_reload(self, tmp_dir, monkeypatch):
+        import utils.blackhole as bh
+        old = self._make_symlink_watcher(tmp_dir, 'torbox')
+        new = self._make_symlink_watcher(tmp_dir, 'torbox')
+        reran = []
+        swapped = threading.Event()
+        monkeypatch.setattr(bh, '_RELOAD_HANDOVER_POLL_S', 0.01)
+
+        def linked_then_stopped(tid, title=''):
+            swapped.wait(2)
+            old._stop_event.set()          # the reload lands just as it links
+            return True
+        monkeypatch.setattr(old, '_watch_added_torrent', linked_then_stopped)
+        monkeypatch.setattr(new, '_watch_added_torrent',
+                            lambda tid, title='': reran.append(tid) or True)
+        monkeypatch.setattr(bh, '_watcher', old)
+        bh.watch_torbox_add('11')
+        monkeypatch.setattr(bh, '_watcher', new)
+        swapped.set()
+        for _ in range(200):
+            if '11' not in bh._added_watches:
+                break
+            time.sleep(0.01)
+        assert '11' not in bh._added_watches
+        assert reran == []
+
     def test_watch_torbox_add_without_blackhole_is_a_noop(self, monkeypatch):
         import utils.blackhole as bh
         monkeypatch.setattr(bh, '_watcher', None)

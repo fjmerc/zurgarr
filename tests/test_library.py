@@ -9023,7 +9023,8 @@ class TestRecoverWantedViaTorbox:
         assert len(wire['adds']) == 2
 
     def test_requested_wanted_pass_runs_inside_the_interval(self, wire, hourly):
-        """A grab turned down as uncached asks for a pass now."""
+        """A grab turned down as uncached asks for a pass now; the pass uses
+        the request up, so the next scan inside the interval is paced again."""
         sc = self._scanner()
         first, second = self._two_titles(wire)
         sc._recover_wanted_via_debrid([], first, {})
@@ -9033,8 +9034,26 @@ class TestRecoverWantedViaTorbox:
         sc._recover_wanted_via_debrid([], second, {})
         assert len(wire['adds']) == 2
         sc._wanted_tb_last_add -= LibraryScanner._WANTED_TB_MIN_GAP_S + 1
-        sc._recover_wanted_via_debrid([], self._two_titles(wire)[0], {})
+        wire['torrentio'] = [{'info_hash': 'e' * 40, 'title': 'Conclave.2024.1080p.WEB-DL.RelE',
+                              'seeds': 10, 'quality': {'label': '1080p', 'score': 100}}]
+        third = [{'title': 'Conclave', 'source': 'wanted', 'imdb_id': 'tt3',
+                  'is_available': True}]
+        sc._recover_wanted_via_debrid([], third, {})
         assert len(wire['adds']) == 2                 # the request was used up
+
+    def test_a_pass_on_an_older_read_leaves_the_request(self, wire, hourly):
+        """A dashboard refresh whose read began before the grab was turned
+        down can't have the new title — it mustn't use up the request the
+        triggered scan needs."""
+        sc = self._scanner()
+        read_before = time.monotonic()
+        sc.request_wanted_pass()
+        sc._recover_wanted_via_debrid([], self._two_titles(wire)[0], {},
+                                      read_started=read_before)
+        assert sc._wanted_pass_requested_at is not None
+        sc._wanted_tb_last_add -= LibraryScanner._WANTED_TB_MIN_GAP_S + 1
+        sc._recover_wanted_via_debrid([], [], {}, read_started=time.monotonic())
+        assert sc._wanted_pass_requested_at is None
 
     def test_wanted_tb_gap_left(self, wire):
         sc = self._scanner()
