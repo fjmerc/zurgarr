@@ -641,7 +641,7 @@ With Sonarr/Radarr configured they are the authority: nothing is linked for a ti
 
 ### Requirements
 
-All of these must be set:
+These must be set (`BLACKHOLE_RCLONE_MOUNT` defaults to `/data`; at least one of the two library paths — each kind is only linked when its path is set):
 
 | Variable | Purpose | Example |
 |----------|---------|---------|
@@ -665,7 +665,7 @@ volumes:
 
 ### What about shows/movies not in Sonarr/Radarr?
 
-Content that isn't tracked by Sonarr/Radarr will still get symlinks created (using the parsed torrent title). These will appear as "unmapped folders" in the arr's Library Import section, where you can review and import them.
+With Sonarr/Radarr configured, nothing is linked for a title they don't have — add the title to Sonarr/Radarr first. Without Sonarr/Radarr configured, folders are named `Show Name (Year)` / `Movie Name (Year)` and appear as "unmapped folders" in the arr's Library Import section, where you can review and import them.
 
 ## FAQ
 
@@ -675,7 +675,7 @@ Virtually none. Symlinks are a few bytes each. The actual media files live on th
 
 ### What happens when a debrid torrent expires or is deleted?
 
-The symlinks become broken (dangling). The cleanup task runs every 5 minutes and removes broken symlinks automatically. Sonarr/Radarr will see the episode as "missing" and can re-grab it.
+The symlinks become broken (dangling) and are removed automatically: in the blackhole's completed folder every 5 minutes, and in the local library by the hourly library scan and the symlink verify task (every 6 hours by default, `SYMLINK_VERIFY_INTERVAL`). Sonarr/Radarr will see the episode as "missing" and can re-grab it.
 
 ### Can I use this alongside qBittorrent/NZBGet?
 

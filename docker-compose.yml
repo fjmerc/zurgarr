@@ -23,9 +23,13 @@ services:
       # - /zurgarr/completed:/completed
     environment:
       ## ---------------------------------------------------------------
-      ## All values are read from your .env file (see .env.example)
-      ## You can safely pull updates without losing your configuration.
-      ## To get started: cp .env.example .env && edit .env
+      ## Zurgarr reads its settings from /config/.env itself (the Settings
+      ## page edits that file — start from .env.example). The ${VAR:-}
+      ## lines below forward values from a .env next to THIS file; a blank
+      ## one doesn't override /config/.env, a set one does (and shows as
+      ## read-only in Settings). STATUS_UI_ENABLED and STATUS_UI_PORT have
+      ## defaults here, so change those in this file's .env, not config/.env
+      ## (the published port below follows STATUS_UI_PORT from here).
       ## ---------------------------------------------------------------
       ## Timezone
       - TZ=${TZ:-}

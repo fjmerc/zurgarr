@@ -7558,13 +7558,13 @@ class LibraryScanner:
     def _create_debrid_symlinks(self, shows, movies, path_index):
         """Create local library symlinks for debrid-only content.
 
-        When content exists on the debrid mount but has no local presence,
-        create an organized symlink structure so Sonarr/Radarr can discover it:
-          TV:     {local_tv}/Show Name (Year)/Season XX/filename.mkv
-          Movies: {local_movies}/Movie Name (Year)/filename.mkv
+        When Sonarr/Radarr have no file for an episode/movie that is on a
+        debrid mount, link it into their own folder so they pick it up:
+          TV:     {local_tv}/<Sonarr's folder>/Season XX/filename.mkv
+          Movies: {local_movies}/<Radarr's folder>/filename.mkv
 
-        Directory names use the parsed torrent title — Sonarr/Radarr's import
-        function will remap to canonical naming on import.
+        Without Sonarr/Radarr the folders are named from the parsed title
+        ("Show Name (Year)").
 
         Runs when BLACKHOLE_SYMLINK_ENABLED=true and the required paths are set.
         Idempotent — skips items that already have a local file or symlink.

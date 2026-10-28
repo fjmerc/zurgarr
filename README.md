@@ -45,11 +45,12 @@ observe. Capabilities grouped by intent:
 - Source-aware **Library browser** combining debrid + local content with
   TMDB metadata, per-item source preferences (Prefer Local /
   Prefer Cloud), and episode-level switch controls
-- **Auto debrid symlinks** — debrid content Sonarr/Radarr are missing is
-  linked into their own folders so they can discover and manage it
-  alongside local files. Sonarr/Radarr stay in charge: nothing is linked
-  for a title they don't have, for an episode/movie they already hold, or
-  while a download of it is on its way into them
+- **Auto debrid symlinks** (with `BLACKHOLE_SYMLINK_ENABLED` and a local
+  library path) — debrid content Sonarr/Radarr are missing is linked into
+  their own folders so they can discover and manage it alongside local
+  files. Sonarr/Radarr stay in charge: nothing is linked for a title they
+  don't have, for an episode/movie they already hold, or while a download
+  of it is on its way into them
 - **Dual-debrid** — run TorBox alongside Real-Debrid; each blackhole grab
   is routed to whichever side has it cached, and TorBox content gets its
   own mount and Plex library
@@ -100,12 +101,14 @@ observe. Capabilities grouped by intent:
   content that reaches the arr via a disk rescan still triggers a Plex
   library scan, and versions Plex marked "unavailable" while a debrid
   mount was briefly down (a container restart) are rescanned once their
-  files are back
+  files are back (not while Plex empties its trash after every scan)
 - **Duplicate-link tidy** (opt-in, `LIBRARY_DUPLICATE_TIDY`) — removes
   extra debrid links that duplicate the copy Sonarr/Radarr track (the
-  same episode showing two or three times in Plex). Links only, never
-  real files, every removal recorded for undo; a one-time clean-up of
-  older duplicates is in `scripts/dedup_library.py`
+  same episode showing two or three times in Plex) and the leftover Plex
+  version. Never the media itself — only the links, their subtitle files
+  (moved aside) and folders left empty; every removal recorded for undo.
+  Duplicates in folders Sonarr/Radarr don't own need the one-time
+  `scripts/dedup_library.py` clean-up
 - **ffprobe recovery** kills stuck Plex scans on expired debrid links
 - **Process auto-restart** with exponential backoff (5 s → 300 s, resets
   after 1 h stable)
@@ -145,7 +148,7 @@ Two workflows. Use either or both.
 Watchlist (Plex / Trakt / Overseerr)
   → plex_debrid (search & match)
     → Real-Debrid (cloud cache)
-      → Zurg (WebDAV) → rclone (/data/zurgarr mount)
+      → Zurg (WebDAV) → rclone (mount, /data/zurgarr by default)
         → Plex / Jellyfin (stream)
 ```
 
@@ -165,10 +168,11 @@ Overseerr (requests) → Sonarr / Radarr (tag-based routing)
                → Sonarr / Radarr (import) → Plex (stream)
 ```
 
-Two more routes feed the same library: the **library scan** links debrid
-content Sonarr/Radarr are missing straight into their folders (then asks
-them to rescan and Plex to refresh), and **Wanted recovery** adds a cached
-copy of something they never grabbed directly to the debrid account.
+Two more routes feed the same library: the **library scan** (with
+blackhole symlinks enabled) links debrid content Sonarr/Radarr are missing
+straight into their folders (then asks them to rescan and Plex to
+refresh), and **Wanted recovery** adds a cached copy of something they
+never grabbed directly to the debrid account.
 
 ## Quick Start
 
@@ -232,7 +236,8 @@ docker compose up -d
 - Status dashboard at `http://your-host:8080/status`
 - Zurg and rclone should show as **Running**
 - Mount check: `ls /zurgarr/mnt/zurgarr/` should show your debrid library
-  categories (and `ls /zurgarr/mnt/torbox/` your TorBox library)
+  categories (and `ls /zurgarr/mnt/torbox/` your TorBox library — the
+  default `RCLONE_MOUNT_NAME` / `TORBOX_MOUNT_NAME`)
 
 ### Updating
 
@@ -291,6 +296,8 @@ BLACKHOLE_LOCAL_LIBRARY_MOVIES=/data/media/movies
 PLEX_REFRESH=true
 PLEX_ADDRESS=http://192.168.1.100:32400
 PLEX_TOKEN=your_plex_token
+# PLEX_MOUNT_DIR is only for Zurg's own refresh hook (see Option A); without
+# it the log notes that hook is skipped — the library scan's refresh still runs
 ```
 
 The symlinks point at `BLACKHOLE_SYMLINK_TARGET_BASE` (TorBox content at
@@ -341,6 +348,9 @@ Background and more symptom-based fixes in
 
 > [!NOTE]
 > These examples are starting points. Adjust paths to match your environment.
+> They use paths relative to the compose file (`./config`, `./mnt`); the
+> Quick Start's compose file uses `/zurgarr/config`, `/zurgarr/mnt` — pick
+> one style and use it in every container (`./mnt` here = `/zurgarr/mnt`).
 
 ### Base setup
 
@@ -436,7 +446,8 @@ Set `STATUS_UI_AUTH` (e.g., `admin:changeme`) to put the whole UI behind
 basic auth. Without it, the Settings editor and state-changing actions
 stay locked, but the other pages are open to anyone who can reach the
 port. `/metrics` is always served without auth, for Prometheus scrapers.
-Behind a reverse proxy, list its address in `STATUS_UI_TRUSTED_ORIGINS`
+Behind a reverse proxy that rewrites the Host header (and doesn't send
+`X-Forwarded-Host`), list its address in `STATUS_UI_TRUSTED_ORIGINS`
 (e.g. `https://zurgarr.example.com`), or saves and dashboard buttons fail
 with "cross-origin request rejected".
 

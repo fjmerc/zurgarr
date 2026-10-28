@@ -133,7 +133,7 @@ __NAV_HTML__
         <div class="wf-arrow">&rarr;</div>
         <div class="wf-node blue">Zurg<small>WebDAV</small></div>
         <div class="wf-arrow">&rarr;</div>
-        <div class="wf-node blue">rclone<small>/data/zurgarr mount</small></div>
+        <div class="wf-node blue">rclone<small>/data mount</small></div>
         <div class="wf-arrow">&rarr;</div>
         <div class="wf-node green">Plex / Jellyfin<small>Stream</small></div>
       </div>
@@ -207,7 +207,7 @@ __NAV_HTML__
       <div class="wf-glossary-title">Glossary</div>
       <dl>
         <dt style="color:var(--green)">Plex / Jellyfin</dt>
-        <dd>Media server that streams your library to any device. It doesn&rsquo;t notice new files on the debrid mounts by itself: with <code style="color:var(--green);font-size:.95em">PLEX_REFRESH</code> on, zurgarr asks Plex to scan when debrid content lands, and rescans folders Plex marked &ldquo;unavailable&rdquo; during a brief mount outage once their files are back (Plex only).</dd>
+        <dd>Media server that streams your library to any device. It doesn&rsquo;t notice new files on the debrid mounts by itself: with <code style="color:var(--green);font-size:.95em">PLEX_REFRESH</code> on, zurgarr asks Plex to scan when debrid content lands, and rescans folders Plex marked &ldquo;unavailable&rdquo; during a brief mount outage once their files are back (Plex only; not while Plex empties its trash after every scan).</dd>
         <dt style="color:var(--text)">Overseerr</dt>
         <dd>Request management UI. Users browse and request movies/shows, which get routed to Sonarr/Radarr for automated downloading.</dd>
         <dt style="color:var(--text)">Sonarr / Radarr</dt>
@@ -219,15 +219,15 @@ __NAV_HTML__
         <dt style="color:var(--blue)">Zurg</dt>
         <dd>Serves your Real-Debrid library as a WebDAV file server, so it looks like local files. TorBox doesn&rsquo;t go through Zurg.</dd>
         <dt style="color:var(--blue)">rclone</dt>
-        <dd>Mounts Zurg&rsquo;s WebDAV at <code style="color:var(--green);font-size:.95em">/data/zurgarr</code> (the <code style="color:var(--green);font-size:.95em">RCLONE_MOUNT_NAME</code>) and TorBox&rsquo;s own WebDAV at <code style="color:var(--green);font-size:.95em">/data/torbox</code>, so your media server and Sonarr/Radarr can read the files.</dd>
+        <dd>Mounts Zurg&rsquo;s WebDAV under <code style="color:var(--green);font-size:.95em">/data</code> (<code style="color:var(--green);font-size:.95em">/data/zurgarr</code> by default, <code style="color:var(--green);font-size:.95em">RCLONE_MOUNT_NAME</code>) and TorBox&rsquo;s own WebDAV (<code style="color:var(--green);font-size:.95em">/data/torbox</code> by default), so your media server and Sonarr/Radarr can read the files.</dd>
         <dt style="color:var(--orange)">Blackhole</dt>
         <dd>Watches a folder for .torrent/.magnet files dropped by Sonarr/Radarr. Sends each to the debrid that has it cached, skips torrents already in your account, waits for the content on the mount, then creates symlinks in a completed directory for Sonarr/Radarr to import. Optional dedup checks your local library first.</dd>
         <dt style="color:var(--orange)">Library scan</dt>
-        <dd>Links debrid content Sonarr/Radarr are missing into their own folders, then asks them to rescan. Sonarr/Radarr stay in charge: nothing is linked for a title they don&rsquo;t have, for an episode/movie they already hold, or while a download of it is on its way into them.</dd>
+        <dd>With blackhole symlinks and a local library path set, links debrid content Sonarr/Radarr are missing into their own folders, then asks them to rescan. Sonarr/Radarr stay in charge: nothing is linked for a title they don&rsquo;t have, for an episode/movie they already hold, or while a download of it is on its way into them.</dd>
         <dt style="color:var(--orange)">Wanted recovery</dt>
         <dd>For titles Sonarr/Radarr never grabbed, searches for a cached release and adds it straight to TorBox or Real-Debrid; the library scan then links it.</dd>
         <dt style="color:var(--orange)">Duplicate tidy</dt>
-        <dd>Optional (<code style="color:var(--green);font-size:.95em">LIBRARY_DUPLICATE_TIDY</code>): removes extra debrid links that duplicate the copy Sonarr/Radarr track, so Plex shows each episode once. Links only, every removal recorded for undo; it stops if a kept copy ever disappears.</dd>
+        <dd>Optional (<code style="color:var(--green);font-size:.95em">LIBRARY_DUPLICATE_TIDY</code>): removes extra debrid links that duplicate the copy Sonarr/Radarr track, so Plex shows each episode once. Never the media itself &mdash; only the links (their subtitle files moved aside) and Plex&rsquo;s leftover version; every removal recorded for undo, and it stops if a kept copy ever disappears.</dd>
         <dt>qBittorrent / Usenet</dt>
         <dd>Traditional download clients for the local path. qBittorrent handles torrents, SABnzbd/NZBGet handle Usenet NZBs. Both store files to local disk.</dd>
         <dt style="color:#bc8cff">VPN</dt>
