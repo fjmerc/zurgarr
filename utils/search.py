@@ -1346,6 +1346,16 @@ def add_to_debrid(info_hash, title='', media_title=None, episode=None,
         with _existing_hashes_lock:
             _inflight_adds.discard(inflight_key)
 
+    # TorBox lists a new torrent minutes after the add and the mount only
+    # re-reads every couple of hours: watch it so the library scan links it
+    # (and Plex gets it) as soon as it shows.  Best-effort.
+    if service == 'torbox' and result.get('success') and result.get('torrent_id'):
+        try:
+            from utils.blackhole import watch_torbox_add
+            watch_torbox_add(result['torrent_id'], title or media_title or '')
+        except Exception as e:
+            logger.debug(f"[search] mount watch for {title or lowered[:16]} not started: {e}")
+
     # Scrub well-known credential patterns from the provider error string
     # IN PLACE, so every downstream consumer gets the sanitized version:
     # history.jsonl, the notification body, AND the HTTP response returned

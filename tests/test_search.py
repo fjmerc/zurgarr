@@ -481,6 +481,44 @@ class TestAddToDebrid:
         assert result['service'] == 'realdebrid'
         assert mock_post.call_count == 2
 
+    @pytest.fixture
+    def watched(self, monkeypatch):
+        import utils.blackhole as bh
+        calls = []
+        monkeypatch.setattr(bh, 'watch_torbox_add',
+                            lambda tid, title='': calls.append((tid, title)) or True)
+        return calls
+
+    def test_torbox_add_is_watched_until_it_reaches_the_mount(self, monkeypatch, watched):
+        monkeypatch.setattr('utils.search._add_to_tb', lambda magnet, key: {
+            'success': True, 'torrent_id': '130129458', 'error': ''})
+        r = add_to_debrid('a' * 40, title='Red October', service='torbox', api_key='k')
+        assert r['success'] is True
+        assert watched == [('130129458', 'Red October')]
+
+    def test_failed_or_duplicate_torbox_add_is_not_watched(self, monkeypatch, watched):
+        monkeypatch.setattr('utils.search._add_to_tb', lambda magnet, key: {
+            'success': False, 'torrent_id': '', 'error': 'boom'})
+        add_to_debrid('a' * 40, service='torbox', api_key='k')
+        monkeypatch.setattr('utils.search._existing_hashes', lambda *a, **kw: {'b' * 40})
+        assert add_to_debrid('b' * 40, service='torbox', api_key='k')['duplicate'] is True
+        assert watched == []
+
+    def test_realdebrid_add_is_not_watched(self, monkeypatch, watched):
+        monkeypatch.setattr('utils.search._add_to_rd', lambda magnet, key: {
+            'success': True, 'torrent_id': 'R1', 'error': ''})
+        add_to_debrid('a' * 40, service='realdebrid', api_key='k')
+        assert watched == []
+
+    def test_watch_failure_never_fails_the_add(self, monkeypatch):
+        import utils.blackhole as bh
+        def boom(*a, **k):
+            raise RuntimeError('x')
+        monkeypatch.setattr(bh, 'watch_torbox_add', boom)
+        monkeypatch.setattr('utils.search._add_to_tb', lambda magnet, key: {
+            'success': True, 'torrent_id': '1', 'error': ''})
+        assert add_to_debrid('a' * 40, service='torbox', api_key='k')['success'] is True
+
     @patch('utils.search._get_debrid_service')
     def test_no_service_configured(self, mock_service):
         """Should fail gracefully when no debrid service configured."""

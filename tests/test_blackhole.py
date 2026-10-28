@@ -5992,6 +5992,100 @@ class TestScannerHandoff:
                             find=find)
         assert self.scans == ['library_scan']
 
+    # ── zurgarr's own TorBox adds (Wanted recovery, manual search) ────
+
+    def _added_watcher(self, tmp_dir, monkeypatch, status='completed', find=None):
+        import utils.blackhole as bh
+        monkeypatch.setattr(bh, '_coalesced_root_refresh', lambda **k: True)
+        monkeypatch.setattr(bh, '_MOUNT_REFRESH_EVERY_S', 0.01)
+        watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
+        statuses = [status] if isinstance(status, str) else list(status)
+        monkeypatch.setattr(
+            watcher, '_check_torbox_status',
+            lambda tid, api_key=None: (statuses.pop(0) if len(statuses) > 1 else statuses[0],
+                                       {'data': {'id': tid}}))
+        monkeypatch.setattr(watcher, '_extract_release_name',
+                            lambda info, debrid=None: 'The.Hunt.for.Red.October.1990.1080p')
+        monkeypatch.setattr(watcher, '_extract_filenames_from_info', lambda *a, **k: [])
+        self.finds = 0
+
+        def default_find(*a, **k):
+            self.finds += 1
+            return ('/data/torbox/x', '', 'x') if self.finds >= 3 else (None, None, None)
+        monkeypatch.setattr(watcher, '_find_on_mount', find or default_find)
+        return watcher
+
+    def test_own_add_is_linked_once_it_reaches_the_mount(self, tmp_dir, monkeypatch):
+        """TorBox lists a Wanted-recovery add minutes later; the mount re-reads
+        only every 2h — keep re-listing and scan the moment it shows."""
+        watcher = self._added_watcher(tmp_dir, monkeypatch)
+        assert watcher._watch_added_torrent('130129458') is True
+        assert self.scans == ['library_scan']
+
+    def test_own_add_waits_for_ready_first(self, tmp_dir, monkeypatch):
+        watcher = self._added_watcher(tmp_dir, monkeypatch,
+                                      status=['queued', 'downloading', 'completed'])
+        assert watcher._watch_added_torrent('1') is True
+        assert self.scans == ['library_scan']
+
+    def test_own_add_never_ready_gives_up(self, tmp_dir, monkeypatch):
+        watcher = self._added_watcher(tmp_dir, monkeypatch, status='downloading')
+        assert watcher._watch_added_torrent('1') is False
+        assert self.scans == [] and self.finds == 0
+
+    def test_own_add_terminal_error_gives_up(self, tmp_dir, monkeypatch):
+        watcher = self._added_watcher(tmp_dir, monkeypatch, status='error')
+        assert watcher._watch_added_torrent('1') is False
+        assert self.scans == []
+
+    def test_own_add_late_arrival_still_scans(self, tmp_dir, monkeypatch):
+        """Past the mount wait, the late watch keeps going."""
+        def find(*a, **k):
+            self.finds += 1
+            return ('/data/torbox/x', '', 'x') if self.finds >= 40 else (None, None, None)
+        watcher = self._added_watcher(tmp_dir, monkeypatch, find=find)
+        watcher.mount_poll_timeout = 0.05
+        watcher.late_arrival_window = 5
+        watcher.late_arrival_poll = 0.005
+        assert watcher._watch_added_torrent('1') is True
+        assert self.scans == ['library_scan']
+
+    def test_own_add_watch_ends_on_shutdown(self, tmp_dir, monkeypatch):
+        watcher = self._added_watcher(tmp_dir, monkeypatch,
+                                      find=lambda *a, **k: (None, None, None))
+        watcher.late_arrival_window = 60
+        threading.Timer(0.2, watcher._stop_event.set).start()
+        t0 = time.monotonic()
+        assert watcher._watch_added_torrent('1') is False
+        assert time.monotonic() - t0 < 5
+
+    def test_watch_torbox_add_starts_one_watch_per_torrent(self, tmp_dir, monkeypatch):
+        import utils.blackhole as bh
+        watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
+        started = []
+        gate = threading.Event()
+        monkeypatch.setattr(watcher, '_watch_added_torrent',
+                            lambda tid, title='': (started.append(tid), gate.wait(2)))
+        monkeypatch.setattr(bh, '_watcher', watcher)
+        assert bh.watch_torbox_add('7', 'X') is True
+        assert bh.watch_torbox_add('7', 'X') is False      # already watched
+        gate.set()
+        for _ in range(100):
+            if started:
+                break
+            time.sleep(0.01)
+        assert started == ['7']
+
+    def test_watch_torbox_add_without_blackhole_is_a_noop(self, monkeypatch):
+        import utils.blackhole as bh
+        monkeypatch.setattr(bh, '_watcher', None)
+        assert bh.watch_torbox_add('7', 'X') is False
+
+    def test_watch_torbox_add_needs_symlink_mode(self, monkeypatch):
+        import utils.blackhole as bh
+        monkeypatch.setattr(bh, '_watcher', BlackholeWatcher('/tmp', 'key', 'torbox'))
+        assert bh.watch_torbox_add('7', 'X') is False
+
     def test_already_linked_folder_needs_no_scan(self, tmp_dir, monkeypatch):
         watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
         self.linked = True               # e.g. the dashboard's refresh linked it

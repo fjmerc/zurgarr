@@ -315,8 +315,11 @@ doesn't rate-limit it). If the wait (`BLACKHOLE_MOUNT_POLL_TIMEOUT`) runs out,
 it hands the title to the library scan as a safety net but keeps watching it
 every 2 minutes for up to 2 hours, and runs the library scan the moment it
 appears — which links it, tells Sonarr/Radarr and refreshes Plex. Before this,
-such titles waited for the next hourly scan or longer. To nudge one yourself,
-run `library_scan` from System → Tasks.
+such titles waited for the next hourly scan or longer. Copies zurgarr adds to
+TorBox itself — Wanted recovery and the search page's Add button — are watched
+the same way (they used to wait for the mount's 2-hour re-read); a restart
+mid-watch leaves them to the scheduled scan. To nudge one yourself, run
+`library_scan` from System → Tasks.
 
 ## New shows/movies only appear in Plex after a manual scan
 

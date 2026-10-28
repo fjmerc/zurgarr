@@ -3258,6 +3258,67 @@ class BlackholeWatcher:
                     f"pick it up")
         return False
 
+    def _watch_added_torrent(self, torrent_id, title=''):
+        """Get a TorBox torrent zurgarr added itself (Wanted recovery, the
+        search page) into the library as soon as TorBox lists it; True once
+        the library scan linked it.
+
+        Same shape as a blackhole grab after its add, minus the /completed
+        symlinks (no arr grabbed it — the library scan links it into the
+        Sonarr/Radarr folder): wait for TorBox to report it ready, re-list
+        the mount every ``_MOUNT_REFRESH_EVERY_S`` for ``mount_poll_timeout``,
+        then keep watching for ``late_arrival_window``, and run the library
+        scan the moment it shows.  The folder comes from the torrent's own
+        record, never the release title.  Not persisted: a restart
+        mid-watch leaves it to the scheduled scan.
+        """
+        label = title or torrent_id
+        api_key = self._api_key_for('torbox')
+        ready_by = time.monotonic() + self.mount_poll_timeout
+        while True:
+            try:
+                status, info = self._check_torbox_status(torrent_id, api_key=api_key)
+            except Exception as e:
+                status, info = 'api_error', {}
+                logger.debug(f"[blackhole] status check for added torrent {torrent_id}: {e}")
+            if self._is_torrent_ready(status, debrid='torbox'):
+                break
+            if self._is_terminal_error(status, debrid='torbox'):
+                logger.info(f"[blackhole] {label} failed on TorBox ({status}); not watching for it")
+                return False
+            if time.monotonic() > ready_by:
+                logger.info(f"[blackhole] {label} isn't ready on TorBox yet ({status}); the "
+                            f"scheduled library scan will pick it up")
+                return False
+            if self._stop_event.wait(self.mount_poll_interval):
+                return False
+        release_name = self._extract_release_name(info, debrid='torbox')
+        if not release_name:
+            logger.info(f"[blackhole] no folder name for added torrent {torrent_id}; the "
+                        f"scheduled library scan will pick it up")
+            return False
+        file_names = self._extract_filenames_from_info(info, debrid='torbox')
+
+        mount_by = time.monotonic() + self.mount_poll_timeout
+        last_refresh = None
+        while time.monotonic() <= mount_by:
+            if last_refresh is None or time.monotonic() - last_refresh >= _MOUNT_REFRESH_EVERY_S:
+                _coalesced_root_refresh()
+                last_refresh = time.monotonic()
+            try:
+                mount_path, _category, _name = self._find_on_mount(
+                    release_name, debrid='torbox', file_names=file_names)
+            except Exception as e:
+                mount_path = None
+                logger.debug(f"[blackhole] mount check for {release_name}: {e}")
+            if mount_path:
+                logger.info(f"[blackhole] {release_name} (added by zurgarr) is on the mount — "
+                            f"running the library scan now")
+                return self._run_library_scan_now(mount_path)
+            if self._stop_event.wait(self.mount_poll_interval):
+                return False
+        return self._watch_late_arrival(release_name, 'torbox', file_names)
+
     def _register_scanner_handoff(self, filename):
         """Hand a confirmed-ready grab off to the library scanner.
 
@@ -6850,6 +6911,42 @@ def _stop_locked():
                 logger.warning("[blackhole] Waiting for the previous watcher to finish its current file")
                 _watcher_thread.join(timeout=min(30, max(0.01, deadline - time.monotonic())))
     _watcher = _watcher_thread = None
+    return True
+
+
+_added_watches = set()
+_added_watches_lock = threading.Lock()
+
+
+def watch_torbox_add(torrent_id, title=''):
+    """Watch a torrent zurgarr just added to TorBox itself until the library
+    scan links it (see ``BlackholeWatcher._watch_added_torrent``), in the
+    background.  True when a watch started; False with no blackhole in
+    symlink mode (nothing to watch with — the scheduled scan picks it up),
+    no TorBox key, or the torrent already watched.
+    """
+    w = _watcher
+    if w is None or not torrent_id:
+        return False
+    if not getattr(w, 'symlink_enabled', False) or not w._api_key_for('torbox'):
+        logger.debug("[blackhole] no TorBox mount watch available for added torrents")
+        return False
+    tid = str(torrent_id)
+    with _added_watches_lock:
+        if tid in _added_watches:
+            return False
+        _added_watches.add(tid)
+
+    def _run():
+        try:
+            w._watch_added_torrent(tid, title)
+        except Exception as e:
+            logger.warning(f"[blackhole] watch for added torrent {tid} failed: {e}")
+        finally:
+            with _added_watches_lock:
+                _added_watches.discard(tid)
+
+    threading.Thread(target=_run, daemon=True, name=f'tb-add-watch-{tid}').start()
     return True
 
 
