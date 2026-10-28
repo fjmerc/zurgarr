@@ -87,7 +87,7 @@ ENV_SCHEMA = [
             ('RADARR_URL', 'Radarr URL', 'url', False, 'Radarr base URL (e.g. http://radarr:7878). Used for downloads, rescans, and folder naming'),
             ('RADARR_API_KEY', 'Radarr API Key', 'secret', False, 'Radarr API key (Settings > General in Radarr)'),
             ('LIBRARY_PREFERENCE_AUTO_ENFORCE', 'Auto-Enforce Preferences', 'boolean', False, 'Automatically switch sources when content arrives matching a stored preference'),
-            ('LIBRARY_DUPLICATE_TIDY', 'Remove Duplicate Links', 'boolean', False, 'Every 6h, remove debrid links that duplicate a copy Sonarr/Radarr hold (Plex shows the same episode or movie twice). Logged with an undo manifest. Enable after running the one-time clean-up (default: off)'),
+            ('LIBRARY_DUPLICATE_TIDY', 'Remove Duplicate Links', 'boolean', False, 'Every 6h, remove debrid links that duplicate a copy Sonarr/Radarr hold (Plex shows the same episode or movie twice). Logged with an undo manifest; stops (and stays stopped) if a kept copy ever disappears. Enable after running the one-time clean-up (default: off)'),
             ('ROUTING_AUTO_TAG_UNTAGGED', 'Auto-Tag Untagged Media', 'boolean', False, 'During the 6h routing audit, auto-apply the debrid tag to monitored Sonarr series / Radarr movies that have no routing tag. Self-heals Overseerr requests that arrive with empty tags and silently fail with "0 active indexers" (default: true)'),
             ('PENDING_WARNING_HOURS', 'Pending Warning After (hours)', 'number:0-168', False, 'Hours before sending a warning notification for stuck pending items (default: 24, 0 to disable)'),
         ],
@@ -238,7 +238,7 @@ ENV_SCHEMA = [
         'fields': [
             ('PLEX_REFRESH', 'Auto Refresh Library', 'boolean', False, 'Automatically refresh Plex libraries after mount changes. The library scanner follows a change right away; Zurg\'s own refresh hook (Real-Debrid/AllDebrid content) when the container starts. Also rescans folders Plex marked unavailable while a debrid mount was down, once their files are back.'),
             ('PLEX_MOUNT_DIR', 'Plex Mount Directory', 'string', False, 'Path where Plex sees the rclone mount (used by Zurg\'s refresh hook — takes effect when the container starts).'),
-            ('DUPLICATE_CLEANUP', 'Duplicate Cleanup', 'boolean', False, 'Automatically remove duplicate media entries. Switching it off applies right away; switching it on takes effect when the container starts.'),
+            ('DUPLICATE_CLEANUP', 'Duplicate Cleanup', 'boolean', False, 'Plex-only: for items Plex has both on the raw debrid mount and on local disk (only when a Plex library points at the mount itself). Not the same as "Remove Duplicate Links", which handles debrid links in Sonarr/Radarr folders. Switching it off applies right away; switching it on takes effect when the container starts.'),
             ('CLEANUP_INTERVAL', 'Cleanup Interval (hours)', 'number:1-168', False, 'How often to run duplicate cleanup. Takes effect when the container starts.'),
             ('DUPLICATE_CLEANUP_KEEP', 'Keep Copy From', 'select:local,zurg', False, 'Which copy to keep: "local" (default, logs Zurg dupes) or "zurg" (deletes local copies)'),
             ('TAUTULLI_URL', 'Tautulli URL', 'url', False, 'Tautulli base URL (e.g. http://tautulli:8181). Enables watch-history correlation: the wanted-recovery pass reads play history to deprioritize never-played titles (see Recovery & Reconciliation). Read-only — zurgarr never writes to Tautulli.'),

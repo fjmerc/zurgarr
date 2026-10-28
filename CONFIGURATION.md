@@ -137,7 +137,7 @@ changes to its settings take effect at the next container start.
 |---|---|---|
 | `PLEX_REFRESH` | Auto-refresh Plex libraries. Enables both Zurg's `on_library_update` hook (RealDebrid content) and the library scanner's Plex section refresh after it symlinks new debrid content (covers TorBox/scanner-delivered titles), plus a rescan (10 min after start, then every 3h) of folders Plex marked unavailable while a debrid mount was down, once their files are back. Requires `PLEX_ADDRESS` and `PLEX_TOKEN`. | `false` |
 | `PLEX_MOUNT_DIR` | Mount path as Plex sees it (for Zurg's own library-refresh hook — not used in NFS mode; takes effect at container start) | |
-| `DUPLICATE_CLEANUP` | Automated Plex duplicate detection + cleanup. Off applies at once; on at container start | `false` |
+| `DUPLICATE_CLEANUP` | Plex-only duplicate check: finds Plex items with one copy Plex reads directly from the debrid mount (a path containing the mount name — only when a Plex library points at the mount itself) and one local copy. With `DUPLICATE_CLEANUP_KEEP=zurg` it deletes the **local file** through Plex. It does nothing for debrid content linked into Sonarr/Radarr folders — duplicates there are `LIBRARY_DUPLICATE_TIDY`'s job. Off applies at once; on at container start | `false` |
 | `CLEANUP_INTERVAL` | Hours between duplicate cleanup runs. Takes effect at container start | `24` |
 | `DUPLICATE_CLEANUP_KEEP` | `local` (logs Zurg dupes) or `zurg` (deletes local copy) | `local` |
 | `AUTO_UPDATE_INTERVAL` | Hours between auto-update checks. Takes effect at container start | `24` |
@@ -257,7 +257,7 @@ Sweep cadences (`DEBRID_HEALTH_INTERVAL`, default 12h; `DEBRID_QUOTA_INTERVAL`, 
 | `BLOCKLIST_AUTO_ADD` | Auto-blocklist torrents that hit terminal debrid errors, disc-rip rejection, or uncached-timeout failures | `true` |
 | `BLOCKLIST_EXPIRY_DAYS` | Auto-expire auto-added blocklist entries after N days (0=never). Manual entries kept forever | `0` |
 | `LIBRARY_PREFERENCE_AUTO_ENFORCE` | Auto-switch sources when content arrives matching a stored preference | `false` |
-| `LIBRARY_DUPLICATE_TIDY` | Every 6h, remove debrid links in Sonarr/Radarr folders that duplicate the copy the arr tracks (Plex showed the same episode/movie twice). Only removes symlinks, only when the kept copy plays; every removal goes to `/config/duplicate_tidy_manifest.tsv` and Plex's leftover version is removed. Read on every run (no restart needed) | `false` |
+| `LIBRARY_DUPLICATE_TIDY` | Every 6h, remove debrid links in Sonarr/Radarr folders that duplicate the copy the arr tracks (Plex showed the same episode/movie twice). Only removes symlinks, only when the kept copy plays; every removal goes to `/config/duplicate_tidy_manifest.tsv` and Plex's leftover version is removed. If a kept copy ever disappears during a run it stops, and stays stopped until `/config/duplicate_tidy_halted.json` is deleted (see TROUBLESHOOTING). Read on every run (no restart needed) | `false` |
 | `DEBRID_UNAVAILABLE_THRESHOLD_DAYS` | Days of failed searches before marking content debrid-unavailable | `3` |
 | `FORCE_GRAB_MAX_ATTEMPTS` | Force-grabs of a debrid release for one stuck title before giving up (marks debrid-unavailable). Each force-grab re-arms TorBox's abuse cooldown, so this caps the self-inflicted churn. Persists across restarts; resets when the title lands on debrid or after 30 idle days | `12` |
 | `PENDING_WARNING_HOURS` | Hours before `pending_warning` notification for stuck items (0 disables) | `24` |

@@ -13,7 +13,7 @@ At its base it packages
 for your Real-Debrid account), **[rclone](https://github.com/rclone/rclone)**
 (mounts it as a local directory), and optionally
 **[plex_debrid](https://github.com/itsToggle/plex_debrid)** (watchlist
-automation) into a single ~150 MB Alpine container — your media server
+automation) into a single Alpine container — your media server
 sees debrid content as local files, no downloading, no local storage.
 
 On top of that foundation it adds an integration layer: a source-aware
@@ -43,11 +43,13 @@ observe. Capabilities grouped by intent:
 **Unified library — make two sources feel like one**
 
 - Source-aware **Library browser** combining debrid + local content with
-  TMDB metadata, per-item source preferences (prefer-local /
-  prefer-debrid / to-any), and episode-level switch controls
-- **Auto debrid symlinks** — debrid-only content appears in your local
-  library paths so Sonarr/Radarr can discover and manage it alongside
-  local files
+  TMDB metadata, per-item source preferences (Prefer Local /
+  Prefer Cloud), and episode-level switch controls
+- **Auto debrid symlinks** — debrid content Sonarr/Radarr are missing is
+  linked into their own folders so they can discover and manage it
+  alongside local files. Sonarr/Radarr stay in charge: nothing is linked
+  for a title they don't have, for an episode/movie they already hold, or
+  while a download of it is on its way into them
 - **Dual-debrid** — run TorBox alongside Real-Debrid; each blackhole grab
   is routed to whichever side has it cached, and TorBox content gets its
   own mount and Plex library
@@ -96,7 +98,14 @@ observe. Capabilities grouped by intent:
   them
 - **Plex refresh for scanner-delivered content** — TorBox and other
   content that reaches the arr via a disk rescan still triggers a Plex
-  library scan
+  library scan, and versions Plex marked "unavailable" while a debrid
+  mount was briefly down (a container restart) are rescanned once their
+  files are back
+- **Duplicate-link tidy** (opt-in, `LIBRARY_DUPLICATE_TIDY`) — removes
+  extra debrid links that duplicate the copy Sonarr/Radarr track (the
+  same episode showing two or three times in Plex). Links only, never
+  real files, every removal recorded for undo; a one-time clean-up of
+  older duplicates is in `scripts/dedup_library.py`
 - **ffprobe recovery** kills stuck Plex scans on expired debrid links
 - **Process auto-restart** with exponential backoff (5 s → 300 s, resets
   after 1 h stable)
@@ -136,7 +145,7 @@ Two workflows. Use either or both.
 Watchlist (Plex / Trakt / Overseerr)
   → plex_debrid (search & match)
     → Real-Debrid (cloud cache)
-      → Zurg (WebDAV) → rclone (/data mount)
+      → Zurg (WebDAV) → rclone (/data/zurgarr mount)
         → Plex / Jellyfin (stream)
 ```
 
@@ -151,10 +160,15 @@ Overseerr (requests) → Sonarr / Radarr (tag-based routing)
   └─ Debrid path (tag: debrid — no VPN needed):
        Blackhole (/watch)
          → Zurgarr (submit to Real-Debrid / TorBox, cache-aware)
-           → Zurg / rclone (mount)
+           → mount: Zurg + rclone (Real-Debrid) or rclone (TorBox)
              → Symlinks (/completed)
                → Sonarr / Radarr (import) → Plex (stream)
 ```
+
+Two more routes feed the same library: the **library scan** links debrid
+content Sonarr/Radarr are missing straight into their folders (then asks
+them to rescan and Plex to refresh), and **Wanted recovery** adds a cached
+copy of something they never grabbed directly to the debrid account.
 
 ## Quick Start
 
@@ -180,27 +194,32 @@ Overseerr (requests) → Sonarr / Radarr (tag-based routing)
 docker build -t zurgarr https://github.com/fjmerc/zurgarr.git
 ```
 
-### 2. Configure
+### 2. Create directories
+
+The example compose file keeps everything under `/zurgarr` on the host:
 
 ```bash
-# Download the example config and compose file
-wget https://raw.githubusercontent.com/fjmerc/zurgarr/master/.env.example -O .env
+sudo mkdir -p /zurgarr/{config,log,cache,mnt,RD,AD}
+```
+
+### 3. Configure
+
+```bash
+# Download the compose file, and the example settings into config/.env
 wget https://raw.githubusercontent.com/fjmerc/zurgarr/master/docker-compose.yml
+sudo wget https://raw.githubusercontent.com/fjmerc/zurgarr/master/.env.example -O /zurgarr/config/.env
 
 # Edit — at minimum set:
 #   RD_API_KEY        (plus TORBOX_API_KEY + TORBOX_WEBDAV_* for TorBox)
 #   STATUS_UI_AUTH    (e.g., admin:yourpassword)
-nano .env
+sudo nano /zurgarr/config/.env
 ```
 
-The [`.env.example`](.env.example) is commented inline. Full reference
+Zurgarr reads `config/.env` itself, and the Settings page edits the same
+file, so every setting works from there. A value set in the compose file's
+`environment:` section overrides it (and shows as read-only in Settings).
+The [`.env.example`](.env.example) is commented inline; the full reference
 lives in [CONFIGURATION.md](CONFIGURATION.md).
-
-### 3. Create directories
-
-```bash
-mkdir -p config log cache mnt RD
-```
 
 ### 4. Start
 
@@ -212,8 +231,17 @@ docker compose up -d
 
 - Status dashboard at `http://your-host:8080/status`
 - Zurg and rclone should show as **Running**
-- Mount check: `ls mnt/zurgarr/` should show your debrid library
-  categories
+- Mount check: `ls /zurgarr/mnt/zurgarr/` should show your debrid library
+  categories (and `ls /zurgarr/mnt/torbox/` your TorBox library)
+
+### Updating
+
+There are no published images — rebuild and restart:
+
+```bash
+docker build -t zurgarr https://github.com/fjmerc/zurgarr.git
+docker compose up -d
+```
 
 ## Choose your workflow
 
@@ -230,7 +258,7 @@ PLEX_ADDRESS=http://192.168.1.100:32400
 
 # Optional: auto-refresh Plex library when new content appears
 PLEX_REFRESH=true
-PLEX_MOUNT_DIR=/zurgarr
+PLEX_MOUNT_DIR=/rclone/zurgarr   # the mount as Plex sees it (Plex companion below)
 
 # Optional: Overseerr integration
 SEERR_API_KEY=your_key
@@ -258,7 +286,18 @@ BLACKHOLE_SYMLINK_TARGET_BASE=/mnt/debrid   # Path as seen by Plex/Sonarr/Radarr
 BLACKHOLE_DEDUP_ENABLED=true
 BLACKHOLE_LOCAL_LIBRARY_TV=/data/media/tv
 BLACKHOLE_LOCAL_LIBRARY_MOVIES=/data/media/movies
+
+# Recommended: tell Plex to scan when debrid content lands
+PLEX_REFRESH=true
+PLEX_ADDRESS=http://192.168.1.100:32400
+PLEX_TOKEN=your_plex_token
 ```
+
+The symlinks point at `BLACKHOLE_SYMLINK_TARGET_BASE` (TorBox content at
+`BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX`, by default the same path +
+`_torbox`), so Plex and Sonarr/Radarr must see the debrid mounts at those
+paths — e.g. `/zurgarr/mnt/zurgarr:/mnt/debrid` and
+`/zurgarr/mnt/torbox:/mnt/debrid_torbox` in their containers.
 
 **Add volumes** in `docker-compose.yml`:
 
@@ -312,7 +351,8 @@ services:
     image: zurgarr:latest
     stdin_open: true
     tty: true
-    env_file: .env
+    # Settings live in ./config/.env (the Settings page edits it); anything
+    # under `environment:` here would override it and lock it in the UI.
     volumes:
       - ./config:/config
       - ./log:/log
@@ -351,6 +391,9 @@ The Plex container should wait for Zurgarr's mount to be ready:
       - /path/to/plex/config:/config
       - /path/to/plex/transcode:/transcode
       - ./mnt:/rclone               # rclone mount from Zurgarr — add to Plex library
+      # Blackhole mode: also mount it where the symlinks point
+      # - ./mnt/zurgarr:/mnt/debrid
+      # - ./mnt/torbox:/mnt/debrid_torbox
     environment:
       - TZ=America/New_York
     ports:
@@ -369,8 +412,12 @@ The web UI has five pages:
   plex_debrid), mount status, connected-service tiles, system resources,
   and recent events
 - **Library** (`/library`) — the unified local + debrid browser with
-  per-item preferences and interactive search
-- **Activity** (`/activity`) — the history log, filterable by type and time
+  per-item preferences and interactive search; the **Wanted** link in the
+  sidebar (with a count) opens it filtered to what Sonarr/Radarr are still
+  missing
+- **Activity** (`/activity`) — the history log, filterable by type and
+  time, with **Blocklist** and **Stuck** tabs (blocked torrents; items whose
+  automatic retries gave up)
 - **System** (`/system`) — scheduled tasks, debrid health and
   quota/expiry cards, running configuration, and a filtered log viewer
 - **Settings** (`/settings`) — two tabs:
@@ -382,12 +429,16 @@ The web UI has five pages:
     pickers, list editors, a quality-profile JSON editor, and
     device-code OAuth buttons for Trakt, Debrid Link, Put.io, and Orionoid
   - Each tab can export its config (`.env` / `settings.json`) for backup
-    or migration
+    or migration; Settings also backs up and restores the whole
+    configuration
 
 Set `STATUS_UI_AUTH` (e.g., `admin:changeme`) to put the whole UI behind
 basic auth. Without it, the Settings editor and state-changing actions
 stay locked, but the other pages are open to anyone who can reach the
 port. `/metrics` is always served without auth, for Prometheus scrapers.
+Behind a reverse proxy, list its address in `STATUS_UI_TRUSTED_ORIGINS`
+(e.g. `https://zurgarr.example.com`), or saves and dashboard buttons fail
+with "cross-origin request rejected".
 
 ## Docs
 
@@ -401,6 +452,8 @@ port. `/metrics` is always served without auth, for Prometheus scrapers.
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — how the internals fit
   together (for contributors)
 - **[CHANGELOG.md](CHANGELOG.md)** — version history and release notes
+- **[Migrating from pd_zurg](TROUBLESHOOTING.md#migrating-from-pd_zurg)** —
+  what changed in names, paths and settings
 
 ## Community
 

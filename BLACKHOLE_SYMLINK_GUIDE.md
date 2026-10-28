@@ -631,12 +631,13 @@ In addition to the blackhole pipeline (where Sonarr/Radarr submit torrents), Zur
 
 When `BLACKHOLE_SYMLINK_ENABLED=true` and local library paths are configured (`BLACKHOLE_LOCAL_LIBRARY_TV` / `BLACKHOLE_LOCAL_LIBRARY_MOVIES`), the library scanner runs after each scan and:
 
-1. Identifies shows/movies that exist on the debrid mount but have no local presence (source = debrid only)
-2. Creates organized symlink structures in the local library:
-   - **TV**: `{local_tv}/Show Name (Year)/Season XX/filename.mkv` → debrid mount
-   - **Movies**: `{local_movies}/Movie Name (Year)/filename.mkv` → debrid mount
-3. Uses Sonarr/Radarr's canonical folder names when the show/movie is already tracked by the arr
-4. Triggers a Sonarr `RescanSeries` / Radarr `RescanMovie` command so the arr picks up the new files
+1. Finds episodes/movies on the debrid mount that Sonarr/Radarr say have **no file**, whose folder holds **no copy** under any name (a renamed import counts)
+2. Links them into Sonarr/Radarr's own folder for that title:
+   - **TV**: `{local_tv}/<Sonarr's folder>/Season XX/filename.mkv` → debrid mount
+   - **Movies**: `{local_movies}/<Radarr's folder>/filename.mkv` → debrid mount
+3. Triggers a Sonarr `RescanSeries` / Radarr `RescanMovie` command so the arr picks up the new files (and, with `PLEX_REFRESH`, a Plex section refresh)
+
+With Sonarr/Radarr configured they are the authority: nothing is linked for a title they don't have, for an episode/movie they already hold, while a download of it is on its way into them (their queue, or a blackhole hand-off in the last 30 minutes), or while they can't be read. A movie on both debrids falls back to the other debrid's copy of the same film when the first holds no playable file; a release of a film's extras only is never linked as the film. Without Sonarr/Radarr, folders are named `Show Name (Year)` / `Movie Name (Year)`.
 
 ### Requirements
 
