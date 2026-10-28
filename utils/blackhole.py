@@ -3122,7 +3122,63 @@ class BlackholeWatcher:
         provider_tag = f" via {debrid}" if debrid != self.debrid_service else ""
         logger.info(f"[blackhole] Monitoring torrent {torrent_id} for {filename}{tag}{provider_tag}")
 
-    def _watch_late_arrival(self, release_name, debrid, file_names):
+    def _hand_off(self, torrent_id, filename, debrid):
+        """Register the scanner hand-off and log it (metric + history)."""
+        try:
+            from utils.metrics import metrics
+            metrics.inc('blackhole_torrent_timeout')
+        except Exception:
+            pass
+        handed_off = self._register_scanner_handoff(filename)
+        # Guard the history block so a parse/log failure can't kill the
+        # monitor thread before _remove_pending runs — a leaked
+        # _active_monitors entry would block a later re-add of the id.
+        if _history:
+            try:
+                _mt, _ep = _enrich_for_history(filename)
+                _detail = ('Ready on debrid, mount slow — handed to library scanner'
+                           if handed_off
+                           else 'Ready on debrid, mount slow — scanner will resolve on next pass')
+                _history.log_event('cached', filename, episode=_ep, source='blackhole',
+                                   detail=_detail,
+                                   meta={'cause': 'blackhole_mount_handoff',
+                                         'provider': debrid,
+                                         'torrent_id': torrent_id,
+                                         'handoff_registered': handed_off},
+                                   media_title=_mt)
+            except Exception as e:
+                logger.debug(f"[blackhole] hand-off history log failed: {e}")
+
+    def _pending_handed_off_at(self, torrent_id):
+        """Wall-clock time this grab was handed off, from its pending entry."""
+        with self._monitors_lock:
+            entry = next((e for e in self._load_pending()
+                          if e.get('torrent_id') == torrent_id), None)
+        try:
+            return float(entry['handed_off_at']) if entry and entry.get('handed_off_at') else None
+        except (TypeError, ValueError):
+            return None
+
+    def _mark_handed_off(self, torrent_id, when):
+        """Record the hand-off on the pending entry, so a resume after a
+        restart doesn't hand off twice and the stuck view leaves it alone."""
+        with self._monitors_lock:
+            entries = self._load_pending()
+            for e in entries:
+                if e.get('torrent_id') == torrent_id:
+                    e['handed_off_at'] = when
+                    self._save_pending(entries)
+                    break
+
+    def _arrival_time(self):
+        """When a late item became visible: the last mount re-list that ran
+        (it's what revealed it), never later than now.  A scan started after
+        that sees it, so items one re-list revealed share one scan."""
+        with _root_refresh_lock:
+            revealed = _root_refresh_ts
+        return min(time.monotonic(), revealed) if revealed else time.monotonic()
+
+    def _watch_late_arrival(self, release_name, debrid, file_names, window=None):
         """Watch a ready grab that missed the mount wait; return True if it
         surfaced.
 
@@ -3134,7 +3190,7 @@ class BlackholeWatcher:
         symlinks itself, so the scan and an arr import can't both claim it.
         Returns early on shutdown.
         """
-        deadline = time.monotonic() + self.late_arrival_window
+        deadline = time.monotonic() + (self.late_arrival_window if window is None else window)
         while not self._stop_event.wait(self.late_arrival_poll):
             if time.monotonic() > deadline:
                 logger.info(f"[blackhole] {release_name} still not on the mount after the late "
@@ -3149,7 +3205,7 @@ class BlackholeWatcher:
                 logger.debug(f"[blackhole] late watch for {release_name}: {e}")
                 continue
             if mount_path:
-                arrived = time.monotonic()
+                arrived = self._arrival_time()
                 logger.info(f"[blackhole] {release_name} reached the mount late — "
                             f"running the library scan now")
                 self._run_library_scan_now(arrived)
@@ -3565,41 +3621,27 @@ class BlackholeWatcher:
                 # _is_torrent_ready and passed the disc-rip check), so a slow
                 # mount is NOT a hard failure — the content IS in the account
                 # and will surface.  Hand off to the library scanner instead
-                # of dropping the item; see _register_scanner_handoff.
-                logger.warning(f"[blackhole] {release_name} not on mount after "
-                               f"{elapsed_mount:.0f}s — confirmed ready on {debrid}, "
-                               f"handing off to library scanner")
-                try:
-                    from utils.metrics import metrics
-                    metrics.inc('blackhole_torrent_timeout')
-                except Exception:
-                    pass
-                handed_off = self._register_scanner_handoff(filename)
-                # Guard the history block so a parse/log failure can't kill the
-                # monitor thread before _remove_pending runs — a leaked
-                # _active_monitors entry would block a later re-add of the id.
-                if _history:
-                    try:
-                        _mt, _ep = _enrich_for_history(filename)
-                        _detail = ('Ready on debrid, mount slow — handed to library scanner'
-                                   if handed_off
-                                   else 'Ready on debrid, mount slow — scanner will resolve on next pass')
-                        _history.log_event('cached', filename, episode=_ep, source='blackhole',
-                                           detail=_detail,
-                                           meta={'cause': 'blackhole_mount_handoff',
-                                                 'provider': debrid,
-                                                 'torrent_id': torrent_id,
-                                                 'handoff_registered': handed_off},
-                                           media_title=_mt)
-                    except Exception as e:
-                        logger.debug(f"[blackhole] hand-off history log failed: {e}")
-                # The hand-off above is the safety net; for TorBox keep
-                # watching so a late listing reaches Plex in minutes, not at
-                # the next scan.  A shutdown mid-watch keeps the pending entry
-                # so the grab is picked up again after the restart.
+                # of dropping the item; see _register_scanner_handoff.  A grab
+                # resumed after a restart was handed off already: no second
+                # event, and its late watch keeps the original deadline.
+                handed_off_at = self._pending_handed_off_at(torrent_id)
+                if handed_off_at is None:
+                    handed_off_at = time.time()
+                    logger.warning(f"[blackhole] {release_name} not on mount after "
+                                   f"{elapsed_mount:.0f}s — confirmed ready on {debrid}, "
+                                   f"handing off to library scanner")
+                    self._hand_off(torrent_id, filename, debrid)
+                    self._mark_handed_off(torrent_id, handed_off_at)
+                # For TorBox keep watching so a late listing reaches Plex in
+                # minutes, not at the next scan.  A shutdown mid-watch keeps
+                # the pending entry so the grab is picked up again after the
+                # restart.
                 try:
                     if debrid == 'torbox':
-                        self._watch_late_arrival(release_name, debrid, file_names)
+                        remaining = self.late_arrival_window - (time.time() - handed_off_at)
+                        if remaining > 0:
+                            self._watch_late_arrival(release_name, debrid, file_names,
+                                                     window=remaining)
                 finally:
                     if not self._stop_event.is_set():
                         self._remove_pending(torrent_id)

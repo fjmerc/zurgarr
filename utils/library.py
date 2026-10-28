@@ -3315,6 +3315,12 @@ def verify_switch_identity(local_path, debrid_path, local_root, media_type, moun
     return False, reason
 
 
+
+# scan() waits this long (checking every _SCAN_EFFECTS_POLL_S) for another
+# refresh's effects to finish before running its own.
+_SCAN_EFFECTS_WAIT_S = 600
+_SCAN_EFFECTS_POLL_S = 2
+
 class LibraryScanner:
     # Guards the three Wanted-recovery memo dicts (_wanted_tb_cooldown,
     # _wanted_rd_miss, _wanted_no_results).  The scan-effects thread owns all
@@ -4450,12 +4456,22 @@ class LibraryScanner:
 
     def scan(self, force_enforce=False):
         data = self._scan_read()
-        # Respect _effects_running to prevent concurrent _scan_effects
-        # execution when refresh() is already running effects on another thread
-        with self._lock:
-            if self._effects_running:
+        # Effects never run twice at once (_effects_running).  When refresh()
+        # is mid-effects on another thread, those started from an older read
+        # that can miss what this scan just saw (a late TorBox arrival the
+        # blackhole asked this scan for), so wait for them and then run ours
+        # rather than skipping.  Capped so a stuck run can't hold the scan.
+        deadline = time.monotonic() + _SCAN_EFFECTS_WAIT_S
+        while True:
+            with self._lock:
+                if not self._effects_running:
+                    self._effects_running = True
+                    break
+            if time.monotonic() > deadline:
+                logger.info("[library] Scan read done, but another refresh is still "
+                            "linking — skipping this scan's effects")
                 return data
-            self._effects_running = True
+            time.sleep(_SCAN_EFFECTS_POLL_S)
         try:
             changed = self._scan_effects(data, force_enforce)
             if changed:
@@ -5135,6 +5151,11 @@ class LibraryScanner:
     # skipped before being re-probed.  6h matches the arr-search retry window.
     _WANTED_TB_MAX_PROBES = 12
     _WANTED_TB_RECOVERY_COOLDOWN = 6 * 3600
+    # Extra scans (a late TorBox arrival runs one at once) must not stack
+    # Wanted→TB passes: TB arms its create cooldown on bursts.  The TB leg
+    # sits out a scan that comes this soon after a pass that added something.
+    _WANTED_TB_MIN_GAP_S = 600
+    _wanted_tb_last_add = float('-inf')     # monotonic; per instance once set
     # RD leg of the Wanted recovery pass.  The ready timeout is short on
     # purpose: cached content reaches ``downloaded`` within seconds of
     # selectFiles; anything still converting/downloading after 20s is an
@@ -5892,6 +5913,10 @@ class LibraryScanner:
 
         tb_budget = wanted_tb_recovery_max_per_scan()
         rd_budget = wanted_rd_recovery_max_per_scan()
+        if tb_ok and now - self._wanted_tb_last_add < self._WANTED_TB_MIN_GAP_S:
+            logger.debug("[library] Wanted→TB leg sits out this scan: the last pass "
+                         "added to TorBox under 10 minutes ago")
+            tb_ok = False
         deadline = now + self._WANTED_RECOVERY_BUDGET_SECONDS
         tb_added = 0
         rd_added = 0
@@ -6242,6 +6267,7 @@ class LibraryScanner:
                     self._memo_wanted(self._wanted_tb_cooldown, key)
                     if result.get('success'):
                         tb_added += 1
+                        self._wanted_tb_last_add = time.monotonic()
                     elif result.get('duplicate'):
                         # The account already holds a release covering this
                         # target, yet the target is still "wanted" — the

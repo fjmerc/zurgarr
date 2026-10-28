@@ -8771,6 +8771,23 @@ class TestRecoverWantedViaTorbox:
         assert add['cause'] == 'wanted_tb_recovered'
         assert add['media_title'] == 'The Substance'
 
+    def test_tb_leg_waits_between_passes_that_added(self, wire):
+        """A late TorBox arrival runs an extra scan; its Wanted pass must not
+        stack TorBox adds right after the last pass that added some (TorBox
+        arms its create cooldown on bursts)."""
+        sc = self._scanner()
+        movie = lambda t, i: [{'title': t, 'source': 'wanted', 'imdb_id': i,
+                               'is_available': True}]
+        sc._recover_wanted_via_debrid([], movie('The Substance', 'tt1'), {})
+        assert len(wire['adds']) == 1
+        sc._recover_wanted_via_debrid([], movie('Anora', 'tt2'), {})
+        assert len(wire['adds']) == 1          # too soon after the last add
+        sc._wanted_tb_last_add -= LibraryScanner._WANTED_TB_MIN_GAP_S + 1
+        wire['torrentio'] = [{'info_hash': 'c' * 40, 'title': 'Anora.2024.1080p.WEB-DL.RelC',
+                              'seeds': 10, 'quality': {'label': '1080p', 'score': 100}}]
+        sc._recover_wanted_via_debrid([], movie('Anora', 'tt2'), {})
+        assert len(wire['adds']) == 2
+
     def test_cam_releases_never_recovered(self, wire, monkeypatch, caplog):
         import logging
         # Prod 2026-10-25/26: the only cached releases of a new cinema title
@@ -10979,3 +10996,42 @@ class TestExtrasReleaseChoice:
         aliases = {'lucky': {'logan lucky'}, 'logan lucky': {'lucky'}}
         [merged] = library.LibraryScanner._dedup_by_tmdb(items, aliases)
         assert 'alt_path' not in merged
+
+
+class TestScanWaitsForRunningEffects:
+    """A scan whose read happened after something new arrived (a late TorBox
+    grab) must still link it when another refresh is busy with effects that
+    started from an older read: wait for those, then run its own."""
+
+    def _scanner(self, effects):
+        sc = LibraryScanner.__new__(LibraryScanner)
+        sc._lock = threading.Lock()
+        sc._effects_running = True
+        sc._cache_time = 0
+        sc._scan_read = lambda: {'movies': [], 'shows': []}
+        sc._scan_effects = lambda data, force=False: effects.append(1) or False
+        return sc
+
+    def test_waits_then_runs_its_own_effects(self, monkeypatch):
+        import utils.library as lib
+        monkeypatch.setattr(lib, '_SCAN_EFFECTS_POLL_S', 0.01)
+        effects = []
+        sc = self._scanner(effects)
+
+        def finish():
+            with sc._lock:
+                sc._effects_running = False
+        threading.Timer(0.1, finish).start()
+        sc.scan()
+        assert effects == [1]
+        assert sc._effects_running is False
+
+    def test_gives_up_after_the_cap(self, monkeypatch):
+        import utils.library as lib
+        monkeypatch.setattr(lib, '_SCAN_EFFECTS_POLL_S', 0.01)
+        monkeypatch.setattr(lib, '_SCAN_EFFECTS_WAIT_S', 0.05)
+        effects = []
+        sc = self._scanner(effects)
+        sc.scan()
+        assert effects == []
+        assert sc._effects_running is True      # the other run still owns it

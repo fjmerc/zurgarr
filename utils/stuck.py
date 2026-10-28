@@ -199,6 +199,11 @@ def _collect_inflight(records):
             continue
         if age < threshold:
             continue
+        if entry.get('handed_off_at'):
+            # Ready on TorBox and handed to the library scan; the blackhole is
+            # only watching for the listing (≤2h).  The library-pending
+            # escalation covers it if it never shows up.
+            continue
         filename = str(entry.get('filename') or entry.get('torrent_id') or '?')
         key = 'inflight:' + _norm_key(filename)
         rec = records.get(key)

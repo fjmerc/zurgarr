@@ -5877,6 +5877,39 @@ class TestScannerHandoff:
         # kept, so the grab is picked up again after the restart
         assert any(e['torrent_id'] == 'tb-5' for e in watcher._load_pending())
 
+    def test_resume_after_restart_doesnt_hand_off_twice(self, tmp_dir, monkeypatch):
+        """A restart mid-watch resumes the grab: no second hand-off event, and
+        the late window still counts from the first hand-off."""
+        import utils.blackhole as bh
+        events = []
+        monkeypatch.setattr(bh, '_coalesced_root_refresh', lambda **k: True)
+        monkeypatch.setattr(bh, '_history', type('H', (), {
+            'log_event': staticmethod(lambda *a, **k: events.append(k.get('meta', {}).get('cause')))})())
+        watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
+        watcher.late_arrival_window = 60
+        watcher.late_arrival_poll = 30
+        threading.Timer(0.5, watcher._stop_event.set).start()
+        fn = 'Crimson.Tide.1995.1080p.WEB-DL.magnet'
+        self._drive_timeout(watcher, monkeypatch, 'tb-8', fn, 'torbox', 'completed')
+        assert events.count('blackhole_mount_handoff') == 1
+        entry = next(e for e in watcher._load_pending() if e['torrent_id'] == 'tb-8')
+        assert entry.get('handed_off_at')
+        # the restarted watcher resumes the same entry
+        again = self._make_symlink_watcher(tmp_dir, 'torbox')
+        again.late_arrival_window = 0.15
+        self._drive_timeout(again, monkeypatch, 'tb-8', fn, 'torbox', 'completed')
+        assert events.count('blackhole_mount_handoff') == 1
+        assert all(e['torrent_id'] != 'tb-8' for e in again._load_pending())
+
+    def test_scan_counts_from_the_relist_that_revealed_the_item(self, tmp_dir, monkeypatch):
+        """Two grabs revealed by one re-list share a scan even when the second
+        notices it a poll later."""
+        import utils.blackhole as bh
+        watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
+        monkeypatch.setattr(bh, '_root_refresh_ts', 100.0)
+        monkeypatch.setattr(time, 'monotonic', lambda: 105.0)
+        assert watcher._arrival_time() == 100.0
+
     def test_realdebrid_keeps_the_single_relist_and_no_late_watch(self, tmp_dir, monkeypatch):
         """Zurg has no TorBox-style listing lag, and every re-list also hits
         the TorBox mount: Real-Debrid grabs behave as before."""

@@ -111,6 +111,19 @@ class TestCollectInflight:
         stuck._collect_inflight(records)
         assert len(records) == 1
 
+    def test_handed_off_entry_is_not_stale_inflight(self, stores, monkeypatch):
+        """A TorBox grab the blackhole handed to the library scan (and is still
+        watching for up to 2h) isn't a stuck download."""
+        monkeypatch.setenv('BLACKHOLE_DIR', stores)
+        monkeypatch.setenv('PENDING_WARNING_HOURS', '1')
+        self._write_pending(stores, [
+            {'torrent_id': 'a1', 'filename': 'X', 'debrid': 'torbox',
+             'timestamp': time.time() - 2 * 3600, 'handed_off_at': time.time() - 6000},
+        ])
+        records = {}
+        stuck._collect_inflight(records)
+        assert records == {}
+
     def test_zero_warning_hours_falls_back_to_24(self, stores, monkeypatch):
         monkeypatch.setenv('PENDING_WARNING_HOURS', '0')
         assert stuck._pending_stuck_threshold_seconds() == 24 * 3600
