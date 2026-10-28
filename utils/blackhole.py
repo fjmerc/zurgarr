@@ -309,7 +309,7 @@ def _request_wanted_scan(stop_event, *, retry=_WANTED_SCAN_RETRY_S):
     def _run():
         global _wanted_scan_pending, _wanted_scan_ts
         try:
-            from utils.library import get_scanner
+            from utils.library import get_scanner, expire_arr_lists
             while True:
                 scanner = get_scanner()
                 with _wanted_scan_lock:
@@ -329,6 +329,7 @@ def _request_wanted_scan(stop_event, *, retry=_WANTED_SCAN_RETRY_S):
                 request = getattr(scanner, 'request_wanted_pass', None)
                 if request:
                     request()
+                expire_arr_lists()
                 if not (scanner is not None and scanner.effects_busy()) \
                         and scheduler.run_now('library_scan'):
                     with _wanted_scan_lock:
@@ -344,7 +345,13 @@ def _request_wanted_scan(stop_event, *, retry=_WANTED_SCAN_RETRY_S):
             with _wanted_scan_lock:
                 _wanted_scan_pending = False
 
-    threading.Thread(target=_run, daemon=True, name='wanted-scan-request').start()
+    try:
+        threading.Thread(target=_run, daemon=True, name='wanted-scan-request').start()
+    except Exception as e:      # e.g. can't start new thread: don't wedge pending
+        with _wanted_scan_lock:
+            _wanted_scan_pending = False
+        logger.debug(f"[blackhole] couldn't start the library-scan request: {e}")
+        return False
     return True
 
 

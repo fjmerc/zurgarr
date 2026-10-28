@@ -39,6 +39,11 @@ MEDIA_EXTENSIONS = {'.mkv', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.ts', '.m4v
 # re-probed on the 7-day RD-miss timer forever.  Read by the /api/stuck
 # collector too, so it stays a single source of truth.
 WANTED_FILTER_GIVEUP_STRIKES = 3
+# Strikes count at most once per this many seconds: a turned-down grab can
+# run Wanted recovery every 10 minutes, on TorBox verdicts cached for 15, and
+# a give-up (which can decline the Seerr request) must rest on passes spread
+# over time, as when recovery only ran hourly.
+WANTED_GIVEUP_STRIKE_SPACING_S = 3600
 
 
 def gap_fill_enabled():
@@ -1708,6 +1713,17 @@ _sonarr_series_lock = threading.Lock()
 _RADARR_MOVIES_TTL = 120
 _radarr_movies_cache = {'data': None, 'ts': 0.0}
 _radarr_movies_lock = threading.Lock()
+
+
+def expire_arr_lists():
+    """Make the next read fetch Sonarr's and Radarr's lists afresh — a
+    title the arr added seconds ago (a new request whose grab was just
+    turned down) must be in the scan's read, not missing from a list
+    cached up to ``_RADARR_MOVIES_TTL`` earlier."""
+    with _sonarr_series_lock:
+        _sonarr_series_cache['ts'] = 0.0
+    with _radarr_movies_lock:
+        _radarr_movies_cache['ts'] = 0.0
 
 
 def _get_radarr_movies_list(client, force_refresh=False):
@@ -6740,6 +6756,9 @@ class LibraryScanner:
         are per-episode and never decline a whole request."""
         from utils import attempt_ledger as _ledger
         try:
+            last = _ledger.last_seen_epoch(f'wantedblock:{key}')
+            if last is not None and time.time() - last < WANTED_GIVEUP_STRIKE_SPACING_S:
+                return
             strikes = _ledger.bump(f'wantedblock:{key}')
         except Exception:
             return

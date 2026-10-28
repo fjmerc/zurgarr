@@ -10310,6 +10310,28 @@ class TestWantedFilterGiveup:
         attempt_ledger._file_path = None
         attempt_ledger._state = {}
 
+    @pytest.fixture(autouse=True)
+    def _strikes_back_to_back(self, monkeypatch):
+        """These tests run passes back to back; one strike per hour is
+        tested on its own below."""
+        import utils.library as lib
+        monkeypatch.setattr(lib, 'WANTED_GIVEUP_STRIKE_SPACING_S', 0)
+
+    def test_one_strike_per_hour(self, wire, ledger, monkeypatch):
+        """A turned-down grab can run Wanted recovery every 10 minutes, on
+        TorBox verdicts cached for 15 — a give-up (which can decline the
+        Seerr request) must still rest on passes an hour apart."""
+        import utils.library as lib
+        monkeypatch.setattr(lib, 'WANTED_GIVEUP_STRIKE_SPACING_S', 3600)
+        self._filter_block(wire)
+        sc = self._scanner()
+        for _ in range(3):
+            sc._recover_wanted_via_debrid([], self._movie(), {})
+        assert ledger.get('wantedblock:tt1234567') == 1
+        ledger._state['wantedblock:tt1234567']['last_ts'] = '2020-01-01T00:00:00+00:00'
+        sc._recover_wanted_via_debrid([], self._movie(), {})
+        assert ledger.get('wantedblock:tt1234567') == 2
+
     def _filter_block(self, wire):
         # RD keyword-filters the add; TB has nothing cached.
         wire['rd_core'] = {'rescued': False, 'reason': 'add_failed',

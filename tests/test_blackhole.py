@@ -6160,6 +6160,31 @@ class TestScannerHandoff:
         assert self.scans == ['library_scan']
         assert requested == [1]
 
+    def test_rejection_scan_reads_fresh_arr_lists(self, monkeypatch):
+        """A new request's grab is turned down seconds after the arr added
+        the title: the scan must not read a list cached before that."""
+        import utils.library as lib
+        bh, stop = self._wanted_scan(monkeypatch)
+        monkeypatch.setitem(lib._radarr_movies_cache, 'ts', time.time())
+        monkeypatch.setitem(lib._sonarr_series_cache, 'ts', time.time())
+        bh._request_wanted_scan(stop, retry=0.01)
+        self._settle(bh)
+        assert lib._radarr_movies_cache['ts'] == 0.0
+        assert lib._sonarr_series_cache['ts'] == 0.0
+
+    def test_rejection_scan_thread_failure_does_not_wedge(self, monkeypatch):
+        bh, stop = self._wanted_scan(monkeypatch)
+
+        class NoThreads:
+            def __init__(self, *a, **k):
+                pass
+
+            def start(self):
+                raise RuntimeError("can't start new thread")
+        monkeypatch.setattr(bh.threading, 'Thread', NoThreads)
+        assert bh._request_wanted_scan(stop, retry=0.01) is False
+        assert bh._wanted_scan_pending is False
+
     def test_rejection_inside_the_window_gets_a_scan_when_it_ends(self, monkeypatch):
         """The scan that just ran read the arrs before this rejection — so a
         rejection inside the window gets one more scan once it ends, and
