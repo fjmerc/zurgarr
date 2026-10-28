@@ -174,6 +174,9 @@ class TestReadLogLines:
 # Config viewer
 # ---------------------------------------------------------------------------
 
+from utils.config_reload import restart_pending as _REAL_RESTART_PENDING
+
+
 class TestGetSanitizedConfig:
 
     @pytest.fixture(autouse=True)
@@ -328,6 +331,65 @@ class TestGetSanitizedConfig:
         config = get_sanitized_config()
         assert 'plaintextpassword99' not in config['ZURG_PASS']
         assert config['ZURG_PASS'].endswith('(takes effect after a restart)')
+
+    def test_secret_key_restart_pending_flagged(self, monkeypatch):
+        """An edited secret file only takes effect after a restart too."""
+        from utils import config_reload, config_resolve
+        monkeypatch.setattr(config_resolve, '_CURRENT', {
+            'RD_API_KEY': config_resolve.Resolved('', 'secret', 'set via Docker secret')})
+        monkeypatch.setattr(config_reload, 'restart_pending', lambda *a, **k: ['RD_API_KEY'])
+        config = get_sanitized_config()
+        assert config['RD_API_KEY'] == '(set via Docker secret) (takes effect after a restart)'
+
+    def test_cleared_restart_pending_key_says_old_value_runs(self, monkeypatch):
+        from utils import config_reload
+        monkeypatch.delenv('RCLONE_VFS_CACHE_MODE', raising=False)
+        monkeypatch.setattr(config_reload, 'restart_pending',
+                            lambda *a, **k: ['RCLONE_VFS_CACHE_MODE'])
+        config = get_sanitized_config()
+        assert config['RCLONE_VFS_CACHE_MODE'] == '(not set; the old value runs until a restart)'
+
+    def test_restart_pending_key_outside_table_still_listed(self, monkeypatch):
+        from utils import config_reload
+        monkeypatch.delenv('ZZ_PENDING_ONLY', raising=False)
+        monkeypatch.setattr(config_reload, 'restart_pending', lambda *a, **k: ['ZZ_PENDING_ONLY'])
+        config = get_sanitized_config()
+        assert config['ZZ_PENDING_ONLY'] == '(not set; the old value runs until a restart)'
+
+    def test_real_restart_pending_marks_changed_rclone_setting(self, monkeypatch, snapshot_boot):
+        """End to end with the real restart_pending, not a stub."""
+        from utils import config_reload
+        monkeypatch.setattr(config_reload, 'restart_pending', _REAL_RESTART_PENDING)
+        monkeypatch.setenv('ZURG_ENABLED', 'true')
+        monkeypatch.setenv('RD_API_KEY', 'abcdefghijklmnop')
+        monkeypatch.setenv('RCLONE_VFS_CACHE_MODE', 'writes')
+        snapshot_boot()
+        assert get_sanitized_config()['RCLONE_VFS_CACHE_MODE'] == 'writes'
+        monkeypatch.setenv('RCLONE_VFS_CACHE_MODE', 'full')
+        config = get_sanitized_config()
+        assert config['RCLONE_VFS_CACHE_MODE'] == 'full (takes effect after a restart)'
+        assert config['ZURG_ENABLED'] == 'true'
+
+    def test_password_fully_masked(self, monkeypatch):
+        """A user-chosen password shows no characters at all."""
+        monkeypatch.setenv('ZURG_PASS', 'hunter2hunter')
+        monkeypatch.setenv('TORBOX_WEBDAV_PASS', 'abcdefghijklmnop')
+        monkeypatch.setenv('STATUS_UI_AUTH', 'admin:longpassword')
+        config = get_sanitized_config()
+        assert config['ZURG_PASS'] == '****'
+        assert config['STATUS_UI_AUTH'] == '****'
+        assert config['TORBOX_WEBDAV_PASS'] == '****'
+
+    def test_partly_live_key_names_zurg_rclone(self, monkeypatch):
+        """zurgarr uses a new Plex token at once; only Zurg's hook waits."""
+        from utils import config_reload
+        monkeypatch.setenv('PLEX_ADDRESS', 'http://plex:32400')
+        monkeypatch.delenv('PLEX_MOUNT_DIR', raising=False)
+        monkeypatch.setattr(config_reload, 'restart_pending',
+                            lambda *a, **k: ['PLEX_ADDRESS', 'PLEX_MOUNT_DIR'])
+        config = get_sanitized_config()
+        assert config['PLEX_ADDRESS'] == 'http://plex:32400 (Zurg/rclone use it after a restart)'
+        assert config['PLEX_MOUNT_DIR'] == '(not set; Zurg/rclone keep the old value until a restart)'
 
     def test_restart_pending_failure_still_returns_config(self, monkeypatch):
         from utils import config_reload

@@ -261,6 +261,11 @@ _CONFIG_PREFIXES = (
 # Keys whose value embeds a credential the name-pattern check can't catch
 # (e.g. Apprise URLs like discord://token@id). Always masked.
 _EMBEDDED_CREDENTIAL_KEYS = {'NOTIFICATION_URL'}
+# User-chosen passwords: no characters shown (a short one would be mostly given away)
+_FULL_MASK_PATTERNS = ('PASS', 'SECRET', 'AUTH')
+# zurgarr uses these at once; only Zurg's Plex hook / the TorBox mount wait for a restart
+_PARTLY_LIVE_KEYS = frozenset({'PLEX_REFRESH', 'PLEX_ADDRESS', 'PLEX_TOKEN',
+                               'PLEX_MOUNT_DIR', 'TORBOX_API_KEY'})
 
 
 def get_sanitized_config():
@@ -276,22 +281,26 @@ def get_sanitized_config():
     from utils import config_reload, config_resolve
     from utils.settings_api import _ALL_KEYS, _SECRET_KEYS
 
-    keys = set(_ALL_KEYS)
-    for key in os.environ:
-        if any(key.startswith(p) for p in _CONFIG_PREFIXES):
-            keys.add(key)
-
     resolved = config_resolve.current()
     try:
         pending = set(config_reload.restart_pending())
     except Exception:
+        logger.debug('restart_pending failed', exc_info=True)
         pending = set()
+
+    # a cleared start-up setting still runs, so it stays listed
+    keys = set(_ALL_KEYS) | pending
+    for key in os.environ:
+        if any(key.startswith(p) for p in _CONFIG_PREFIXES):
+            keys.add(key)
 
     config = {}
     for key in sorted(keys):
         r = resolved.get(key)
         if r is not None and r.source == 'secret':
             config[key] = '(set via Docker secret)'
+            if key in pending:
+                config[key] += _pending_note(key)
             continue
         value = os.environ.get(key, '')
         sensitive = (
@@ -300,7 +309,7 @@ def get_sanitized_config():
             or key in _EMBEDDED_CREDENTIAL_KEYS
         )
         if sensitive:
-            if value and len(value) > 12:
+            if value and len(value) > 12 and not any(p in key.upper() for p in _FULL_MASK_PATTERNS):
                 config[key] = value[:4] + '****' + value[-4:]
             elif value:
                 config[key] = '****'
@@ -309,9 +318,20 @@ def get_sanitized_config():
         else:
             config[key] = value if value else '(not set)'
         if key in pending:
-            config[key] += ' (takes effect after a restart)'
+            if config[key] == '(not set)':
+                config[key] = ('(not set; Zurg/rclone keep the old value until a restart)'
+                               if key in _PARTLY_LIVE_KEYS
+                               else '(not set; the old value runs until a restart)')
+            else:
+                config[key] += _pending_note(key)
 
     return config
+
+
+def _pending_note(key):
+    if key in _PARTLY_LIVE_KEYS:
+        return ' (Zurg/rclone use it after a restart)'
+    return ' (takes effect after a restart)'
 
 
 # ---------------------------------------------------------------------------
