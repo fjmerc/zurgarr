@@ -268,10 +268,9 @@ _MOUNT_REFRESH_EVERY_S = 30
 # it surfaces instead of leaving it for the next hourly scan.
 _LATE_ARRIVAL_WINDOW_S = 2 * 3600
 _LATE_ARRIVAL_POLL_S = 120
-# Monotonic time the last library scan was started for a late arrival: one
-# scan that starts after an item surfaced covers every item that did.
-_scan_started_lock = threading.Lock()
-_scan_started_ts = float('-inf')
+# Monotonic time of the last root re-list that rclone confirmed: a late item
+# the watch then finds was revealed by it (see _arrival_time).
+_root_refresh_ok_ts = 0.0
 
 
 def _coalesced_root_refresh(*, _now=None):
@@ -294,9 +293,12 @@ def _coalesced_root_refresh(*, _now=None):
         if now - _root_refresh_ts < _ROOT_REFRESH_COALESCE_S:
             return False
         _root_refresh_ts = now
+    global _root_refresh_ok_ts
     try:
         from utils.rclone_rc import refresh_dir
-        refresh_dir('')
+        if refresh_dir(''):
+            with _root_refresh_lock:
+                _root_refresh_ok_ts = now
     except Exception:
         pass
     return True
@@ -3171,12 +3173,14 @@ class BlackholeWatcher:
                     break
 
     def _arrival_time(self):
-        """When a late item became visible: the last mount re-list that ran
-        (it's what revealed it), never later than now.  A scan started after
-        that sees it, so items one re-list revealed share one scan."""
+        """When a late item became visible: the last re-list rclone confirmed
+        (it's what revealed it), never later than now; without one, now.
+        A read begun after that sees it, so items one re-list revealed share
+        one scan."""
         with _root_refresh_lock:
-            revealed = _root_refresh_ts
-        return min(time.monotonic(), revealed) if revealed else time.monotonic()
+            revealed = _root_refresh_ok_ts
+        now = time.monotonic()
+        return min(now, revealed) if revealed else now
 
     def _watch_late_arrival(self, release_name, debrid, file_names, window=None):
         """Watch a ready grab that missed the mount wait; return True if it
@@ -3212,21 +3216,24 @@ class BlackholeWatcher:
                 return True
         return False
 
-    def _run_library_scan_now(self, arrived, attempts=10):
-        """Make sure a library scan starts after ``arrived`` (monotonic).
+    def _run_library_scan_now(self, arrived, attempts=30):
+        """Make sure the library gets linked from a read begun after
+        ``arrived`` (monotonic); returns True once that has started.
 
-        A scan another late arrival already started after ``arrived`` covers
-        this item too, so several items surfacing together share one scan.
-        A scan already running may have listed the mount before the item
-        appeared, so otherwise retry until one starts (``run_now`` returns
-        False while a scan runs).  Returns False when the scan isn't
-        available or every attempt found one running; the hand-off's
-        pending entry still has a later scan resolve it.
+        Covered when the scanner reports an effects run (the scheduled scan
+        or the dashboard's refresh) whose read began at or after
+        ``arrived`` — several items surfacing together share one.  Until
+        then, ask the scheduler for a scan every ~30s: one may be busy, or
+        may finish its read and skip linking because a refresh is busy
+        linking from an older read.  Returns False when the scan isn't
+        available or the budget (~15 min) runs out; the hand-off's pending
+        entry still has a later scan resolve it.
         """
-        global _scan_started_ts
         try:
+            from utils.library import get_scanner
             from utils.task_scheduler import scheduler
-            if scheduler.get_task('library_scan') is None:
+            scanner = get_scanner()
+            if scanner is None or scheduler.get_task('library_scan') is None:
                 logger.info("[blackhole] library scan isn't scheduled (STATUS_UI_ENABLED off?) "
                             "— can't link the late arrival now")
                 return False
@@ -3235,21 +3242,22 @@ class BlackholeWatcher:
             return False
         retry = min(self.late_arrival_poll, 30)
         for _ in range(attempts):
-            with _scan_started_lock:
-                if _scan_started_ts >= arrived:
+            try:
+                if scanner.covers(arrived):
                     return True
-                try:
-                    started = scheduler.run_now('library_scan')
-                except Exception as e:
-                    logger.debug(f"[blackhole] library scan trigger failed: {e}")
-                    return False
-                if started:
-                    _scan_started_ts = time.monotonic()
-                    return True
+                scheduler.run_now('library_scan')
+            except Exception as e:
+                logger.debug(f"[blackhole] library scan trigger failed: {e}")
+                return False
             if self._stop_event.wait(retry):
                 return False
-        logger.warning("[blackhole] a library scan kept running while a late arrival waited "
-                       "to be linked; the next scheduled scan will pick it up")
+            try:
+                if scanner.covers(arrived):
+                    return True
+            except Exception:
+                return False
+        logger.warning("[blackhole] no library scan could link a late arrival in time; "
+                       "the next scheduled scan will pick it up")
         return False
 
     def _register_scanner_handoff(self, filename):
@@ -3610,6 +3618,21 @@ class BlackholeWatcher:
         # the burst trips TorBox's WebDAV listing rate-limit.  One re-list per
         # window surfaces every sibling episode, so the suppressed monitors
         # still find their content on the very next poll.
+        # Resumed after a restart and already handed off: straight back to
+        # the late watch (no second wait; never the /completed path, which
+        # would race the scanner the hand-off already involved).
+        prior = self._pending_handed_off_at(torrent_id) if debrid == 'torbox' else None
+        if prior is not None:
+            remaining = min(self.late_arrival_window - (time.time() - prior),
+                            self.late_arrival_window)
+            try:
+                if remaining > 0:
+                    self._watch_late_arrival(release_name, debrid, file_names, window=remaining)
+            finally:
+                if not self._stop_event.is_set():
+                    self._remove_pending(torrent_id)
+            return
+
         _coalesced_root_refresh()
         last_refresh = time.monotonic()
 
@@ -3638,7 +3661,8 @@ class BlackholeWatcher:
                 # restart.
                 try:
                     if debrid == 'torbox':
-                        remaining = self.late_arrival_window - (time.time() - handed_off_at)
+                        remaining = min(self.late_arrival_window - (time.time() - handed_off_at),
+                                        self.late_arrival_window)
                         if remaining > 0:
                             self._watch_late_arrival(release_name, debrid, file_names,
                                                      window=remaining)

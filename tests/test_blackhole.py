@@ -5731,7 +5731,16 @@ class TestScannerHandoff:
         monkeypatch.setattr(ts.scheduler, 'run_now',
                             lambda name: self.scans.append(name) or True)
         monkeypatch.setattr(ts.scheduler, 'get_task', lambda name: {'name': name})
-        monkeypatch.setattr(bh, '_scan_started_ts', float('-inf'))
+        # A scanner whose next effects run begins with every scan we start.
+        self.covered_from = float('-inf')
+        scanner = type('S', (), {'covers': lambda _s, t: self.covered_from >= t})()
+        monkeypatch.setattr('utils.library.get_scanner', lambda: scanner)
+
+        def run_now(name):
+            self.scans.append(name)
+            self.covered_from = time.monotonic()
+            return True
+        monkeypatch.setattr(ts.scheduler, 'run_now', run_now)
 
     def _after_handoff(self, watcher, monkeypatch):
         """An Event set once the mount wait has timed out and handed off, and
@@ -5852,8 +5861,14 @@ class TestScannerHandoff:
         import utils.task_scheduler as ts
         monkeypatch.setattr(bh, '_coalesced_root_refresh', lambda **k: True)
         answers = iter([False, False, True])
-        monkeypatch.setattr(ts.scheduler, 'run_now',
-                            lambda name: self.scans.append(name) or next(answers))
+
+        def run_now(name):          # busy twice, then a scan starts
+            self.scans.append(name)
+            started = next(answers)
+            if started:
+                self.covered_from = time.monotonic()
+            return started
+        monkeypatch.setattr(ts.scheduler, 'run_now', run_now)
         watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
         watcher.late_arrival_window = 2.0
         find = self._after_handoff(watcher, monkeypatch)
@@ -5902,13 +5917,61 @@ class TestScannerHandoff:
         assert all(e['torrent_id'] != 'tb-8' for e in again._load_pending())
 
     def test_scan_counts_from_the_relist_that_revealed_the_item(self, tmp_dir, monkeypatch):
-        """Two grabs revealed by one re-list share a scan even when the second
-        notices it a poll later."""
+        """Two grabs revealed by one successful re-list share a scan even when
+        the second notices it a poll later; a failed re-list revealed nothing."""
         import utils.blackhole as bh
         watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
-        monkeypatch.setattr(bh, '_root_refresh_ts', 100.0)
+        monkeypatch.setattr(bh, '_root_refresh_ok_ts', 100.0)
         monkeypatch.setattr(time, 'monotonic', lambda: 105.0)
         assert watcher._arrival_time() == 100.0
+        monkeypatch.setattr(bh, '_root_refresh_ok_ts', 0.0)
+        assert watcher._arrival_time() == 105.0
+
+    def test_only_a_successful_relist_counts(self, monkeypatch):
+        import utils.blackhole as bh
+        import utils.rclone_rc as rc
+        monkeypatch.setattr(bh, '_root_refresh_ts', 0.0)
+        monkeypatch.setattr(bh, '_root_refresh_ok_ts', 0.0)
+        monkeypatch.setattr(rc, 'refresh_dir', lambda *a, **k: False)
+        assert bh._coalesced_root_refresh(_now=5000.0) is True
+        assert bh._root_refresh_ok_ts == 0.0
+        monkeypatch.setattr(rc, 'refresh_dir', lambda *a, **k: True)
+        assert bh._coalesced_root_refresh(_now=6000.0) is True
+        assert bh._root_refresh_ok_ts > 0.0
+
+    def test_resumed_hand_off_skips_the_mount_wait(self, tmp_dir, monkeypatch):
+        """After a restart, a grab already handed off goes straight back to its
+        late watch (no second 5-minute wait, no /completed race)."""
+        import utils.blackhole as bh
+        monkeypatch.setattr(bh, '_coalesced_root_refresh', lambda **k: True)
+        watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
+        watcher.mount_poll_timeout = 30
+        watcher.late_arrival_window = 2.0
+        fn = 'Crimson.Tide.1995.1080p.WEB-DL.magnet'
+        watcher._add_pending('tb-9', fn, debrid='torbox')
+        watcher._mark_handed_off('tb-9', time.time() - 0.5)   # handed off before the restart
+        made = []
+        monkeypatch.setattr(watcher, '_create_symlinks', lambda *a, **k: made.append(1) or 1)
+        t0 = time.monotonic()
+        self._drive_timeout(watcher, monkeypatch, 'tb-9', fn, 'torbox', 'completed',
+                            find=lambda *a, **k: ('/data/torbox/x', 'movies', 'x'))
+        assert time.monotonic() - t0 < 5
+        assert made == []                      # the scan links it, not /completed
+        assert self.scans == ['library_scan']
+
+    def test_resumed_hand_off_past_its_window_just_ends(self, tmp_dir, monkeypatch):
+        import utils.blackhole as bh
+        monkeypatch.setattr(bh, '_coalesced_root_refresh', lambda **k: True)
+        watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
+        watcher.mount_poll_timeout = 30
+        fn = 'Crimson.Tide.1995.1080p.WEB-DL.magnet'
+        watcher._add_pending('tb-10', fn, debrid='torbox')
+        watcher._mark_handed_off('tb-10', time.time() - 3 * 3600)
+        t0 = time.monotonic()
+        self._drive_timeout(watcher, monkeypatch, 'tb-10', fn, 'torbox', 'completed')
+        assert time.monotonic() - t0 < 5
+        assert self.scans == []
+        assert all(e['torrent_id'] != 'tb-10' for e in watcher._load_pending())
 
     def test_realdebrid_keeps_the_single_relist_and_no_late_watch(self, tmp_dir, monkeypatch):
         """Zurg has no TorBox-style listing lag, and every re-list also hits
@@ -5947,14 +6010,28 @@ class TestScannerHandoff:
         assert self.scans == ['library_scan']
 
     def test_one_scan_covers_items_that_arrived_before_it(self, tmp_dir, monkeypatch):
-        import utils.blackhole as bh
         watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
         arrived = time.monotonic()
         assert watcher._run_library_scan_now(arrived) is True
         assert watcher._run_library_scan_now(arrived) is True   # already covered
         assert self.scans == ['library_scan']
-        assert watcher._run_library_scan_now(time.monotonic() + 1) is True
-        assert self.scans == ['library_scan', 'library_scan']
+
+    def test_a_scan_that_linked_nothing_doesnt_count(self, tmp_dir, monkeypatch):
+        """run_now says started, but that scan skipped its effects (a refresh
+        was busy): keep nudging until a run whose read began after the item
+        appeared has claimed the effects slot."""
+        import utils.task_scheduler as ts
+        watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
+        calls = []
+
+        def run_now(name):
+            calls.append(name)
+            if len(calls) == 3:          # the third scan really runs its effects
+                self.covered_from = time.monotonic()
+            return True
+        monkeypatch.setattr(ts.scheduler, 'run_now', run_now)
+        assert watcher._run_library_scan_now(time.monotonic()) is True
+        assert len(calls) == 3
 
     def test_no_library_scan_task_means_no_retry_loop(self, tmp_dir, monkeypatch):
         import utils.task_scheduler as ts

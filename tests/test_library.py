@@ -10998,40 +10998,38 @@ class TestExtrasReleaseChoice:
         assert 'alt_path' not in merged
 
 
-class TestScanWaitsForRunningEffects:
-    """A scan whose read happened after something new arrived (a late TorBox
-    grab) must still link it when another refresh is busy with effects that
-    started from an older read: wait for those, then run its own."""
+class TestScanCoverage:
+    """``covers(t)``: an effects run (scan or refresh) whose library read
+    began at or after ``t`` has claimed the effects slot, so it will link
+    anything that was on the mount at ``t``.  A scan that skips its effects
+    (another run is busy) covers nothing — and never acts on an old read."""
 
     def _scanner(self, effects):
         sc = LibraryScanner.__new__(LibraryScanner)
         sc._lock = threading.Lock()
-        sc._effects_running = True
+        sc._effects_running = False
         sc._cache_time = 0
         sc._scan_read = lambda: {'movies': [], 'shows': []}
         sc._scan_effects = lambda data, force=False: effects.append(1) or False
         return sc
 
-    def test_waits_then_runs_its_own_effects(self, monkeypatch):
-        import utils.library as lib
-        monkeypatch.setattr(lib, '_SCAN_EFFECTS_POLL_S', 0.01)
+    def test_scan_that_runs_effects_covers_earlier_arrivals(self):
+        import time as _t
         effects = []
         sc = self._scanner(effects)
-
-        def finish():
-            with sc._lock:
-                sc._effects_running = False
-        threading.Timer(0.1, finish).start()
+        before = _t.monotonic()
+        assert not sc.covers(before)
         sc.scan()
         assert effects == [1]
-        assert sc._effects_running is False
+        assert sc.covers(before)
+        assert not sc.covers(_t.monotonic() + 1)
 
-    def test_gives_up_after_the_cap(self, monkeypatch):
-        import utils.library as lib
-        monkeypatch.setattr(lib, '_SCAN_EFFECTS_POLL_S', 0.01)
-        monkeypatch.setattr(lib, '_SCAN_EFFECTS_WAIT_S', 0.05)
+    def test_scan_that_skips_effects_covers_nothing(self):
+        import time as _t
         effects = []
         sc = self._scanner(effects)
+        sc._effects_running = True          # a refresh() is mid-effects
+        before = _t.monotonic()
         sc.scan()
-        assert effects == []
-        assert sc._effects_running is True      # the other run still owns it
+        assert effects == []                # skips at once, as before
+        assert not sc.covers(before)

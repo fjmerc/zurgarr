@@ -197,6 +197,20 @@ def clean_stale_queue_items():
 # Task: Library Scan (Priority 1)
 # ---------------------------------------------------------------------------
 
+def _publish_scan(scanner, data):
+    """Put a finished scan's read in the UI cache — unless its effects changed
+    things (the cache was invalidated so the next read shows them) or a
+    refresh() published a newer read meanwhile."""
+    with scanner._lock:
+        if getattr(scanner, '_last_scan_changed', False):
+            return
+        if scanner._cache_time and scanner._cache_time > getattr(
+                scanner, '_last_scan_read_started', float('-inf')):
+            return
+        scanner._cache = data
+        scanner._cache_time = time.monotonic()
+
+
 def library_scan():
     """Scan debrid mount and local library, auto-create symlinks, trigger rescans."""
     from utils.library import get_scanner
@@ -206,12 +220,7 @@ def library_scan():
         return {'status': 'error', 'message': 'Library scanner not initialized'}
 
     data = scanner.scan()
-
-    # Update the scanner cache so WebUI reflects latest data
-    import threading
-    with scanner._lock:
-        scanner._cache = data
-        scanner._cache_time = time.monotonic()
+    _publish_scan(scanner, data)
 
     movies = len(data.get('movies', []))
     shows = len(data.get('shows', []))
@@ -1226,9 +1235,7 @@ def enforce_source_preferences():
 
     # Run a scan with forced preference enforcement (no env var mutation)
     data = scanner.scan(force_enforce=True)
-    with scanner._lock:
-        scanner._cache = data
-        scanner._cache_time = time.monotonic()
+    _publish_scan(scanner, data)
 
     movies = len(data.get('movies', []))
     shows = len(data.get('shows', []))

@@ -576,6 +576,16 @@ def _replaces_extras(group, new_path):
             and not _is_extras_release(os.path.basename(new_path)))
 
 
+def _seen_debrid_names(paths):
+    """Every path component of the debrid paths a scan saw: a torrent whose
+    name is among them was seen on the mount."""
+    names = set()
+    for p in paths:
+        if p:
+            names.update(part for part in os.path.normpath(p).split(os.sep) if part)
+    return names
+
+
 def _movie_debrid_dirs(movie, blocklist=None):
     """A movie's debrid folders in the order to try them — its own, then the
     other debrid's copy (``alt_path``) — without anti-DMCA obfuscated
@@ -3315,12 +3325,6 @@ def verify_switch_identity(local_path, debrid_path, local_root, media_type, moun
     return False, reason
 
 
-
-# scan() waits this long (checking every _SCAN_EFFECTS_POLL_S) for another
-# refresh's effects to finish before running its own.
-_SCAN_EFFECTS_WAIT_S = 600
-_SCAN_EFFECTS_POLL_S = 2
-
 class LibraryScanner:
     # Guards the three Wanted-recovery memo dicts (_wanted_tb_cooldown,
     # _wanted_rd_miss, _wanted_no_results).  The scan-effects thread owns all
@@ -4455,25 +4459,22 @@ class LibraryScanner:
         return changed
 
     def scan(self, force_enforce=False):
+        read_started = time.monotonic()
         data = self._scan_read()
-        # Effects never run twice at once (_effects_running).  When refresh()
-        # is mid-effects on another thread, those started from an older read
-        # that can miss what this scan just saw (a late TorBox arrival the
-        # blackhole asked this scan for), so wait for them and then run ours
-        # rather than skipping.  Capped so a stuck run can't hold the scan.
-        deadline = time.monotonic() + _SCAN_EFFECTS_WAIT_S
-        while True:
-            with self._lock:
-                if not self._effects_running:
-                    self._effects_running = True
-                    break
-            if time.monotonic() > deadline:
-                logger.info("[library] Scan read done, but another refresh is still "
-                            "linking — skipping this scan's effects")
+        self._last_scan_read_started = read_started
+        self._last_scan_changed = False
+        # Respect _effects_running to prevent concurrent _scan_effects
+        # execution when refresh() is already running effects on another
+        # thread.  Skipping (never waiting) keeps effects from acting on an
+        # old read: prefer-local deletes from what the read saw.
+        with self._lock:
+            if self._effects_running:
                 return data
-            time.sleep(_SCAN_EFFECTS_POLL_S)
+            self._effects_running = True
+            self._claim_effects_read(read_started)
         try:
             changed = self._scan_effects(data, force_enforce)
+            self._last_scan_changed = bool(changed)
             if changed:
                 with self._lock:
                     self._cache_time = 0
@@ -4481,6 +4482,25 @@ class LibraryScanner:
             with self._lock:
                 self._effects_running = False
         return data
+
+    # Monotonic start of the library read used by the latest effects run to
+    # claim the slot (scan or refresh).  Class default: no run yet.
+    _effects_read_started = float('-inf')
+    _last_scan_read_started = float('-inf')
+    _last_scan_changed = False
+
+    def _claim_effects_read(self, read_started):
+        """Note an effects run starting from a read begun at *read_started*
+        (call with self._lock held)."""
+        if read_started > self._effects_read_started:
+            self._effects_read_started = read_started
+
+    def covers(self, t):
+        """True once an effects run whose library read began at or after
+        monotonic *t* has started: it will link anything that was on the
+        mount at *t* (the blackhole's late TorBox arrivals rely on this)."""
+        with self._lock:
+            return self._effects_read_started >= t
 
     def peek_data(self):
         """Return the cached scan payload without ever triggering a scan.
@@ -4527,6 +4547,7 @@ class LibraryScanner:
             try:
                 # Read phase — update cache immediately so UI gets data fast
                 had_mount_before = self._mount_path is not None
+                read_started = time.monotonic()
                 data = self._scan_read()
                 has_mount_now = self._mount_path is not None
                 # Capture index snapshot before another scan can rebind.
@@ -4560,6 +4581,7 @@ class LibraryScanner:
                 with self._lock:
                     if not self._effects_running:
                         self._effects_running = True
+                        self._claim_effects_read(read_started)
                         run_effects = True
             if run_effects:
                 try:
@@ -5078,19 +5100,21 @@ class LibraryScanner:
                         has_both = True
             # Only safe to delete if there are both-source eps AND no debrid-only eps
             if has_both and not has_debrid_only:
-                prefer_local_safe[norm] = show
+                prefer_local_safe[norm] = (show, _seen_debrid_names(
+                    p for (n, _s, _e), p in path_index.items() if n == norm))
 
         for movie in movies:
             norm = _normalize_title(movie['title'])
             if self._get_pref(norm, preferences) == 'prefer-local' and movie.get('source') == 'both':
-                prefer_local_safe[norm] = movie
+                prefer_local_safe[norm] = (movie, _seen_debrid_names(
+                    (movie.get('path'), movie.get('alt_path'))))
 
         if prefer_local_safe:
             try:
                 from utils.debrid_client import get_debrid_client
                 client, svc = get_debrid_client()
                 if client:
-                    for norm, item in prefer_local_safe.items():
+                    for norm, (item, seen) in prefer_local_safe.items():
                         if norm in enforced_this_scan:
                             continue
                         year = item.get('year')
@@ -5101,6 +5125,16 @@ class LibraryScanner:
                             item.get('_parsed_title') or item['title']
                         )
                         matches = client.find_torrents_by_title(parsed_norm, target_year=year)
+                        # Only torrents whose folder this scan's read saw are
+                        # covered by local copies; one added since (a new
+                        # season pack not yet on the TorBox mount) may be the
+                        # only copy of what it holds.  Fail closed.
+                        unseen = [m for m in matches if m.get('filename') not in seen]
+                        if unseen:
+                            logger.info(
+                                f"[library] prefer-local for {item['title']}: keeping "
+                                f"{len(unseen)} debrid torrent(s) this scan didn't see")
+                        matches = [m for m in matches if m.get('filename') in seen]
                         if matches:
                             deleted = 0
                             for m in matches:
@@ -5152,8 +5186,8 @@ class LibraryScanner:
     _WANTED_TB_MAX_PROBES = 12
     _WANTED_TB_RECOVERY_COOLDOWN = 6 * 3600
     # Extra scans (a late TorBox arrival runs one at once) must not stack
-    # Wanted→TB passes: TB arms its create cooldown on bursts.  The TB leg
-    # sits out a scan that comes this soon after a pass that added something.
+    # Wanted→TB passes: TB arms its create cooldown on bursts.  A pass that
+    # comes this soon after one that added to TorBox is skipped.
     _WANTED_TB_MIN_GAP_S = 600
     _wanted_tb_last_add = float('-inf')     # monotonic; per instance once set
     # RD leg of the Wanted recovery pass.  The ready timeout is short on
@@ -5894,6 +5928,13 @@ class LibraryScanner:
 
         if not tb_ok and not rd_ok:
             return
+        if tb_ok and time.monotonic() - self._wanted_tb_last_add < self._WANTED_TB_MIN_GAP_S:
+            # An extra scan (a late TorBox arrival runs one at once) right
+            # after a pass that added: skip the whole pass, so neither leg
+            # probes titles TorBox may already have cached.
+            logger.debug("[library] Wanted recovery sits out this scan: the last pass "
+                         "added to TorBox under 10 minutes ago")
+            return
 
         now = time.monotonic()
         # Expire per-title cooldown/miss entries.
@@ -5913,10 +5954,6 @@ class LibraryScanner:
 
         tb_budget = wanted_tb_recovery_max_per_scan()
         rd_budget = wanted_rd_recovery_max_per_scan()
-        if tb_ok and now - self._wanted_tb_last_add < self._WANTED_TB_MIN_GAP_S:
-            logger.debug("[library] Wanted→TB leg sits out this scan: the last pass "
-                         "added to TorBox under 10 minutes ago")
-            tb_ok = False
         deadline = now + self._WANTED_RECOVERY_BUDGET_SECONDS
         tb_added = 0
         rd_added = 0

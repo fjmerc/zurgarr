@@ -446,10 +446,58 @@ class TestAutoEnforcement:
         mock_client.find_torrents_by_title.return_value = [{'id': 'ABC', 'filename': 'Show.S01.mkv', 'parsed_title': 'Show', 'year': None}]
         mock_client.delete_torrent.return_value = True
 
+        path_index = {(norm, 1, 1): os.path.join(tmp_dir, 'mount', 'shows', 'Show.S01.mkv',
+                                                  'Show.S01E01.mkv')}
         with patch('utils.debrid_client.get_debrid_client', return_value=(mock_client, 'realdebrid')):
-            scanner._enforce_preferences([show], [], preferences, {}, {})
+            scanner._enforce_preferences([show], [], preferences, path_index, {})
 
         mock_client.delete_torrent.assert_called_once_with('ABC')
+
+    def test_prefer_local_keeps_torrents_the_scan_didnt_see(self, tmp_dir, monkeypatch):
+        """A torrent added after the scan's read (say a new season pack still
+        waiting to show on the TorBox mount) has no local copy yet: never
+        delete it, only the ones whose folder the scan saw."""
+        local_tv = os.path.join(tmp_dir, 'tv')
+        os.makedirs(local_tv)
+        monkeypatch.setenv('BLACKHOLE_RCLONE_MOUNT', os.path.join(tmp_dir, 'mount'))
+        monkeypatch.setenv('BLACKHOLE_SYMLINK_TARGET_BASE', '/mnt/debrid')
+        monkeypatch.setenv('LIBRARY_PREFERENCE_AUTO_ENFORCE', 'true')
+        scanner = self._make_scanner(local_tv, monkeypatch)
+        show = self._make_show('Show', [(1, 1, 'both')])
+        from utils.library import _normalize_title
+        norm = _normalize_title('Show')
+        path_index = {(norm, 1, 1): os.path.join(tmp_dir, 'mount', 'shows', 'Show.S01.1080p',
+                                                  'Show.S01E01.mkv')}
+        mock_client = MagicMock()
+        mock_client.find_torrents_by_title.return_value = [
+            {'id': 'S1', 'filename': 'Show.S01.1080p', 'parsed_title': 'Show', 'year': None},
+            {'id': 'S2', 'filename': 'Show.S02.1080p', 'parsed_title': 'Show', 'year': None},
+        ]
+        mock_client.delete_torrent.return_value = True
+        with patch('utils.debrid_client.get_debrid_client', return_value=(mock_client, 'realdebrid')):
+            scanner._enforce_preferences([show], [], {norm: 'prefer-local'}, path_index, {})
+        mock_client.delete_torrent.assert_called_once_with('S1')
+
+    def test_prefer_local_movie_keeps_an_unseen_release(self, tmp_dir, monkeypatch):
+        local_tv = os.path.join(tmp_dir, 'tv')
+        os.makedirs(local_tv)
+        monkeypatch.setenv('BLACKHOLE_RCLONE_MOUNT', os.path.join(tmp_dir, 'mount'))
+        monkeypatch.setenv('BLACKHOLE_SYMLINK_TARGET_BASE', '/mnt/debrid')
+        monkeypatch.setenv('LIBRARY_PREFERENCE_AUTO_ENFORCE', 'true')
+        scanner = self._make_scanner(local_tv, monkeypatch)
+        from utils.library import _normalize_title
+        norm = _normalize_title('Movie')
+        movie = {'title': 'Movie', 'year': 2020, 'source': 'both',
+                 'path': os.path.join(tmp_dir, 'mount', 'movies', 'Movie.2020.1080p')}
+        mock_client = MagicMock()
+        mock_client.find_torrents_by_title.return_value = [
+            {'id': 'M1', 'filename': 'Movie.2020.1080p', 'parsed_title': 'Movie', 'year': 2020},
+            {'id': 'M2', 'filename': 'Movie.2020.2160p', 'parsed_title': 'Movie', 'year': 2020},
+        ]
+        mock_client.delete_torrent.return_value = True
+        with patch('utils.debrid_client.get_debrid_client', return_value=(mock_client, 'realdebrid')):
+            scanner._enforce_preferences([], [movie], {norm: 'prefer-local'}, {}, {})
+        mock_client.delete_torrent.assert_called_once_with('M1')
 
     def test_disabled_by_config(self, tmp_dir, monkeypatch):
         """LIBRARY_PREFERENCE_AUTO_ENFORCE=false disables enforcement."""
@@ -707,6 +755,8 @@ class TestAutoEnforcement:
         movie = {
             'title': 'Black Adam', 'year': 2022, 'source': 'both',
             'type': 'movie',
+            # the debrid folder this scan saw (prefer-local only deletes those)
+            'path': os.path.join(tmp_dir, 'mount', 'movies', 'Black.Adam.2022.mkv'),
         }
 
         mock_client = MagicMock()
