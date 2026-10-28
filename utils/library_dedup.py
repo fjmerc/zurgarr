@@ -247,7 +247,9 @@ def years_conflict(path, keep):
 
 
 _SITE_PREFIX_RE = re.compile(r'^(?:www\.)?[\w-]+\.(?:org|com|net|to|cc|tv)\s*-\s*', re.IGNORECASE)
-_SHOW_STOPWORDS = {'the', 'a', 'an', 'and', 'us', 'uk', 'au', 'ca', 'nz'}
+_SHOW_STOPWORDS = {'the', 'a', 'an', 'and'}
+# a trailing country tag tells same-name remakes apart (Ghosts US / AU)
+_COUNTRY_TAGS = {'us', 'uk', 'au', 'ca', 'nz'}
 # letters NFKD doesn't decompose to ASCII
 _TRANSLIT = str.maketrans({'ø': 'o', 'Ø': 'O', 'ß': 'ss', 'æ': 'ae', 'Æ': 'AE', 'œ': 'oe',
                            'Œ': 'OE', 'đ': 'd', 'Đ': 'D', 'ł': 'l', 'Ł': 'L', 'þ': 'th'})
@@ -259,12 +261,13 @@ _PACK_SEASON_RE = re.compile(r'[\s._(\[-]+(?:S\d{1,2}(?!\d)|Season|Complete)', r
 
 def _show_tokens(text):
     """Normalised words of a series title, years and filler dropped (accents
-    folded, "&"/"and" and country tags ignored, so "Shōgun" / "Shogun",
-    "Law & Order" / "Law.Order" and "Ghosts (AU)" / "Ghosts" are the same
-    show)."""
+    folded, "&"/"and" ignored, so "Shōgun" / "Shogun" and "Law & Order" /
+    "Law.Order" read the same).  A title that is only a year ("1923") keeps
+    its first year.  Country tags stay: ``_show_ident`` compares them."""
     text = unicodedata.normalize('NFKD', text.translate(_TRANSLIT).replace('&', ' '))
-    text = text.encode('ascii', 'ignore').decode()
-    text = _NAME_YEAR_RE.sub(' ', text.lower().replace("'", '').replace('’', ''))
+    text = text.encode('ascii', 'ignore').decode().lower().replace("'", '').replace('’', '')
+    title_years = _NAME_YEAR_RE.findall(text)
+    text = _NAME_YEAR_RE.sub(' ', text)
     words, run = [], []
     for t in [t for t in re.split(r'[^a-z0-9]+', text) if t] + ['']:
         if len(t) == 1:
@@ -277,13 +280,27 @@ def _show_tokens(text):
         run = []
         if t:
             words.append(t)
-    return tuple(t for t in words if t not in _SHOW_STOPWORDS)
+    words = tuple(t for t in words if t not in _SHOW_STOPWORDS)
+    return words or tuple(title_years[:1])
 
 
-def _show_key(tokens):
-    """Show tokens as one comparable string: "S.H.I.E.L.D." and "SHIELD",
-    "M*A*S*H" and "MASH" read the same."""
-    return ''.join(tokens or ())
+def _show_ident(tokens):
+    """``(key, country)`` of show tokens: the words as one string ("S.H.I.E.L.D."
+    and "SHIELD", "M*A*S*H" and "MASH" read the same) and a trailing country
+    tag, or None."""
+    tokens = tuple(tokens or ())
+    country = None
+    if len(tokens) > 1 and tokens[-1] in _COUNTRY_TAGS:
+        tokens, country = tokens[:-1], tokens[-1]
+    return ''.join(tokens), country
+
+
+def _named_for(tokens, names):
+    """True when show *tokens* name one of *names* (``series_names``): the
+    same words, and no two different country tags ("Ghosts (US)" is not
+    "Ghosts AU"; an untagged "Ghosts" may be either)."""
+    key, country = _show_ident(tokens)
+    return any(key == k and (country is None or c is None or country == c) for k, c in names)
 
 
 def _show_text(path, local=True, end_re=_PACK_SHOW_END_RE):
@@ -343,13 +360,20 @@ def _episode_title(path, local=True):
     return ()
 
 
+# words that don't make an episode title specific ("Episode 1", "Part Two")
+_GENERIC_TITLE_WORDS = {'episode', 'ep', 'part', 'chapter', 'folge', 'capitulo', 'episodio',
+                        'pilot', 'finale', 'one', 'two', 'three', 'four', 'five', 'six', 'seven',
+                        'eight', 'nine', 'ten', 'eleven', 'twelve'}
+
+
 def _same_episode_title(a, b):
     """True when extra copy *a* and kept copy *b* name the same episode
-    title of two words or more — one-word titles ("Pilot") are too common to
-    vouch for a copy.  *b*'s title is read from its link target only: its
-    local name is the arr's rename."""
+    title with two or more specific words — "Pilot", "Episode 1" or "Part
+    Two" are too common to vouch for a copy.  *b*'s title is read from its
+    link target only: its local name is the arr's rename."""
     ta, tb = (_episode_title(a) if a else ()), (_episode_title(b, local=False) if b else ())
-    return bool(ta and ta == tb and len(ta) >= 2)
+    specific = [w for w in ta if not w.isdigit() and w not in _GENERIC_TITLE_WORDS]
+    return bool(ta and ta == tb and len(specific) >= 2)
 
 
 def show_conflict(path, keep, series_title, aliases=()):
@@ -363,7 +387,7 @@ def show_conflict(path, keep, series_title, aliases=()):
     conflict."""
     names = series_names(series_title, aliases)
     a, b = _copy_show(path), _copy_show(keep, local=False)
-    if not (names and a and _show_key(a) in names and b and _show_key(b) not in names):
+    if not (names and a and _named_for(a, names) and b and not _named_for(b, names)):
         return False
     return not _same_episode_title(path, keep)
 
@@ -406,28 +430,55 @@ def movie_file_mismatch(keep, years):
     found = {int(y) for y in _copy_years(keep)}
     if not years or not found or found & set(years):
         return None
-    # a release folder naming one year vouches for a misnamed file in it
-    # ("…State.1998…/…state.1997…"); a collection's "1937-2026" does not
+    # a release folder naming one year vouches for a file in it misnamed by
+    # a year ("…State.1998…/…state.1997…"); not for a distant year (a bonus
+    # film: "Scarface.1983…/Scarface.1932…"), nor a collection's "1937-2026"
     folder_years = {int(y) for y in _NAME_YEAR_RE.findall(_target_names(keep)[1])}
-    if len(folder_years) == 1 and folder_years & set(years):
+    if (len(folder_years) == 1 and folder_years & set(years)
+            and all(abs(f - y) <= 1 for f in found for y in folder_years)):
         return None
     return "Radarr's file is from %s, the film from %s" % (
         '/'.join(map(str, sorted(found))), '/'.join(map(str, sorted(years))))
 
 
-def series_years(series):
+def series_years(series, aliases=None):
     """Years a copy of Sonarr's series may name: its year, first-aired year,
-    and any year that is part of its title or an alias ("1923")."""
+    and any year that is part of its title or an alias ("1923").  *aliases*
+    defaults to ``series_aliases(series)``."""
     years = {_int(series.get('year')), _year_of(series.get('firstAired'))}
-    for t in (series.get('title') or '', *series_aliases(series)):
+    aliases = series_aliases(series) if aliases is None else aliases
+    for t in (series.get('title') or '', *aliases):
         years |= {int(y) for y in _NAME_YEAR_RE.findall(t)}
     return {y for y in years if y}
 
 
 def series_names(title, aliases=()):
-    """Show-name keys (``_show_key``) Sonarr knows the series by: its title
+    """Show idents (``_show_ident``) Sonarr knows the series by: its title
     and aliases."""
-    return {k for k in (_show_key(_show_tokens(x or '')) for x in (title, *aliases)) if k}
+    return {i for i in (_show_ident(_show_tokens(x or '')) for x in (title, *aliases)) if i[0]}
+
+
+def _named_years(keep):
+    """Years a kept copy's link target names its show with: in its file
+    name before the SxxEyy, and in its folder name before the season marker
+    ("Dark.Matter.2015.S01…/Dark.Matter.S01E01…" is the 2015 show)."""
+    file, folder = _target_names(keep)
+    texts = []
+    m = _EPISODE_RE.search(file)
+    if m and m.start() > 0:
+        texts.append(_SITE_PREFIX_RE.sub('', file[:m.start()]))
+    folder = _SITE_PREFIX_RE.sub('', folder)
+    m = _PACK_SEASON_RE.search(folder) or _EPISODE_RE.search(folder)
+    if m and m.start() > 0:
+        texts.append(folder[:m.start()])
+    return {int(y) for t in texts for y in _NAME_YEAR_RE.findall(t)}
+
+
+def _scene_numbered(eps, ep):
+    """True when the file's episodes are plausibly Sonarr's *ep* under scene
+    numbering (S02E01 mapped to S01E13): another regular season and another
+    episode number.  Specials (season 0) are never renumbered that way."""
+    return all(s and ep[0] and s != ep[0] and e != ep[1] for s, e in eps)
 
 
 def _ep_label(ep):
@@ -442,8 +493,8 @@ def episode_file_mismatch(keep, ep, names, extra=None, years=()):
     unless it has the same episode title as *extra*, the copy it would
     replace ("Daredevil … In the Blood" for Marvel's Daredevil).  A name
     without an episode marker or show text is not a mismatch, and neither is
-    one in another season (scene numbering: Sonarr can map S02E01 to its
-    S01E13).  A year in the show-name part must be one of the series'
+    one in another regular season with another number (scene numbering:
+    Sonarr can map S02E01 to its S01E13).  A year in the show-name part must be one of the series'
     *years* (``series_years``): a reboot's file ("Dark Matter 2015" for
     the 2024 series).  Only the link target is read — the local name is
     Sonarr's own rename — so a real file (no link) can't be checked."""
@@ -451,15 +502,14 @@ def episode_file_mismatch(keep, ep, names, extra=None, years=()):
     if not file:
         return None
     eps = parse_episode_numbers(file) or parse_episode_numbers(folder)
-    if eps and ep not in eps and all(s == ep[0] for s, _e in eps):
+    if eps and ep not in eps and not _scene_numbered(eps, ep):
         return "Sonarr's file for %s holds %s" % (_ep_label(ep), ', '.join(map(_ep_label, eps)))
-    named = {int(y) for y in _NAME_YEAR_RE.findall(
-        _show_text(keep, local=False, end_re=_PACK_SEASON_RE) or '')}
+    named = _named_years(keep)
     if years and named and not named & set(years):
         return "Sonarr's file for %s is from %s, the series from %s" % (
             _ep_label(ep), '/'.join(map(str, sorted(named))), '/'.join(map(str, sorted(years))))
     show = _copy_show(keep, local=False)
-    if show and names and _show_key(show) not in names:
+    if show and names and not _named_for(show, names):
         if _same_episode_title(extra, keep):
             return None
         return "Sonarr's file for %s is named for %r" % (_ep_label(ep), ' '.join(show))
@@ -824,9 +874,9 @@ def plan_foreign_folders(root, kind, owned, maps, tracked_by_entry, pairs,
                 report.append(dict(row, rule='arr-error',
                                    detail=f"{info['folder']!r} can't be read"))
                 continue
-            aliases = series_aliases(record)
+            aliases = series_aliases(record, _other_title_idents(by_title.values(), info))
             show_names = series_names(info.get('title'), aliases)
-            years = series_years(record) if record else {
+            years = series_years(record, aliases) if record else {
                 y for y in (_int(info.get('year')),) if y}
             for n, p in media:
                 eps = eps_of[p]
@@ -1415,9 +1465,22 @@ def sonarr_tracked(client, series, local_dir):
     return tracked
 
 
-def series_aliases(series):
-    """Sonarr's alternate titles for a series record."""
-    return tuple(a['title'] for a in series.get('alternateTitles') or () if a.get('title'))
+def series_aliases(series, taken=frozenset()):
+    """Sonarr's alternate titles for a series record, minus any that name
+    *taken* — other series' title idents (Daredevil: Born Again listed as
+    "Daredevil" must not pass the 2015 show's files as its own)."""
+    out = []
+    for a in series.get('alternateTitles') or ():
+        t = a.get('title') if isinstance(a, dict) else None
+        if t and _show_ident(_show_tokens(t)) not in taken:
+            out.append(t)
+    return tuple(out)
+
+
+def _other_title_idents(entries, own):
+    """Title idents of every entry but *own* (matched on ``id``)."""
+    return frozenset(_show_ident(_show_tokens(e.get('title') or '')) for e in entries
+                     if e.get('id') != own.get('id'))
 
 
 def radarr_tracked(movie, local_dir):
@@ -1437,7 +1500,8 @@ def plan_arr_tv(client, local_tv, pairs, skipped=None):
     answer for is skipped.  ``get_all_series`` failing raises.
     """
     removals, protected = [], set()
-    for s in client.get_all_series(strict=True) or []:
+    series = client.get_all_series(strict=True) or []
+    for s in series:
         folder = arr_folder_name(s.get('path'))
         if not folder:
             continue
@@ -1455,9 +1519,10 @@ def plan_arr_tv(client, local_tv, pairs, skipped=None):
             logger.warning("[dedup] Skipping %r — Sonarr episode data unavailable: %s",
                            s.get('title'), e)
             continue
+        aliases = series_aliases(s, _other_title_idents(series, s))
         removals += plan_series_duplicates(local_dir, tracked, pairs, s.get('title', ''),
-                                           skipped=skipped, aliases=series_aliases(s),
-                                           years=series_years(s))
+                                           skipped=skipped, aliases=aliases,
+                                           years=series_years(s, aliases))
     return removals, protected
 
 

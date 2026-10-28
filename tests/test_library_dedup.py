@@ -2113,3 +2113,88 @@ class TestArrFileMismatchBugHunterFixes:
         out = plan_movie_duplicates(str(L.lib / 'Enemy of the State (1998)'), kept, L.pairs,
                                     'Enemy of the State', years={1998})
         assert [r.path for r in out] == [extra]
+
+
+class TestArrFileMismatchBugHunterPass2:
+    """bug-hunter 2026-10-28, second pass on the kept-copy check."""
+
+    def _plan_tv(self, tmp_path, title, keep_release, extra_release, ep=(1, 1), years=(),
+                 aliases=()):
+        from utils.library_dedup import plan_series_duplicates
+        L = _Lib(tmp_path)
+        kept = L.link('S/Season 01/S - S%02dE%02d - x.mkv' % ep, keep_release)
+        extra = L.link('S/Season 01/extra.S%02dE%02d.mkv' % ep, extra_release)
+        out = plan_series_duplicates(str(L.lib / 'S'), {ep: kept}, L.pairs, title,
+                                     years=years, aliases=aliases)
+        return [r.path for r in out], extra
+
+    @pytest.mark.parametrize('title,keep,extra', [
+        ('Ghosts (US)', 'Ghosts.AU.S01E01.1080p.WEB/Ghosts.AU.S01E01.1080p.WEB.mkv',
+         'X/Ghosts.US.S01E01.mkv'),
+        ('The Office (US)', 'The.Office.UK.S01/The.Office.UK.S01E01.mkv', 'X/The.Office.US.S01E01.mkv'),
+    ])
+    def test_other_country_remake_held(self, tmp_path, title, keep, extra):
+        out, _ = self._plan_tv(tmp_path, title, keep, extra)
+        assert out == []
+
+    def test_untagged_release_of_tagged_series_removed(self, tmp_path):
+        out, extra = self._plan_tv(tmp_path, 'Ghosts (US)', 'Ghosts.S01/Ghosts.S01E01.mkv',
+                                   'X/S01E01.mkv')
+        assert out == [extra]
+
+    def test_regular_episode_file_for_a_special_held(self, tmp_path):
+        out, _ = self._plan_tv(tmp_path, 'Show', 'Show.S01E05.1080p/Show.S01E05.1080p.mkv',
+                               'X/Show.S00E05.Special.mkv', ep=(0, 5))
+        assert out == []
+
+    def test_same_episode_number_other_season_held(self, tmp_path):
+        out, _ = self._plan_tv(tmp_path, 'Show', 'Show.S01/Show.S01E05.mkv', 'X/Show.S02E05.mkv',
+                               ep=(2, 5))
+        assert out == []
+
+    def test_reboot_year_in_folder_when_file_has_none(self, tmp_path):
+        out, _ = self._plan_tv(tmp_path, 'Dark Matter',
+                               'Dark.Matter.2015.S01.1080p.BluRay/Dark.Matter.S01E01.1080p.BluRay.mkv',
+                               'Dark.Matter.S01E01.WEB/Dark.Matter.S01E01.WEB.mkv', years={2024})
+        assert out == []
+
+    def test_year_titled_series_checks_show_name(self, tmp_path):
+        out, _ = self._plan_tv(tmp_path, '1923', '1883.S01E01.1080p.WEB/1883.S01E01.1080p.WEB.mkv',
+                               'X/S01E01.mkv', years={1923, 2022})
+        assert out == []
+
+    def test_year_titled_series_own_release_removed(self, tmp_path):
+        out, extra = self._plan_tv(tmp_path, '1923', '1923.2022.S01/1923.2022.S01E01.mkv',
+                                   'X/S01E01.mkv', years={1923, 2022})
+        assert out == [extra]
+
+    def test_generic_episode_title_does_not_excuse_another_show(self, tmp_path):
+        out, _ = self._plan_tv(tmp_path, 'Daredevil: Born Again',
+                               'Daredevil.S01E01.Episode.1.1080p/Daredevil.S01E01.Episode.1.1080p.mkv',
+                               'X/Daredevil.Born.Again.S01E01.Episode.1.1080p.mkv')
+        assert out == []
+
+    def test_single_year_folder_does_not_vouch_for_a_distant_year(self, tmp_path):
+        from utils.library_dedup import plan_movie_duplicates
+        L = _Lib(tmp_path)
+        kept = L.link('Scarface (1983)/Scarface (1983).mkv',
+                      'Scarface.1983.REMASTERED.1080p.BluRay/Scarface.1932.1080p.BluRay.mkv')
+        L.link('Scarface (1983)/scarface.mkv', 'X/x.mkv')
+        assert plan_movie_duplicates(str(L.lib / 'Scarface (1983)'), kept, L.pairs, 'Scarface',
+                                     years={1983}) == []
+
+    def test_alias_that_is_another_series_title_is_ignored(self, tmp_path):
+        from unittest.mock import MagicMock
+        from utils.library_dedup import plan_arr_tv
+        L = _Lib(tmp_path)
+        L.link('DDBA (2025)/Season 01/DDBA - S01E05.mkv', 'Daredevil.S01E05.WEB/Daredevil.S01E05.WEB.mkv')
+        L.link('DDBA (2025)/Season 01/S01E05.mkv', 'X/S01E05.mkv')
+        c = MagicMock()
+        c.get_all_series.return_value = [
+            {'id': 1, 'title': 'Daredevil: Born Again', 'path': '/tv/DDBA (2025)', 'year': 2025,
+             'alternateTitles': [{'title': 'Daredevil'}]},
+            {'id': 2, 'title': 'Daredevil', 'path': '/tv/Daredevil (2015)', 'year': 2015}]
+        c.get_episodes.return_value = [{'seasonNumber': 1, 'episodeNumber': 5, 'episodeFileId': 9}]
+        c.get_episode_files.return_value = [{'id': 9, 'path': '/tv/DDBA (2025)/Season 01/DDBA - S01E05.mkv'}]
+        removals, _ = plan_arr_tv(c, str(L.lib), L.pairs)
+        assert removals == []
