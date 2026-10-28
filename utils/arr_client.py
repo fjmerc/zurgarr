@@ -734,10 +734,10 @@ class _ArrClientBase:
         """
         raise NotImplementedError
 
-    def _grabs_by_hash(self, since):
-        """Grab records since epoch *since*, keyed by upper-case
-        ``torrentInfoHash``; None when the arr didn't answer."""
-        out = {}
+    def _grab_records(self, since):
+        """Grab history records since epoch *since*, newest first; None when
+        the arr didn't answer."""
+        out = []
         for page in range(1, _GRAB_HISTORY_MAX_PAGES + 1):
             resp = self._get('/api/v3/history',
                              {'eventType': 1, 'page': page,
@@ -754,13 +754,33 @@ class _ArrClientBase:
                 if when is not None and when < since:
                     older = True
                     continue
-                data = rec.get('data') if isinstance(rec.get('data'), dict) else {}
-                h = str(data.get('torrentInfoHash') or '').strip().upper()
-                if h:
-                    out.setdefault(h, []).append(rec)
+                out.append(rec)
             if older or len(records) < _GRAB_HISTORY_PAGE_SIZE:
                 break
         return out
+
+    def _grabs_by_hash(self, since):
+        """Grab records since epoch *since*, keyed by upper-case
+        ``torrentInfoHash``; None when the arr didn't answer."""
+        records = self._grab_records(since)
+        if records is None:
+            return None
+        out = {}
+        for rec in records:
+            data = rec.get('data') if isinstance(rec.get('data'), dict) else {}
+            h = str(data.get('torrentInfoHash') or '').strip().upper()
+            if h:
+                out.setdefault(h, []).append(rec)
+        return out
+
+    def recent_grab_ids(self, since):
+        """Series/movie ids grabbed since epoch *since* — every grab, with or
+        without a torrent hash (usenet); None when the arr didn't answer."""
+        records = self._grab_records(since)
+        if records is None:
+            return None
+        return {rec.get(self._MEDIA_ID_KEY) for rec in records
+                if rec.get(self._MEDIA_ID_KEY) is not None}
 
     def recent_grabs_by_hash(self, since):
         """Public form of ``_grabs_by_hash`` — grab records since epoch

@@ -211,10 +211,15 @@ def _publish_scan(scanner, data):
         scanner._cache_time = time.monotonic()
 
 
-_NEW_REQUEST_CHECK_INTERVAL = 120
-_NEW_REQUEST_GRACE_S = 180       # the arr searches when a title is added; give it time
+# Every check reads Radarr's/Sonarr's whole lists (their 120s cache has
+# lapsed by then), so not more often than this.
+_NEW_REQUEST_CHECK_INTERVAL = 300
+_NEW_REQUEST_GRACE_S = 120       # the arr searches when a title is added; give it time
 _NEW_REQUEST_WINDOW_S = 3600     # older titles are the hourly Wanted pass's
-_new_request_seen = {}           # (kind, arr id) -> epoch handled
+# (kind, arr id) -> epoch handled: a Wanted pass queued for it, or the arr
+# grabbed it (the blackhole's turn).  In memory: after a restart, titles
+# added in the last hour may be checked once more — harmless.
+_new_request_seen = {}
 
 
 def _new_requests_without_grab(kind, client, items, now):
@@ -241,11 +246,12 @@ def _new_requests_without_grab(kind, client, items, now):
         fresh.append((it, added))
     if not fresh:
         return []
-    grabs = client.recent_grabs_by_hash(min(a for _, a in fresh))
-    if grabs is None:
+    grabbed = client.recent_grab_ids(min(a for _, a in fresh))
+    if grabbed is None:
         return None
-    key = 'movieId' if kind == 'movie' else 'seriesId'
-    grabbed = {r.get(key) for recs in grabs.values() for r in recs}
+    for it, _ in fresh:
+        if it.get('id') in grabbed:      # the blackhole handles a turned-down grab
+            _new_request_seen[(kind, it.get('id'))] = now
     return [it for it, _ in fresh if it.get('id') not in grabbed]
 
 
@@ -262,7 +268,7 @@ def new_request_check():
         return {'status': 'skipped', 'message': 'Wanted recovery is off'}
     from utils.arr_client import get_download_service
     now = time.time()
-    for k in [k for k, t in _new_request_seen.items() if now - t > 2 * _NEW_REQUEST_WINDOW_S]:
+    for k in [k for k, t in _new_request_seen.items() if now - t > _NEW_REQUEST_WINDOW_S]:
         del _new_request_seen[k]
     found = []
     for kind, svc_name, fetch in (('movie', 'radarr', _get_radarr_movies_list),
@@ -280,7 +286,10 @@ def new_request_check():
     if not found:
         return {'status': 'success', 'message': 'No new requests waiting'}
     from utils.blackhole import _request_wanted_scan
-    _request_wanted_scan(None)
+    if not _request_wanted_scan(None):
+        # one is already queued, and may have read the arrs before these
+        # titles — look again next run
+        return {'status': 'success', 'message': 'A library scan is already queued'}
     for kind, it in found:
         _new_request_seen[(kind, it.get('id'))] = now
     titles = ', '.join(it.get('title') or '?' for _, it in found)

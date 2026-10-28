@@ -40,8 +40,8 @@ def env(monkeypatch):
     radarr, sonarr = MagicMock(), MagicMock()
     radarr.get_all_movies.return_value = []
     sonarr.get_all_series.return_value = []
-    radarr.recent_grabs_by_hash.return_value = {}
-    sonarr.recent_grabs_by_hash.return_value = {}
+    radarr.recent_grab_ids.return_value = set()
+    sonarr.recent_grab_ids.return_value = set()
     svc = lambda kind: (radarr, 'radarr') if kind == 'movie' else (sonarr, 'sonarr')
     with patch('utils.arr_client.get_download_service', svc):
         yield {'radarr': radarr, 'sonarr': sonarr, 'requested': requested}
@@ -62,7 +62,7 @@ def test_each_title_triggers_once(env):
 
 
 def test_too_new_waits_for_the_arrs_own_search(env):
-    env['radarr'].get_all_movies.return_value = [_movie(added=1)]
+    env['radarr'].get_all_movies.return_value = [_movie(added=1.5)]
     st.new_request_check()
     assert env['requested'] == []
 
@@ -84,14 +84,14 @@ def test_movie_radarr_grabbed_is_left_to_the_blackhole(env):
     """A grab goes through the blackhole, which starts the scan itself when
     it turns one down."""
     env['radarr'].get_all_movies.return_value = [_movie()]
-    env['radarr'].recent_grabs_by_hash.return_value = {'H': [{'movieId': 760}]}
+    env['radarr'].recent_grab_ids.return_value = {760}
     st.new_request_check()
     assert env['requested'] == []
 
 
 def test_unreadable_grab_history_skips_quietly(env):
     env['radarr'].get_all_movies.return_value = [_movie()]
-    env['radarr'].recent_grabs_by_hash.return_value = None
+    env['radarr'].recent_grab_ids.return_value = None
     st.new_request_check()
     assert env['requested'] == []
     assert st._new_request_seen == {}        # tried again next run
@@ -112,7 +112,7 @@ def test_series_not_a_new_empty_request_is_skipped(env, kw):
 
 def test_series_sonarr_grabbed_is_left_to_the_blackhole(env):
     env['sonarr'].get_all_series.return_value = [_series()]
-    env['sonarr'].recent_grabs_by_hash.return_value = {'H': [{'seriesId': 9}]}
+    env['sonarr'].recent_grab_ids.return_value = {9}
     st.new_request_check()
     assert env['requested'] == []
 
@@ -145,3 +145,26 @@ class TestNewRequestsFirst:
         with patch('utils.arr_client.get_download_service', return_value=(client, 'radarr')):
             library._apply_radarr_wanted_movies(movies)
         assert abs(movies[0]['_added'] - (datetime.now(timezone.utc).timestamp() - 300)) < 60
+
+
+def test_grabbed_title_is_checked_once(env):
+    env['radarr'].get_all_movies.return_value = [_movie()]
+    env['radarr'].recent_grab_ids.return_value = {760}
+    st.new_request_check()
+    library._radarr_movies_cache['ts'] = 0.0
+    st.new_request_check()
+    assert env['radarr'].recent_grab_ids.call_count == 1
+    assert env['requested'] == []
+
+
+def test_title_waits_when_no_scan_could_be_queued(env, monkeypatch):
+    """A scan already pending may have read the arr before this title: try
+    again next run instead of counting it done."""
+    answers = [False, True]
+    monkeypatch.setattr('utils.blackhole._request_wanted_scan',
+                        lambda stop, **k: env['requested'].append(1) or answers.pop(0))
+    env['radarr'].get_all_movies.return_value = [_movie()]
+    st.new_request_check()
+    library._radarr_movies_cache['ts'] = 0.0
+    st.new_request_check()
+    assert env['requested'] == [1, 1]

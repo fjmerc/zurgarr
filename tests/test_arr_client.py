@@ -3584,3 +3584,27 @@ class TestQueuedItems:
             {'movieId': 1, 'status': 'completed', 'trackedDownloadState': 'importPending',
              'trackedDownloadStatus': 'warning'}])
         assert radarr.queued_movie_ids() == set()
+
+
+class TestRecentGrabIds:
+    """Media ids grabbed since a time — including grabs with no torrent hash
+    (usenet, an indexer that gives none), which the hash-keyed lookup drops."""
+
+    @pytest.fixture(params=['sonarr', 'radarr'])
+    def client(self, request, sonarr, radarr):
+        return sonarr if request.param == 'sonarr' else radarr
+
+    @patch('urllib.request.urlopen')
+    def test_ids_include_grabs_without_a_hash(self, mock_urlopen, client):
+        key = client._MEDIA_ID_KEY
+        mock_urlopen.return_value = _mock_urlopen({'records': [
+            {'eventType': 'grabbed', key: 1, 'date': '2099-01-01T00:00:00Z',
+             'data': {'torrentInfoHash': 'ABC'}},
+            {'eventType': 'grabbed', key: 2, 'date': '2099-01-01T00:00:00Z', 'data': {}},
+        ]})
+        assert client.recent_grab_ids(0) == {1, 2}
+
+    @patch('urllib.request.urlopen')
+    def test_unreadable_history_is_none(self, mock_urlopen, client):
+        mock_urlopen.return_value = _mock_urlopen(['not', 'a', 'dict'])
+        assert client.recent_grab_ids(0) is None
