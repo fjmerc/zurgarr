@@ -259,6 +259,16 @@ _ROOT_REFRESH_COALESCE_S = 15  # seconds; one TorBox WebDAV listing window
 _root_refresh_lock = threading.Lock()
 _root_refresh_ts = 0.0  # monotonic ts of the last fired root refresh
 
+# TorBox's WebDAV can list a torrent minutes after its API reports it ready
+# (seen: ~6 min), so one re-list at the start of the mount wait often comes
+# too early.  Re-list this often while waiting (still coalesced above).
+_MOUNT_REFRESH_EVERY_S = 30
+# After the mount wait times out, keep watching a ready grab this long,
+# checking every _LATE_ARRIVAL_POLL_S, and run the library scan the moment
+# it surfaces instead of leaving it for the next hourly scan.
+_LATE_ARRIVAL_WINDOW_S = 2 * 3600
+_LATE_ARRIVAL_POLL_S = 120
+
 
 def _coalesced_root_refresh(*, _now=None):
     """Fire an rclone root re-list at most once per coalesce window.
@@ -1725,7 +1735,8 @@ class BlackholeWatcher:
                  rclone_mount='/data', symlink_target_base='', mount_poll_timeout=300,
                  mount_poll_interval=10, symlink_max_age=72,
                  dedup_enabled=False, local_library_tv='', local_library_movies='',
-                 debrid_api_keys=None):
+                 debrid_api_keys=None, late_arrival_window=_LATE_ARRIVAL_WINDOW_S,
+                 late_arrival_poll=_LATE_ARRIVAL_POLL_S):
         self.watch_dir = watch_dir
         self.debrid_api_key = debrid_api_key
         self.debrid_service = debrid_service
@@ -1754,6 +1765,8 @@ class BlackholeWatcher:
         self.symlink_target_base = symlink_target_base
         self.mount_poll_timeout = mount_poll_timeout
         self.mount_poll_interval = mount_poll_interval
+        self.late_arrival_window = late_arrival_window
+        self.late_arrival_poll = late_arrival_poll
         self.symlink_max_age = symlink_max_age
 
         # Active monitor tracking (prevents duplicate monitors)
@@ -3105,6 +3118,58 @@ class BlackholeWatcher:
         provider_tag = f" via {debrid}" if debrid != self.debrid_service else ""
         logger.info(f"[blackhole] Monitoring torrent {torrent_id} for {filename}{tag}{provider_tag}")
 
+    def _watch_late_arrival(self, release_name, debrid, file_names):
+        """Watch a ready grab that missed the mount wait; return True if it
+        surfaced.
+
+        Re-lists the mount and looks for it every ``late_arrival_poll``
+        seconds for up to ``late_arrival_window``.  When it appears, runs the
+        library scan right away: the scan links it into the Sonarr/Radarr
+        folder, asks them to rescan and refreshes Plex, the same path the
+        hand-off would take an hour later.  It doesn't create /completed
+        symlinks itself, so the scan and an arr import can't both claim it.
+        Returns early on shutdown.
+        """
+        deadline = time.monotonic() + self.late_arrival_window
+        while not self._stop_event.wait(self.late_arrival_poll):
+            if time.monotonic() > deadline:
+                logger.info(f"[blackhole] {release_name} still not on the mount after the late "
+                            f"watch; the library scan will pick it up when it appears")
+                return False
+            _coalesced_root_refresh()
+            mount_path, _category, _name = self._find_on_mount(
+                release_name, debrid=debrid, file_names=file_names)
+            if mount_path:
+                logger.info(f"[blackhole] {release_name} reached the mount late — "
+                            f"running the library scan now")
+                self._run_library_scan_now()
+                return True
+        return False
+
+    def _run_library_scan_now(self, attempts=10):
+        """Start a library scan that begins after this call.
+
+        A scan already running may have listed the mount before the item
+        appeared, so retry until one starts (``run_now`` returns False while
+        a scan runs).  Gives up quietly after ``attempts``; the hand-off's
+        pending entry still has the next scheduled scan resolve it.
+        """
+        try:
+            from utils.task_scheduler import scheduler
+        except Exception:
+            return False
+        retry = min(self.late_arrival_poll, 30)
+        for _ in range(attempts):
+            try:
+                if scheduler.run_now('library_scan'):
+                    return True
+            except Exception as e:
+                logger.debug(f"[blackhole] library scan trigger failed: {e}")
+                return False
+            if self._stop_event.wait(retry):
+                return False
+        return False
+
     def _register_scanner_handoff(self, filename):
         """Hand a confirmed-ready grab off to the library scanner.
 
@@ -3464,6 +3529,7 @@ class BlackholeWatcher:
         # window surfaces every sibling episode, so the suppressed monitors
         # still find their content on the very next poll.
         _coalesced_root_refresh()
+        last_refresh = time.monotonic()
 
         while not self._stop_event.is_set():
             elapsed_mount = time.time() - mount_start
@@ -3501,8 +3567,17 @@ class BlackholeWatcher:
                                            media_title=_mt)
                     except Exception as e:
                         logger.debug(f"[blackhole] hand-off history log failed: {e}")
-                self._remove_pending(torrent_id)
+                # The hand-off above is the safety net; keep watching so a
+                # late listing reaches Plex in minutes, not at the next scan.
+                try:
+                    self._watch_late_arrival(release_name, debrid, file_names)
+                finally:
+                    self._remove_pending(torrent_id)
                 return
+
+            if time.monotonic() - last_refresh >= _MOUNT_REFRESH_EVERY_S:
+                _coalesced_root_refresh()
+                last_refresh = time.monotonic()
 
             mount_path, category, matched_name = self._find_on_mount(
                 release_name, debrid=debrid, file_names=file_names,

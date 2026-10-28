@@ -2,6 +2,7 @@
 
 import json
 import os
+import threading
 import time
 import pytest
 from utils.blackhole import (
@@ -5718,10 +5719,19 @@ class TestScannerHandoff:
             symlink_enabled=True, completed_dir=completed,
             rclone_mount=os.path.join(tmp_dir, 'data'),
             mount_poll_timeout=0.3, mount_poll_interval=0.02,
+            late_arrival_window=0.15, late_arrival_poll=0.02,
         )
 
+    @pytest.fixture(autouse=True)
+    def _no_real_scan(self, monkeypatch):
+        """Record library-scan triggers instead of running the scheduler."""
+        import utils.task_scheduler as ts
+        self.scans = []
+        monkeypatch.setattr(ts.scheduler, 'run_now',
+                            lambda name: self.scans.append(name) or True)
+
     def _drive_timeout(self, watcher, monkeypatch, torrent_id, filename,
-                       debrid, ready_status, label=None):
+                       debrid, ready_status, label=None, find=None):
         """Run _monitor_and_symlink with stubs so it reaches the Phase-2
         mount-timeout branch (ready on debrid, never on mount)."""
         status_attr = {
@@ -5737,9 +5747,10 @@ class TestScannerHandoff:
                             lambda info, debrid=None: filename.rsplit('.', 1)[0])
         monkeypatch.setattr(watcher, '_extract_filenames_from_info',
                             lambda *a, **k: [])
-        # Never surfaces on the mount → forces the timeout branch.
+        # Never surfaces on the mount (unless a test passes ``find``) → forces
+        # the timeout branch.
         monkeypatch.setattr(watcher, '_find_on_mount',
-                            lambda *a, **k: (None, None, None))
+                            find or (lambda *a, **k: (None, None, None)))
         # Seed the blackhole monitor entry so we can assert it's removed.
         watcher._add_pending(torrent_id, filename, label=label, debrid=debrid)
         watcher._monitor_and_symlink(torrent_id, filename, label, debrid)
@@ -5773,6 +5784,90 @@ class TestScannerHandoff:
         assert entry['direction'] == 'to-debrid'
         assert entry['episodes'] == [{'season': 1, 'episode': 5}]
         assert all(e['torrent_id'] != 'tb-xyz' for e in watcher._load_pending())
+
+
+    # ── TorBox listing lag: keep re-reading, and watch past the timeout ──
+
+    def test_mount_wait_rereads_the_listing_more_than_once(self, tmp_dir, monkeypatch):
+        """TorBox can list a ready torrent minutes after its API says ready;
+        one re-list at the start of the wait isn't enough."""
+        import utils.blackhole as bh
+        calls = []
+        monkeypatch.setattr(bh, '_coalesced_root_refresh', lambda **k: calls.append(1) or True)
+        monkeypatch.setattr(bh, '_MOUNT_REFRESH_EVERY_S', 0.05)
+        watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
+        self._drive_timeout(watcher, monkeypatch, 'tb-1',
+                            'Crimson.Tide.1995.1080p.WEB-DL.magnet', 'torbox', 'completed')
+        assert len(calls) >= 4      # at the start, during the wait, and while watching late
+
+    def test_late_arrival_runs_the_library_scan(self, tmp_dir, monkeypatch):
+        """Surfaces after the timeout → the library scan runs right away
+        (it links, tells the arr and refreshes Plex), instead of an hour later."""
+        import utils.library_prefs as lp
+        import utils.blackhole as bh
+        monkeypatch.setattr(bh, '_coalesced_root_refresh', lambda **k: True)
+        watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
+        made = []
+        monkeypatch.setattr(watcher, '_create_symlinks', lambda *a, **k: made.append(1) or 1)
+        start = time.monotonic()
+
+        def find(*a, **k):        # appears only after the 0.3s mount wait
+            if time.monotonic() - start > 0.35:
+                return ('/data/torbox/x', 'movies', 'x')
+            return (None, None, None)
+        self._drive_timeout(watcher, monkeypatch, 'tb-2',
+                            'Crimson.Tide.1995.1080p.WEB-DL.magnet', 'torbox', 'completed',
+                            find=find)
+        assert self.scans == ['library_scan']
+        assert made == []           # the scan links it; no second /completed copy
+        assert lp.get_all_pending()                     # handoff safety net still registered
+        assert all(e['torrent_id'] != 'tb-2' for e in watcher._load_pending())
+
+    def test_late_watch_gives_up_after_its_window(self, tmp_dir, monkeypatch):
+        import utils.blackhole as bh
+        monkeypatch.setattr(bh, '_coalesced_root_refresh', lambda **k: True)
+        watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
+        t0 = time.monotonic()
+        self._drive_timeout(watcher, monkeypatch, 'tb-3',
+                            'Crimson.Tide.1995.1080p.WEB-DL.magnet', 'torbox', 'completed')
+        assert time.monotonic() - t0 < 2
+        assert self.scans == []
+        assert all(e['torrent_id'] != 'tb-3' for e in watcher._load_pending())
+
+    def test_late_arrival_retries_while_a_scan_is_already_running(self, tmp_dir, monkeypatch):
+        """A scan that started before the item surfaced may miss it: retry until
+        one starts after."""
+        import utils.blackhole as bh
+        import utils.task_scheduler as ts
+        monkeypatch.setattr(bh, '_coalesced_root_refresh', lambda **k: True)
+        answers = iter([False, False, True])
+        monkeypatch.setattr(ts.scheduler, 'run_now',
+                            lambda name: self.scans.append(name) or next(answers))
+        watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
+        watcher.late_arrival_window = 1.0
+        start = time.monotonic()
+
+        def find(*a, **k):        # appears only after the 0.3s mount wait
+            if time.monotonic() - start > 0.35:
+                return ('/data/torbox/x', 'movies', 'x')
+            return (None, None, None)
+        self._drive_timeout(watcher, monkeypatch, 'tb-4',
+                            'Crimson.Tide.1995.1080p.WEB-DL.magnet', 'torbox', 'completed',
+                            find=find)
+        assert self.scans == ['library_scan'] * 3
+
+    def test_stop_ends_the_late_watch_promptly(self, tmp_dir, monkeypatch):
+        import utils.blackhole as bh
+        monkeypatch.setattr(bh, '_coalesced_root_refresh', lambda **k: True)
+        watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
+        watcher.late_arrival_window = 60
+        watcher.late_arrival_poll = 30
+        threading.Timer(0.5, watcher._stop_event.set).start()
+        t0 = time.monotonic()
+        self._drive_timeout(watcher, monkeypatch, 'tb-5',
+                            'Crimson.Tide.1995.1080p.WEB-DL.magnet', 'torbox', 'completed')
+        assert time.monotonic() - t0 < 3
+        assert self.scans == []
 
 
 class TestTorboxCachedAlternative:

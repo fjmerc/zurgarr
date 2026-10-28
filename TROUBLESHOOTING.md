@@ -18,6 +18,7 @@ isn't here, open a [GitHub issue](https://github.com/fjmerc/zurgarr/issues).
 - [Docker Desktop: mount propagation error](#docker-desktop-mount-propagation-error)
 - [Plex not seeing debrid content](#plex-not-seeing-debrid-content)
 - [New shows/movies only appear in Plex after a manual scan](#new-showsmovies-only-appear-in-plex-after-a-manual-scan)
+- [A TorBox grab is ready but takes a long time to reach Plex](#a-torbox-grab-is-ready-but-takes-a-long-time-to-reach-plex)
 - [A download for one show is stuck under a same-name show in Sonarr ("Not an upgrade")](#a-download-for-one-show-is-stuck-under-a-same-name-show-in-sonarr-not-an-upgrade)
 - [Plex shows the same episode or movie two or more times](#plex-shows-the-same-episode-or-movie-two-or-more-times)
 - [Duplicate tidy stopped: "a kept copy disappeared"](#duplicate-tidy-stopped-a-kept-copy-disappeared)
@@ -296,6 +297,26 @@ needs. Options:
   Zurgarr's healthcheck is passing first.
 - Try `PLEX_REFRESH=true` with `PLEX_MOUNT_DIR` set to the mount path
   **as Plex sees it** (not the path inside the Zurgarr container).
+
+## A TorBox grab is ready but takes a long time to reach Plex
+
+Symptom: the log says `Torrent ready: … via torbox`, but five minutes later
+`not on mount after 300s — confirmed ready on torbox, handing off to library
+scanner`, and the title shows up in Plex much later (the Activity page says
+"Ready on torbox, mount slow — handed to library scanner").
+
+Cause: TorBox's WebDAV file listing can include a new torrent several
+minutes after its API reports it ready, and the TorBox mount only re-reads
+that listing every `TORBOX_RCLONE_DIR_CACHE_TIME` (2h) on its own.
+
+What zurgarr does: while it waits for a grab it re-reads the listing every
+30 seconds (at most one listing per 15 seconds across all grabs, so TorBox
+doesn't rate-limit it). If the wait (`BLACKHOLE_MOUNT_POLL_TIMEOUT`) runs out,
+it hands the title to the library scan as a safety net but keeps watching it
+every 2 minutes for up to 2 hours, and runs the library scan the moment it
+appears — which links it, tells Sonarr/Radarr and refreshes Plex. Before this,
+such titles waited for the next hourly scan or longer. To nudge one yourself,
+run `library_scan` from System → Tasks.
 
 ## New shows/movies only appear in Plex after a manual scan
 
