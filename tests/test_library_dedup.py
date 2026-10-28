@@ -2198,3 +2198,12 @@ class TestArrFileMismatchBugHunterPass2:
         c.get_episode_files.return_value = [{'id': 9, 'path': '/tv/DDBA (2025)/Season 01/DDBA - S01E05.mkv'}]
         removals, _ = plan_arr_tv(c, str(L.lib), L.pairs)
         assert removals == []
+
+    def test_series_title_year_used_when_no_years_passed(self, tmp_path):
+        from utils.library_dedup import plan_series_duplicates
+        L = _Lib(tmp_path)
+        kept = L.link('Dark Matter (2024)/Season 01/x - S01E01.mkv',
+                      'Dark.Matter.2015.S01/Dark.Matter.2015.S01E01.mkv')
+        L.link('Dark Matter (2024)/Season 01/Dark.Matter.S01E01.mkv', 'X/Dark.Matter.S01E01.mkv')
+        assert plan_series_duplicates(str(L.lib / 'Dark Matter (2024)'), {(1, 1): kept}, L.pairs,
+                                      'Dark Matter (2024)') == []

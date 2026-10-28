@@ -611,6 +611,7 @@ def plan_series_duplicates(series_dir, tracked, pairs, title, skipped=None, alia
     are the series' alternate titles, *years* its ``series_years``."""
     tracked_paths = {os.path.normpath(p) for p in tracked.values() if p}
     names = series_names(title, aliases)
+    years = years or {int(y) for y in _NAME_YEAR_RE.findall(title or '')}
     removals, mismatched = [], []
     try:
         entries = _media_entries(series_dir)
