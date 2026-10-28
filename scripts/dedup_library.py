@@ -116,7 +116,8 @@ def _plan_tv(ctx):
     ids, full = _tmdb_context('tv')
     foreign, report = dd.plan_foreign_folders(
         ctx.local_tv, 'tv', owned, arr_title_maps(series, ctx.sonarr, True), tracked,
-        ctx.pairs, cached_tmdb=ids, tmdb_cache=full, exclude={r.path for r in removals})
+        ctx.pairs, cached_tmdb=ids, tmdb_cache=full, exclude={r.path for r in removals},
+        arr_record=lambda info: by_id.get(info['id']))
     report += _year_conflict_rows('tv', ctx.local_tv, skipped)
     # Episodes with copies in Sonarr's folder that Sonarr tracks none of —
     # listed for the owner, never removed.
@@ -163,7 +164,8 @@ def _plan_movies(ctx):
     ids, full = _tmdb_context('movie')
     foreign, report = dd.plan_foreign_folders(
         ctx.local_movies, 'movie', owned, arr_title_maps(movies, ctx.radarr, False), tracked,
-        ctx.pairs, cached_tmdb=ids, tmdb_cache=full, exclude={r.path for r in removals})
+        ctx.pairs, cached_tmdb=ids, tmdb_cache=full, exclude={r.path for r in removals},
+        arr_record=lambda info: by_id.get(info['id']))
     report += _year_conflict_rows('movie', ctx.local_movies, skipped)
     # Movie folders holding copies Radarr tracks none of — listed, never removed.
     for m in movies:
@@ -183,12 +185,22 @@ def _plan_movies(ctx):
 
 
 def _year_conflict_rows(kind, root, skipped):
-    """Report rows for extra copies kept because their year differs from the
-    copy the arr tracks — the arr may hold another title (check it there)."""
-    return [{'kind': kind, 'folder': os.path.relpath(path, root), 'rule': 'year-conflict',
-             'detail': f'kept: year differs from the tracked copy {os.path.basename(keep)!r} '
-                       f'— the arr may hold another title'}
-            for path, keep in skipped]
+    """Report rows for extra copies kept because the copy the arr tracks
+    looks like another title — its year differs from the extra copy's, or
+    (with a reason) from the arr's own title, year or episode.  Check the
+    arr: it may hold the wrong file."""
+    rows = []
+    for path, keep, *reason in skipped:
+        if reason:
+            rows.append({'kind': kind, 'folder': os.path.relpath(path, root),
+                         'rule': 'arr-file-mismatch',
+                         'detail': f'kept: {reason[0]} — the arr may hold the wrong file'})
+        else:
+            rows.append({'kind': kind, 'folder': os.path.relpath(path, root),
+                         'rule': 'year-conflict',
+                         'detail': f'kept: year differs from the tracked copy '
+                                   f'{os.path.basename(keep)!r} — the arr may hold another title'})
+    return rows
 
 
 def _deferred_groups(ctx, kind, removals):

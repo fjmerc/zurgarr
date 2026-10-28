@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import time
+import unicodedata
 from dataclasses import dataclass, replace
 
 from utils.logger import get_logger
@@ -240,7 +241,10 @@ _SHOW_STOPWORDS = {'the', 'a', 'an', 'us', 'uk'}
 
 
 def _show_tokens(text):
-    """Normalised words of a series title, years and filler dropped."""
+    """Normalised words of a series title, years and filler dropped (accents
+    folded and "&" read as "and", so "Shōgun" / "Shogun" and "Friends &
+    Neighbors" / "Friends.and.Neighbors" are the same show)."""
+    text = unicodedata.normalize('NFKD', text.replace('&', ' and ')).encode('ascii', 'ignore').decode()
     text = _NAME_YEAR_RE.sub(' ', text.lower().replace("'", '').replace('’', ''))
     return tuple(t for t in re.split(r'[^a-z0-9]+', text) if t and t not in _SHOW_STOPWORDS)
 
@@ -305,6 +309,70 @@ def show_conflict(path, keep, series_title):
         return False
     ta, tb = _episode_title(path), _episode_title(keep)
     return not (ta and tb and ta == tb)
+
+
+def _year_of(value):
+    """Year of an arr date ('1943-01-15T00:00:00Z'), or None."""
+    m = re.match(r'(\d{4})-', str(value or ''))
+    return int(m.group(1)) if m else None
+
+
+def movie_years(movie):
+    """Years a copy of Radarr's film may carry: its year, secondary year,
+    and cinema and digital release years (a streaming original's real date —
+    Hamilton is 2025 by its cinema re-release, 2020 on streaming).  Physical
+    releases run decades late, so they don't count."""
+    years = {movie.get('year'), movie.get('secondaryYear'),
+             _year_of(movie.get('inCinemas')), _year_of(movie.get('digitalRelease'))}
+    return {int(y) for y in years if y}
+
+
+def movie_file_mismatch(keep, years):
+    """Why the kept copy looks like another film than Radarr's — its name
+    carries years and none is one of *years* — or None.  Exact: remakes can
+    be a year apart (Obsession 2025 / 2026), and *years* already holds every
+    date Radarr knows the film by.  Nothing to compare on either side is not
+    a mismatch."""
+    found = {int(y) for y in _copy_years(keep)}
+    if not years or not found or found & set(years):
+        return None
+    return "Radarr's file is from %s, the film from %s" % (
+        '/'.join(map(str, sorted(found))), '/'.join(map(str, sorted(years))))
+
+
+def series_names(title, aliases=()):
+    """Show-name tokens Sonarr knows the series by: its title and aliases."""
+    return {t for t in (_show_tokens(x or '') for x in (title, *aliases)) if t}
+
+
+def _ep_label(ep):
+    return 'S%02dE%02d' % ep
+
+
+def episode_file_mismatch(keep, ep, names, extra=None):
+    """Why the kept copy of *ep* looks like another episode or show than
+    Sonarr's, or None.  Read from the link target (an arr's rename can't
+    change it): it names other episodes (iCarly S05E08 tracking a file that
+    is only S05E07), or another show than the series' title and aliases —
+    unless it has the same episode title as *extra*, the copy it would
+    replace ("Daredevil … In the Blood" for Marvel's Daredevil).  A name
+    without an episode marker or show text is not a mismatch."""
+    try:
+        target = os.readlink(keep) if os.path.islink(keep) else ''
+    except OSError:
+        target = ''
+    if not target:
+        return None
+    eps = parse_episode_numbers(os.path.basename(target))
+    if eps and ep not in eps:
+        return "Sonarr's file for %s holds %s" % (_ep_label(ep), ', '.join(map(_ep_label, eps)))
+    show = _copy_show(keep)
+    if show and names and show not in names:
+        ta, tb = (_episode_title(extra) if extra else ()), _episode_title(keep)
+        if ta and tb and ta == tb:
+            return None
+        return "Sonarr's file for %s is named for %r" % (_ep_label(ep), ' '.join(show))
+    return None
 
 
 def kept_copy_ok(path, pairs):
@@ -394,12 +462,14 @@ def sidecars_for(removals, kept_paths=()):
     return out
 
 
-def plan_series_duplicates(series_dir, tracked, pairs, title, skipped=None):
+def plan_series_duplicates(series_dir, tracked, pairs, title, skipped=None, aliases=()):
     """Extra links in a Sonarr series folder: untracked debrid symlinks whose
     every claimed episode has a tracked copy that plays.  *tracked* maps
-    ``(season, episode)`` → local path of Sonarr's tracked file."""
+    ``(season, episode)`` → local path of Sonarr's tracked file; *aliases*
+    are the series' alternate titles."""
     tracked_paths = {os.path.normpath(p) for p in tracked.values() if p}
-    removals = []
+    names = series_names(title, aliases)
+    removals, mismatched = [], []
     try:
         entries = _media_entries(series_dir)
     except OSError as e:
@@ -414,6 +484,13 @@ def plan_series_duplicates(series_dir, tracked, pairs, title, skipped=None):
         eps = parse_episode_numbers(name)
         if not eps or not all(kept_copy_ok(tracked.get(ep), pairs) for ep in eps):
             continue
+        reason = next((r for r in (episode_file_mismatch(tracked[ep], ep, names, path)
+                                   for ep in eps) if r), None)
+        if reason:
+            mismatched.append(reason)
+            if skipped is not None:
+                skipped.append((path, tracked[eps[0]], reason))
+            continue
         if any(years_conflict(path, tracked[ep]) or show_conflict(path, tracked[ep], title)
                for ep in eps):
             logger.info("[dedup] Keeping %r — the tracked copy looks like another title", path)
@@ -423,16 +500,28 @@ def plan_series_duplicates(series_dir, tracked, pairs, title, skipped=None):
         removals.append(Removal(path, target, 'tv', 'arr-folder-untracked',
                                 tracked[eps[0]], title,
                                 keeps=tuple(sorted({tracked[ep] for ep in eps}))))
+    _warn_mismatch(title, mismatched, 'Sonarr')
     return removals + sidecars_for(removals, tracked_paths)
 
 
-def plan_movie_duplicates(movie_dir, tracked_path, pairs, title, skipped=None):
+def _warn_mismatch(title, reasons, arr):
+    """One warning per title: the arr's own file looks like another title,
+    so its extra copies stay (they may be the right one)."""
+    if reasons:
+        logger.warning("[dedup] Not removing %d extra cop%s of %r — %s; %s may hold the wrong "
+                       "file (check it there)", len(reasons), 'y' if len(reasons) == 1 else 'ies',
+                       title, '; '.join(sorted(set(reasons))[:3]), arr)
+
+
+def plan_movie_duplicates(movie_dir, tracked_path, pairs, title, skipped=None, years=None):
     """Extra debrid symlinks in a Radarr movie folder, when Radarr's own
-    tracked file plays."""
+    tracked file plays and its name fits the film's *years*
+    (``movie_years``)."""
     if not kept_copy_ok(tracked_path, pairs):
         return []
     keep = os.path.normpath(tracked_path)
-    removals = []
+    reason = movie_file_mismatch(tracked_path, years)
+    removals, mismatched = [], []
     try:
         entries = _media_entries(movie_dir)
     except OSError as e:
@@ -444,12 +533,18 @@ def plan_movie_duplicates(movie_dir, tracked_path, pairs, title, skipped=None):
         target = _removable_link(path, pairs)
         if target is None:
             continue
+        if reason:
+            mismatched.append(reason)
+            if skipped is not None:
+                skipped.append((path, tracked_path, reason))
+            continue
         if years_conflict(path, tracked_path):
             logger.info("[dedup] Keeping %r — its year differs from the tracked copy's", path)
             if skipped is not None:
                 skipped.append((path, tracked_path))
             continue
         removals.append(Removal(path, target, 'movie', 'arr-folder-untracked', tracked_path, title))
+    _warn_mismatch(title, mismatched, 'Radarr')
     return removals + sidecars_for(removals, [tracked_path])
 
 
@@ -492,7 +587,8 @@ def _keep_for_episode(ep, tracked, arr_index, pairs):
 
 
 def plan_foreign_folders(root, kind, owned, maps, tracked_by_entry, pairs,
-                         cached_tmdb=None, tmdb_cache=None, exclude=frozenset()):
+                         cached_tmdb=None, tmdb_cache=None, exclude=frozenset(),
+                         arr_record=None):
     """Plan removals in top-level folders of *root* that no arr entry owns.
 
     *maps* is ``library.arr_title_maps(...)``; the folder name is resolved
@@ -501,7 +597,10 @@ def plan_foreign_folders(root, kind, owned, maps, tracked_by_entry, pairs,
     entry: ``{(s, e): path}`` for TV, a path (or None) for movies.
 
     *exclude* holds link paths already planned for removal (``plan_arr_*``);
-    they are never chosen as a kept copy.
+    they are never chosen as a kept copy.  *arr_record(info)* returns the
+    arr's full record for a matched entry (its years / alternate titles,
+    to check the kept copy against); without it the match's title and year
+    are used.
 
     Returns ``(removals, report_rows)``; report rows are dicts with
     ``kind``, ``folder``, ``rule`` and ``detail``.  A folder holding any real
@@ -610,10 +709,11 @@ def plan_foreign_folders(root, kind, owned, maps, tracked_by_entry, pairs,
         rule = 'foreign-folder' if strict else 'foreign-folder-review'
         try:
             tracked = tracked_by_entry(info)
+            record = (arr_record(info) if arr_record else None) or {}
         except Exception as e:
             report.append(dict(row, rule='arr-error', detail=str(e)))
             continue
-        planned, uncovered, conflicts = [], [], []
+        planned, uncovered, conflicts, mismatched = [], [], [], []
         if is_tv:
             tracked = tracked or {}
             arr_index = episode_index(arr_folder)
@@ -621,9 +721,16 @@ def plan_foreign_folders(root, kind, owned, maps, tracked_by_entry, pairs,
                 report.append(dict(row, rule='arr-error',
                                    detail=f"{info['folder']!r} can't be read"))
                 continue
+            names = series_names(info.get('title'), series_aliases(record))
             for n, p in media:
                 eps = eps_of[p]
                 keeps = [_keep_for_episode(ep, tracked, arr_index, pairs) for ep in eps]
+                reason = eps and all(keeps) and next(
+                    (r for r in (episode_file_mismatch(k, ep, names, p)
+                                 for k, ep in zip(keeps, eps)) if r), None)
+                if reason:
+                    mismatched.append((n, reason))
+                    continue
                 if eps and all(keeps) and any(years_conflict(p, k)
                                               or show_conflict(p, k, info.get('title'))
                                               for k in keeps):
@@ -638,7 +745,13 @@ def plan_foreign_folders(root, kind, owned, maps, tracked_by_entry, pairs,
                     uncovered.append((n, p))
         else:
             ok = kept_copy_ok(tracked, pairs)
+            years = movie_years(record) if record else (
+                {int(info['year'])} if info.get('year') else set())
+            reason = ok and movie_file_mismatch(tracked, years)
             for n, p in media:
+                if reason:
+                    mismatched.append((n, reason))
+                    continue
                 if ok and years_conflict(p, tracked):
                     conflicts.append(n)
                     continue
@@ -649,6 +762,11 @@ def plan_foreign_folders(root, kind, owned, maps, tracked_by_entry, pairs,
                 else:
                     uncovered.append((n, p))
         removals += planned + sidecars_for(planned, [p for _n, p in uncovered])
+        if mismatched:
+            report.append(dict(row, rule='arr-file-mismatch', detail='%d kept (%s — the arr may '
+                               'hold the wrong file, check it there): %s' % (
+                                   len(mismatched), '; '.join(sorted({r for _n, r in mismatched})[:3]),
+                                   ', '.join(n for n, _r in mismatched[:5]))))
         if conflicts:
             report.append(dict(row, rule='year-conflict', detail='%d kept (year or show differs '
                                "from %s's copy — the arr may hold another title): %s" % (
@@ -1188,6 +1306,11 @@ def sonarr_tracked(client, series, local_dir):
     return tracked
 
 
+def series_aliases(series):
+    """Sonarr's alternate titles for a series record."""
+    return tuple(a['title'] for a in series.get('alternateTitles') or () if a.get('title'))
+
+
 def radarr_tracked(movie, local_dir):
     """Local path of Radarr's tracked file for one movie, or None."""
     path = (movie.get('movieFile') or {}).get('path')
@@ -1224,7 +1347,7 @@ def plan_arr_tv(client, local_tv, pairs, skipped=None):
                            s.get('title'), e)
             continue
         removals += plan_series_duplicates(local_dir, tracked, pairs, s.get('title', ''),
-                                           skipped=skipped)
+                                           skipped=skipped, aliases=series_aliases(s))
     return removals, protected
 
 
@@ -1244,5 +1367,6 @@ def plan_arr_movies(client, local_movies, pairs, skipped=None):
             logger.warning("[dedup] Skipping %r — its folder can't be read: %s", m.get('title'), e)
             continue
         removals += plan_movie_duplicates(local_dir, radarr_tracked(m, local_dir),
-                                          pairs, m.get('title', ''), skipped=skipped)
+                                          pairs, m.get('title', ''), skipped=skipped,
+                                          years=movie_years(m))
     return removals, protected

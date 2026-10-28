@@ -583,16 +583,22 @@ def test_radarr_rename_stops_when_plex_stays_busy(tmp_path):
     assert plex.merged == []
 
 
-def test_plan_reports_year_conflicts_in_arr_folders(tmp_path):
+@pytest.mark.parametrize('kept_release,extra_release,rule', [
+    # Radarr's file is the 2025 film: the arr's own file is suspect
+    ('Obsession 2025 BYNDR/o.mkv', 'Obsession 2026 KyoGo/o.mkv', 'arr-file-mismatch'),
+    # Radarr's file fits; the extra copy is another year's film
+    ('Obsession 2026 KyoGo/o.mkv', 'Obsession 2025 BYNDR/o.mkv', 'year-conflict'),
+])
+def test_plan_reports_year_conflicts_in_arr_folders(tmp_path, kept_release, extra_release, rule):
     L = Lib(tmp_path)
-    L.link(L.movies, 'Obsession (2026)/Obsession (2026).mkv', 'Obsession 2025 BYNDR/o.mkv')
-    L.link(L.movies, 'Obsession (2026)/Obsession.2026.1080p.mkv', 'Obsession 2026 KyoGo/o.mkv')
+    L.link(L.movies, 'Obsession (2026)/Obsession (2026).mkv', kept_release)
+    L.link(L.movies, 'Obsession (2026)/Obsession.extra.1080p.mkv', extra_release)
     radarr = _radarr([{'id': 1, 'title': 'Obsession', 'year': 2026, 'hasFile': True,
                        'path': '/d/movies/Obsession (2026)',
                        'movieFile': {'path': '/d/movies/Obsession (2026)/Obsession (2026).mkv'}}])
     out = str(tmp_path / 'plan.tsv')
     dedup.main(['plan', '--kind', 'movie', '--out', out], ctx=_ctx(L, radarr=radarr))
-    assert [(r['action'], r['rule']) for r in _read(out)] == [('report', 'year-conflict')]
+    assert [(r['action'], r['rule']) for r in _read(out)] == [('report', rule)]
 
 
 def test_radarr_rename_when_plex_replaced_the_item(tmp_path):
@@ -766,3 +772,34 @@ def test_apply_stops_when_a_kept_copy_is_lost(tmp_path, monkeypatch, capsys):
     printed = capsys.readouterr().out
     assert 'KEPT copy disappeared' in printed and 're-run apply' not in printed
     assert halt.exists()          # the scheduled tidy stops too
+
+
+def test_plan_reports_arr_file_mismatch(tmp_path):
+    """Radarr's own file is another film (Predator: Badlands tracking the
+    1973 Badlands): the extra copy is listed as held, not removed."""
+    L = Lib(tmp_path)
+    L.link(L.movies, 'Badlands ()/Predator Badlands (2025).mkv',
+           'Badlands 1973 BluRay 2160p/Badlands (1973).mkv')
+    L.link(L.movies, 'Badlands ()/predator.badlands.mkv', 'Predator WEB/p.mkv')
+    radarr = _radarr([{'id': 1, 'title': 'Predator: Badlands', 'year': 2025, 'hasFile': True,
+                       'inCinemas': '2025-11-05T00:00:00Z', 'path': '/d/movies/Badlands ()',
+                       'movieFile': {'path': '/d/movies/Badlands ()/Predator Badlands (2025).mkv'}}])
+    out = str(tmp_path / 'plan.tsv')
+    dedup.main(['plan', '--kind', 'movie', '--out', out], ctx=_ctx(L, radarr=radarr))
+    rows = _read(out)
+    assert [(r['action'], r['rule']) for r in rows] == [('report', 'arr-file-mismatch')]
+    assert '1973' in rows[0]['detail']
+
+
+def test_plan_foreign_folder_uses_radarr_record_years(tmp_path):
+    """A foreign folder's kept copy is checked against Radarr's full record
+    (secondary year counts: Casablanca is 1943 with secondary year 1942)."""
+    L = Lib(tmp_path)
+    L.link(L.movies, 'Casablanca (1942)/Casablanca (1943).mkv', 'Casablanca 1942 BluRay/c.mkv')
+    L.link(L.movies, 'Casablanca/casablanca.mkv', 'Casablanca WEB/c.mkv')
+    radarr = _radarr([{'id': 1, 'title': 'Casablanca', 'year': 1943, 'secondaryYear': 1942,
+                       'hasFile': True, 'path': '/d/movies/Casablanca (1942)',
+                       'movieFile': {'path': '/d/movies/Casablanca (1942)/Casablanca (1943).mkv'}}])
+    out = str(tmp_path / 'plan.tsv')
+    dedup.main(['plan', '--kind', 'movie', '--out', out], ctx=_ctx(L, radarr=radarr))
+    assert ('remove', 'foreign-folder') in [(r['action'], r['rule']) for r in _read(out)]

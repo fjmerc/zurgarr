@@ -21,6 +21,7 @@ isn't here, open a [GitHub issue](https://github.com/fjmerc/zurgarr/issues).
 - [A download for one show is stuck under a same-name show in Sonarr ("Not an upgrade")](#a-download-for-one-show-is-stuck-under-a-same-name-show-in-sonarr-not-an-upgrade)
 - [Plex shows the same episode or movie two or more times](#plex-shows-the-same-episode-or-movie-two-or-more-times)
 - [Duplicate tidy stopped: "a kept copy disappeared"](#duplicate-tidy-stopped-a-kept-copy-disappeared)
+- [Duplicate clean-up: "Sonarr/Radarr may hold the wrong file"](#duplicate-clean-up-sonarrradarr-may-hold-the-wrong-file)
 - [Plex shows episodes or movies as "unavailable" after a restart](#plex-shows-episodes-or-movies-as-unavailable-after-a-restart)
 - [Sonarr/Radarr requests fail with "Try again" (temporary failure in name resolution)](#sonarrradarr-requests-fail-with-try-again-temporary-failure-in-name-resolution)
 - [Blackhole: symlinks created but broken](#blackhole-symlinks-created-but-broken)
@@ -417,6 +418,30 @@ history for an upgrade or rename; then a rescan of the series/movie shows
 what's missing (the next library scan relinks a debrid copy when one
 exists). Then delete `/config/duplicate_tidy_halted.json`; the tidy resumes
 on its next run and finishes the Plex follow-ups it had saved.
+
+## Duplicate clean-up: "Sonarr/Radarr may hold the wrong file"
+
+Symptom: the log says `[dedup] Not removing N extra copies of '<title>' —
+Radarr's file is from 1973, the film from 2025; Radarr may hold the wrong
+file` (or `Sonarr's file for S05E08 holds S05E07`, or `… is named for
+'<another show>'`), or a `scripts/dedup_library.py plan` lists
+`arr-file-mismatch` rows. Typically the movie or episode plays the wrong
+film or episode, or is missing from Plex.
+
+Cause: the file Sonarr/Radarr has on record for that title looks like
+another title — read from the release name its link points to, which a
+rename doesn't change. The duplicate clean-up keeps the arr's file and
+removes the others, so it leaves this title alone: one of the other copies
+may be the right one.
+
+Fix: in Sonarr/Radarr, open the title and check its file. If it's the
+wrong one: make sure the right copy is still in the folder (or will be
+re-downloaded), delete the wrong file there (for a link this removes only
+the link), rescan the series/movie so the arr picks up the right copy, and
+turn monitoring back on — Radarr unmonitors a movie when its file is
+deleted. Then rescan the folder in Plex. A title that is right as it is
+(a release named with a year the movie database doesn't list) can be left:
+only its duplicates stay.
 
 ## Plex shows episodes or movies as "unavailable" after a restart
 
