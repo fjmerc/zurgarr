@@ -5734,9 +5734,11 @@ class TestScannerHandoff:
         # A scanner where every scan we start links the folder.
         self.linked = False
         self.busy = []                      # effects_busy() answers, consumed in order
+        self.passes = 0                     # completed link passes
         scanner = type('S', (), {
-            'linked_from': lambda _s, folder: self.linked,
+            'linked_from': lambda _s, folder, since=None: self.linked,
             'effects_busy': lambda _s: self.busy.pop(0) if self.busy else False,
+            'link_passes': lambda _s: self.passes,
         })()
         monkeypatch.setattr('utils.library.get_scanner', lambda: scanner)
 
@@ -6013,14 +6015,30 @@ class TestScannerHandoff:
         assert len(calls) == 2
 
     def test_gives_up_after_three_scans_that_link_nothing(self, tmp_dir, monkeypatch):
-        """A title Sonarr/Radarr don't track never gets linked: stop asking
-        after three scans instead of scanning back to back."""
+        """Scans keep failing before they link anything: stop asking after
+        three instead of scanning back to back."""
         import utils.task_scheduler as ts
         watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
         calls = []
         monkeypatch.setattr(ts.scheduler, 'run_now', lambda name: calls.append(name) or True)
         assert watcher._run_library_scan_now('/data/torbox/x') is False
         assert len(calls) == 3
+
+    def test_stops_after_two_full_passes_that_chose_not_to_link(self, tmp_dir, monkeypatch):
+        """The scan won't link it (Radarr already has a file, an upgrade
+        grab): two completed passes since the folder appeared settle it —
+        one scan, not three back to back."""
+        import utils.task_scheduler as ts
+        watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
+        calls = []
+
+        def run_now(name):
+            calls.append(name)
+            self.passes += 2      # e.g. the running refresh finished, then this scan
+            return True
+        monkeypatch.setattr(ts.scheduler, 'run_now', run_now)
+        assert watcher._run_library_scan_now('/data/torbox/x') is False
+        assert len(calls) == 1
 
     def test_no_scan_while_a_refresh_is_linking(self, tmp_dir, monkeypatch):
         """A scan started while another run is linking would read the library

@@ -11018,6 +11018,38 @@ class TestRecentLinks:
         assert sc.linked_from(folder)
         assert not sc.linked_from(os.path.join(tmp_dir, 'torbox', 'Crimson Tide 1995 2160p'))
 
+    def test_old_links_dont_count(self, tmp_dir, monkeypatch):
+        import time as _t
+        sc = self._scanner()
+        folder = os.path.join(tmp_dir, 'torbox', 'Show.S01')
+        os.makedirs(folder)
+        sc._note_linked(os.path.join(folder, 'e1.mkv'))
+        later = _t.monotonic() + 5
+        assert sc.linked_from(folder)
+        assert not sc.linked_from(folder, since=later)
+
+    def test_a_completed_effects_run_counts_a_link_pass(self):
+        sc = self._scanner()
+        for step in ('_cleanup_disc_rips', '_search_for_missing_episodes',
+                     '_recover_wanted_via_debrid', '_recover_local_fallback_routing',
+                     '_clear_resolved_pending', '_escalate_stuck_pending',
+                     '_warn_stalled_pending', '_cleanup_broken_debrid_symlinks',
+                     '_create_debrid_symlinks'):
+            setattr(sc, step, lambda *a, **k: None)
+        sc._enforce_preferences = lambda *a, **k: False
+        sc._path_lock = threading.Lock()
+        sc._path_index, sc._local_path_index = {}, {}
+        before = sc.link_passes()
+        sc._scan_effects({'shows': [], 'movies': []})
+        assert sc.link_passes() == before + 1
+
+        def boom(*a, **k):
+            raise OSError('mount gone')
+        sc._create_debrid_symlinks = boom
+        with pytest.raises(OSError):
+            sc._scan_effects({'shows': [], 'movies': []})
+        assert sc.link_passes() == before + 1        # a failed pass doesn't count
+
     def test_effects_busy(self):
         sc = self._scanner()
         assert not sc.effects_busy()

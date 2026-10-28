@@ -3206,10 +3206,13 @@ class BlackholeWatcher:
         Starts a scan when none is linking — a scan started while another run
         links would read the library and skip linking — and checks every
         ~30s.  A run that links it for another reason (the dashboard's
-        refresh, a sibling's scan) counts too.  Stops after *max_scans*
-        scans that didn't link it (a title Sonarr/Radarr don't track never
-        will) or when the budget (~15 min) runs out; the hand-off's pending
-        entry still has a later scan resolve it.
+        refresh, a sibling's scan) counts too.  Settled without a link once
+        two linking passes have finished since the folder was found (the
+        first may have read the library before it showed): the scan chose
+        not to link it — Sonarr/Radarr already have a file (an upgrade grab)
+        or don't track the title.  Also stops after *max_scans* scans or
+        ~15 min; the hand-off's pending entry still has a later scan resolve
+        it.
         """
         try:
             from utils.library import get_scanner
@@ -3219,15 +3222,22 @@ class BlackholeWatcher:
                 logger.info("[blackhole] library scan isn't scheduled (STATUS_UI_ENABLED off?) "
                             "— can't link the late arrival now")
                 return False
+            found = time.monotonic()
+            passes_at_find = scanner.link_passes()
         except Exception as e:
             logger.debug(f"[blackhole] library scan unavailable: {e}")
             return False
+        name = os.path.basename(mount_path)
         retry = min(self.late_arrival_poll, 30)
         started = 0
         for _ in range(attempts):
             try:
-                if scanner.linked_from(mount_path):
+                if scanner.linked_from(mount_path, since=found):
                     return True
+                if scanner.link_passes() - passes_at_find >= 2:
+                    logger.info(f"[blackhole] the library scan didn't link {name} (Sonarr/Radarr "
+                                f"may already have a file for it, or don't track it)")
+                    return False
                 if started >= max_scans:
                     task = scheduler.get_task('library_scan') or {}
                     if not task.get('running') and not scanner.effects_busy():
@@ -3240,12 +3250,12 @@ class BlackholeWatcher:
             if self._stop_event.wait(retry):
                 return False
         try:
-            if scanner.linked_from(mount_path):
+            if scanner.linked_from(mount_path, since=found):
                 return True
         except Exception:
             pass
-        logger.warning(f"[blackhole] the library scan didn't link {os.path.basename(mount_path)}; "
-                       f"the next scheduled scan will try again")
+        logger.info(f"[blackhole] {name} isn't linked yet; the next scheduled scan will "
+                    f"pick it up")
         return False
 
     def _register_scanner_handoff(self, filename):

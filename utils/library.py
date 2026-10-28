@@ -577,10 +577,12 @@ def _replaces_extras(group, new_path):
 
 
 def _seen_debrid_names(paths, are_files):
-    """Release keys (``_same_release_key``) of every folder in the debrid
-    paths a scan saw — folders only, never file names, so a torrent named
-    like a file inside a seen pack doesn't count as seen.  *are_files*: the
-    paths end in a file (episodes) rather than a folder (movies)."""
+    """Release keys (``_same_release_key``) of the release folders in the
+    debrid paths a scan saw — the torrent's own folder only: never a file
+    name, a "Season N" subfolder or the mount's directories, so nothing the
+    scan didn't enumerate counts as seen.  *are_files*: the paths end in a
+    file (episodes, ``<release>/[Season N/]<file>``) rather than the release
+    folder itself (movies)."""
     keys = set()
     for p in paths:
         if not p:
@@ -588,7 +590,9 @@ def _seen_debrid_names(paths, are_files):
         p = os.path.normpath(p)
         if are_files:
             p = os.path.dirname(p)
-        keys.update(_same_release_key(part) for part in p.split(os.sep) if part)
+            if _match_season_dir(os.path.basename(p)):
+                p = os.path.dirname(p)          # <release>/<Season N>/<file>
+        keys.add(_same_release_key(os.path.basename(p)))
     return keys
 
 
@@ -4462,6 +4466,7 @@ class LibraryScanner:
         self._warn_stalled_pending()
         self._cleanup_broken_debrid_symlinks()
         self._create_debrid_symlinks(shows, movies, path_index)
+        self._count_link_pass()        # reached only when linking ran to the end
         return changed
 
     def scan(self, force_enforce=False):
@@ -4505,13 +4510,27 @@ class LibraryScanner:
             for k in [k for k, t in links.items() if now - t > self._LINKED_KEEP_S]:
                 del links[k]
 
-    def linked_from(self, folder):
-        """True if a scan recently linked a file from *folder* (a mount path)."""
+    def linked_from(self, folder, since=None):
+        """True if a scan linked a file from *folder* (a mount path) within
+        the last _LINKED_KEEP_S, and at or after monotonic *since* if given."""
         root = os.path.realpath(folder)
         prefix = root.rstrip(os.sep) + os.sep
+        floor = time.monotonic() - self._LINKED_KEEP_S
+        if since is not None:
+            floor = max(floor, since)
         with self._links_lock:
             links = self.__dict__.get('_recent_links') or {}
-            return any(k == root or k.startswith(prefix) for k in links)
+            return any(t >= floor and (k == root or k.startswith(prefix))
+                       for k, t in links.items())
+
+    def _count_link_pass(self):
+        with self._links_lock:
+            self.__dict__['_link_passes'] = self.__dict__.get('_link_passes', 0) + 1
+
+    def link_passes(self):
+        """How many effects runs have finished their linking step."""
+        with self._links_lock:
+            return self.__dict__.get('_link_passes', 0)
 
     def effects_busy(self):
         """True while a scan or refresh is running its effects (linking)."""

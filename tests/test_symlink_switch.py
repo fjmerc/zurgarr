@@ -534,6 +534,31 @@ class TestAutoEnforcement:
             scanner._enforce_preferences([show], [], {norm: 'prefer-local'}, path_index, {})
         mock_client.delete_torrent.assert_called_once_with('P')
 
+    def test_prefer_local_season_folder_and_mount_dirs_arent_releases(self, tmp_dir, monkeypatch):
+        """Only the release folder counts as seen — not "Season 2" inside it,
+        nor the mount's own directories."""
+        local_tv = os.path.join(tmp_dir, 'tv')
+        os.makedirs(local_tv)
+        monkeypatch.setenv('BLACKHOLE_RCLONE_MOUNT', os.path.join(tmp_dir, 'mount'))
+        monkeypatch.setenv('BLACKHOLE_SYMLINK_TARGET_BASE', '/mnt/debrid')
+        monkeypatch.setenv('LIBRARY_PREFERENCE_AUTO_ENFORCE', 'true')
+        scanner = self._make_scanner(local_tv, monkeypatch)
+        show = self._make_show('Show', [(2, 1, 'both')])
+        from utils.library import _normalize_title
+        norm = _normalize_title('Show')
+        path_index = {(norm, 2, 1): os.path.join(tmp_dir, 'mount', 'shows', 'Show.Complete.1080p',
+                                                  'Season 2', 'Show.S02E01.mkv')}
+        mock_client = MagicMock()
+        mock_client.find_torrents_by_title.return_value = [
+            {'id': 'P', 'filename': 'Show.Complete.1080p', 'parsed_title': 'Show', 'year': None},
+            {'id': 'S', 'filename': 'Season 2', 'parsed_title': 'Show', 'year': None},
+            {'id': 'M', 'filename': 'shows', 'parsed_title': 'Show', 'year': None},
+        ]
+        mock_client.delete_torrent.return_value = True
+        with patch('utils.debrid_client.get_debrid_client', return_value=(mock_client, 'realdebrid')):
+            scanner._enforce_preferences([show], [], {norm: 'prefer-local'}, path_index, {})
+        mock_client.delete_torrent.assert_called_once_with('P')
+
     def test_prefer_local_movie_keeps_an_unseen_release(self, tmp_dir, monkeypatch):
         local_tv = os.path.join(tmp_dir, 'tv')
         os.makedirs(local_tv)
