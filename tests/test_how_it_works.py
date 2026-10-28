@@ -128,7 +128,7 @@ def test_cards_follow_each_jobs_prerequisites(hiw_env):
     hiw_env.setenv('STATUS_UI_ENABLED', 'true')
     hiw_env.setenv('BLACKHOLE_SYMLINK_ENABLED', 'false')
     off = {j['key'] for j in _data()['jobs'] if j['off']}
-    assert off == {'verify', 'tidy'}
+    assert off == {'scan', 'verify', 'tidy'}    # the scan still runs, but links nothing
     hiw_env.setenv('BLACKHOLE_SYMLINK_ENABLED', 'true')
     hiw_env.setenv('PLEX_REFRESH', 'false')
     assert _job(_data(), 'rescan')['off']
@@ -165,9 +165,10 @@ def test_registration_gates_match_the_cards(hiw_env, env):
     registered = set(fake.tasks)
     hiw_env.setattr('utils.task_scheduler.scheduler', FakeScheduler())   # judge by settings alone
     data = _data()
-    for key, task in (('scan', 'library_scan'), ('verify', 'verify_symlinks'),
-                      ('mountcheck', 'mount_liveness')):
+    for key, task in (('verify', 'verify_symlinks'), ('mountcheck', 'mount_liveness')):
         assert _job(data, key)['off'] == (task not in registered), key
+    if 'library_scan' not in registered:
+        assert _job(data, 'scan')['off']
     if 'duplicate_tidy' not in registered:
         assert _job(data, 'tidy')['off']
     if 'enforce_preferences' not in registered:

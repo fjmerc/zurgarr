@@ -240,7 +240,9 @@ def build_data():
     jobs = [
         {'key': 'scan', 'code': 'S', 'title': 'Library scan',
          'when': interval('library_scan', 'LIBRARY_SCAN_INTERVAL'),
-         'needs': gate('library_scan', (status_ui, 'STATUS_UI_ENABLED')),
+         # it runs regardless (it feeds the Library page) but only links with symlinks on
+         'needs': gate('library_scan', (status_ui, 'STATUS_UI_ENABLED')) or _missing(
+             (symlinks, 'BLACKHOLE_SYMLINK_ENABLED')),
          'short': 'Links in anything on your cloud folders that Sonarr/Radarr are missing.',
          'text': 'Looks through your cloud folders for anything Sonarr/Radarr are missing and '
                  'links it in, then asks them to rescan. It never links something they already '
