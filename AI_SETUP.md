@@ -46,10 +46,10 @@ STEP 0: ASK ME ALL OF THIS IN ONE MESSAGE
 Then show me my target layout as a table: each container, each path inside it, and the host path it maps to. Wait for my OK.
 
 SETTINGS THIS SETUP NEEDS (names exactly as in CONFIGURATION.md; .env.example has every one, commented)
-- Always:
-  - RD_API_KEY, or AD_API_KEY with Zurg nightly. zurgarr only starts its mounts when Zurg runs, so TorBox alone isn't enough.
-  - STATUS_UI_ENABLED=true and STATUS_UI_AUTH=user:password: the dashboard, Settings page and library scan need them.
-  - TZ.
+- Cloud mounts (almost every setup): RD_API_KEY, or AD_API_KEY with Zurg nightly. zurgarr only starts its mounts when Zurg runs; with TorBox alone it runs, but with no mounts.
+- The dashboard and the library scan: STATUS_UI_ENABLED=true.
+- The Settings page and dashboard buttons that change things: STATUS_UI_AUTH=user:password.
+- TZ (otherwise UTC).
 - TorBox as well: TORBOX_API_KEY, TORBOX_WEBDAV_USER, TORBOX_WEBDAV_PASS.
 - Sonarr/Radarr blackhole with symlinks:
   - BLACKHOLE_ENABLED=true and BLACKHOLE_SYMLINK_ENABLED=true.

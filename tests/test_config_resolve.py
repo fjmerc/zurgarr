@@ -397,3 +397,18 @@ def test_every_env_file_reader_uses_read_env_file():
         with open(os.path.join(REPO, rel)) as f:
             src = f.read()
         assert not re.search(r'(?<!\.)\bdotenv_values\(', src), rel
+
+
+@pytest.mark.parametrize('text, expected', [
+    ('A=  # placeholder\nA=real\n', 'real'),        # later real value wins
+    ('A=real\nA=  # placeholder\n', ''),            # later placeholder wins
+    ('A =  # spaced\n', ''),
+    ('A=  # crlf\r\nB=x\r\n', ''),
+    ("'A'=  # quoted key\n", ''),
+    ('B="line1\nA=  # inside a quoted value\n"\nA=real\n', 'real'),
+])
+def test_read_env_file_follows_dotenv_line_order(tmp_path, text, expected):
+    from utils.config_resolve import read_env_file
+    p = tmp_path / '.env'
+    p.write_bytes(text.encode())
+    assert read_env_file(str(p))['A'] == expected

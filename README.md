@@ -222,8 +222,9 @@ sudo wget https://raw.githubusercontent.com/fjmerc/zurgarr/master/.env.example -
 
 # Edit — the "WHAT YOU MUST SET" block at the top of the file lists the
 # minimum for each kind of setup. For any setup that's at least:
-#   RD_API_KEY                      (plus TORBOX_API_KEY + TORBOX_WEBDAV_* for TorBox)
-#   STATUS_UI_ENABLED=true + STATUS_UI_AUTH (e.g., admin:yourpassword)
+#   RD_API_KEY              (plus TORBOX_API_KEY + TORBOX_WEBDAV_* for TorBox)
+#   STATUS_UI_ENABLED=true  (the dashboard and the library scan)
+#   STATUS_UI_AUTH          (e.g., admin:yourpassword, for the Settings page)
 sudo nano /zurgarr/config/.env
 ```
 

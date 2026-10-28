@@ -10,14 +10,19 @@ Precedence for every key (highest wins):
   unset   — none of the above
 
 Blank or whitespace-only always means "not provided".  This module must
-stay import-light (os + dataclasses only): base/ imports it at startup.
+stay import-light (standard library only; python-dotenv is imported inside
+read_env_file): base/ imports it at startup.
 """
 
 import os
+import re
 import threading
 from dataclasses import dataclass
 
 SOURCES = ('locked', 'secret', 'set', 'auto', 'default', 'unset')
+
+# `KEY=   # note`: nothing but whitespace between '=' and the comment
+_COMMENT_ONLY_VALUE = re.compile(r'[ \t]+#')
 
 
 @dataclass(frozen=True)
@@ -173,22 +178,29 @@ def read_env_file(path):
     comment), so a placeholder line like ``.env.example``'s would read as a
     setting.  Such a key reads as blank.  ``KEY=x  # note`` is already
     stripped to ``x``, and ``KEY=#x`` (no space before ``#``) keeps ``#x``.
+    Decided per assignment in dotenv's own parse, so the last line for a key
+    wins and a quoted multi-line value is never mistaken for an assignment.
     A missing file reads as empty.
     """
-    import re
     from dotenv import dotenv_values
+    from dotenv.parser import parse_stream
     if not path or not os.path.exists(path):
         return {}
     values = dotenv_values(path)
-    comment_only = re.compile(r'^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_.]*)\s*=[ \t]+#')
+    placeholder = {}
     try:
         with open(path, encoding='utf-8') as f:
-            for line in f:
-                m = comment_only.match(line)
-                if m and m.group(1) in values:
-                    values[m.group(1)] = ''
+            for binding in parse_stream(f):
+                if binding.key is None or binding.error:
+                    continue
+                rest = binding.original.string.split('=', 1)
+                placeholder[binding.key] = (
+                    len(rest) == 2 and _COMMENT_ONLY_VALUE.match(rest[1]) is not None)
     except (OSError, UnicodeDecodeError):
-        pass
+        pass       # dotenv_values read the same file above, so this can't really happen
+    for key, blank in placeholder.items():
+        if blank and key in values:
+            values[key] = ''
     return values
 
 
