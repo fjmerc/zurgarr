@@ -180,6 +180,9 @@ never grabbed directly to the debrid account.
 
 ## Quick Start
 
+Setting up with an AI assistant? [AI_SETUP.md](AI_SETUP.md) has a prompt
+that walks it through every step below, with a check after each one.
+
 ### Prerequisites
 
 - A **Linux Docker host** (not Docker Desktop — it lacks
@@ -461,6 +464,8 @@ with "cross-origin request rejected".
   feature, with defaults
 - **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** — symptom-first fixes for
   the common problems
+- **[AI_SETUP.md](AI_SETUP.md)** — a prompt for an AI assistant to set
+  zurgarr up phase by phase, with checks and the settings each part needs
 - **[BLACKHOLE_SYMLINK_GUIDE.md](BLACKHOLE_SYMLINK_GUIDE.md)** — complete
   Sonarr/Radarr blackhole setup including symlink mode, multi-host NFS,
   dedup, and diagnostics
