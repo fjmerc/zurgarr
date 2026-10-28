@@ -8992,6 +8992,50 @@ class TestRecoverWantedViaTorbox:
             self._scanner()._recover_wanted_via_debrid([show], [], {})
         assert wire['adds'] == []
 
+    @pytest.fixture
+    def hourly(self, monkeypatch):
+        import utils.task_scheduler as ts
+        monkeypatch.setattr(ts.scheduler, 'get_task',
+                            lambda name: {'name': name, 'interval': 3600}
+                            if name == 'library_scan' else None)
+
+    def _two_titles(self, wire):
+        movie = lambda t, i: [{'title': t, 'source': 'wanted', 'imdb_id': i,
+                               'is_available': True}]
+        wire['torrentio_b'] = [{'info_hash': 'c' * 40, 'title': 'Anora.2024.1080p.WEB-DL.RelC',
+                                'seeds': 10, 'quality': {'label': '1080p', 'score': 100}}]
+        return movie('The Substance', 'tt1'), movie('Anora', 'tt2')
+
+    def test_wanted_pass_runs_once_per_scan_interval(self, wire, hourly):
+        """Scans a TorBox arrival starts (to link it) must not run Wanted
+        recovery too — each would add more, whose arrivals start more scans:
+        TorBox adds would snowball into the bursts that arm its cooldown."""
+        sc = self._scanner()
+        first, second = self._two_titles(wire)
+        sc._recover_wanted_via_debrid([], first, {})
+        assert len(wire['adds']) == 1
+        sc._wanted_tb_last_add -= LibraryScanner._WANTED_TB_MIN_GAP_S + 1
+        wire['torrentio'] = wire['torrentio_b']
+        sc._recover_wanted_via_debrid([], second, {})
+        assert len(wire['adds']) == 1                 # paced: under an hour
+        sc._wanted_last_pass -= 3600
+        sc._recover_wanted_via_debrid([], second, {})
+        assert len(wire['adds']) == 2
+
+    def test_requested_wanted_pass_runs_inside_the_interval(self, wire, hourly):
+        """A grab turned down as uncached asks for a pass now."""
+        sc = self._scanner()
+        first, second = self._two_titles(wire)
+        sc._recover_wanted_via_debrid([], first, {})
+        sc._wanted_tb_last_add -= LibraryScanner._WANTED_TB_MIN_GAP_S + 1
+        wire['torrentio'] = wire['torrentio_b']
+        sc.request_wanted_pass()
+        sc._recover_wanted_via_debrid([], second, {})
+        assert len(wire['adds']) == 2
+        sc._wanted_tb_last_add -= LibraryScanner._WANTED_TB_MIN_GAP_S + 1
+        sc._recover_wanted_via_debrid([], self._two_titles(wire)[0], {})
+        assert len(wire['adds']) == 2                 # the request was used up
+
     def test_wanted_tb_gap_left(self, wire):
         sc = self._scanner()
         assert sc.wanted_tb_gap_left() == 0

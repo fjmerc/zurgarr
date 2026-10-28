@@ -272,3 +272,8 @@ def test_embedded_data_cannot_close_its_script_tag(hiw_env, monkeypatch):
     assert '<' not in block and '>' not in block
     assert '__HIW_JS__' in block      # placeholders inside data are left alone
     assert json.loads(block)['info']['plex']['text'].startswith('</script>')
+
+
+def test_wanted_card_shows_its_pace(hiw_env):
+    hiw_env.setenv('LIBRARY_SCAN_INTERVAL', '3600')
+    assert _job(_data(), 'wanted')['when'] == 'Every hour, with the scan'

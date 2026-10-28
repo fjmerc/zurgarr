@@ -324,6 +324,11 @@ def _request_wanted_scan(stop_event, *, retry=_WANTED_SCAN_RETRY_S):
                 if scheduler.get_task('library_scan') is None:
                     return
                 scanner = get_scanner()
+                # Wanted recovery runs once per scan interval; this scan
+                # needs it now.  A scan that starts first uses it too.
+                request = getattr(scanner, 'request_wanted_pass', None)
+                if request:
+                    request()
                 if not (scanner is not None and scanner.effects_busy()) \
                         and scheduler.run_now('library_scan'):
                     with _wanted_scan_lock:
@@ -3342,8 +3347,9 @@ class BlackholeWatcher:
         the mount every ``_MOUNT_REFRESH_EVERY_S`` for ``mount_poll_timeout``,
         then keep watching for ``late_arrival_window``, and run the library
         scan the moment it shows.  The folder comes from the torrent's own
-        record, never the release title.  Not persisted: a restart
-        mid-watch leaves it to the scheduled scan.
+        record, never the release title.  Not persisted: a container
+        restart mid-watch leaves it to the scheduled scan (a settings save
+        hands it to the new watcher — see ``watch_torbox_add``).
         """
         label = title or torrent_id
         api_key = self._api_key_for('torbox')
@@ -6991,6 +6997,25 @@ def _stop_locked():
 
 _added_watches = set()
 _added_watches_lock = threading.Lock()
+_RELOAD_HANDOVER_WAIT_S = 120
+_RELOAD_HANDOVER_POLL_S = 2
+
+
+def _next_watcher(stopped):
+    """The running watcher that replaced *stopped* (a settings save restarts
+    the blackhole), waiting up to ``_RELOAD_HANDOVER_WAIT_S`` for it; None
+    when there's none — the container is shutting down, or the blackhole
+    was turned off."""
+    from utils import processes
+    deadline = time.monotonic() + _RELOAD_HANDOVER_WAIT_S
+    while not processes._shutting_down:
+        w = _watcher
+        if w is not None and w is not stopped and not w._stop_event.is_set():
+            return w if getattr(w, 'symlink_enabled', False) else None
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(_RELOAD_HANDOVER_POLL_S)
+    return None
 
 
 def watch_torbox_add(torrent_id, title=''):
@@ -7013,8 +7038,19 @@ def watch_torbox_add(torrent_id, title=''):
         _added_watches.add(tid)
 
     def _run():
+        current = w
         try:
-            w._watch_added_torrent(tid, title)
+            while True:
+                current._watch_added_torrent(tid, title)
+                if not current._stop_event.is_set():
+                    return
+                # Stopped: a settings save restarts the blackhole — carry on
+                # with the new watcher (a container shutdown has none).
+                current = _next_watcher(current)
+                if current is None:
+                    logger.info(f"[blackhole] stopped watching added torrent {title or tid}; "
+                                f"the scheduled library scan will pick it up")
+                    return
         except Exception as e:
             logger.warning(f"[blackhole] watch for added torrent {tid} failed: {e}")
         finally:

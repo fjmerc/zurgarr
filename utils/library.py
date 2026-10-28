@@ -4597,6 +4597,25 @@ class LibraryScanner:
         with self._lock:
             return self._effects_running
 
+    def request_wanted_pass(self):
+        """Let the next scan run Wanted recovery even if it ran less than a
+        scan interval ago (a grab was just turned down as uncached)."""
+        self._wanted_pass_requested = True
+
+    def _wanted_pass_paced(self):
+        """True when Wanted recovery ran within the last ~scan interval and
+        no pass was requested — see ``_wanted_last_pass``.  Never paced when
+        the library scan isn't scheduled."""
+        if self._wanted_pass_requested:
+            return False
+        try:
+            from utils.task_scheduler import scheduler
+            interval = (scheduler.get_task('library_scan') or {}).get('interval') or 0
+        except Exception:
+            interval = 0
+        # 0.9: the scheduled scan an interval later must not land just short
+        return bool(interval) and time.monotonic() - self._wanted_last_pass < 0.9 * interval
+
     def wanted_tb_gap_left(self):
         """Seconds until Wanted recovery runs again in a scan — it sits out
         scans within ``_WANTED_TB_MIN_GAP_S`` of a pass that added to
@@ -5290,6 +5309,14 @@ class LibraryScanner:
     # comes this soon after one that added to TorBox is skipped.
     _WANTED_TB_MIN_GAP_S = 600
     _wanted_tb_last_add = float('-inf')     # monotonic; per instance once set
+    # Wanted recovery runs once per library-scan interval, not in every scan:
+    # a TorBox arrival (blackhole late arrival, or a copy this pass added)
+    # starts a scan to link it, and if that scan added more, their arrivals
+    # would start more scans — TorBox adds snowballing into the bursts that
+    # arm its create cooldown.  ``request_wanted_pass`` (a grab turned down
+    # as uncached) lets the next scan run it anyway.
+    _wanted_last_pass = float('-inf')       # monotonic; per instance once set
+    _wanted_pass_requested = False
     # RD leg of the Wanted recovery pass.  The ready timeout is short on
     # purpose: cached content reaches ``downloaded`` within seconds of
     # selectFiles; anything still converting/downloading after 20s is an
@@ -6099,6 +6126,11 @@ class LibraryScanner:
             logger.debug("[library] Wanted recovery sits out this scan: the last pass "
                          "added to TorBox under 10 minutes ago")
             return
+        if self._wanted_pass_paced():
+            logger.debug("[library] Wanted recovery already ran this scan interval")
+            return
+        self._wanted_pass_requested = False
+        self._wanted_last_pass = time.monotonic()
 
         now = time.monotonic()
         # Expire per-title cooldown/miss entries.

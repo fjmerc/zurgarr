@@ -6094,6 +6094,31 @@ class TestScannerHandoff:
             time.sleep(0.01)
         assert bh.watch_torbox_add('8') is True
 
+    def test_watch_moves_to_the_new_watcher_after_a_settings_reload(
+            self, tmp_dir, monkeypatch):
+        """A settings save restarts the blackhole; an in-flight watch carries
+        on with the new watcher instead of waiting for the hourly scan."""
+        import utils.blackhole as bh
+        old = self._make_symlink_watcher(tmp_dir, 'torbox')
+        new = self._make_symlink_watcher(tmp_dir, 'torbox')
+        monkeypatch.setattr(bh, '_RELOAD_HANDOVER_WAIT_S', 2)
+        monkeypatch.setattr(bh, '_RELOAD_HANDOVER_POLL_S', 0.01)
+        on_new = threading.Event()
+
+        def old_watch(tid, title=''):
+            old._stop_event.wait(5)
+            return False
+        monkeypatch.setattr(old, '_watch_added_torrent', old_watch)
+        monkeypatch.setattr(new, '_watch_added_torrent',
+                            lambda tid, title='': on_new.set() or True)
+        monkeypatch.setattr(bh, '_watcher', old)
+        assert bh.watch_torbox_add('9', 'X') is True
+        old._stop_event.set()                  # the reload stops the old watcher...
+        monkeypatch.setattr(bh, '_watcher', None)
+        time.sleep(0.05)
+        monkeypatch.setattr(bh, '_watcher', new)   # ...and starts a new one
+        assert on_new.wait(2)
+
     def test_watch_torbox_add_without_blackhole_is_a_noop(self, monkeypatch):
         import utils.blackhole as bh
         monkeypatch.setattr(bh, '_watcher', None)
@@ -6121,11 +6146,19 @@ class TestScannerHandoff:
 
     def test_rejected_grab_starts_a_scan_soon(self, monkeypatch):
         """The library scan's Wanted pass finds a cached copy of a title whose
-        grab was uncached — run it now instead of at the next hourly scan."""
+        grab was uncached — run it now instead of at the next hourly scan,
+        and let that scan's Wanted pass run though it's paced hourly."""
+        import utils.library as lib
         bh, stop = self._wanted_scan(monkeypatch)
-        assert bh._request_wanted_scan(stop, retry=0.01) is True
-        self._settle(bh)
+        requested = []
+        type(lib.get_scanner()).request_wanted_pass = lambda _s: requested.append(1)
+        try:
+            assert bh._request_wanted_scan(stop, retry=0.01) is True
+            self._settle(bh)
+        finally:
+            del type(lib.get_scanner()).request_wanted_pass
         assert self.scans == ['library_scan']
+        assert requested == [1]
 
     def test_rejection_inside_the_window_gets_a_scan_when_it_ends(self, monkeypatch):
         """The scan that just ran read the arrs before this rejection — so a
