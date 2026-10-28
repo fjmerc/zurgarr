@@ -269,8 +269,11 @@ def get_sanitized_config():
     The key set is the union of the authoritative settings schema
     (``settings_api._ALL_KEYS``) and any live env var matching a config
     prefix, so schema keys are shown even when unset and non-schema knobs
-    (e.g. ZURG_INSTANCES_CONFIG) still appear.
+    (e.g. ZURG_INSTANCES_CONFIG) still appear.  A key a Docker secret sets
+    says so (its value never reaches the environment), and a start-up-only
+    setting changed since the container started is marked as not running yet.
     """
+    from utils import config_reload, config_resolve
     from utils.settings_api import _ALL_KEYS, _SECRET_KEYS
 
     keys = set(_ALL_KEYS)
@@ -278,8 +281,18 @@ def get_sanitized_config():
         if any(key.startswith(p) for p in _CONFIG_PREFIXES):
             keys.add(key)
 
+    resolved = config_resolve.current()
+    try:
+        pending = set(config_reload.restart_pending())
+    except Exception:
+        pending = set()
+
     config = {}
     for key in sorted(keys):
+        r = resolved.get(key)
+        if r is not None and r.source == 'secret':
+            config[key] = '(set via Docker secret)'
+            continue
         value = os.environ.get(key, '')
         sensitive = (
             any(s in key.upper() for s in _SENSITIVE_PATTERNS)
@@ -295,6 +308,8 @@ def get_sanitized_config():
                 config[key] = '(not set)'
         else:
             config[key] = value if value else '(not set)'
+        if key in pending:
+            config[key] += ' (takes effect after a restart)'
 
     return config
 

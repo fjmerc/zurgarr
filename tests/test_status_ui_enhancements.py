@@ -176,6 +176,12 @@ class TestReadLogLines:
 
 class TestGetSanitizedConfig:
 
+    @pytest.fixture(autouse=True)
+    def _nothing_pending(self, monkeypatch):
+        # restart_pending compares against the import-time boot snapshot
+        from utils import config_reload
+        monkeypatch.setattr(config_reload, 'restart_pending', lambda *a, **k: [])
+
     def test_masks_api_keys(self, monkeypatch):
         """API keys should be masked."""
         monkeypatch.setenv('RD_API_KEY', 'abcdefghijklmnop')
@@ -295,6 +301,42 @@ class TestGetSanitizedConfig:
         monkeypatch.setenv('ZURG_INSTANCES_CONFIG', '/config/zurg.yml')
         config = get_sanitized_config()
         assert config.get('ZURG_INSTANCES_CONFIG') == '/config/zurg.yml'
+
+    def test_docker_secret_key_says_so(self, monkeypatch):
+        """A key set by Docker secret shows that, not a stale container value."""
+        from utils import config_resolve
+        monkeypatch.setenv('RD_API_KEY', 'containervalue123456')
+        monkeypatch.setattr(config_resolve, '_CURRENT', {
+            'RD_API_KEY': config_resolve.Resolved('', 'secret', 'set via Docker secret')})
+        config = get_sanitized_config()
+        assert config['RD_API_KEY'] == '(set via Docker secret)'
+
+    def test_restart_pending_key_flagged(self, monkeypatch):
+        """A changed start-up-only setting is marked as not running yet."""
+        from utils import config_reload
+        monkeypatch.setenv('RCLONE_VFS_CACHE_MODE', 'full')
+        monkeypatch.setattr(config_reload, 'restart_pending',
+                            lambda *a, **k: ['RCLONE_VFS_CACHE_MODE'])
+        config = get_sanitized_config()
+        assert config['RCLONE_VFS_CACHE_MODE'] == 'full (takes effect after a restart)'
+        assert not config['ZURG_ENABLED'].endswith('restart)')
+
+    def test_restart_pending_sensitive_key_stays_masked(self, monkeypatch):
+        from utils import config_reload
+        monkeypatch.setenv('ZURG_PASS', 'plaintextpassword99')
+        monkeypatch.setattr(config_reload, 'restart_pending', lambda *a, **k: ['ZURG_PASS'])
+        config = get_sanitized_config()
+        assert 'plaintextpassword99' not in config['ZURG_PASS']
+        assert config['ZURG_PASS'].endswith('(takes effect after a restart)')
+
+    def test_restart_pending_failure_still_returns_config(self, monkeypatch):
+        from utils import config_reload
+
+        def boom(*a, **k):
+            raise RuntimeError('x')
+        monkeypatch.setattr(config_reload, 'restart_pending', boom)
+        monkeypatch.setenv('ZURG_ENABLED', 'true')
+        assert get_sanitized_config()['ZURG_ENABLED'] == 'true'
 
 
 # ---------------------------------------------------------------------------
