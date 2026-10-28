@@ -105,6 +105,50 @@ class TestBlackholeRequireCached:
         handler._add_to_realdebrid.assert_not_called()
         assert not os.path.exists(path)
 
+    def test_uncached_rejection_looks_for_a_cached_copy_now(
+            self, handler, magnet_file, monkeypatch):
+        """A turned-down grab leaves its title wanted: start the library scan
+        (its Wanted pass adds a cached copy) instead of waiting an hour."""
+        import utils.blackhole as bh
+        requested = []
+        monkeypatch.setattr(bh, '_request_wanted_scan',
+                            lambda stop, **k: requested.append(stop) or True)
+        path, h = magnet_file
+        monkeypatch.setenv('BLACKHOLE_REQUIRE_CACHED', 'true')
+        with patch('utils.search._existing_hashes', return_value=set()), \
+             patch('utils.search.check_debrid_cache', return_value={h: False}):
+            handler._process_file(path)
+        assert len(requested) == 1
+
+    def test_cross_confirmed_rejection_looks_for_a_cached_copy_now(
+            self, handler, magnet_file, monkeypatch):
+        import utils.blackhole as bh
+        requested = []
+        monkeypatch.setattr(bh, '_request_wanted_scan',
+                            lambda stop, **k: requested.append(stop) or True)
+        path, h = magnet_file
+        handler.debrid_api_keys = {'realdebrid': 'rd-key', 'torbox': 'tb-key'}
+        monkeypatch.setenv('BLACKHOLE_REQUIRE_CACHED', 'true')
+        with patch('utils.search._existing_hashes', return_value=set()), \
+             patch('utils.search.check_debrid_cache',
+                   side_effect=lambda hashes, service=None, api_key=None:
+                   {h: False} if service == 'torbox' else {h: None}):
+            handler._process_file(path)
+        assert not os.path.exists(path)
+        assert len(requested) == 1
+
+    def test_deferred_grab_does_not_request_a_scan(self, handler, magnet_file, monkeypatch):
+        import utils.blackhole as bh
+        requested = []
+        monkeypatch.setattr(bh, '_request_wanted_scan',
+                            lambda stop, **k: requested.append(stop) or True)
+        path, h = magnet_file
+        monkeypatch.setenv('BLACKHOLE_REQUIRE_CACHED', 'true')
+        with patch('utils.search._existing_hashes', return_value=set()), \
+             patch('utils.search.check_debrid_cache', return_value={h: None}):
+            handler._process_file(path)
+        assert requested == []
+
     def test_unknown_blocked_when_gate_on(self, handler, magnet_file, monkeypatch):
         """Single-debrid RD, cache probe returns None: must NOT submit, AND must
         NOT delete — file defers to the next watcher poll.  (The cross-probe

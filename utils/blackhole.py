@@ -270,6 +270,61 @@ _LATE_ARRIVAL_WINDOW_S = 2 * 3600
 _LATE_ARRIVAL_POLL_S = 120
 
 
+# A grab turned down as uncached leaves its title wanted; the library scan's
+# Wanted pass adds a cached copy.  Start that scan right away instead of at
+# the next hourly run — at most once per this window (each scan reads the
+# whole library and the arrs), retrying while another scan is running.
+_WANTED_SCAN_MIN_GAP_S = 600
+_WANTED_SCAN_RETRY_S = 30
+_WANTED_SCAN_TRIES = 20
+_wanted_scan_lock = threading.Lock()
+_wanted_scan_ts = float('-inf')    # monotonic ts of the last scan started here
+_wanted_scan_pending = False
+
+
+def _request_wanted_scan(stop_event, *, retry=_WANTED_SCAN_RETRY_S):
+    """Run the library scan soon so its Wanted pass looks for a cached copy
+    of a title whose grab was just turned down as uncached.  Starts it from a
+    background thread — waiting while another scan runs or links, up to
+    ``_WANTED_SCAN_TRIES`` tries — and at most once per
+    ``_WANTED_SCAN_MIN_GAP_S``.  True when a request was queued."""
+    global _wanted_scan_pending
+    with _wanted_scan_lock:
+        if (_wanted_scan_pending
+                or time.monotonic() - _wanted_scan_ts < _WANTED_SCAN_MIN_GAP_S):
+            return False
+        _wanted_scan_pending = True
+
+    stop = stop_event or threading.Event()
+
+    def _run():
+        global _wanted_scan_pending, _wanted_scan_ts
+        try:
+            from utils.library import get_scanner
+            from utils.task_scheduler import scheduler
+            for _ in range(_WANTED_SCAN_TRIES):
+                if scheduler.get_task('library_scan') is None:
+                    return
+                scanner = get_scanner()
+                if not (scanner is not None and scanner.effects_busy()) \
+                        and scheduler.run_now('library_scan'):
+                    with _wanted_scan_lock:
+                        _wanted_scan_ts = time.monotonic()
+                    logger.info("[blackhole] grab turned down as uncached — running the "
+                                "library scan now to look for a cached copy")
+                    return
+                if stop.wait(retry):
+                    return
+        except Exception as e:
+            logger.debug(f"[blackhole] couldn't start the library scan: {e}")
+        finally:
+            with _wanted_scan_lock:
+                _wanted_scan_pending = False
+
+    threading.Thread(target=_run, daemon=True, name='wanted-scan-request').start()
+    return True
+
+
 def _coalesced_root_refresh(*, _now=None):
     """Fire an rclone root re-list at most once per coalesce window.
 
@@ -6092,6 +6147,7 @@ class BlackholeWatcher:
                         metrics.inc('blackhole_processed', {'status': 'skipped_uncached'})
                     except Exception:
                         pass
+                    _request_wanted_scan(getattr(self, '_stop_event', None))
                     return
                 if cached is None:
                     # Cross-probe: only TB has a working cache endpoint; avoid defer-forever on RD/AD.
@@ -6147,6 +6203,7 @@ class BlackholeWatcher:
                                         {'status': 'skipped_uncached_cross_confirmed'})
                         except Exception:
                             pass
+                        _request_wanted_scan(getattr(self, '_stop_event', None))
                         return
 
                     if tb_key and tb_cached is True:

@@ -6076,6 +6076,24 @@ class TestScannerHandoff:
             time.sleep(0.01)
         assert started == ['7']
 
+    def test_watch_torbox_add_can_watch_again_after_a_failed_watch(self, tmp_dir, monkeypatch):
+        import utils.blackhole as bh
+        watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
+        done = threading.Event()
+
+        def boom(tid, title=''):
+            done.set()
+            raise RuntimeError('mount gone')
+        monkeypatch.setattr(watcher, '_watch_added_torrent', boom)
+        monkeypatch.setattr(bh, '_watcher', watcher)
+        assert bh.watch_torbox_add('8') is True
+        assert done.wait(2)
+        for _ in range(100):
+            if '8' not in bh._added_watches:
+                break
+            time.sleep(0.01)
+        assert bh.watch_torbox_add('8') is True
+
     def test_watch_torbox_add_without_blackhole_is_a_noop(self, monkeypatch):
         import utils.blackhole as bh
         monkeypatch.setattr(bh, '_watcher', None)
@@ -6085,6 +6103,63 @@ class TestScannerHandoff:
         import utils.blackhole as bh
         monkeypatch.setattr(bh, '_watcher', BlackholeWatcher('/tmp', 'key', 'torbox'))
         assert bh.watch_torbox_add('7', 'X') is False
+
+    # ── a grab turned down as uncached: look for a cached copy now ────
+
+    def _wanted_scan(self, monkeypatch):
+        import utils.blackhole as bh
+        monkeypatch.setattr(bh, '_wanted_scan_ts', float('-inf'))
+        monkeypatch.setattr(bh, '_wanted_scan_pending', False)
+        stop = threading.Event()
+        return bh, stop
+
+    def _settle(self, bh):
+        for _ in range(200):
+            if not bh._wanted_scan_pending:
+                return
+            time.sleep(0.01)
+
+    def test_rejected_grab_starts_a_scan_soon(self, monkeypatch):
+        """The library scan's Wanted pass finds a cached copy of a title whose
+        grab was uncached — run it now instead of at the next hourly scan."""
+        bh, stop = self._wanted_scan(monkeypatch)
+        assert bh._request_wanted_scan(stop, retry=0.01) is True
+        self._settle(bh)
+        assert self.scans == ['library_scan']
+
+    def test_rejected_grabs_start_one_scan_per_window(self, monkeypatch):
+        bh, stop = self._wanted_scan(monkeypatch)
+        bh._request_wanted_scan(stop, retry=0.01)
+        self._settle(bh)
+        assert bh._request_wanted_scan(stop, retry=0.01) is False
+        self._settle(bh)
+        assert self.scans == ['library_scan']
+
+    def test_rejected_grab_waits_for_a_linking_scan_to_finish(self, monkeypatch):
+        bh, stop = self._wanted_scan(monkeypatch)
+        self.busy = [True, True]
+        bh._request_wanted_scan(stop, retry=0.01)
+        self._settle(bh)
+        assert self.scans == ['library_scan']
+
+    def test_rejected_grab_retries_while_a_scan_is_running(self, monkeypatch):
+        import utils.task_scheduler as ts
+        bh, stop = self._wanted_scan(monkeypatch)
+        answers = [False, False, True]
+        monkeypatch.setattr(ts.scheduler, 'run_now',
+                            lambda name: self.scans.append(name) or answers.pop(0))
+        bh._request_wanted_scan(stop, retry=0.01)
+        self._settle(bh)
+        assert self.scans == ['library_scan'] * 3
+        assert bh._wanted_scan_ts > float('-inf')
+
+    def test_rejected_grab_without_library_scan_is_a_noop(self, monkeypatch):
+        import utils.task_scheduler as ts
+        bh, stop = self._wanted_scan(monkeypatch)
+        monkeypatch.setattr(ts.scheduler, 'get_task', lambda name: None)
+        bh._request_wanted_scan(stop, retry=0.01)
+        self._settle(bh)
+        assert self.scans == []
 
     def test_already_linked_folder_needs_no_scan(self, tmp_dir, monkeypatch):
         watcher = self._make_symlink_watcher(tmp_dir, 'torbox')

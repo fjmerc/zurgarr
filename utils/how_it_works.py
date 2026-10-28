@@ -256,8 +256,10 @@ def build_data():
          'short': 'Adds a cached copy of things Sonarr/Radarr never grabbed.',
          'text': 'For titles Sonarr/Radarr never managed to grab, it finds a cached release and '
                  'adds it to TorBox or Real-Debrid directly, without the watch folder, a few per '
-                 'scan. A TorBox copy is linked as soon as TorBox lists it, a Real-Debrid one by '
-                 'the next scan. Needs Torrentio or Prowlarr.',
+                 'scan; a grab turned down as uncached starts a scan right away (at most every '
+                 '10 minutes). With the blackhole in symlink mode, a TorBox copy is linked as '
+                 'soon as TorBox lists it; otherwise the next scan links it. Needs Torrentio or '
+                 'Prowlarr.',
          'links': [['arr', 'tbmount'], ['arr', 'rdmount']]},
         {'key': 'prefer', 'code': 'P', 'title': 'Prefer cloud / local',
          'when': 'With each scan and ' + interval(
