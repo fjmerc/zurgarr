@@ -273,3 +273,10 @@ def test_halt_holds_even_when_its_file_cannot_be_written(env, monkeypatch):
     with patch('utils.library_dedup.plan_arr_tv') as plan:
         out = scheduled_tasks.library_duplicate_tidy()
     assert out['status'] == 'error' and not plan.called
+
+
+def test_split_item_hint_fits_the_kind():
+    """radarr-rename is movies only; a TV split points at the episode in Plex."""
+    assert 'radarr-rename' in scheduled_tasks._split_hint('movie')
+    tv = scheduled_tasks._split_hint('tv')
+    assert 'radarr' not in tv and 'episode' in tv

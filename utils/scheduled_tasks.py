@@ -939,7 +939,7 @@ def _tidy_kind(library_dedup, plex, kind, root, client, svc, planner, pairs, ret
         split = library_dedup.split_titles(snapshot, removals, root)
         for _kind, title in sorted(split):
             logger.warning("[dedup] Not removing %r duplicates — the kept copy is a separate "
-                           "Plex item (use scripts/dedup_library.py radarr-rename / merge)", title)
+                           "Plex item (%s)", title, _split_hint(kind))
         removals = [r for r in removals if (r.kind, r.title) not in split]
     done = library_dedup.apply_removals(removals, _DUPLICATE_TIDY_MANIFEST, root, protected,
                                         pairs=pairs)
@@ -950,6 +950,13 @@ def _tidy_kind(library_dedup, plex, kind, root, client, svc, planner, pairs, ret
         retry += _retry_list(items, result)
         _tidy_plex_warnings(result)
     return len(done)
+
+
+def _split_hint(kind):
+    if kind == 'movie':
+        return 'use scripts/dedup_library.py radarr-rename, or merge the two items in Plex'
+    return ('check that episode in Plex — usually a multi-episode file or a wrong match; '
+            'merge the two items there if they are the same show')
 
 
 def _log_duplicate_removals(done, kind):
