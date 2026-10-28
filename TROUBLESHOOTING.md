@@ -309,7 +309,7 @@ Cause: TorBox's WebDAV file listing can include a new torrent several
 minutes after its API reports it ready, and the TorBox mount only re-reads
 that listing every `TORBOX_RCLONE_DIR_CACHE_TIME` (2h) on its own.
 
-What zurgarr does: while it waits for a grab it re-reads the listing every
+What zurgarr does (TorBox grabs): while it waits for a grab it re-reads the listing every
 30 seconds (at most one listing per 15 seconds across all grabs, so TorBox
 doesn't rate-limit it). If the wait (`BLACKHOLE_MOUNT_POLL_TIMEOUT`) runs out,
 it hands the title to the library scan as a safety net but keeps watching it

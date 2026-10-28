@@ -5726,9 +5726,24 @@ class TestScannerHandoff:
     def _no_real_scan(self, monkeypatch):
         """Record library-scan triggers instead of running the scheduler."""
         import utils.task_scheduler as ts
+        import utils.blackhole as bh
         self.scans = []
         monkeypatch.setattr(ts.scheduler, 'run_now',
                             lambda name: self.scans.append(name) or True)
+        monkeypatch.setattr(ts.scheduler, 'get_task', lambda name: {'name': name})
+        monkeypatch.setattr(bh, '_scan_started_ts', float('-inf'))
+
+    def _after_handoff(self, watcher, monkeypatch):
+        """An Event set once the mount wait has timed out and handed off, and
+        a find() that only hits after that (no clock races)."""
+        handed = threading.Event()
+        real = watcher._register_scanner_handoff
+        monkeypatch.setattr(watcher, '_register_scanner_handoff',
+                            lambda fn: (real(fn), handed.set())[0])
+
+        def find(*a, **k):
+            return ('/data/torbox/x', 'movies', 'x') if handed.is_set() else (None, None, None)
+        return find
 
     def _drive_timeout(self, watcher, monkeypatch, torrent_id, filename,
                        debrid, ready_status, label=None, find=None):
@@ -5807,14 +5822,10 @@ class TestScannerHandoff:
         import utils.blackhole as bh
         monkeypatch.setattr(bh, '_coalesced_root_refresh', lambda **k: True)
         watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
+        watcher.late_arrival_window = 2.0
         made = []
         monkeypatch.setattr(watcher, '_create_symlinks', lambda *a, **k: made.append(1) or 1)
-        start = time.monotonic()
-
-        def find(*a, **k):        # appears only after the 0.3s mount wait
-            if time.monotonic() - start > 0.35:
-                return ('/data/torbox/x', 'movies', 'x')
-            return (None, None, None)
+        find = self._after_handoff(watcher, monkeypatch)
         self._drive_timeout(watcher, monkeypatch, 'tb-2',
                             'Crimson.Tide.1995.1080p.WEB-DL.magnet', 'torbox', 'completed',
                             find=find)
@@ -5844,13 +5855,8 @@ class TestScannerHandoff:
         monkeypatch.setattr(ts.scheduler, 'run_now',
                             lambda name: self.scans.append(name) or next(answers))
         watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
-        watcher.late_arrival_window = 1.0
-        start = time.monotonic()
-
-        def find(*a, **k):        # appears only after the 0.3s mount wait
-            if time.monotonic() - start > 0.35:
-                return ('/data/torbox/x', 'movies', 'x')
-            return (None, None, None)
+        watcher.late_arrival_window = 2.0
+        find = self._after_handoff(watcher, monkeypatch)
         self._drive_timeout(watcher, monkeypatch, 'tb-4',
                             'Crimson.Tide.1995.1080p.WEB-DL.magnet', 'torbox', 'completed',
                             find=find)
@@ -5868,6 +5874,62 @@ class TestScannerHandoff:
                             'Crimson.Tide.1995.1080p.WEB-DL.magnet', 'torbox', 'completed')
         assert time.monotonic() - t0 < 3
         assert self.scans == []
+        # kept, so the grab is picked up again after the restart
+        assert any(e['torrent_id'] == 'tb-5' for e in watcher._load_pending())
+
+    def test_realdebrid_keeps_the_single_relist_and_no_late_watch(self, tmp_dir, monkeypatch):
+        """Zurg has no TorBox-style listing lag, and every re-list also hits
+        the TorBox mount: Real-Debrid grabs behave as before."""
+        import utils.blackhole as bh
+        calls = []
+        monkeypatch.setattr(bh, '_coalesced_root_refresh', lambda **k: calls.append(1) or True)
+        monkeypatch.setattr(bh, '_MOUNT_REFRESH_EVERY_S', 0.05)
+        watcher = self._make_symlink_watcher(tmp_dir, 'realdebrid')
+        watcher.late_arrival_window = 30
+        t0 = time.monotonic()
+        self._drive_timeout(watcher, monkeypatch, 'rd-6',
+                            'Crimson.Tide.1995.1080p.WEB-DL.magnet', 'realdebrid', 'downloaded')
+        assert time.monotonic() - t0 < 3
+        assert calls == [1]
+        assert self.scans == []
+
+    def test_a_mount_error_doesnt_end_the_late_watch(self, tmp_dir, monkeypatch):
+        import utils.blackhole as bh
+        monkeypatch.setattr(bh, '_coalesced_root_refresh', lambda **k: True)
+        watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
+        watcher.late_arrival_window = 2.0
+        hit = self._after_handoff(watcher, monkeypatch)
+        state = {'n': 0}
+
+        def find(*a, **k):
+            r = hit()
+            if r[0]:
+                state['n'] += 1
+                if state['n'] == 1:
+                    raise OSError(107, 'Transport endpoint is not connected')
+            return r
+        self._drive_timeout(watcher, monkeypatch, 'tb-7',
+                            'Crimson.Tide.1995.1080p.WEB-DL.magnet', 'torbox', 'completed',
+                            find=find)
+        assert self.scans == ['library_scan']
+
+    def test_one_scan_covers_items_that_arrived_before_it(self, tmp_dir, monkeypatch):
+        import utils.blackhole as bh
+        watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
+        arrived = time.monotonic()
+        assert watcher._run_library_scan_now(arrived) is True
+        assert watcher._run_library_scan_now(arrived) is True   # already covered
+        assert self.scans == ['library_scan']
+        assert watcher._run_library_scan_now(time.monotonic() + 1) is True
+        assert self.scans == ['library_scan', 'library_scan']
+
+    def test_no_library_scan_task_means_no_retry_loop(self, tmp_dir, monkeypatch):
+        import utils.task_scheduler as ts
+        monkeypatch.setattr(ts.scheduler, 'get_task', lambda name: None)
+        watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
+        t0 = time.monotonic()
+        assert watcher._run_library_scan_now(time.monotonic()) is False
+        assert self.scans == [] and time.monotonic() - t0 < 1
 
 
 class TestTorboxCachedAlternative:

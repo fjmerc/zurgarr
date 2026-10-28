@@ -268,6 +268,10 @@ _MOUNT_REFRESH_EVERY_S = 30
 # it surfaces instead of leaving it for the next hourly scan.
 _LATE_ARRIVAL_WINDOW_S = 2 * 3600
 _LATE_ARRIVAL_POLL_S = 120
+# Monotonic time the last library scan was started for a late arrival: one
+# scan that starts after an item surfaced covers every item that did.
+_scan_started_lock = threading.Lock()
+_scan_started_ts = float('-inf')
 
 
 def _coalesced_root_refresh(*, _now=None):
@@ -2393,11 +2397,11 @@ class BlackholeWatcher:
             if not _is_safe_mount_name(entry):
                 # Well-behaved FUSE never returns this; defense-in-depth.
                 continue
-            entry_path = os.path.join(mount_path, entry)
-            if not os.path.isdir(entry_path):
-                continue
             entry_fuzzy = norm_for_matching(_strip_indexer_prefix(entry) or entry)
-            if entry_fuzzy == target_fuzzy:
+            if entry_fuzzy != target_fuzzy:
+                continue
+            entry_path = os.path.join(mount_path, entry)
+            if os.path.isdir(entry_path):          # only stat the name matches
                 matches.append((entry_path, entry))
 
         if len(matches) == 1:
@@ -3136,38 +3140,60 @@ class BlackholeWatcher:
                 logger.info(f"[blackhole] {release_name} still not on the mount after the late "
                             f"watch; the library scan will pick it up when it appears")
                 return False
-            _coalesced_root_refresh()
-            mount_path, _category, _name = self._find_on_mount(
-                release_name, debrid=debrid, file_names=file_names)
+            try:
+                _coalesced_root_refresh()
+                mount_path, _category, _name = self._find_on_mount(
+                    release_name, debrid=debrid, file_names=file_names)
+            except Exception as e:
+                # a mount blip is exactly when late arrivals happen: keep watching
+                logger.debug(f"[blackhole] late watch for {release_name}: {e}")
+                continue
             if mount_path:
+                arrived = time.monotonic()
                 logger.info(f"[blackhole] {release_name} reached the mount late — "
                             f"running the library scan now")
-                self._run_library_scan_now()
+                self._run_library_scan_now(arrived)
                 return True
         return False
 
-    def _run_library_scan_now(self, attempts=10):
-        """Start a library scan that begins after this call.
+    def _run_library_scan_now(self, arrived, attempts=10):
+        """Make sure a library scan starts after ``arrived`` (monotonic).
 
+        A scan another late arrival already started after ``arrived`` covers
+        this item too, so several items surfacing together share one scan.
         A scan already running may have listed the mount before the item
-        appeared, so retry until one starts (``run_now`` returns False while
-        a scan runs).  Gives up quietly after ``attempts``; the hand-off's
-        pending entry still has the next scheduled scan resolve it.
+        appeared, so otherwise retry until one starts (``run_now`` returns
+        False while a scan runs).  Returns False when the scan isn't
+        available or every attempt found one running; the hand-off's
+        pending entry still has a later scan resolve it.
         """
+        global _scan_started_ts
         try:
             from utils.task_scheduler import scheduler
-        except Exception:
+            if scheduler.get_task('library_scan') is None:
+                logger.info("[blackhole] library scan isn't scheduled (STATUS_UI_ENABLED off?) "
+                            "— can't link the late arrival now")
+                return False
+        except Exception as e:
+            logger.debug(f"[blackhole] library scan unavailable: {e}")
             return False
         retry = min(self.late_arrival_poll, 30)
         for _ in range(attempts):
-            try:
-                if scheduler.run_now('library_scan'):
+            with _scan_started_lock:
+                if _scan_started_ts >= arrived:
                     return True
-            except Exception as e:
-                logger.debug(f"[blackhole] library scan trigger failed: {e}")
-                return False
+                try:
+                    started = scheduler.run_now('library_scan')
+                except Exception as e:
+                    logger.debug(f"[blackhole] library scan trigger failed: {e}")
+                    return False
+                if started:
+                    _scan_started_ts = time.monotonic()
+                    return True
             if self._stop_event.wait(retry):
                 return False
+        logger.warning("[blackhole] a library scan kept running while a late arrival waited "
+                       "to be linked; the next scheduled scan will pick it up")
         return False
 
     def _register_scanner_handoff(self, filename):
@@ -3567,15 +3593,21 @@ class BlackholeWatcher:
                                            media_title=_mt)
                     except Exception as e:
                         logger.debug(f"[blackhole] hand-off history log failed: {e}")
-                # The hand-off above is the safety net; keep watching so a
-                # late listing reaches Plex in minutes, not at the next scan.
+                # The hand-off above is the safety net; for TorBox keep
+                # watching so a late listing reaches Plex in minutes, not at
+                # the next scan.  A shutdown mid-watch keeps the pending entry
+                # so the grab is picked up again after the restart.
                 try:
-                    self._watch_late_arrival(release_name, debrid, file_names)
+                    if debrid == 'torbox':
+                        self._watch_late_arrival(release_name, debrid, file_names)
                 finally:
-                    self._remove_pending(torrent_id)
+                    if not self._stop_event.is_set():
+                        self._remove_pending(torrent_id)
                 return
 
-            if time.monotonic() - last_refresh >= _MOUNT_REFRESH_EVERY_S:
+            # TorBox only: Zurg has no listing lag, and every re-list also
+            # hits the TorBox mount (refresh_dir covers all mounts).
+            if debrid == 'torbox' and time.monotonic() - last_refresh >= _MOUNT_REFRESH_EVERY_S:
                 _coalesced_root_refresh()
                 last_refresh = time.monotonic()
 
