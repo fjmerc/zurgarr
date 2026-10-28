@@ -211,6 +211,85 @@ def _publish_scan(scanner, data):
         scanner._cache_time = time.monotonic()
 
 
+_NEW_REQUEST_CHECK_INTERVAL = 120
+_NEW_REQUEST_GRACE_S = 180       # the arr searches when a title is added; give it time
+_NEW_REQUEST_WINDOW_S = 3600     # older titles are the hourly Wanted pass's
+_new_request_seen = {}           # (kind, arr id) -> epoch handled
+
+
+def _new_requests_without_grab(kind, client, items, now):
+    """Titles added to the arr in the last ``_NEW_REQUEST_WINDOW_S`` (past
+    the grace for its own search) that are still wanted and that it grabbed
+    nothing for.  None when its grab history can't be read."""
+    from utils.library import _iso_epoch
+    fresh = []
+    for it in items or ():
+        if not isinstance(it, dict) or not it.get('monitored'):
+            continue
+        if kind == 'movie':
+            if it.get('hasFile') or not it.get('isAvailable'):
+                continue
+        else:
+            stats = it.get('statistics') or {}
+            if stats.get('episodeFileCount') or not stats.get('episodeCount'):
+                continue
+        added = _iso_epoch(it.get('added'))
+        if added is None or not (_NEW_REQUEST_GRACE_S <= now - added <= _NEW_REQUEST_WINDOW_S):
+            continue
+        if (kind, it.get('id')) in _new_request_seen:
+            continue
+        fresh.append((it, added))
+    if not fresh:
+        return []
+    grabs = client.recent_grabs_by_hash(min(a for _, a in fresh))
+    if grabs is None:
+        return None
+    key = 'movieId' if kind == 'movie' else 'seriesId'
+    grabbed = {r.get(key) for recs in grabs.values() for r in recs}
+    return [it for it, _ in fresh if it.get('id') not in grabbed]
+
+
+def new_request_check():
+    """A title just added to Sonarr/Radarr (an Overseerr request, an import
+    list, a manual add) whose own search grabbed nothing — every release
+    rejected by the profile, or no results: run the library scan's Wanted
+    recovery now instead of at its next hourly pass.  A title the arr did
+    grab goes through the blackhole, which does the same when it turns the
+    grab down.  Each title once."""
+    from utils.library import (wanted_tb_recovery_enabled, wanted_rd_recovery_enabled,
+                               _get_radarr_movies_list, _get_sonarr_series_list)
+    if not (wanted_tb_recovery_enabled() or wanted_rd_recovery_enabled()):
+        return {'status': 'skipped', 'message': 'Wanted recovery is off'}
+    from utils.arr_client import get_download_service
+    now = time.time()
+    for k in [k for k, t in _new_request_seen.items() if now - t > 2 * _NEW_REQUEST_WINDOW_S]:
+        del _new_request_seen[k]
+    found = []
+    for kind, svc_name, fetch in (('movie', 'radarr', _get_radarr_movies_list),
+                                  ('show', 'sonarr', _get_sonarr_series_list)):
+        try:
+            client, svc = get_download_service(kind)
+            if not client or svc != svc_name:
+                continue
+            fresh = _new_requests_without_grab(kind, client, fetch(client), now)
+        except Exception as e:
+            logger.debug(f"[scheduler] new-request check for {svc_name}: {e}")
+            continue
+        for it in fresh or ():
+            found.append((kind, it))
+    if not found:
+        return {'status': 'success', 'message': 'No new requests waiting'}
+    from utils.blackhole import _request_wanted_scan
+    _request_wanted_scan(None)
+    for kind, it in found:
+        _new_request_seen[(kind, it.get('id'))] = now
+    titles = ', '.join(it.get('title') or '?' for _, it in found)
+    logger.info(f"[scheduler] Sonarr/Radarr grabbed nothing for new request(s): {titles} — "
+                f"running Wanted recovery now")
+    return {'status': 'success',
+            'message': f'Wanted recovery started for {len(found)} new request(s)'}
+
+
 def library_scan():
     """Scan debrid mount and local library, auto-create symlinks, trigger rescans."""
     from utils.library import get_scanner
@@ -2007,6 +2086,14 @@ def register_all():
             interval_seconds=_get_interval('LIBRARY_SCAN_INTERVAL'),
             description='Scan debrid mount and local library, auto-create symlinks',
             initial_delay=120,  # 2 min
+        )
+
+        scheduler.register(
+            'new_request_check',
+            new_request_check,
+            interval_seconds=_NEW_REQUEST_CHECK_INTERVAL,
+            description='Run Wanted recovery for new requests Sonarr/Radarr grabbed nothing for',
+            initial_delay=180,
         )
 
     # Verify Symlinks — only if blackhole symlinks are enabled

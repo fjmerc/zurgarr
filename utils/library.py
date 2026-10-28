@@ -1478,6 +1478,29 @@ def _delivered_hashes(since):
     return out
 
 
+def _iso_epoch(value):
+    """An arr ISO timestamp ("2026-10-28T20:01:16Z") as epoch seconds, or None."""
+    try:
+        return datetime.fromisoformat(str(value).replace('Z', '+00:00')).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+_NEW_REQUEST_FIRST_S = 24 * 3600
+
+
+def _new_requests_first(targets):
+    """Stable-sort Wanted targets so titles added to Sonarr/Radarr in the
+    last day go first: the pass adds only a couple per run, and a new
+    request is never-played (Tautulli puts those last) by definition."""
+    now = time.time()
+
+    def recent(t):
+        added = (t[1] or {}).get('_added')
+        return added is not None and now - added <= _NEW_REQUEST_FIRST_S
+    return sorted(targets, key=lambda t: 0 if recent(t) else 1)
+
+
 def _arr_downloading(arr_id, busy):
     """True when the arr already has a download for this ghost (*arr_id*
     in *busy*), or that couldn't be told (*busy* None — fail closed: a
@@ -2221,6 +2244,7 @@ def _apply_sonarr_wanted_shows(shows, matched_ids, pending=None, degraded=None):
             '_sonarr_id': sid,
             '_sonarr_tmdb_id': tmdb_id,
             '_profile_id': s.get('qualityProfileId'),
+            '_added': _iso_epoch(s.get('added')),
         }
         if monitored_total > 0:
             ghost['monitored_episodes'] = monitored_total
@@ -2649,6 +2673,7 @@ def _apply_radarr_wanted_movies(movies, pending=None, degraded=None):
             '_radarr_id': rm.get('id'),
             '_radarr_tmdb_id': tmdb_id,
             '_profile_id': rm.get('qualityProfileId'),
+            '_added': _iso_epoch(rm.get('added')),
         }
         if rm.get('imdbId'):
             ghost['imdb_id'] = rm['imdbId']
@@ -6275,7 +6300,7 @@ class LibraryScanner:
 
         # Tautulli watch-correlation: never-played titles go to the back
         # of the queue so the per-scan budgets favor watched content.
-        targets = self._deprioritize_unplayed(targets)
+        targets = _new_requests_first(self._deprioritize_unplayed(targets))
 
         try:
             from utils.blocklist import is_blocked as _is_blocked
