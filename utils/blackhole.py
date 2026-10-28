@@ -268,9 +268,6 @@ _MOUNT_REFRESH_EVERY_S = 30
 # it surfaces instead of leaving it for the next hourly scan.
 _LATE_ARRIVAL_WINDOW_S = 2 * 3600
 _LATE_ARRIVAL_POLL_S = 120
-# Monotonic time of the last root re-list that rclone confirmed: a late item
-# the watch then finds was revealed by it (see _arrival_time).
-_root_refresh_ok_ts = 0.0
 
 
 def _coalesced_root_refresh(*, _now=None):
@@ -293,12 +290,9 @@ def _coalesced_root_refresh(*, _now=None):
         if now - _root_refresh_ts < _ROOT_REFRESH_COALESCE_S:
             return False
         _root_refresh_ts = now
-    global _root_refresh_ok_ts
     try:
         from utils.rclone_rc import refresh_dir
-        if refresh_dir(''):
-            with _root_refresh_lock:
-                _root_refresh_ok_ts = now
+        refresh_dir('')
     except Exception:
         pass
     return True
@@ -3172,16 +3166,6 @@ class BlackholeWatcher:
                     self._save_pending(entries)
                     break
 
-    def _arrival_time(self):
-        """When a late item became visible: the last re-list rclone confirmed
-        (it's what revealed it), never later than now; without one, now.
-        A read begun after that sees it, so items one re-list revealed share
-        one scan."""
-        with _root_refresh_lock:
-            revealed = _root_refresh_ok_ts
-        now = time.monotonic()
-        return min(now, revealed) if revealed else now
-
     def _watch_late_arrival(self, release_name, debrid, file_names, window=None):
         """Watch a ready grab that missed the mount wait; return True if it
         surfaced.
@@ -3209,24 +3193,22 @@ class BlackholeWatcher:
                 logger.debug(f"[blackhole] late watch for {release_name}: {e}")
                 continue
             if mount_path:
-                arrived = self._arrival_time()
                 logger.info(f"[blackhole] {release_name} reached the mount late — "
                             f"running the library scan now")
-                self._run_library_scan_now(arrived)
+                self._run_library_scan_now(mount_path)
                 return True
         return False
 
-    def _run_library_scan_now(self, arrived, attempts=30):
-        """Make sure the library gets linked from a read begun after
-        ``arrived`` (monotonic); returns True once that has started.
+    def _run_library_scan_now(self, mount_path, attempts=30, max_scans=3):
+        """Get the library scan to link the files in *mount_path*; True once
+        it has (the scanner remembers what it linked).
 
-        Covered when the scanner reports an effects run (the scheduled scan
-        or the dashboard's refresh) whose read began at or after
-        ``arrived`` — several items surfacing together share one.  Until
-        then, ask the scheduler for a scan every ~30s: one may be busy, or
-        may finish its read and skip linking because a refresh is busy
-        linking from an older read.  Returns False when the scan isn't
-        available or the budget (~15 min) runs out; the hand-off's pending
+        Starts a scan when none is linking — a scan started while another run
+        links would read the library and skip linking — and checks every
+        ~30s.  A run that links it for another reason (the dashboard's
+        refresh, a sibling's scan) counts too.  Stops after *max_scans*
+        scans that didn't link it (a title Sonarr/Radarr don't track never
+        will) or when the budget (~15 min) runs out; the hand-off's pending
         entry still has a later scan resolve it.
         """
         try:
@@ -3241,23 +3223,29 @@ class BlackholeWatcher:
             logger.debug(f"[blackhole] library scan unavailable: {e}")
             return False
         retry = min(self.late_arrival_poll, 30)
+        started = 0
         for _ in range(attempts):
             try:
-                if scanner.covers(arrived):
+                if scanner.linked_from(mount_path):
                     return True
-                scheduler.run_now('library_scan')
+                if started >= max_scans:
+                    task = scheduler.get_task('library_scan') or {}
+                    if not task.get('running') and not scanner.effects_busy():
+                        break           # our last scan is done and didn't link it
+                elif not scanner.effects_busy() and scheduler.run_now('library_scan'):
+                    started += 1
             except Exception as e:
                 logger.debug(f"[blackhole] library scan trigger failed: {e}")
                 return False
             if self._stop_event.wait(retry):
                 return False
-            try:
-                if scanner.covers(arrived):
-                    return True
-            except Exception:
-                return False
-        logger.warning("[blackhole] no library scan could link a late arrival in time; "
-                       "the next scheduled scan will pick it up")
+        try:
+            if scanner.linked_from(mount_path):
+                return True
+        except Exception:
+            pass
+        logger.warning(f"[blackhole] the library scan didn't link {os.path.basename(mount_path)}; "
+                       f"the next scheduled scan will try again")
         return False
 
     def _register_scanner_handoff(self, filename):

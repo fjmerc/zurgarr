@@ -576,14 +576,20 @@ def _replaces_extras(group, new_path):
             and not _is_extras_release(os.path.basename(new_path)))
 
 
-def _seen_debrid_names(paths):
-    """Every path component of the debrid paths a scan saw: a torrent whose
-    name is among them was seen on the mount."""
-    names = set()
+def _seen_debrid_names(paths, are_files):
+    """Release keys (``_same_release_key``) of every folder in the debrid
+    paths a scan saw — folders only, never file names, so a torrent named
+    like a file inside a seen pack doesn't count as seen.  *are_files*: the
+    paths end in a file (episodes) rather than a folder (movies)."""
+    keys = set()
     for p in paths:
-        if p:
-            names.update(part for part in os.path.normpath(p).split(os.sep) if part)
-    return names
+        if not p:
+            continue
+        p = os.path.normpath(p)
+        if are_files:
+            p = os.path.dirname(p)
+        keys.update(_same_release_key(part) for part in p.split(os.sep) if part)
+    return keys
 
 
 def _movie_debrid_dirs(movie, blocklist=None):
@@ -4469,9 +4475,10 @@ class LibraryScanner:
         # old read: prefer-local deletes from what the read saw.
         with self._lock:
             if self._effects_running:
+                logger.info("[library] Another refresh is linking — skipping this scan's "
+                            "effects (that run covers them)")
                 return data
             self._effects_running = True
-            self._claim_effects_read(read_started)
         try:
             changed = self._scan_effects(data, force_enforce)
             self._last_scan_changed = bool(changed)
@@ -4483,24 +4490,33 @@ class LibraryScanner:
                 self._effects_running = False
         return data
 
-    # Monotonic start of the library read used by the latest effects run to
-    # claim the slot (scan or refresh).  Class default: no run yet.
-    _effects_read_started = float('-inf')
     _last_scan_read_started = float('-inf')
     _last_scan_changed = False
+    # Mount files the scan linked recently: {realpath: monotonic}.  The
+    # blackhole's late-arrival watch asks whether its folder got linked.
+    _LINKED_KEEP_S = 3 * 3600
+    _links_lock = threading.Lock()      # class-level: one scanner per process
 
-    def _claim_effects_read(self, read_started):
-        """Note an effects run starting from a read begun at *read_started*
-        (call with self._lock held)."""
-        if read_started > self._effects_read_started:
-            self._effects_read_started = read_started
+    def _note_linked(self, source_realpath):
+        now = time.monotonic()
+        with self._links_lock:
+            links = self.__dict__.setdefault('_recent_links', {})
+            links[source_realpath] = now
+            for k in [k for k, t in links.items() if now - t > self._LINKED_KEEP_S]:
+                del links[k]
 
-    def covers(self, t):
-        """True once an effects run whose library read began at or after
-        monotonic *t* has started: it will link anything that was on the
-        mount at *t* (the blackhole's late TorBox arrivals rely on this)."""
+    def linked_from(self, folder):
+        """True if a scan recently linked a file from *folder* (a mount path)."""
+        root = os.path.realpath(folder)
+        prefix = root.rstrip(os.sep) + os.sep
+        with self._links_lock:
+            links = self.__dict__.get('_recent_links') or {}
+            return any(k == root or k.startswith(prefix) for k in links)
+
+    def effects_busy(self):
+        """True while a scan or refresh is running its effects (linking)."""
         with self._lock:
-            return self._effects_read_started >= t
+            return self._effects_running
 
     def peek_data(self):
         """Return the cached scan payload without ever triggering a scan.
@@ -4547,7 +4563,6 @@ class LibraryScanner:
             try:
                 # Read phase — update cache immediately so UI gets data fast
                 had_mount_before = self._mount_path is not None
-                read_started = time.monotonic()
                 data = self._scan_read()
                 has_mount_now = self._mount_path is not None
                 # Capture index snapshot before another scan can rebind.
@@ -4581,7 +4596,6 @@ class LibraryScanner:
                 with self._lock:
                     if not self._effects_running:
                         self._effects_running = True
-                        self._claim_effects_read(read_started)
                         run_effects = True
             if run_effects:
                 try:
@@ -5101,13 +5115,13 @@ class LibraryScanner:
             # Only safe to delete if there are both-source eps AND no debrid-only eps
             if has_both and not has_debrid_only:
                 prefer_local_safe[norm] = (show, _seen_debrid_names(
-                    p for (n, _s, _e), p in path_index.items() if n == norm))
+                    (p for (n, _s, _e), p in path_index.items() if n == norm), are_files=True))
 
         for movie in movies:
             norm = _normalize_title(movie['title'])
             if self._get_pref(norm, preferences) == 'prefer-local' and movie.get('source') == 'both':
                 prefer_local_safe[norm] = (movie, _seen_debrid_names(
-                    (movie.get('path'), movie.get('alt_path'))))
+                    (movie.get('path'), movie.get('alt_path')), are_files=False))
 
         if prefer_local_safe:
             try:
@@ -5129,12 +5143,12 @@ class LibraryScanner:
                         # covered by local copies; one added since (a new
                         # season pack not yet on the TorBox mount) may be the
                         # only copy of what it holds.  Fail closed.
-                        unseen = [m for m in matches if m.get('filename') not in seen]
+                        unseen = [m for m in matches if not (_release_keys(m) & seen)]
                         if unseen:
                             logger.info(
                                 f"[library] prefer-local for {item['title']}: keeping "
                                 f"{len(unseen)} debrid torrent(s) this scan didn't see")
-                        matches = [m for m in matches if m.get('filename') in seen]
+                        matches = [m for m in matches if _release_keys(m) & seen]
                         if matches:
                             deleted = 0
                             for m in matches:
@@ -7968,6 +7982,7 @@ class LibraryScanner:
                     os.symlink(symlink_target, local_path)
                     created += 1
                     symlinked_movies.add(title)
+                    self._note_linked(real_debrid)
                     # Record the new basename + size for activity event meta.
                     prior = _prior_symlinks.get(title) or set()
                     if prior and media_file not in prior and title not in _symlink_replaces:
@@ -8161,6 +8176,7 @@ class LibraryScanner:
                             os.symlink(symlink_target, local_path)
                             created += 1
                             symlinked_shows.add(title)
+                            self._note_linked(real_debrid)
                             prior = _prior_symlinks.get(title) or set()
                             if prior and filename not in prior:
                                 _symlink_is_upgrade[title] = True

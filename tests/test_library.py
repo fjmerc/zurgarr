@@ -10998,38 +10998,41 @@ class TestExtrasReleaseChoice:
         assert 'alt_path' not in merged
 
 
-class TestScanCoverage:
-    """``covers(t)``: an effects run (scan or refresh) whose library read
-    began at or after ``t`` has claimed the effects slot, so it will link
-    anything that was on the mount at ``t``.  A scan that skips its effects
-    (another run is busy) covers nothing — and never acts on an old read."""
+class TestRecentLinks:
+    """The scan remembers which mount files it just linked, so the
+    blackhole's late-arrival watch can tell when its folder really got
+    linked (not merely that some scan ran)."""
 
-    def _scanner(self, effects):
+    def _scanner(self):
         sc = LibraryScanner.__new__(LibraryScanner)
         sc._lock = threading.Lock()
         sc._effects_running = False
-        sc._cache_time = 0
-        sc._scan_read = lambda: {'movies': [], 'shows': []}
-        sc._scan_effects = lambda data, force=False: effects.append(1) or False
         return sc
 
-    def test_scan_that_runs_effects_covers_earlier_arrivals(self):
-        import time as _t
-        effects = []
-        sc = self._scanner(effects)
-        before = _t.monotonic()
-        assert not sc.covers(before)
-        sc.scan()
-        assert effects == [1]
-        assert sc.covers(before)
-        assert not sc.covers(_t.monotonic() + 1)
+    def test_linked_from_matches_files_inside_the_folder(self, tmp_dir):
+        sc = self._scanner()
+        folder = os.path.join(tmp_dir, 'torbox', 'www.UIndex.org    -    Crimson Tide 1995')
+        os.makedirs(folder)
+        assert not sc.linked_from(folder)
+        sc._note_linked(os.path.join(folder, 'Crimson Tide 1995.mkv'))
+        assert sc.linked_from(folder)
+        assert not sc.linked_from(os.path.join(tmp_dir, 'torbox', 'Crimson Tide 1995 2160p'))
 
-    def test_scan_that_skips_effects_covers_nothing(self):
-        import time as _t
+    def test_effects_busy(self):
+        sc = self._scanner()
+        assert not sc.effects_busy()
+        sc._effects_running = True
+        assert sc.effects_busy()
+
+    def test_scan_that_skips_effects_says_so(self, caplog):
+        import logging
+        sc = self._scanner()
+        sc._effects_running = True
+        sc._cache_time = 0
+        sc._scan_read = lambda: {'movies': [], 'shows': []}
         effects = []
-        sc = self._scanner(effects)
-        sc._effects_running = True          # a refresh() is mid-effects
-        before = _t.monotonic()
-        sc.scan()
-        assert effects == []                # skips at once, as before
-        assert not sc.covers(before)
+        sc._scan_effects = lambda data, force=False: effects.append(1)
+        with caplog.at_level(logging.INFO):
+            sc.scan()
+        assert effects == []
+        assert 'skipping this scan' in caplog.text

@@ -478,6 +478,62 @@ class TestAutoEnforcement:
             scanner._enforce_preferences([show], [], {norm: 'prefer-local'}, path_index, {})
         mock_client.delete_torrent.assert_called_once_with('S1')
 
+    def _prefer_local_movie(self, tmp_dir, monkeypatch, folder, matches):
+        local_tv = os.path.join(tmp_dir, 'tv')
+        os.makedirs(local_tv, exist_ok=True)
+        monkeypatch.setenv('BLACKHOLE_RCLONE_MOUNT', os.path.join(tmp_dir, 'mount'))
+        monkeypatch.setenv('BLACKHOLE_SYMLINK_TARGET_BASE', '/mnt/debrid')
+        monkeypatch.setenv('LIBRARY_PREFERENCE_AUTO_ENFORCE', 'true')
+        scanner = self._make_scanner(local_tv, monkeypatch)
+        from utils.library import _normalize_title
+        movie = {'title': 'Movie', 'year': 2020, 'source': 'both',
+                 'path': os.path.join(tmp_dir, 'mount', 'movies', folder)}
+        mock_client = MagicMock()
+        mock_client.find_torrents_by_title.return_value = matches
+        mock_client.delete_torrent.return_value = True
+        with patch('utils.debrid_client.get_debrid_client', return_value=(mock_client, 'realdebrid')):
+            scanner._enforce_preferences([], [movie], {_normalize_title('Movie'): 'prefer-local'},
+                                         {}, {})
+        return mock_client
+
+    def test_prefer_local_rd_single_file_movie_still_deleted(self, tmp_dir, monkeypatch):
+        """RD lists a single-file torrent as "X.mkv"; Zurg's folder is "X"."""
+        c = self._prefer_local_movie(tmp_dir, monkeypatch, 'Movie.2020.1080p.WEB', [
+            {'id': 'R1', 'filename': 'Movie.2020.1080p.WEB.mkv', 'parsed_title': 'Movie', 'year': 2020}])
+        c.delete_torrent.assert_called_once_with('R1')
+
+    def test_prefer_local_torbox_folder_name_still_deleted(self, tmp_dir, monkeypatch):
+        """TorBox's display name differs from its mount folder; the match's
+        ``folder`` (from its files) and the dropped '&' still line up."""
+        c = self._prefer_local_movie(tmp_dir, monkeypatch, 'Fast  Furious 2009 1080p', [
+            {'id': 'T1', 'filename': 'Fast and Furious 2009', 'folder': 'Fast & Furious 2009 1080p',
+             'parsed_title': 'Movie', 'year': 2020}])
+        c.delete_torrent.assert_called_once_with('T1')
+
+    def test_prefer_local_ignores_file_names_inside_a_seen_folder(self, tmp_dir, monkeypatch):
+        """A new single-episode torrent named like a file inside a seen pack
+        wasn't itself seen: keep it."""
+        local_tv = os.path.join(tmp_dir, 'tv')
+        os.makedirs(local_tv)
+        monkeypatch.setenv('BLACKHOLE_RCLONE_MOUNT', os.path.join(tmp_dir, 'mount'))
+        monkeypatch.setenv('BLACKHOLE_SYMLINK_TARGET_BASE', '/mnt/debrid')
+        monkeypatch.setenv('LIBRARY_PREFERENCE_AUTO_ENFORCE', 'true')
+        scanner = self._make_scanner(local_tv, monkeypatch)
+        show = self._make_show('Show', [(1, 1, 'both')])
+        from utils.library import _normalize_title
+        norm = _normalize_title('Show')
+        path_index = {(norm, 1, 1): os.path.join(tmp_dir, 'mount', 'shows', 'Show.S01.1080p',
+                                                  'Show.S01E01.1080p.mkv')}
+        mock_client = MagicMock()
+        mock_client.find_torrents_by_title.return_value = [
+            {'id': 'P', 'filename': 'Show.S01.1080p', 'parsed_title': 'Show', 'year': None},
+            {'id': 'E', 'filename': 'Show.S01E01.1080p.mkv', 'parsed_title': 'Show', 'year': None},
+        ]
+        mock_client.delete_torrent.return_value = True
+        with patch('utils.debrid_client.get_debrid_client', return_value=(mock_client, 'realdebrid')):
+            scanner._enforce_preferences([show], [], {norm: 'prefer-local'}, path_index, {})
+        mock_client.delete_torrent.assert_called_once_with('P')
+
     def test_prefer_local_movie_keeps_an_unseen_release(self, tmp_dir, monkeypatch):
         local_tv = os.path.join(tmp_dir, 'tv')
         os.makedirs(local_tv)
