@@ -8976,6 +8976,14 @@ class TestRecoverWantedViaTorbox:
             self._scanner()._recover_wanted_via_debrid([], [self._ghost()], {})
         assert wire['adds'] == []
 
+    def test_unreadable_account_only_holds_grabbed_ghosts(self, wire, account):
+        """A broken account key makes only grabbed titles uncertain — a
+        ghost nobody grabbed still recovers."""
+        account['hashes'] = None
+        with self._arrs(radarr_grabs={'D' * 40: [{'movieId': 1}]}):
+            self._scanner()._recover_wanted_via_debrid([], [self._ghost()], {})
+        assert len(wire['adds']) == 1
+
     def test_skips_show_ghost_whose_grab_was_delivered(self, wire, account):
         account['hashes'] = {'d' * 40}
         show = {'title': 'The Substance', 'source': 'wanted', 'imdb_id': 'tt7',

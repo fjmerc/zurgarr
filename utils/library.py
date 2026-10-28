@@ -5935,9 +5935,9 @@ class LibraryScanner:
         copy that a later scan links beside the arr's import.  Busy means
         in the arr's queue, or grabbed in the last ``_WANTED_GRAB_HOLD_S``
         with a torrent zurgarr delivered (on a debrid account, or swapped
-        for a TorBox alternative).  A grab zurgarr rejected as uncached
-        isn't busy — that's what recovery is for.  Empty when no ghost
-        needs the check.
+        for a TorBox alternative; every grabbed title when an account
+        can't be listed).  A grab zurgarr rejected as uncached isn't busy —
+        that's what recovery is for.  Empty when no ghost needs the check.
         """
         from utils.arr_client import get_download_service
         delivered = []  # lazily: [set of lowercase hashes] or [None]
@@ -5960,11 +5960,11 @@ class LibraryScanner:
                 if grabs is None:
                     raise RuntimeError('grab history unreadable')
                 if grabs:
+                    # An account that can't be listed makes only the grabbed
+                    # titles uncertain — hold those, not every ghost.
                     have = _delivered()
-                    if have is None:
-                        raise RuntimeError('debrid account unreadable')
                     for h, recs in grabs.items():
-                        if h.lower() in have:
+                        if have is None or h.lower() in have:
                             busy.update(r.get(grab_key) for r in recs)
                 return busy
             except Exception as e:
