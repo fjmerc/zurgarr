@@ -252,7 +252,15 @@ def _new_requests_without_grab(kind, client, items, now):
     for it, _ in fresh:
         if it.get('id') in grabbed:      # the blackhole handles a turned-down grab
             _new_request_seen[(kind, it.get('id'))] = now
-    return [it for it, _ in fresh if it.get('id') not in grabbed]
+    fresh = [it for it, _ in fresh if it.get('id') not in grabbed]
+    if not fresh:
+        return []
+    # Its own search may still be running (slow indexers, a busy queue) —
+    # recovering now could add a copy just before it grabs one.
+    searching = client.searching_ids()
+    if searching is None:
+        return None
+    return [it for it in fresh if it.get('id') not in searching]
 
 
 def new_request_check():
@@ -262,10 +270,11 @@ def new_request_check():
     recovery now instead of at its next hourly pass.  A title the arr did
     grab goes through the blackhole, which does the same when it turns the
     grab down.  Each title once."""
-    from utils.library import (wanted_tb_recovery_enabled, wanted_rd_recovery_enabled,
+    from utils.library import (wanted_recovery_possible,
                                _get_radarr_movies_list, _get_sonarr_series_list)
-    if not (wanted_tb_recovery_enabled() or wanted_rd_recovery_enabled()):
-        return {'status': 'skipped', 'message': 'Wanted recovery is off'}
+    if not wanted_recovery_possible():
+        return {'status': 'skipped', 'message': 'Wanted recovery is off or has no search '
+                                                'source or debrid key'}
     from utils.arr_client import get_download_service
     now = time.time()
     for k in [k for k, t in _new_request_seen.items() if now - t > _NEW_REQUEST_WINDOW_S]:

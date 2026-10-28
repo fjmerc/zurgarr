@@ -9,6 +9,8 @@ import pytest
 import utils.library as library
 import utils.scheduled_tasks as st
 
+_real_recovery_possible = library.wanted_recovery_possible
+
 
 def _iso(minutes_ago):
     return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).strftime(
@@ -42,6 +44,9 @@ def env(monkeypatch):
     sonarr.get_all_series.return_value = []
     radarr.recent_grab_ids.return_value = set()
     sonarr.recent_grab_ids.return_value = set()
+    radarr.searching_ids.return_value = set()
+    sonarr.searching_ids.return_value = set()
+    monkeypatch.setattr('utils.library.wanted_recovery_possible', lambda: True, raising=False)
     svc = lambda kind: (radarr, 'radarr') if kind == 'movie' else (sonarr, 'sonarr')
     with patch('utils.arr_client.get_download_service', svc):
         yield {'radarr': radarr, 'sonarr': sonarr, 'requested': requested}
@@ -118,6 +123,8 @@ def test_series_sonarr_grabbed_is_left_to_the_blackhole(env):
 
 
 def test_wanted_recovery_off_does_nothing(env, monkeypatch):
+    monkeypatch.setattr('utils.library.wanted_recovery_possible', _real_recovery_possible)
+    monkeypatch.setattr('base.load_secret_or_env', lambda name: 'key')
     monkeypatch.setenv('WANTED_TB_RECOVERY_ENABLED', 'false')
     monkeypatch.setenv('WANTED_RD_RECOVERY_ENABLED', 'false')
     env['radarr'].get_all_movies.return_value = [_movie()]
@@ -168,3 +175,32 @@ def test_title_waits_when_no_scan_could_be_queued(env, monkeypatch):
     library._radarr_movies_cache['ts'] = 0.0
     st.new_request_check()
     assert env['requested'] == [1, 1]
+
+
+def test_title_the_arr_is_still_searching_for_waits(env):
+    env['radarr'].get_all_movies.return_value = [_movie()]
+    env['radarr'].searching_ids.return_value = {760}
+    st.new_request_check()
+    assert env['requested'] == []
+    assert st._new_request_seen == {}        # looked at again next run
+
+
+def test_unreadable_search_queue_waits(env):
+    env['radarr'].get_all_movies.return_value = [_movie()]
+    env['radarr'].searching_ids.return_value = None
+    st.new_request_check()
+    assert env['requested'] == []
+
+
+def test_nothing_to_recover_with_does_nothing(env, monkeypatch):
+    """No search source: the Wanted pass can't run, so don't scan for it."""
+    monkeypatch.undo()
+    monkeypatch.setenv('WANTED_TB_RECOVERY_ENABLED', 'true')
+    monkeypatch.delenv('TORRENTIO_URL', raising=False)
+    monkeypatch.setattr('utils.prowlarr.is_prowlarr_configured', lambda: False)
+    monkeypatch.setattr('utils.blackhole._request_wanted_scan',
+                        lambda stop, **k: env['requested'].append(1) or True)
+    env['radarr'].get_all_movies.return_value = [_movie()]
+    st.new_request_check()
+    assert env['requested'] == []
+    assert not env['radarr'].get_all_movies.called

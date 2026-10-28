@@ -3608,3 +3608,31 @@ class TestRecentGrabIds:
     def test_unreadable_history_is_none(self, mock_urlopen, client):
         mock_urlopen.return_value = _mock_urlopen(['not', 'a', 'dict'])
         assert client.recent_grab_ids(0) is None
+
+
+class TestSearchingIds:
+    """Series/movie ids with an arr search queued or running."""
+
+    @patch('urllib.request.urlopen')
+    def test_radarr_movie_search_ids(self, mock_urlopen, radarr):
+        mock_urlopen.return_value = _mock_urlopen([
+            {'name': 'MoviesSearch', 'status': 'started', 'body': {'movieIds': [760]}},
+            {'name': 'MoviesSearch', 'status': 'completed', 'body': {'movieIds': [5]}},
+            {'name': 'RssSync', 'status': 'queued', 'body': {}},
+        ])
+        assert radarr.searching_ids() == {760}
+
+    @patch('urllib.request.urlopen')
+    def test_sonarr_series_season_episode_search_ids(self, mock_urlopen, sonarr):
+        mock_urlopen.return_value = _mock_urlopen([
+            {'name': 'SeriesSearch', 'status': 'queued', 'body': {'seriesId': 9}},
+            {'name': 'SeasonSearch', 'status': 'started', 'body': {'seriesId': 4}},
+            {'name': 'EpisodeSearch', 'status': 'started', 'body': {'episodeIds': [1]}},
+            {'name': 'SeriesSearch', 'status': 'completed', 'body': {'seriesId': 3}},
+        ])
+        assert sonarr.searching_ids() == {9, 4}
+
+    @patch('urllib.request.urlopen')
+    def test_unreadable_is_none(self, mock_urlopen, radarr):
+        mock_urlopen.return_value = _mock_urlopen({'error': 'x'})
+        assert radarr.searching_ids() is None

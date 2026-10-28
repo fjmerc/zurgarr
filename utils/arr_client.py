@@ -773,6 +773,22 @@ class _ArrClientBase:
                 out.setdefault(h, []).append(rec)
         return out
 
+    def searching_ids(self):
+        """Series/movie ids with a search command queued or running in the
+        arr; None when it didn't answer."""
+        cmds = self._get('/api/v3/command')
+        if not isinstance(cmds, list):
+            return None
+        out = set()
+        for c in cmds:
+            if not isinstance(c, dict) or c.get('status') not in ('queued', 'started'):
+                continue
+            out.update(self._searched_ids(c.get('name'), c.get('body') or {}))
+        return out
+
+    def _searched_ids(self, name, body):
+        raise NotImplementedError
+
     def recent_grab_ids(self, since):
         """Series/movie ids grabbed since epoch *since* — every grab, with or
         without a torrent hash (usenet); None when the arr didn't answer."""
@@ -1678,6 +1694,11 @@ class SonarrClient(_ArrClientBase):
         return out
 
     _MEDIA_ID_KEY = 'seriesId'
+
+    def _searched_ids(self, name, body):
+        if name in ('SeriesSearch', 'SeasonSearch') and body.get('seriesId') is not None:
+            return {body['seriesId']}
+        return set()
     _QUEUE_UNKNOWN_PARAM = 'includeUnknownSeriesItems'
 
     def _media_record(self, media_id):
@@ -2792,6 +2813,11 @@ class RadarrClient(_ArrClientBase):
                 if r.get('movieId') is not None and _queue_active(r)}
 
     _MEDIA_ID_KEY = 'movieId'
+
+    def _searched_ids(self, name, body):
+        if name == 'MoviesSearch':
+            return {i for i in body.get('movieIds') or () if i is not None}
+        return set()
     _QUEUE_UNKNOWN_PARAM = 'includeUnknownMovieItems'
 
     def _media_record(self, media_id):

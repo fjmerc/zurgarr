@@ -87,6 +87,21 @@ def wanted_tb_recovery_max_per_scan():
     return n if n > 0 else 2
 
 
+def wanted_recovery_possible():
+    """True when a Wanted recovery pass could add anything: a leg is on with
+    its debrid key, and Torrentio or Prowlarr is configured to search."""
+    if not (os.environ.get('TORRENTIO_URL')):
+        try:
+            from utils.prowlarr import is_prowlarr_configured
+            if not is_prowlarr_configured():
+                return False
+        except Exception:
+            return False
+    from base import load_secret_or_env
+    return bool((wanted_tb_recovery_enabled() and load_secret_or_env('torbox_api_key'))
+                or (wanted_rd_recovery_enabled() and load_secret_or_env('rd_api_key')))
+
+
 def wanted_rd_recovery_enabled():
     """Return ``True`` when the RD leg of Wanted recovery is enabled.
 

@@ -6182,6 +6182,7 @@ class TestScannerHandoff:
 
     def _wanted_scan(self, monkeypatch):
         import utils.blackhole as bh
+        monkeypatch.setattr('utils.library.wanted_recovery_possible', lambda: True)
         monkeypatch.setattr(bh, '_wanted_scan_ts', float('-inf'))
         monkeypatch.setattr(bh, '_wanted_scan_pending', False)
         stop = threading.Event()

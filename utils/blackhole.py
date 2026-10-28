@@ -296,7 +296,8 @@ def _request_wanted_scan(stop_event, *, retry=_WANTED_SCAN_RETRY_S):
     global _wanted_scan_pending
     try:
         from utils.task_scheduler import scheduler
-        if scheduler.get_task('library_scan') is None:
+        from utils.library import wanted_recovery_possible
+        if scheduler.get_task('library_scan') is None or not wanted_recovery_possible():
             return False
     except Exception:
         return False
