@@ -1453,12 +1453,56 @@ def _get_zurg_auth():
     return (user, password) if user and password else None
 
 
+def _delivered_hashes(since):
+    """Lowercase info hashes zurgarr delivered: every torrent on a
+    configured debrid account, plus grabs the blackhole swapped for a TorBox
+    alternative since epoch *since*.  None when an account can't be listed."""
+    from utils import search as _search
+    from utils import history as _hist
+    out = set()
+    for svc in _search.list_configured_services():
+        have = _search._existing_hashes(svc, _search._resolve_service_key(svc))
+        if have is None:
+            return None
+        out |= have
+    start = datetime.fromtimestamp(since, timezone.utc).isoformat(timespec='seconds')
+    for e in _hist.events_since(start):
+        meta = e.get('meta') or {}
+        if meta.get('cause') == 'tb_cached_alt_grabbed' and meta.get('rejected_info_hash'):
+            out.add(str(meta['rejected_info_hash']).strip().lower())
+    return out
+
+
+def _arr_downloading(arr_id, busy):
+    """True when the arr already has a download for this ghost (*arr_id*
+    in *busy*), or that couldn't be told (*busy* None — fail closed: a
+    skipped recovery costs one scan, a false one a second debrid copy)."""
+    if arr_id is None:
+        return False
+    return busy is None or arr_id in busy
+
+
+def _arr_imdb_id(item):
+    """The imdb_id a Wanted ghost got from Radarr/Sonarr, else None.
+
+    The arr's id is the identity it imports against, and a just-requested
+    title isn't in the TMDB cache yet — without it the Wanted recovery pass
+    skips the title until a later scan.  Only ghosts carry one into
+    enrichment (today just Radarr's — Sonarr ghosts are injected after
+    enrichment); on-disk items always take the cache's.
+    """
+    if item.get('source') != 'wanted':
+        return None
+    return item.get('imdb_id') or None
+
+
 def _enrich_with_tmdb_cache(movies, shows, _shared_tmdb_cache=None):
     """Attach cached TMDB poster/status data to library items for grid cards.
 
     Performs a single bulk cache lookup (no API calls).  Items without
-    cached data get None fields.  Triggers background population for
-    uncached items.
+    cached data get None fields, except a wanted ghost's arr-supplied
+    ``imdb_id`` (see ``_arr_imdb_id``).  Triggers background population
+    for uncached items.
 
     When a TMDB hit yields a canonical title that differs from the parsed
     folder title (e.g. multi-language torrent folders that bundle both
@@ -1483,11 +1527,11 @@ def _enrich_with_tmdb_cache(movies, shows, _shared_tmdb_cache=None):
         for item in movies:
             item['poster_url'] = None
             item['tmdb_status'] = None
-            item['imdb_id'] = None
+            item['imdb_id'] = _arr_imdb_id(item)
         for item in shows:
             item['poster_url'] = None
             item['tmdb_status'] = None
-            item['imdb_id'] = None
+            item['imdb_id'] = _arr_imdb_id(item)
             item['total_episodes'] = None
             item['missing_episodes'] = None
         return []
@@ -1596,11 +1640,11 @@ def _enrich_with_tmdb_cache(movies, shows, _shared_tmdb_cache=None):
             _maybe_rename(movie, info)
             movie['poster_url'] = info['poster_url'] or None
             movie['tmdb_status'] = info.get('tmdb_status') or None
-            movie['imdb_id'] = info.get('imdb_id') or None
+            movie['imdb_id'] = _arr_imdb_id(movie) or info.get('imdb_id') or None
         else:
             movie['poster_url'] = None
             movie['tmdb_status'] = None
-            movie['imdb_id'] = None
+            movie['imdb_id'] = _arr_imdb_id(movie)
             uncached.append({'title': movie['title'], 'year': movie.get('year'), 'type': 'movie'})
 
     for show in shows:
@@ -1627,7 +1671,7 @@ def _enrich_with_tmdb_cache(movies, shows, _shared_tmdb_cache=None):
             _maybe_rename(show, info)
             show['poster_url'] = info['poster_url'] or None
             show['tmdb_status'] = info.get('tmdb_status') or None
-            show['imdb_id'] = info.get('imdb_id') or None
+            show['imdb_id'] = _arr_imdb_id(show) or info.get('imdb_id') or None
             total = info.get('total_episodes') or 0
             show['total_episodes'] = total if total > 0 else None
             have = show.get('episodes', 0)
@@ -1635,7 +1679,7 @@ def _enrich_with_tmdb_cache(movies, shows, _shared_tmdb_cache=None):
         else:
             show['poster_url'] = None
             show['tmdb_status'] = None
-            show['imdb_id'] = None
+            show['imdb_id'] = _arr_imdb_id(show)
             show['total_episodes'] = None
             show['missing_episodes'] = None
             uncached.append({'title': show['title'], 'year': show.get('year'), 'type': 'show'})
@@ -2462,7 +2506,7 @@ def _apply_radarr_wanted_movies(movies, pending=None, degraded=None):
     Ghost entry shape::
 
         {'title', 'year', 'source': 'wanted', 'size_bytes': 0,
-         'path': '', 'missing': True,
+         'path': '', 'missing': True, 'imdb_id': <str, when Radarr has one>,
          '_radarr_id': <int>, '_radarr_tmdb_id': <int>}
 
     Source is set to a new ``'wanted'`` label that is intentionally
@@ -2516,6 +2560,12 @@ def _apply_radarr_wanted_movies(movies, pending=None, degraded=None):
     # without a tmdb_id (e.g. hand-imported libraries).
     existing_tmdb_ids = set()
     existing_keys = set()
+    # Punctuation-blind twin of existing_keys: folder parsing drops the
+    # colons/hyphens Radarr keeps ("Mission Impossible Dead Reckoning" vs
+    # "Mission: Impossible - Dead Reckoning"), so a release the blackhole
+    # just delivered — not imported yet, hasFile still False — would
+    # otherwise also surface as a ghost the Wanted pass adds a second time.
+    existing_match_keys = set()
     for m in movies:
         tid = m.get('tmdb_id')
         if tid:
@@ -2523,6 +2573,9 @@ def _apply_radarr_wanted_movies(movies, pending=None, degraded=None):
         norm = _normalize_title(m.get('title') or '')
         if norm:
             existing_keys.add((norm, m.get('year')))
+            mk = _norm_for_matching(norm)
+            if mk:  # '' for an all non-Latin title — never a match key
+                existing_match_keys.add((mk, m.get('year')))
 
     injected = 0
     for rm in radarr_movies:
@@ -2542,6 +2595,9 @@ def _apply_radarr_wanted_movies(movies, pending=None, degraded=None):
             continue
         norm = _normalize_title(title)
         if (norm, year) in existing_keys:
+            continue
+        mk = _norm_for_matching(norm)
+        if mk and (mk, year) in existing_match_keys:
             continue
 
         # Pending state suppression: if this title (or any alias) is in
@@ -2578,6 +2634,8 @@ def _apply_radarr_wanted_movies(movies, pending=None, degraded=None):
             '_radarr_tmdb_id': tmdb_id,
             '_profile_id': rm.get('qualityProfileId'),
         }
+        if rm.get('imdbId'):
+            ghost['imdb_id'] = rm['imdbId']
         movies.append(ghost)
         injected += 1
         # Update dedup keys so a duplicate Radarr entry (rare but
@@ -2585,6 +2643,8 @@ def _apply_radarr_wanted_movies(movies, pending=None, degraded=None):
         if tmdb_id:
             existing_tmdb_ids.add(tmdb_id)
         existing_keys.add((norm, year))
+        if mk:
+            existing_match_keys.add((mk, year))
 
     return injected
 
@@ -5856,6 +5916,70 @@ class LibraryScanner:
                 f"({', '.join(sorted(allowed))}) for '{media_title}'")
         return kept
 
+    # How long a delivered grab keeps its ghost out of Wanted recovery: past
+    # the 2h TorBox late-arrival watch plus the arr's import.  Too short
+    # re-adds a slow delivery; too long delays recovery when a delivered
+    # release never imports.
+    _WANTED_GRAB_HOLD_S = 6 * 3600
+
+    @classmethod
+    def _wanted_arr_busy(cls, movies, shows):
+        """``(radarr movie ids, sonarr series ids)`` the arr already has a
+        download for, for ghosts carrying that arr's id; None for an arr
+        that can't be read.
+
+        A release the blackhole just delivered is a ghost until the arr
+        imports it — its folder title may not match the arr's ("F1 The
+        Movie" vs "F1"), and the arr's queue only shows it once it polls
+        its watch folder — so adding it again would make a second debrid
+        copy that a later scan links beside the arr's import.  Busy means
+        in the arr's queue, or grabbed in the last ``_WANTED_GRAB_HOLD_S``
+        with a torrent zurgarr delivered (on a debrid account, or swapped
+        for a TorBox alternative).  A grab zurgarr rejected as uncached
+        isn't busy — that's what recovery is for.  Empty when no ghost
+        needs the check.
+        """
+        from utils.arr_client import get_download_service
+        delivered = []  # lazily: [set of lowercase hashes] or [None]
+
+        def _delivered():
+            if not delivered:
+                delivered.append(_delivered_hashes(time.time() - cls._WANTED_GRAB_HOLD_S))
+            return delivered[0]
+
+        def _read(kind, svc_name, id_key, grab_key, items, queued_ids):
+            if not any(i.get('source') == 'wanted' and i.get(id_key) is not None
+                       for i in items):
+                return set()
+            try:
+                client, svc = get_download_service(kind)
+                if not client or svc != svc_name:
+                    return set()
+                busy = set(queued_ids(client))
+                grabs = client.recent_grabs_by_hash(time.time() - cls._WANTED_GRAB_HOLD_S)
+                if grabs is None:
+                    raise RuntimeError('grab history unreadable')
+                if grabs:
+                    have = _delivered()
+                    if have is None:
+                        raise RuntimeError('debrid account unreadable')
+                    for h, recs in grabs.items():
+                        if h.lower() in have:
+                            busy.update(r.get(grab_key) for r in recs)
+                return busy
+            except Exception as e:
+                logger.warning(f"[library] Wanted recovery: can't tell what {svc_name} "
+                               f"is downloading ({e.__class__.__name__}: {e}) — its "
+                               f"wanted titles wait for the next scan")
+                return None
+
+        return (
+            _read('movie', 'radarr', '_radarr_id', 'movieId', movies,
+                  lambda c: c.queued_movie_ids()),
+            _read('show', 'sonarr', '_sonarr_id', 'seriesId', shows,
+                  lambda c: {k[0] for k in c.queued_episodes()}),
+        )
+
     def _recover_wanted_via_debrid(self, shows, movies, preferences):
         """Proactively grab debrid-cached copies of "Wanted" media.
 
@@ -6012,6 +6136,7 @@ class LibraryScanner:
         # succeed, the arr import simply replaces the symlinked file.
         # Season targets exist precisely because gap-fill's indexer pool
         # has been failing on these seasons.
+        busy_movies, busy_series = self._wanted_arr_busy(movies, shows)
         targets = []  # (media_type, item, season, episode)
         for m in movies:
             if m.get('source') != 'wanted':
@@ -6020,11 +6145,15 @@ class LibraryScanner:
                 continue  # unreleased — Torrentio won't have a real release
             if not m.get('imdb_id'):
                 continue
+            if _arr_downloading(m.get('_radarr_id'), busy_movies):
+                continue
             targets.append(('movie', m, None, None))
         for s in shows:
             if s.get('source') != 'wanted':
                 continue
             if not s.get('imdb_id'):
+                continue
+            if _arr_downloading(s.get('_sonarr_id'), busy_series):
                 continue
             # A "wanted" show ghost is a Sonarr-monitored series with ZERO
             # on-disk episodes (_apply_sonarr_wanted_shows only injects

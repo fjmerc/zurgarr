@@ -5152,6 +5152,100 @@ class TestApplySonarrMonitoredFilterReturnsMatchedIds:
         assert matched == set()
 
 
+class TestWantedGhostImdbId:
+    """A just-requested title isn't in the TMDB cache yet, so the Wanted
+    recovery pass (which needs an imdb_id) skipped it until a later scan.
+    The arr already knows the id: ghosts carry it and enrichment keeps it."""
+
+    def test_radarr_ghost_carries_imdb_id(self):
+        from utils.library import _apply_radarr_wanted_movies
+        movies = []
+        radarr_movies = [
+            {'id': 758, 'tmdbId': 1669, 'imdbId': 'tt0099810',
+             'title': 'The Hunt for Red October', 'year': 1990,
+             'monitored': True, 'hasFile': False, 'isAvailable': True},
+        ]
+        with _fake_radarr(radarr_movies):
+            _apply_radarr_wanted_movies(movies)
+        assert movies[0]['imdb_id'] == 'tt0099810'
+
+    def test_no_ghost_beside_a_just_delivered_punctuated_title(self):
+        """The folder parser drops punctuation Radarr keeps; a release the
+        blackhole just delivered (not imported yet, so hasFile False) must
+        not also surface as a ghost the Wanted pass would add again."""
+        from utils.library import _apply_radarr_wanted_movies
+        movies = [{'title': 'Mission Impossible Dead Reckoning Part One',
+                   'year': 2023, 'source': 'debrid'}]
+        with _fake_radarr([{'id': 9, 'tmdbId': 575264, 'imdbId': 'tt9603212',
+                            'title': 'Mission: Impossible - Dead Reckoning Part One',
+                            'year': 2023, 'monitored': True, 'hasFile': False}]):
+            assert _apply_radarr_wanted_movies(movies) == 0
+        assert [m['source'] for m in movies] == ['debrid']
+
+    def test_punctuation_match_still_needs_the_year(self):
+        from utils.library import _apply_radarr_wanted_movies
+        movies = [{'title': 'Dune', 'year': 1984, 'source': 'debrid'}]
+        with _fake_radarr([{'id': 1, 'tmdbId': 438631, 'imdbId': 'tt1160419',
+                            'title': 'Dune', 'year': 2021,
+                            'monitored': True, 'hasFile': False}]):
+            assert _apply_radarr_wanted_movies(movies) == 1
+
+    def test_radarr_ghost_without_imdb_id_has_none(self):
+        from utils.library import _apply_radarr_wanted_movies
+        movies = []
+        with _fake_radarr([{'id': 1, 'tmdbId': 2, 'title': 'X', 'year': 2020,
+                            'monitored': True, 'hasFile': False}]):
+            _apply_radarr_wanted_movies(movies)
+        assert not movies[0].get('imdb_id')
+
+    def _enrich(self, monkeypatch, movies, shows, cached):
+        from utils import tmdb as _tmdb
+        from utils.library import _enrich_with_tmdb_cache
+        monkeypatch.setattr(_tmdb, '_load_cache', lambda: {'movies': {}, 'shows': {}})
+        monkeypatch.setattr(_tmdb, 'background_populate_cache', lambda items: None)
+        monkeypatch.setattr(_tmdb, 'find_show_by_season', lambda *a, **kw: None)
+        monkeypatch.setattr(_tmdb, 'get_cached_posters', lambda items: cached)
+        _enrich_with_tmdb_cache(movies, shows)
+
+    def test_enrichment_cache_miss_keeps_arr_imdb_id(self, monkeypatch):
+        movies = [{'title': 'The Hunt for Red October', 'year': 1990,
+                   'source': 'wanted', 'imdb_id': 'tt0099810'}]
+        shows = [{'title': 'New Show', 'year': 2026, 'source': 'wanted',
+                  'imdb_id': 'tt9999999', 'season_data': []}]
+        self._enrich(monkeypatch, movies, shows, {})
+        assert movies[0]['imdb_id'] == 'tt0099810'
+        assert shows[0]['imdb_id'] == 'tt9999999'
+
+    def test_enrichment_cache_hit_prefers_arr_imdb_id(self, monkeypatch):
+        """The arr's id is the identity it imports against; a title-keyed
+        cache entry never overrides it."""
+        movies = [{'title': 'Crash', 'year': 2004, 'source': 'wanted',
+                   'imdb_id': 'tt0375679'}]
+        cached = {'crash (2004)': {'poster_url': 'p', 'tmdb_status': 'Released',
+                                   'imdb_id': 'tt0115964', 'title': 'Crash'}}
+        self._enrich(monkeypatch, movies, [], cached)
+        assert movies[0]['imdb_id'] == 'tt0375679'
+        assert movies[0]['poster_url'] == 'p'
+
+    def test_enrichment_still_fills_imdb_id_from_cache(self, monkeypatch):
+        movies = [{'title': 'Gattaca', 'year': 1997, 'source': 'debrid'}]
+        cached = {'gattaca (1997)': {'poster_url': 'p', 'tmdb_status': 'Released',
+                                     'imdb_id': 'tt0119177', 'title': 'Gattaca'}}
+        self._enrich(monkeypatch, movies, [], cached)
+        assert movies[0]['imdb_id'] == 'tt0119177'
+
+    def test_on_disk_item_never_keeps_a_stale_imdb_id(self, monkeypatch):
+        movies = [{'title': 'Gattaca', 'year': 1997, 'source': 'debrid',
+                   'imdb_id': 'tt0000001'},
+                  {'title': 'Unknown', 'year': 2001, 'source': 'local',
+                   'imdb_id': 'tt0000002'}]
+        cached = {'gattaca (1997)': {'poster_url': 'p', 'tmdb_status': 'Released',
+                                     'imdb_id': 'tt0119177', 'title': 'Gattaca'}}
+        self._enrich(monkeypatch, movies, [], cached)
+        assert movies[0]['imdb_id'] == 'tt0119177'
+        assert movies[1]['imdb_id'] is None
+
+
 class TestApplySonarrWantedShows:
     """Inject Sonarr-monitored series with zero on-disk episodes as ghost
     show entries — the TV mirror of ``_apply_radarr_wanted_movies``.
@@ -8770,6 +8864,125 @@ class TestRecoverWantedViaTorbox:
         assert add['service'] == 'torbox'
         assert add['cause'] == 'wanted_tb_recovered'
         assert add['media_title'] == 'The Substance'
+
+    @staticmethod
+    def _arrs(radarr_queued=(), sonarr_queued=(), radarr_error=None,
+              sonarr_error=None, radarr_grabs=None, sonarr_grabs=None):
+        radarr, sonarr = MagicMock(), MagicMock()
+        radarr.recent_grabs_by_hash.return_value = (
+            {} if radarr_grabs is None else radarr_grabs)
+        sonarr.recent_grabs_by_hash.return_value = (
+            {} if sonarr_grabs is None else sonarr_grabs)
+        if radarr_error:
+            radarr.queued_movie_ids.side_effect = radarr_error
+        else:
+            radarr.queued_movie_ids.return_value = set(radarr_queued)
+        if sonarr_error:
+            sonarr.queued_episodes.side_effect = sonarr_error
+        else:
+            sonarr.queued_episodes.return_value = set(sonarr_queued)
+        return patch('utils.arr_client.get_download_service',
+                     side_effect=lambda kind: (radarr, 'radarr') if kind == 'movie'
+                     else (sonarr, 'sonarr'))
+
+    def _ghost(self, **kw):
+        return dict({'title': 'The Substance', 'source': 'wanted',
+                     'imdb_id': 'tt1234567', 'is_available': True,
+                     '_radarr_id': 9}, **kw)
+
+    def test_skips_movie_ghost_radarr_is_downloading(self, wire):
+        """A release the blackhole just delivered sits in Radarr's queue
+        until imported — re-adding it would make a second debrid copy."""
+        with self._arrs(radarr_queued={9}):
+            self._scanner()._recover_wanted_via_debrid([], [self._ghost()], {})
+        assert wire['adds'] == []
+
+    def test_movie_ghost_not_in_queue_is_recovered(self, wire):
+        with self._arrs(radarr_queued={4}):
+            self._scanner()._recover_wanted_via_debrid([], [self._ghost()], {})
+        assert len(wire['adds']) == 1
+
+    def test_movie_ghosts_wait_when_radarr_queue_unreadable(self, wire):
+        with self._arrs(radarr_error=RuntimeError('down')):
+            self._scanner()._recover_wanted_via_debrid([], [self._ghost()], {})
+        assert wire['adds'] == []
+
+    def test_skips_show_ghost_sonarr_is_downloading(self, wire):
+        show = {'title': 'The Substance', 'source': 'wanted', 'imdb_id': 'tt7',
+                '_sonarr_id': 5, 'season_data': []}
+        with self._arrs(sonarr_queued={(5, 1, 1)}):
+            self._scanner()._recover_wanted_via_debrid([show], [], {})
+        assert wire['adds'] == []
+
+    def test_show_ghosts_wait_when_sonarr_queue_unreadable(self, wire):
+        show = {'title': 'The Substance', 'source': 'wanted', 'imdb_id': 'tt7',
+                '_sonarr_id': 5, 'season_data': []}
+        with self._arrs(sonarr_error=RuntimeError('down')):
+            self._scanner()._recover_wanted_via_debrid([show], [], {})
+        assert wire['adds'] == []
+
+    @pytest.fixture
+    def account(self, monkeypatch):
+        """Debrid account contents and zurgarr's own TB-alt swaps."""
+        import utils.search as search
+        import utils.history as history
+        state = {'hashes': set(), 'alt_swaps': []}
+        monkeypatch.setattr(search, 'list_configured_services', lambda: ['torbox'])
+        monkeypatch.setattr(search, '_resolve_service_key', lambda svc: 'k')
+        monkeypatch.setattr(search, '_existing_hashes',
+                            lambda svc, key, **kw: None if state['hashes'] is None
+                            else set(state['hashes']))
+        monkeypatch.setattr(history, 'events_since', lambda start: [
+            {'type': 'tb_cached_alt_grabbed',
+             'meta': {'cause': 'tb_cached_alt_grabbed', 'rejected_info_hash': h}}
+            for h in state['alt_swaps']])
+        return state
+
+    def test_skips_ghost_whose_grab_was_delivered(self, wire, account):
+        """F1 shape: the delivered folder ("F1 The Movie") doesn't match
+        Radarr's title, Radarr hasn't polled it into its queue yet — the
+        grab's torrent sitting in the account is what says "delivered"."""
+        account['hashes'] = {'d' * 40}
+        with self._arrs(radarr_grabs={'D' * 40: [{'movieId': 9}]}):
+            self._scanner()._recover_wanted_via_debrid([], [self._ghost()], {})
+        assert wire['adds'] == []
+
+    def test_rejected_grab_is_still_recovered(self, wire, account):
+        """Red October shape: the grab was uncached and never added."""
+        account['hashes'] = {'e' * 40}
+        with self._arrs(radarr_grabs={'D' * 40: [{'movieId': 9}]}):
+            self._scanner()._recover_wanted_via_debrid([], [self._ghost()], {})
+        assert len(wire['adds']) == 1
+
+    def test_skips_ghost_whose_grab_was_swapped_for_a_tb_alternative(
+            self, wire, account):
+        account['alt_swaps'] = ['d' * 40]
+        with self._arrs(radarr_grabs={'D' * 40: [{'movieId': 9}]}):
+            self._scanner()._recover_wanted_via_debrid([], [self._ghost()], {})
+        assert wire['adds'] == []
+
+    def test_ghost_waits_when_grab_history_unreadable(self, wire, account):
+        radarr = MagicMock()
+        radarr.queued_movie_ids.return_value = set()
+        radarr.recent_grabs_by_hash.return_value = None
+        with patch('utils.arr_client.get_download_service',
+                   return_value=(radarr, 'radarr')):
+            self._scanner()._recover_wanted_via_debrid([], [self._ghost()], {})
+        assert wire['adds'] == []
+
+    def test_grabbed_ghost_waits_when_account_unreadable(self, wire, account):
+        account['hashes'] = None
+        with self._arrs(radarr_grabs={'D' * 40: [{'movieId': 9}]}):
+            self._scanner()._recover_wanted_via_debrid([], [self._ghost()], {})
+        assert wire['adds'] == []
+
+    def test_skips_show_ghost_whose_grab_was_delivered(self, wire, account):
+        account['hashes'] = {'d' * 40}
+        show = {'title': 'The Substance', 'source': 'wanted', 'imdb_id': 'tt7',
+                '_sonarr_id': 5, 'season_data': []}
+        with self._arrs(sonarr_grabs={'D' * 40: [{'seriesId': 5}]}):
+            self._scanner()._recover_wanted_via_debrid([show], [], {})
+        assert wire['adds'] == []
 
     def test_tb_leg_waits_between_passes_that_added(self, wire):
         """A late TorBox arrival runs an extra scan; its Wanted pass must not

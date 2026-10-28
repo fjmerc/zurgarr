@@ -762,6 +762,12 @@ class _ArrClientBase:
                 break
         return out
 
+    def recent_grabs_by_hash(self, since):
+        """Public form of ``_grabs_by_hash`` — grab records since epoch
+        *since*, keyed by upper-case info hash; None when the arr didn't
+        answer."""
+        return self._grabs_by_hash(since)
+
     def _grab_target(self, grabs):
         """The single series/movie id *grabs* were made for, else None."""
         ids = {g.get(self._MEDIA_ID_KEY) for g in grabs or ()
