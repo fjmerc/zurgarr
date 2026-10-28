@@ -19,6 +19,7 @@ isn't here, open a [GitHub issue](https://github.com/fjmerc/zurgarr/issues).
 - [Plex not seeing debrid content](#plex-not-seeing-debrid-content)
 - [New shows/movies only appear in Plex after a manual scan](#new-showsmovies-only-appear-in-plex-after-a-manual-scan)
 - [A TorBox grab is ready but takes a long time to reach Plex](#a-torbox-grab-is-ready-but-takes-a-long-time-to-reach-plex)
+- [Plex shows a title but Sonarr/Radarr still say it's missing](#plex-shows-a-title-but-sonarrradarr-still-say-its-missing)
 - [A download for one show is stuck under a same-name show in Sonarr ("Not an upgrade")](#a-download-for-one-show-is-stuck-under-a-same-name-show-in-sonarr-not-an-upgrade)
 - [Plex shows the same episode or movie two or more times](#plex-shows-the-same-episode-or-movie-two-or-more-times)
 - [Duplicate tidy stopped: "a kept copy disappeared"](#duplicate-tidy-stopped-a-kept-copy-disappeared)
@@ -297,6 +298,26 @@ needs. Options:
   Zurgarr's healthcheck is passing first.
 - Try `PLEX_REFRESH=true` with `PLEX_MOUNT_DIR` set to the mount path
   **as Plex sees it** (not the path inside the Zurgarr container).
+
+## Plex shows a title but Sonarr/Radarr still say it's missing
+
+Symptom: a movie or episode zurgarr linked plays in Plex, but Radarr/Sonarr
+show it as missing, and their log says `Couldn't import file … Could not find
+file '/mnt/debrid_torbox/…'` (or your debrid target path).
+
+Cause: Sonarr/Radarr follow the link through their own host's view of the
+debrid mount. When that is a separate rclone mount (another machine, its own
+directory cache), it can list a new TorBox folder a little later than zurgarr
+does — and zurgarr links a TorBox copy within a minute of TorBox listing it.
+A rescan that lands in between finds a link to nothing and skips it.
+
+What zurgarr does: after asking for the rescan it checks, 1, 2, 4 and 8
+minutes later, whether Sonarr/Radarr now list the file, and asks again if not.
+Every library scan also asks again (at most every 30 minutes per title; after
+three tries, once a day) for linked titles they still don't list, as long as
+the link plays and they aren't downloading it. To nudge one yourself, use
+Rescan in Sonarr/Radarr. If it keeps happening, check the arr host's own
+debrid mount (`ls` the folder there).
 
 ## A TorBox grab is ready but takes a long time to reach Plex
 

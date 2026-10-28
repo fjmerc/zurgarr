@@ -245,7 +245,8 @@ def build_data():
              (symlinks, 'BLACKHOLE_SYMLINK_ENABLED')),
          'short': 'Links in anything on your cloud folders that Sonarr/Radarr are missing.',
          'text': 'Looks through your cloud folders for anything Sonarr/Radarr are missing and '
-                 'links it in, then asks them to rescan. It never links something they already '
+                 'links it in, then asks them to rescan \u2014 again until they list it. It never '
+                 'links something they already '
                  'have, don\u2019t track, or are importing right now.',
          'links': [['tbmount', 'links'], ['rdmount', 'links'], ['links', 'arr']]},
         {'key': 'wanted', 'code': 'W', 'title': 'Wanted recovery',

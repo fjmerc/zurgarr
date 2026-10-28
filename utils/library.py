@@ -7816,6 +7816,84 @@ class LibraryScanner:
                 logger.debug("[library] Failed to log cleanup event: %s", exc)
 
     _MISSING_FILE_RESCAN_INTERVAL = 24 * 3600
+    # After a rescan for new links: check the arr lists them after each of
+    # these waits and rescan again if not.  The arr's host has its own view
+    # of the debrid mount (TorBox listing on its own clock) — a rescan that
+    # lands before it lists the new folder finds a link to nothing.
+    _RESCAN_FOLLOWUP_DELAYS = (60, 120, 240, 480)
+    # Linked titles the arr still doesn't list get a rescan per scan at most
+    # this often; after _UNLISTED_RESCAN_TRIES, once a day (the arr may be
+    # rejecting the file for its own reasons).
+    _UNLISTED_RESCAN_INTERVAL = 30 * 60
+    _UNLISTED_RESCAN_TRIES = 3
+
+    def _rescan_unlisted_ok(self, kind, arr_id):
+        """Rate limit for the per-scan rescan of linked-but-unlisted titles;
+        True (and recorded) when one may be requested now."""
+        stamps = self.__dict__.setdefault('_unlisted_rescans', {})
+        key = (kind, arr_id)
+        last, tries = stamps.get(key, (None, 0))
+        wait = (self._UNLISTED_RESCAN_INTERVAL if tries < self._UNLISTED_RESCAN_TRIES
+                else self._MISSING_FILE_RESCAN_INTERVAL)
+        now = time.monotonic()
+        if last is not None and now - last < wait:
+            return False
+        stamps[key] = (now, tries + 1)
+        return True
+
+    def _start_import_followup(self, items):
+        """Check in the background that Sonarr/Radarr list what was just
+        linked (see ``_follow_up_imports``)."""
+        if not items:
+            return
+        t = threading.Thread(target=self._follow_up_imports, args=(list(items),),
+                             daemon=True, name='arr-import-followup')
+        self._last_import_followup = t
+        t.start()
+
+    def _follow_up_imports(self, items):
+        """After each of ``_RESCAN_FOLLOWUP_DELAYS``: drop items the arr now
+        lists (or whose links are gone), rescan the rest.  Each item is
+        ``{'kind', 'client', 'id', 'title', 'eps', 'links'}`` — *eps* the
+        (season, episode) pairs linked for a show."""
+        pending = items
+        for delay in self._RESCAN_FOLLOWUP_DELAYS:
+            time.sleep(delay)
+            still = []
+            for it in pending:
+                if not any(os.path.lexists(p) for p in it['links']):
+                    continue
+                try:
+                    if it['kind'] == 'show':
+                        hf = _sonarr_episode_has_file(it['client'], it['id'], {})
+                        listed = None if hf is None else all(hf.get(e) for e in it['eps'])
+                    else:
+                        movie = it['client'].get_movie(it['id'])
+                        listed = bool(movie.get('hasFile')) if isinstance(movie, dict) else None
+                except Exception as e:
+                    logger.debug(f"[library] import check for {it['title']!r} failed: {e}")
+                    listed = None
+                if listed:
+                    continue
+                still.append(it)
+                if listed is False and any(os.path.lexists(p) for p in it['links']):
+                    # (None: the arr didn't answer — just look again)
+                    try:
+                        if it['kind'] == 'show':
+                            it['client'].rescan_series(it['id'], media_title=it['title'],
+                                                       cause='post_symlink_rescan')
+                        else:
+                            it['client'].rescan_movie(it['id'], media_title=it['title'],
+                                                      cause='post_symlink_rescan')
+                    except Exception as e:
+                        logger.debug(f"[library] rescan for {it['title']!r} failed: {e}")
+            pending = still
+            if not pending:
+                return
+        for it in pending:
+            logger.info(f"[library] {'Sonarr' if it['kind'] == 'show' else 'Radarr'} still "
+                        f"doesn't list {it['title']!r} after its rescans — its view of the "
+                        f"debrid mount may lag; the next scan asks again")
 
     def _rescan_for_missing_file(self, kind, arr_info, title):
         """Sonarr/Radarr list a file for an episode/movie whose folder holds
@@ -7963,6 +8041,38 @@ class LibraryScanner:
                 if real_debrid_path.startswith(_m + os.sep) or real_debrid_path == _m:
                     return _b + real_debrid_path[len(_m):]
             return None
+
+        def _linked_files_that_play(folder):
+            """Media links in *folder* that point at a debrid mount and whose
+            file is there (targets are in the arrs' namespace — translated
+            back to the mount, the inverse of _resolve_symlink_target)."""
+            found = []
+            try:
+                entries = list(os.scandir(folder))
+            except OSError:
+                return found
+            for e in entries:
+                if os.path.splitext(e.name)[1].lower() not in MEDIA_EXTENSIONS:
+                    continue
+                try:
+                    if not e.is_symlink():
+                        continue
+                    target = os.readlink(e.path)
+                except OSError:
+                    continue
+                for _m, _b in _mount_target_pairs:
+                    base = _b.rstrip(os.sep)
+                    if target.startswith(base + os.sep) and \
+                            os.path.exists(_m + target[len(base):]):
+                        found.append(e.path)
+                        break
+            return found
+
+        # Rescans to follow up (see _follow_up_imports): linked this scan,
+        # or linked earlier and still not listed by the arr.
+        _followups = {}           # (kind, title) -> item
+        _unlisted_movies = {}     # title -> (arr_info, links)
+        _unlisted_shows = {}      # title -> (arr_info, eps, links)
 
         created = 0
         phantom_sources = 0
@@ -8144,6 +8254,14 @@ class LibraryScanner:
                 # matches the debrid filename, so a second link would be a
                 # duplicate Plex version).
                 if _dir_has_media_name(os.path.join(self._local_movies_path, movie_dir)):
+                    if arr_info:
+                        # Linked earlier but Radarr still lists no file (its
+                        # rescan found the link before its host's view of the
+                        # mount showed the file): ask it again.
+                        links = _linked_files_that_play(
+                            os.path.join(self._local_movies_path, movie_dir))
+                        if links:
+                            _unlisted_movies[title] = (arr_info, links)
                     continue
 
                 # Find the largest media file in the torrent folder.  Searches
@@ -8198,6 +8316,8 @@ class LibraryScanner:
                     created += 1
                     symlinked_movies.add(title)
                     self._note_linked(real_debrid)
+                    _followups.setdefault(('movie', title), {'eps': set(), 'links': []}
+                                          )['links'].append(local_path)
                     # Record the new basename + size for activity event meta.
                     prior = _prior_symlinks.get(title) or set()
                     if prior and media_file not in prior and title not in _symlink_replaces:
@@ -8313,6 +8433,16 @@ class LibraryScanner:
                             continue
                         enum = ep['number']
                         if (snum, enum) in present:
+                            if (arr_info and has_file.get((snum, enum)) is False
+                                    and sonarr_queued is not None
+                                    and (arr_info['id'], snum, enum) not in sonarr_queued):
+                                links = _linked_files_that_play(
+                                    os.path.join(self._local_tv_path, show_dir, season_dir))
+                                if links:
+                                    _, eps_u, links_u = _unlisted_shows.setdefault(
+                                        title, (arr_info, set(), set()))
+                                    eps_u.add((snum, enum))
+                                    links_u.update(links)
                             continue
                         if has_file.get((snum, enum)):
                             missing_tracked = True   # Sonarr lists a file the folder lacks
@@ -8392,6 +8522,10 @@ class LibraryScanner:
                             created += 1
                             symlinked_shows.add(title)
                             self._note_linked(real_debrid)
+                            _fu = _followups.setdefault(('show', title),
+                                                        {'eps': set(), 'links': []})
+                            _fu['eps'].add((snum, enum))
+                            _fu['links'].append(local_path)
                             prior = _prior_symlinks.get(title) or set()
                             if prior and filename not in prior:
                                 _symlink_is_upgrade[title] = True
@@ -8612,6 +8746,10 @@ class LibraryScanner:
                         info['client'].rescan_series(info['id'], media_title=title,
                                                      cause='post_symlink_rescan',
                                                      prior_event_id=prior)
+                        _fu = _followups.get(('show', title))
+                        if _fu is not None:
+                            _fu.update(kind='show', client=info['client'], id=info['id'],
+                                       title=title)
                         # Successful symlink + rescan — drop any lingering
                         # retry-cycle counter so future searches don't show
                         # stale "retry #47" annotations for a satisfied item.
@@ -8655,6 +8793,10 @@ class LibraryScanner:
                         info['client'].rescan_movie(info['id'], media_title=title,
                                                     cause='post_symlink_rescan',
                                                     prior_event_id=prior)
+                        _fu = _followups.get(('movie', title))
+                        if _fu is not None:
+                            _fu.update(kind='movie', client=info['client'], id=info['id'],
+                                       title=title)
                         try:
                             from utils import retry_counter as _rc
                             _rc.reset('radarr', info['id'])
@@ -8690,6 +8832,37 @@ class LibraryScanner:
                     radarr_map_norm=radarr_map_norm))
             except Exception as e:
                 logger.warning(f"[library] Seerr writeback skipped: {type(e).__name__}")
+
+        # Linked earlier, still not listed by the arr: rescan (rate-limited)
+        # and follow those up too — whether or not this scan linked anything.
+        for title, (info, links) in _unlisted_movies.items():
+            if not self._rescan_unlisted_ok('movie', info['id']):
+                continue
+            try:
+                info['client'].rescan_movie(info['id'], media_title=title,
+                                            cause='post_symlink_rescan')
+                logger.info(f"[library] {title!r} is linked but Radarr doesn't list it "
+                            f"yet — rescan requested")
+                _followups[('movie', title)] = {'kind': 'movie', 'client': info['client'],
+                                                'id': info['id'], 'title': title,
+                                                'eps': set(), 'links': links}
+            except Exception as e:
+                logger.warning(f"[library] Radarr rescan failed for {title}: {e}")
+        for title, (info, eps, links) in _unlisted_shows.items():
+            if title in symlinked_shows or not self._rescan_unlisted_ok('show', info['id']):
+                continue
+            try:
+                info['client'].rescan_series(info['id'], media_title=title,
+                                             cause='post_symlink_rescan')
+                logger.info(f"[library] {title!r} has linked episodes Sonarr doesn't "
+                            f"list yet — rescan requested")
+                _followups[('show', title)] = {'kind': 'show', 'client': info['client'],
+                                               'id': info['id'], 'title': title,
+                                               'eps': eps, 'links': sorted(links)}
+            except Exception as e:
+                logger.warning(f"[library] Sonarr rescan failed for {title}: {e}")
+        self._start_import_followup(
+            [it for it in _followups.values() if it.get('client') is not None])
 
     # Category names that indicate TV/show content
     _SHOW_CATEGORIES = {'shows', 'tv', 'anime', 'series', 'television'}

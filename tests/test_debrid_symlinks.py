@@ -1565,3 +1565,141 @@ def test_dir_has_media_name_missing_dir_is_empty(tmp_path):
 def test_is_extras_release(name, expected):
     from utils.library import _is_extras_release
     assert _is_extras_release(name) is expected
+
+
+@pytest.mark.usefixtures('_fresh_arr_caches')
+class TestArrImportFollowUp:
+    """zurgarr links a TorBox copy within a minute of TorBox listing it — the
+    arr's host can still have an older TorBox listing, so its rescan finds a
+    link to nothing and skips it.  Check that the arr lists the file and
+    rescan again until it does; and in every scan, ask again for linked
+    titles the arr still doesn't list."""
+
+    @pytest.fixture(autouse=True)
+    def _fast(self, monkeypatch):
+        monkeypatch.setattr(library.LibraryScanner, '_RESCAN_FOLLOWUP_DELAYS', (0, 0, 0))
+
+    @staticmethod
+    def _wait(scanner):
+        t = getattr(scanner, '_last_import_followup', None)
+        if t is not None:
+            t.join(5)
+
+    def test_movie_rescanned_again_until_radarr_lists_it(self, tmp_dir, monkeypatch):
+        scanner, local_movies, movies = _movie_fixture(tmp_dir, monkeypatch)
+        client = _radarr(_film(False))
+        client.get_movie.side_effect = [{'hasFile': False}, {'hasFile': True}]
+        _run_movie(scanner, client, movies)
+        self._wait(scanner)
+        assert client.rescan_movie.call_count == 2
+        assert client.get_movie.call_count == 2
+
+    def test_movie_listed_at_first_check_needs_no_second_rescan(self, tmp_dir, monkeypatch):
+        scanner, local_movies, movies = _movie_fixture(tmp_dir, monkeypatch)
+        client = _radarr(_film(False))
+        client.get_movie.return_value = {'hasFile': True}
+        _run_movie(scanner, client, movies)
+        self._wait(scanner)
+        assert client.rescan_movie.call_count == 1
+
+    def test_follow_up_gives_up_after_its_tries(self, tmp_dir, monkeypatch, caplog):
+        import logging
+        scanner, local_movies, movies = _movie_fixture(tmp_dir, monkeypatch)
+        client = _radarr(_film(False))
+        client.get_movie.return_value = {'hasFile': False}
+        with caplog.at_level(logging.INFO, logger='ZURGARR'):
+            _run_movie(scanner, client, movies)
+            self._wait(scanner)
+        assert client.rescan_movie.call_count == 4          # first + 3 tries
+        assert any("still doesn't list" in r.getMessage() for r in caplog.records)
+
+    def test_follow_up_stops_when_the_link_is_gone(self, tmp_dir, monkeypatch):
+        scanner, local_movies, movies = _movie_fixture(tmp_dir, monkeypatch)
+        client = _radarr(_film(False))
+
+        def gone(movie_id):
+            for root, _d, files in os.walk(local_movies):
+                for f in files:
+                    os.unlink(os.path.join(root, f))
+            return {'hasFile': False}
+        client.get_movie.side_effect = gone
+        _run_movie(scanner, client, movies)
+        self._wait(scanner)
+        assert client.rescan_movie.call_count == 1
+        assert client.get_movie.call_count == 1
+
+    def test_sonarr_follow_up_checks_only_the_linked_episodes(self, tmp_dir, monkeypatch):
+        scanner, local_tv, shows, pidx = _show_fixture(tmp_dir, monkeypatch)
+        client = _sonarr(_SERIES)
+        client.get_episodes.side_effect = [
+            [{'seasonNumber': 1, 'episodeNumber': 1, 'hasFile': False}],   # the scan
+            [{'seasonNumber': 1, 'episodeNumber': 1, 'hasFile': True},     # follow-up
+             {'seasonNumber': 1, 'episodeNumber': 2, 'hasFile': False}],
+        ]
+        _run_show(scanner, client, shows, pidx)
+        self._wait(scanner)
+        assert client.rescan_series.call_count == 1
+
+    def test_sonarr_rescanned_again_until_it_lists_the_episode(self, tmp_dir, monkeypatch):
+        scanner, local_tv, shows, pidx = _show_fixture(tmp_dir, monkeypatch)
+        client = _sonarr(_SERIES)
+        no = [{'seasonNumber': 1, 'episodeNumber': 1, 'hasFile': False}]
+        yes = [{'seasonNumber': 1, 'episodeNumber': 1, 'hasFile': True}]
+        client.get_episodes.side_effect = [no, no, yes]
+        _run_show(scanner, client, shows, pidx)
+        self._wait(scanner)
+        assert client.rescan_series.call_count == 2
+
+    # ── safety net: linked earlier, still not listed ──
+
+    def _linked_movie(self, tmp_dir, monkeypatch, target_exists=True):
+        scanner, local_movies, movies = _movie_fixture(tmp_dir, monkeypatch)
+        folder = os.path.join(local_movies, 'Film (2020) ITA')
+        os.makedirs(folder)
+        os.symlink('/mnt/debrid/movies/Film.2020.1080p/Film.2020.1080p.mkv',
+                   os.path.join(folder, 'Film.2020.1080p.mkv'))
+        if not target_exists:
+            os.unlink(os.path.join(tmp_dir, 'mount', 'movies', 'Film.2020.1080p',
+                                   'Film.2020.1080p.mkv'))
+        return scanner, movies
+
+    def test_linked_movie_radarr_still_misses_is_rescanned(self, tmp_dir, monkeypatch):
+        scanner, movies = self._linked_movie(tmp_dir, monkeypatch)
+        client = _radarr(_film(False))
+        client.get_movie.return_value = {'hasFile': True}
+        _run_movie(scanner, client, movies)
+        self._wait(scanner)
+        _run_movie(scanner, client, movies)      # inside the interval: not again
+        self._wait(scanner)
+        assert client.rescan_movie.call_count == 1
+        assert client.rescan_movie.call_args[0][0] == 3
+
+    def test_broken_link_is_not_rescanned(self, tmp_dir, monkeypatch):
+        scanner, movies = self._linked_movie(tmp_dir, monkeypatch, target_exists=False)
+        client = _radarr(_film(False))
+        _run_movie(scanner, client, movies)
+        self._wait(scanner)
+        assert not client.rescan_movie.called
+
+    def test_linked_movie_radarr_is_downloading_is_not_rescanned(self, tmp_dir, monkeypatch):
+        scanner, movies = self._linked_movie(tmp_dir, monkeypatch)
+        client = _radarr(_film(False))
+        client.queued_movie_ids.return_value = {3}
+        _run_movie(scanner, client, movies)
+        self._wait(scanner)
+        assert not client.rescan_movie.called
+
+    def test_linked_episode_sonarr_still_misses_is_rescanned(self, tmp_dir, monkeypatch):
+        scanner, local_tv, shows, pidx = _show_fixture(tmp_dir, monkeypatch)
+        season = os.path.join(local_tv, 'Show (2025)', 'Season 01')
+        os.makedirs(season)
+        os.symlink('/mnt/debrid/shows/Show.S01E01.1080p/Show.S01E01.1080p.mkv',
+                   os.path.join(season, 'Show.S01E01.1080p.mkv'))
+        no = [{'seasonNumber': 1, 'episodeNumber': 1, 'hasFile': False}]
+        yes = [{'seasonNumber': 1, 'episodeNumber': 1, 'hasFile': True}]
+        client = _sonarr(_SERIES)
+        client.get_episodes.side_effect = [no, yes]
+        _run_show(scanner, client, shows, pidx)
+        self._wait(scanner)
+        assert client.rescan_series.call_count == 1
+        assert client.rescan_series.call_args[0][0] == 7
