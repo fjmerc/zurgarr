@@ -3627,10 +3627,12 @@ class TestSearchingIds:
         mock_urlopen.return_value = _mock_urlopen([
             {'name': 'SeriesSearch', 'status': 'queued', 'body': {'seriesId': 9}},
             {'name': 'SeasonSearch', 'status': 'started', 'body': {'seriesId': 4}},
+            {'name': 'MissingEpisodeSearch', 'status': 'queued', 'body': {'seriesId': 6}},
+            {'name': 'RefreshSeries', 'status': 'started', 'body': {'seriesId': 8}},
             {'name': 'EpisodeSearch', 'status': 'started', 'body': {'episodeIds': [1]}},
             {'name': 'SeriesSearch', 'status': 'completed', 'body': {'seriesId': 3}},
         ])
-        assert sonarr.searching_ids() == {9, 4}
+        assert sonarr.searching_ids() == {9, 4, 6}
 
     @patch('urllib.request.urlopen')
     def test_unreadable_is_none(self, mock_urlopen, radarr):

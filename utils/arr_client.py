@@ -1696,7 +1696,9 @@ class SonarrClient(_ArrClientBase):
     _MEDIA_ID_KEY = 'seriesId'
 
     def _searched_ids(self, name, body):
-        if name in ('SeriesSearch', 'SeasonSearch') and body.get('seriesId') is not None:
+        # SeriesSearch, SeasonSearch, MissingEpisodeSearch (what an add with
+        # "search for missing" can queue) — any search naming the series
+        if str(name or '').endswith('Search') and body.get('seriesId') is not None:
             return {body['seriesId']}
         return set()
     _QUEUE_UNKNOWN_PARAM = 'includeUnknownSeriesItems'
@@ -2815,7 +2817,7 @@ class RadarrClient(_ArrClientBase):
     _MEDIA_ID_KEY = 'movieId'
 
     def _searched_ids(self, name, body):
-        if name == 'MoviesSearch':
+        if str(name or '').endswith('Search'):      # MoviesSearch, ...
             return {i for i in body.get('movieIds') or () if i is not None}
         return set()
     _QUEUE_UNKNOWN_PARAM = 'includeUnknownMovieItems'
