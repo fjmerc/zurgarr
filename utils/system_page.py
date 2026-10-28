@@ -10,6 +10,7 @@ def get_system_html():
     """Return the complete system page HTML with shared CSS and nav."""
     from utils.ui_common import (get_base_head, get_nav_html, THEME_TOGGLE_JS,
                                  WANTED_BADGE_JS, KEYBOARD_JS, TOAST_JS)
+    from utils.how_it_works import get_how_it_works_html
     html = _SYSTEM_HTML
     html = html.replace('__BASE_HEAD__', get_base_head('Zurgarr System',
                                                        _SYSTEM_EXTRA_CSS))
@@ -17,6 +18,7 @@ def get_system_html():
     html = html.replace('__THEME_TOGGLE_JS__',
                         THEME_TOGGLE_JS + KEYBOARD_JS + TOAST_JS)
     html = html.replace('__WANTED_BADGE_JS__', WANTED_BADGE_JS)
+    html = html.replace('__HOW_IT_WORKS__', get_how_it_works_html())
     return html
 
 
@@ -99,142 +101,7 @@ __NAV_HTML__
   <h3 style="font-size:.85em;color:var(--text2);text-transform:uppercase;letter-spacing:.05em;margin-bottom:12px">Running Configuration</h3>
   <table class="cfg-table" id="config-table"><tbody></tbody></table>
 
-  <details style="margin-top:24px">
-    <summary>How it works (click to expand)</summary>
-    <style>
-.wf{margin:16px 0 8px}.wf-title{font-size:.8em;font-weight:600;color:var(--text);margin-bottom:10px;display:flex;align-items:center;gap:8px}.wf-title span{font-size:.85em;font-weight:400;color:var(--text3)}
-.wf-row{display:flex;align-items:center;flex-wrap:wrap;gap:0;margin-bottom:6px}
-.wf-node{padding:8px 14px;border-radius:8px;background:var(--bg);border:1.5px solid var(--border);font-size:.8em;font-weight:600;text-align:center;white-space:nowrap;min-width:80px}
-.wf-node small{display:block;font-weight:400;color:var(--text2);font-size:.85em;margin-top:2px}
-.wf-node.green{border-color:var(--green);color:var(--green)}.wf-node.blue{border-color:var(--blue);color:var(--blue)}.wf-node.yellow{border-color:var(--yellow);color:var(--yellow)}.wf-node.orange{border-color:var(--orange);color:var(--orange)}.wf-node.purple{border-color:#bc8cff;color:#bc8cff}.wf-node.muted{border-color:var(--border);color:var(--text2)}
-.wf-arrow{color:var(--text3);font-size:1.1em;padding:0 6px;flex-shrink:0}
-.wf-label{font-size:.65em;color:var(--text3);text-align:center;margin-top:-4px;margin-bottom:2px;padding:0 6px}
-.wf-branch{display:flex;flex-direction:column;gap:10px;margin:8px 0 0 0}
-.wf-branch>div{padding:12px;border-radius:8px;border:1px solid var(--border2);background:var(--bg)}
-.wf-branch>div>.wf-branch-title{font-size:.75em;font-weight:600;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid var(--border2)}
-.wf-branch>div>.wf-branch-title.local{color:var(--text2)}.wf-branch>div>.wf-branch-title.debrid{color:var(--yellow)}
-.wf-glossary{margin-top:16px;padding-top:14px;border-top:1px solid var(--border2)}
-.wf-glossary-title{font-size:.8em;font-weight:600;color:var(--text);margin-bottom:10px}
-.wf-glossary dl{margin:0;font-size:.78em;line-height:1.6}
-.wf-glossary dt{color:var(--text);font-weight:600;margin-top:8px}
-.wf-glossary dd{color:var(--text2);margin:0 0 0 0;padding:0 0 8px 0;border-bottom:1px solid var(--border2)}
-@media(max-width:600px){.wf-row{gap:2px}.wf-node{padding:6px 8px;font-size:.72em;min-width:60px}.wf-arrow{font-size:.9em;padding:0 3px}}
-    </style>
-
-    <!-- Workflow 1: Watchlist / plex_debrid flow -->
-    <div class="wf">
-      <div class="wf-title">Watchlist Flow <span>&mdash; plex_debrid monitors your watchlists automatically</span></div>
-      <div class="wf-row">
-        <div class="wf-node muted">Watchlist<small>Plex / Trakt / Overseerr</small></div>
-        <div class="wf-arrow">&rarr;</div>
-        <div class="wf-node green">plex_debrid<small>Search &amp; Match</small></div>
-        <div class="wf-arrow">&rarr;</div>
-        <div class="wf-node yellow">Real-Debrid<small>Cloud Cache</small></div>
-        <div class="wf-arrow">&rarr;</div>
-        <div class="wf-node blue">Zurg<small>WebDAV</small></div>
-        <div class="wf-arrow">&rarr;</div>
-        <div class="wf-node blue">rclone<small>/data mount</small></div>
-        <div class="wf-arrow">&rarr;</div>
-        <div class="wf-node green">Plex / Jellyfin<small>Stream</small></div>
-      </div>
-    </div>
-
-    <!-- Workflow 2: Arr + Blackhole flow -->
-    <div class="wf">
-      <div class="wf-title">Arr + Blackhole Flow <span>&mdash; Sonarr/Radarr with tag-based routing</span></div>
-      <div class="wf-row">
-        <div class="wf-node muted">Overseerr<small>Requests</small></div>
-        <div class="wf-arrow">&rarr;</div>
-        <div class="wf-node muted">Sonarr / Radarr<small>Tag-based routing</small></div>
-      </div>
-      <div class="wf-branch">
-        <div>
-          <div class="wf-branch-title local">Local Path &mdash; no debrid tag</div>
-          <div class="wf-row">
-            <div class="wf-node purple">VPN<small>gluetun / Mullvad</small></div>
-            <div class="wf-arrow">&rarr;</div>
-            <div class="wf-node muted">qBittorrent / Usenet<small>Download</small></div>
-            <div class="wf-arrow">&rarr;</div>
-            <div class="wf-node muted">Local Disk<small>Storage</small></div>
-            <div class="wf-arrow">&rarr;</div>
-            <div class="wf-node green">Plex<small>Stream</small></div>
-          </div>
-        </div>
-        <div>
-          <div class="wf-branch-title debrid">Debrid Path &mdash; tag: debrid &mdash; no VPN needed</div>
-          <div class="wf-row">
-            <div class="wf-node orange">Blackhole<small>/watch folder</small></div>
-            <div class="wf-arrow">&rarr;</div>
-            <div class="wf-node orange">Zurgarr<small>Cache-aware routing</small></div>
-            <div class="wf-arrow">&rarr;</div>
-            <div class="wf-node yellow">Real-Debrid / TorBox<small>Cache</small></div>
-            <div class="wf-arrow">&rarr;</div>
-            <div class="wf-node blue">Mount<small>Zurg + rclone (RD) &middot; rclone (TorBox)</small></div>
-            <div class="wf-arrow">&rarr;</div>
-            <div class="wf-node orange">Symlinks<small>/completed</small></div>
-            <div class="wf-arrow">&rarr;</div>
-            <div class="wf-node muted">Sonarr / Radarr<small>Import</small></div>
-            <div class="wf-arrow">&rarr;</div>
-            <div class="wf-node green">Plex<small>Stream</small></div>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Workflow 3: library scan + Wanted recovery -->
-    <div class="wf">
-      <div class="wf-title">Library Scan &amp; Wanted Recovery <span>&mdash; filling the gaps Sonarr/Radarr leave</span></div>
-      <div class="wf-row">
-        <div class="wf-node blue">Debrid mounts<small>What you already have</small></div>
-        <div class="wf-arrow">&rarr;</div>
-        <div class="wf-node orange">Library scan<small>Links what&rsquo;s missing</small></div>
-        <div class="wf-arrow">&rarr;</div>
-        <div class="wf-node muted">Sonarr / Radarr<small>Rescan</small></div>
-        <div class="wf-arrow">&rarr;</div>
-        <div class="wf-node green">Plex<small>Refresh</small></div>
-      </div>
-      <div class="wf-row">
-        <div class="wf-node muted">Wanted<small>Never grabbed</small></div>
-        <div class="wf-arrow">&rarr;</div>
-        <div class="wf-node orange">Wanted recovery<small>Cached release</small></div>
-        <div class="wf-arrow">&rarr;</div>
-        <div class="wf-node yellow">TorBox / Real-Debrid<small>Added directly</small></div>
-      </div>
-    </div>
-
-    <!-- Component glossary -->
-    <div class="wf-glossary">
-      <div class="wf-glossary-title">Glossary</div>
-      <dl>
-        <dt style="color:var(--green)">Plex / Jellyfin</dt>
-        <dd>Media server that streams your library to any device. It doesn&rsquo;t notice new files on the debrid mounts by itself: with <code style="color:var(--green);font-size:.95em">PLEX_REFRESH</code> on, zurgarr asks Plex to scan when debrid content lands, and rescans folders Plex marked &ldquo;unavailable&rdquo; during a brief mount outage once their files are back (Plex only; not while Plex empties its trash after every scan).</dd>
-        <dt style="color:var(--text)">Overseerr</dt>
-        <dd>Request management UI. Users browse and request movies/shows, which get routed to Sonarr/Radarr for automated downloading.</dd>
-        <dt style="color:var(--text)">Sonarr / Radarr</dt>
-        <dd>Automated TV show and movie managers. Monitor indexers, manage quality profiles, rename files, and track new episodes. Route downloads to different clients using tags.</dd>
-        <dt style="color:var(--green)">plex_debrid</dt>
-        <dd>Monitors Plex/Trakt/Overseerr watchlists. Searches torrent indexers for cached releases matching your quality profile and sends the best match to your debrid service.</dd>
-        <dt style="color:var(--yellow)">Real-Debrid / TorBox</dt>
-        <dd>Cloud torrent caches. They store popular torrents on fast servers for instant access via HTTPS &mdash; no seeding, no VPN needed on this path. TorBox can run alongside Real-Debrid (AllDebrid instead of Real-Debrid needs Zurg&rsquo;s nightly build).</dd>
-        <dt style="color:var(--blue)">Zurg</dt>
-        <dd>Serves your Real-Debrid library as a WebDAV file server, so it looks like local files. TorBox doesn&rsquo;t go through Zurg.</dd>
-        <dt style="color:var(--blue)">rclone</dt>
-        <dd>Mounts Zurg&rsquo;s WebDAV under <code style="color:var(--green);font-size:.95em">/data</code> (<code style="color:var(--green);font-size:.95em">/data/zurgarr</code> by default, <code style="color:var(--green);font-size:.95em">RCLONE_MOUNT_NAME</code>) and TorBox&rsquo;s own WebDAV (<code style="color:var(--green);font-size:.95em">/data/torbox</code> by default), so your media server and Sonarr/Radarr can read the files.</dd>
-        <dt style="color:var(--orange)">Blackhole</dt>
-        <dd>Watches a folder for .torrent/.magnet files dropped by Sonarr/Radarr. Sends each to the debrid that has it cached, skips torrents already in your account, waits for the content on the mount, then creates symlinks in a completed directory for Sonarr/Radarr to import. Optional dedup checks your local library first.</dd>
-        <dt style="color:var(--orange)">Library scan</dt>
-        <dd>With blackhole symlinks and a local library path set, links debrid content Sonarr/Radarr are missing into their own folders, then asks them to rescan. Sonarr/Radarr stay in charge: nothing is linked for a title they don&rsquo;t have, for an episode/movie they already hold, or while a download of it is on its way into them.</dd>
-        <dt style="color:var(--orange)">Wanted recovery</dt>
-        <dd>For titles Sonarr/Radarr never grabbed, searches for a cached release and adds it straight to TorBox or Real-Debrid; the library scan then links it.</dd>
-        <dt style="color:var(--orange)">Duplicate tidy</dt>
-        <dd>Optional (<code style="color:var(--green);font-size:.95em">LIBRARY_DUPLICATE_TIDY</code>): removes extra debrid links that duplicate the copy Sonarr/Radarr track, so Plex shows each episode once. Never the media itself &mdash; only the links (their subtitle files moved aside) and Plex&rsquo;s leftover version; every removal recorded for undo, and it stops if a kept copy ever disappears.</dd>
-        <dt>qBittorrent / Usenet</dt>
-        <dd>Traditional download clients for the local path. qBittorrent handles torrents, SABnzbd/NZBGet handle Usenet NZBs. Both store files to local disk.</dd>
-        <dt style="color:#bc8cff">VPN</dt>
-        <dd>Encrypts torrent/Usenet traffic and hides your IP. Required for the local download path (gluetun, Mullvad, etc). Not needed for the debrid path &mdash; that&rsquo;s just HTTPS to the debrid&rsquo;s API.</dd>
-      </dl>
-    </div>
-  </details>
+  __HOW_IT_WORKS__
 </div>
 
 <div class="footer" style="margin-top:16px"></div>

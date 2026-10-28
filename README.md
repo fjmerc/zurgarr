@@ -140,6 +140,10 @@ observe. Capabilities grouped by intent:
 
 ## How it works
 
+![The "How it works" map on zurgarr's System page: requests flow through Sonarr/Radarr to zurgarr, TorBox and Real-Debrid, then into the library and Plex, with the local download route alongside and letter tags marking the background jobs](assets/how-it-works.png)
+
+*System → Config → How it works. Switch routes on and off, click any box for details, or pick a background job to see what it works on.*
+
 Two workflows. Use either or both.
 
 **Watchlist flow** — plex_debrid monitors your watchlists automatically:

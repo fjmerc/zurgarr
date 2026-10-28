@@ -73,7 +73,7 @@ Developer reference for Zurgarr internals. Complements [CLAUDE.md](CLAUDE.md) (r
 ┌─────────────────────────────────────────────────────────────┐
 │  UI Layer                                                    │
 │  status_server  settings_page  library_page  activity_page   │
-│  system_page    settings_api   ui_common                     │
+│  system_page    how_it_works   settings_api   ui_common      │
 ├─────────────────────────────────────────────────────────────┤
 │  Integration Layer                                           │
 │  arr_client (Sonarr/Radarr)   tmdb        search (Torrentio)│
