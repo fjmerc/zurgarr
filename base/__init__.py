@@ -1,5 +1,5 @@
 from json import load, dump
-from dotenv import find_dotenv, dotenv_values
+from dotenv import find_dotenv
 from datetime import datetime, timedelta
 import logging
 from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler, BaseRotatingHandler
@@ -124,7 +124,7 @@ def load_env_file(path):
     the file in ENV_FILE_FILLED_KEYS for main()'s startup log.
     """
     from utils import config_resolve
-    file_env = dotenv_values(path) if path and os.path.exists(path) else {}
+    file_env = config_resolve.read_env_file(path)
     blank_before = {k for k, v in os.environ.items() if not v.strip()}
     config_resolve.resolve_and_apply(file_env, config_resolve.present_secrets(SECRETS_DIR))
     for key, r in config_resolve.current().items():

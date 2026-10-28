@@ -220,9 +220,10 @@ sudo mkdir -p /zurgarr/{config,log,cache,mnt,RD,AD}
 wget https://raw.githubusercontent.com/fjmerc/zurgarr/master/docker-compose.yml
 sudo wget https://raw.githubusercontent.com/fjmerc/zurgarr/master/.env.example -O /zurgarr/config/.env
 
-# Edit — at minimum set:
-#   RD_API_KEY        (plus TORBOX_API_KEY + TORBOX_WEBDAV_* for TorBox)
-#   STATUS_UI_AUTH    (e.g., admin:yourpassword)
+# Edit — the "WHAT YOU MUST SET" block at the top of the file lists the
+# minimum for each kind of setup. For any setup that's at least:
+#   RD_API_KEY                      (plus TORBOX_API_KEY + TORBOX_WEBDAV_* for TorBox)
+#   STATUS_UI_ENABLED=true + STATUS_UI_AUTH (e.g., admin:yourpassword)
 sudo nano /zurgarr/config/.env
 ```
 

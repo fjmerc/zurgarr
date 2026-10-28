@@ -13,7 +13,7 @@ Usage:
 
 import os
 import threading
-from dotenv import dotenv_values
+from utils import config_resolve
 from utils import boot_layout as _boot
 from utils.boot_layout import zurg_layout as _zurg_layout
 from utils.logger import get_logger
@@ -92,14 +92,13 @@ def _reload_env():
     edits, and locked (compose-set) keys are never touched.
     """
     from base import SECRETS_DIR
-    from utils import config_resolve
 
     if not os.path.exists(ENV_FILE):
         logger.warning(f"[reload] No .env file found at {ENV_FILE}")
         return set()
 
     changes = config_resolve.resolve_and_apply(
-        dotenv_values(ENV_FILE), config_resolve.present_secrets(SECRETS_DIR))
+        config_resolve.read_env_file(ENV_FILE), config_resolve.present_secrets(SECRETS_DIR))
     for key, (old_val, new_val) in sorted(changes.items()):
         if key in _ALWAYS_MASKED or any(s in key.upper() for s in _SENSITIVE_MARKERS):
             logger.info(f"[reload] {key} changed: *** -> ***")
@@ -121,7 +120,6 @@ _TORBOX_MOUNT_KEYS = frozenset({'TORBOX_MOUNT_NAME', 'TORBOX_WEBDAV_USER', 'TORB
                                 'TORBOX_RCLONE_DIR_CACHE_TIME'})
 
 def _zurg_auto():
-    from utils import config_resolve
     r = config_resolve.current().get('ZURG_ENABLED')
     return r is not None and r.source == 'auto'
 

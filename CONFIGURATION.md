@@ -39,12 +39,18 @@ A blank value at any layer counts as "not set".
 
 ## Minimum required to start
 
-| Variable | Why |
-|---|---|
-| `RD_API_KEY` (or `AD_API_KEY` with Zurg nightly) | Zurg can't connect without a debrid account. TorBox alone isn't enough — Zurg can't serve TorBox; it's an add-on (see [TorBox co-debrid](#torbox-co-debrid-mount-plan-39)) |
-| `STATUS_UI_AUTH` | Unlocks the web UI at `/settings`. Format: `user:password` |
+zurgarr refuses to start when a feature you turned on is missing what it needs, so the minimum depends on what you use. [`.env.example`](.env.example) opens with the same list.
 
-Everything else has a sensible default or is opt-in.
+| You want | Set | Why |
+|---|---|---|
+| Anything at all | `RD_API_KEY` (or `AD_API_KEY` with Zurg nightly) | zurgarr's mounts only start when Zurg runs. TorBox alone isn't enough; it's an add-on (see [TorBox co-debrid](#torbox-co-debrid-mount-plan-39)) |
+| The dashboard | `STATUS_UI_ENABLED=true`, `STATUS_UI_AUTH` (`user:password`) | The dashboard, the Settings page and the library scan need both |
+| TorBox as well | `TORBOX_API_KEY`, `TORBOX_WEBDAV_USER`, `TORBOX_WEBDAV_PASS` | The API key alone doesn't open the TorBox mount |
+| Sonarr/Radarr through zurgarr | `BLACKHOLE_ENABLED`, `BLACKHOLE_SYMLINK_ENABLED`, `BLACKHOLE_SYMLINK_TARGET_BASE`, `SONARR_URL` + `SONARR_API_KEY`, `RADARR_URL` + `RADARR_API_KEY` | Startup refuses symlinks without the target base; the library scan, routing audit and duplicate tidy need the arrs |
+| Library scan and duplicate clean-up | `BLACKHOLE_LOCAL_LIBRARY_TV` and/or `BLACKHOLE_LOCAL_LIBRARY_MOVIES` | Where Sonarr/Radarr keep the library |
+| Plex refresh | `PLEX_REFRESH=true`, `PLEX_ADDRESS`, `PLEX_TOKEN` | Startup refuses `PLEX_REFRESH` without the address and token |
+
+Recommended: `TZ` (otherwise UTC), `TMDB_API_KEY` (posters and better title matching), and `SEERR_ADDRESS` + `SEERR_API_KEY` if you use Overseerr/Jellyseerr. Everything else has a sensible default or is opt-in.
 
 ---
 

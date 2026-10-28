@@ -165,6 +165,33 @@ def _clean(value):
     return value.strip() if isinstance(value, str) else ''
 
 
+def read_env_file(path):
+    """Read an env file (config/.env) the way every reader here must.
+
+    Same as ``dotenv_values`` except for one case: python-dotenv returns the
+    comment as the value for ``KEY=   # note`` (an empty value followed by a
+    comment), so a placeholder line like ``.env.example``'s would read as a
+    setting.  Such a key reads as blank.  ``KEY=x  # note`` is already
+    stripped to ``x``, and ``KEY=#x`` (no space before ``#``) keeps ``#x``.
+    A missing file reads as empty.
+    """
+    import re
+    from dotenv import dotenv_values
+    if not path or not os.path.exists(path):
+        return {}
+    values = dotenv_values(path)
+    comment_only = re.compile(r'^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_.]*)\s*=[ \t]+#')
+    try:
+        with open(path, encoding='utf-8') as f:
+            for line in f:
+                m = comment_only.match(line)
+                if m and m.group(1) in values:
+                    values[m.group(1)] = ''
+    except (OSError, UnicodeDecodeError):
+        pass
+    return values
+
+
 def present_secrets(secrets_dir='/run/secrets'):
     """Keys whose Docker secret file exists and is non-empty."""
     found = set()

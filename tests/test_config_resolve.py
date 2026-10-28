@@ -352,3 +352,48 @@ def test_dry_resolve_reads_environ_and_written_under_the_lock(monkeypatch):
     monkeypatch.setattr(config_resolve, 'resolve', spy)
     config_resolve.dry_resolve({})
     assert seen == [True]
+
+
+# --- reading config/.env: a comment after an empty value is not the value ---
+
+def test_read_env_file_blanks_comment_only_values(tmp_path):
+    from utils.config_resolve import read_env_file
+    p = tmp_path / '.env'
+    p.write_text('A=   # Required: put your key here\n'
+                 'B= #note\n'
+                 'export C=\t# tab before the comment\n'
+                 'D=value   # trailing comment\n'
+                 'E=#starts-with-hash\n'
+                 'F="" # quoted empty\n'
+                 'G=\n')
+    v = read_env_file(str(p))
+    assert v['A'] == '' and v['B'] == '' and v['C'] == ''
+    assert v['D'] == 'value'
+    assert v['E'] == '#starts-with-hash'     # no space before '#': it's the value
+    assert v['F'] == '' and v['G'] == ''
+
+
+def test_read_env_file_missing_file_is_empty(tmp_path):
+    from utils.config_resolve import read_env_file
+    assert read_env_file(str(tmp_path / 'nope.env')) == {}
+
+
+def test_env_example_settings_parse_without_their_comments():
+    """A new user copies .env.example to config/.env before filling it in; an
+    empty setting must read as not set, never as its own comment text."""
+    from utils.config_resolve import read_env_file
+    values = read_env_file(os.path.join(REPO, '.env.example'))
+    assert values['RD_API_KEY'] == ''
+    assert values['STATUS_UI_ENABLED'] == 'true'
+    bad = {k: v for k, v in values.items() if (v or '').lstrip().startswith('#')}
+    assert not bad, bad
+
+
+def test_every_env_file_reader_uses_read_env_file():
+    """python-dotenv alone reads `KEY=   # note` as '# note'; every place that
+    reads config/.env must go through read_env_file."""
+    import re
+    for rel in ('base/__init__.py', 'utils/settings_api.py', 'utils/config_reload.py'):
+        with open(os.path.join(REPO, rel)) as f:
+            src = f.read()
+        assert not re.search(r'(?<!\.)\bdotenv_values\(', src), rel

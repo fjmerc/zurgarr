@@ -11,7 +11,7 @@ import os
 import re
 import signal
 import threading
-from dotenv import dotenv_values
+from utils import config_resolve
 from urllib.parse import urlparse
 from utils.file_utils import atomic_write
 from utils.logger import get_logger
@@ -362,7 +362,6 @@ def _dry_resolve(explicit):
     """What the settings resolve to once *explicit* is saved, or None."""
     try:
         from base import SECRETS_DIR
-        from utils import config_resolve
         return config_resolve.dry_resolve(explicit, config_resolve.present_secrets(SECRETS_DIR))
     except Exception as e:
         logger.warning(f'[settings] Could not resolve the new settings: {e}')
@@ -428,7 +427,6 @@ def _torbox_name_problems(values):
 
 def _current_effective_values():
     """The settings in effect now (for "was this already so before the save")."""
-    from utils import config_resolve
     vals = {k: r.value for k, r in config_resolve.current().items()
             if r.source != 'unset' and r.value is not None}
     return _with_secret_placeholders(vals)
@@ -439,7 +437,6 @@ def _classify_problems(problems_fn, values, errors, warnings):
     and involves only settings the page can't change (compose / Docker
     secret): an error would block every save — a warning then."""
     try:
-        from utils import config_resolve
         fixed = {k for k, r in config_resolve.current().items() if r.source in ('locked', 'secret')}
         before = {msg for _keys, msg in problems_fn(_current_effective_values())}
     except Exception:
@@ -501,9 +498,8 @@ def read_env_values():
     """
     file_values = {}
     if os.path.exists(ENV_FILE):
-        file_values = dotenv_values(ENV_FILE)
+        file_values = config_resolve.read_env_file(ENV_FILE)
 
-    from utils import config_resolve
     from base import SECRETS_DIR
     # Resolve against the file as it is now — not what the last reload put in
     # os.environ: right after a save the reload may not have run yet, and a
@@ -573,7 +569,6 @@ def _derived_reasons():
 
 def get_env_sources():
     """Provenance for every schema key: {'source', 'reason'} (see config_resolve)."""
-    from utils import config_resolve
     resolved, written = config_resolve.snapshot()
     out = {}
     for key in sorted(_ALL_KEYS):
@@ -708,7 +703,7 @@ def write_env_values(values):
     # Locked (compose) and secret keys can't be changed from here.
     with _env_write_lock:
         existing = read_env_values()
-        file_values = dotenv_values(ENV_FILE) if os.path.exists(ENV_FILE) else {}
+        file_values = config_resolve.read_env_file(ENV_FILE)
         sources = get_env_sources()
         # Keep every non-blank schema key already in the file — including
         # locked/secret ones: they're inert while compose/secrets win, but
@@ -802,7 +797,6 @@ def write_env_values(values):
             from utils.boot_layout import live_getter as _boot_live_getter
             # Preview with a dry run of the same resolver the SIGHUP reload
             # uses, so the banner names only services that will really restart.
-            from utils import config_resolve
             if dry is None:
                 raise RuntimeError('settings could not be resolved')
             current = config_resolve.current()
@@ -866,7 +860,6 @@ def _with_secret_placeholders(values):
     """Docker-secret credentials are never in env or the form (they show
     as ''), but they ARE set — validate as if present."""
     try:
-        from utils import config_resolve
         secret = {k for k, r in config_resolve.current().items() if r.source == 'secret'}
     except Exception:
         secret = set()
@@ -1573,9 +1566,8 @@ def _sync_plex_debrid_to_env(values):
         # Read current .env values to detect actual changes
         current = {}
         if os.path.exists(ENV_FILE):
-            current = dotenv_values(ENV_FILE)
+            current = config_resolve.read_env_file(ENV_FILE)
 
-        from utils import config_resolve
         resolved = config_resolve.current()
         changed = {}
         for key, new_val in env_updates.items():
@@ -1614,7 +1606,7 @@ def _sync_plex_debrid_to_env(values):
         # directly would make these look compose-locked to the resolver.
         from base import SECRETS_DIR, config
         config_resolve.resolve_and_apply(
-            dotenv_values(ENV_FILE), config_resolve.present_secrets(SECRETS_DIR))
+            config_resolve.read_env_file(ENV_FILE), config_resolve.present_secrets(SECRETS_DIR))
         try:
             config.load(read_env_file=False)   # the config singleton follows too
         except Exception as e:
