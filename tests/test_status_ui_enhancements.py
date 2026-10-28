@@ -575,3 +575,20 @@ class TestStatusHandlerClientDisconnect:
         )
         h.handle_one_request()
         assert called == [True]
+
+
+class TestSystemPageTasks:
+    def test_system_page_tasks_sorted_by_name(self):
+        """The task table lists tasks alphabetically, so rows (and their Run
+        buttons) stay put while the table refreshes."""
+        import re, subprocess
+        from utils.system_page import get_system_html
+        html = get_system_html()
+        fn = re.search(r'function sortTasks\(tasks\)\{.*?\n\}', html, re.S).group(0)
+        js = (fn + ';process.stdout.write(sortTasks([{name:"verify_symlinks"},'
+              '{name:"audit_download_routing"},{name:"mount_liveness"}])'
+              '.map(function(t){return t.name}).join(","))')
+        out = subprocess.run(['node', '-e', js], capture_output=True,
+                             text=True, check=True).stdout
+        assert out == 'audit_download_routing,mount_liveness,verify_symlinks'
+        assert 'sortTasks(tasks).forEach' in html

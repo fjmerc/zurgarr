@@ -292,6 +292,9 @@ function fmtInterval(s){
   if(s<86400)return Math.floor(s/3600)+'h';
   return Math.floor(s/86400)+'d';
 }
+function sortTasks(tasks){
+  return tasks.slice().sort(function(a,b){return a.name<b.name?-1:a.name>b.name?1:0});
+}
 function updateTasks(){
   fetch('/api/tasks').then(function(r){return r.json()}).then(function(tasks){
     var el=document.getElementById('tasks');
@@ -299,7 +302,7 @@ function updateTasks(){
     document.getElementById('task-actions-hdr').textContent=hasAuth?'Actions':'';
     if(!tasks||!tasks.length){el.innerHTML='<tr><td colspan="7" style="color:var(--text2)">No tasks registered</td></tr>';return;}
     var h='';
-    tasks.forEach(function(t){
+    sortTasks(tasks).forEach(function(t){
       var intv=fmtInterval(t.interval);
       var lastRun=t.last_run?timeAgo(t.last_run):'Never';
       var dur=t.last_duration!==null?t.last_duration+'s':'-';
