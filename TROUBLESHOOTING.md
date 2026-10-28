@@ -314,8 +314,8 @@ A rescan that lands in between finds a link to nothing and skips it.
 What zurgarr does: after asking for the rescan it checks, 1, 2, 4 and 8
 minutes later, whether Sonarr/Radarr now list the file, and asks again if not.
 Every library scan also asks again (at most every 30 minutes per title; after
-three tries, once a day) for linked titles they still don't list, as long as
-the link plays and they aren't downloading it. To nudge one yourself, use
+three tries, once a day, until they list it) for linked titles they still
+don't list, as long as the link plays and they aren't downloading it. To nudge one yourself, use
 Rescan in Sonarr/Radarr. If it keeps happening, check the arr host's own
 debrid mount (`ls` the folder there).
 

@@ -1664,9 +1664,9 @@ class TestArrImportFollowUp:
         return scanner, movies
 
     def test_linked_movie_radarr_still_misses_is_rescanned(self, tmp_dir, monkeypatch):
+        monkeypatch.setattr(library.LibraryScanner, '_RESCAN_FOLLOWUP_DELAYS', ())
         scanner, movies = self._linked_movie(tmp_dir, monkeypatch)
         client = _radarr(_film(False))
-        client.get_movie.return_value = {'hasFile': True}
         _run_movie(scanner, client, movies)
         self._wait(scanner)
         _run_movie(scanner, client, movies)      # inside the interval: not again
@@ -1703,3 +1703,39 @@ class TestArrImportFollowUp:
         self._wait(scanner)
         assert client.rescan_series.call_count == 1
         assert client.rescan_series.call_args[0][0] == 7
+
+    def test_failed_rescan_request_does_not_use_up_a_try(self, tmp_dir, monkeypatch):
+        scanner, movies = self._linked_movie(tmp_dir, monkeypatch)
+        client = _radarr(_film(False))
+        client.rescan_movie.return_value = None          # Radarr didn't take it
+        _run_movie(scanner, client, movies)
+        client.rescan_movie.return_value = {'id': 1}
+        client.get_movie.return_value = {'hasFile': True}
+        _run_movie(scanner, client, movies)              # asks again at once
+        self._wait(scanner)
+        assert client.rescan_movie.call_count == 2
+
+    def test_limit_resets_once_the_arr_lists_it(self, tmp_dir, monkeypatch):
+        scanner, movies = self._linked_movie(tmp_dir, monkeypatch)
+        client = _radarr(_film(False))
+        client.get_movie.return_value = {'hasFile': True}
+        _run_movie(scanner, client, movies)
+        self._wait(scanner)
+        assert ('movie', 3) not in scanner._unlisted_rescans
+
+    def test_show_safety_net_needs_the_episodes_own_link(self, tmp_dir, monkeypatch):
+        """S01E01 is a real file Sonarr doesn't list; S01E02's link plays —
+        S01E01 isn't ours, so no rescan."""
+        scanner, local_tv, shows, pidx = _show_fixture(tmp_dir, monkeypatch)
+        season = os.path.join(local_tv, 'Show (2025)', 'Season 01')
+        os.makedirs(season)
+        _touch(os.path.join(season, 'Show.S01E01.real.mkv'))
+        _touch(os.path.join(tmp_dir, 'mount', 'shows', 'Show.S01E02.1080p', 'Show.S01E02.1080p.mkv'))
+        os.symlink('/mnt/debrid/shows/Show.S01E02.1080p/Show.S01E02.1080p.mkv',
+                   os.path.join(season, 'Show.S01E02.1080p.mkv'))
+        client = _sonarr(_SERIES, episodes=[
+            {'seasonNumber': 1, 'episodeNumber': 1, 'hasFile': False},
+            {'seasonNumber': 1, 'episodeNumber': 2, 'hasFile': True}])
+        _run_show(scanner, client, shows, pidx)
+        self._wait(scanner)
+        assert not client.rescan_series.called
