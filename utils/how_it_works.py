@@ -18,6 +18,8 @@ def _true(name):
 
 def _every(seconds):
     seconds = int(seconds)
+    if seconds <= 0:
+        return 'Not scheduled'
     if seconds % 86400 == 0:
         n = seconds // 86400
         return 'Every day' if n == 1 else f'Every {n} days'
@@ -38,6 +40,32 @@ def _search_configured():
         return bool(is_prowlarr_configured())
     except Exception:
         return False
+
+
+def _plex_configured():
+    try:
+        from utils.plex_versions import PlexLibrary
+        return PlexLibrary.from_env() is not None
+    except Exception:
+        return False
+
+
+def _wanted_leg_enabled():
+    try:
+        from utils.library import wanted_tb_recovery_enabled, wanted_rd_recovery_enabled
+        return wanted_tb_recovery_enabled() or wanted_rd_recovery_enabled()
+    except Exception:
+        return False
+
+
+def _missing(*requirements):
+    """The first unmet requirement's name, or None when all are met.
+    Mirrors the gates in scheduled_tasks.register_all and in each task, so a
+    card never says a job runs when it doesn't."""
+    for ok, name in requirements:
+        if not ok:
+            return name
+    return None
 
 
 # Box positions on a 1000 × 470 canvas: x is the centre, y the row centre.
@@ -82,11 +110,13 @@ _INFO = {
             'else goes to your normal download client.',
             [['cloud', 'tag: debrid → cloud'], ['local', 'no tag → local']]),
     'zurgarr': ('Getting the file', 'zurgarr checks the cloud',
-                'Sonarr/Radarr drop the torrent in zurgarr’s watch folder. zurgarr checks '
-                'whether TorBox already has it cached and, if so, sends it there; otherwise it '
-                'goes to your main debrid (Real-Debrid no longer answers “is this '
-                'cached?”). If the release isn’t cached, zurgarr looks for a cached copy '
-                'of the same kind, or tells Sonarr/Radarr to pick another release.',
+                'Sonarr/Radarr drop the torrent in zurgarr’s watch folder, and zurgarr sends it '
+                'to a debrid service. With one set up, it goes there. With two (say TorBox and '
+                'Real-Debrid), zurgarr sends it to the one that already has it cached, or to your '
+                'primary debrid if both or neither do. Only TorBox can still be asked; '
+                'Real-Debrid and AllDebrid no longer answer “is this cached?”. If the '
+                'release isn’t cached, zurgarr looks for a cached copy of the same kind, or '
+                'tells Sonarr/Radarr to pick another release.',
                 [['path', '/watch']]),
     'qbit': ('Getting the file', 'qBittorrent or Usenet downloads it',
              'Your normal download client fetches the whole file the usual way, through your '
@@ -97,20 +127,22 @@ _INFO = {
                 'Your TorBox account, mounted as a folder by rclone so it looks like local files.',
                 [['path', '/data/torbox']]),
     'rdmount': ('Where files live', 'Real-Debrid folder',
-                'Your Real-Debrid account, served by Zurg and mounted as a folder by rclone so it '
-                'looks like local files.',
+                'Your Real-Debrid (or AllDebrid) account, served by Zurg and mounted as a folder '
+                'by rclone so it looks like local files.',
                 [['path', '/data/zurgarr']]),
     'local': ('Where files live', 'Your disk',
               'Sonarr/Radarr move finished downloads into your library folders on local storage.',
               []),
     'links': ('Library & Plex', 'zurgarr links it into your library',
-              'For cloud files, zurgarr puts a shortcut (symlink) in the completed folder. '
-              'Sonarr/Radarr import that shortcut into your library folder and rename it their '
-              'way. It takes up no disk space.',
+              'Cloud files reach your library as shortcuts (symlinks) that take up no disk '
+              'space, in two ways. For a download, zurgarr puts a shortcut in the completed '
+              'folder and Sonarr/Radarr import it into your library folder, renamed their way. '
+              'The library scan links anything else they\u2019re missing straight into their '
+              'folders and asks them to rescan.',
               [['path', '/completed'], ['', 'library folders']]),
     'plex': ('Library & Plex', 'Plex shows it',
              'For what Sonarr/Radarr import, their own Plex connection tells Plex. For what '
-             'zurgarr links by itself, zurgarr asks Plex to scan that folder (PLEX_REFRESH). '
+             'zurgarr links by itself, zurgarr asks Plex to refresh that library (PLEX_REFRESH). '
              'Either way it appears within a minute or two, and playback streams straight from '
              'the cloud.',
              [['', 'PLEX_REFRESH']]),
@@ -147,12 +179,26 @@ def build_data():
     pd = _true('PD_ENABLED')
     nodes = dict(_NODES)
     info_src = dict(_INFO)
-    for key, name in (('rdmount', boot_layout.rclone_mount_name() or 'zurgarr'),
-                      ('tbmount', boot_layout.torbox_mount_name() or 'torbox')):
-        x, y, label, _ = nodes[key]
-        nodes[key] = (x, y, label, f'/data/{name}')
-        kicker, title, text, _ = info_src[key]
-        info_src[key] = (kicker, title, text, [['path', f'/data/{name}']])
+    # The cloud boxes show the mounts this container started (or would start).
+    layout = boot_layout.BOOT_LAYOUT if boot_layout.BOOTED else boot_layout.zurg_layout()
+    zname = layout.rclone_mount or 'zurgarr'
+    inst = layout.instances if layout.zurg else frozenset()
+    if inst == {'RD', 'AD'}:
+        zlabel, zpath = 'Real-Debrid · AllDebrid', f'/data/{zname}_RD, _AD'
+    elif inst:
+        zlabel, zpath = ('AllDebrid' if inst == {'AD'} else 'Real-Debrid'), f'/data/{zname}'
+    else:
+        zlabel, zpath = 'Real-Debrid', None
+    tpath = f'/data/{layout.torbox_mount}' if layout.torbox else None
+    for key, label, path in (('rdmount', zlabel, zpath), ('tbmount', 'TorBox', tpath)):
+        x, y, _, _ = nodes[key]
+        nodes[key] = (x, y, label, path or 'not set up')
+        kicker, _, text, _ = info_src[key]
+        if path:
+            info_src[key] = (kicker, f'{label} folder', text, [['path', path]])
+        else:
+            info_src[key] = (kicker, f'{label} folder',
+                             f'{label} isn’t set up in this container. ' + text, [])
     edges = list(_EDGES)
     routes = [
         {'key': 'cloud', 'label': 'Cloud route', 'on': True,
@@ -167,56 +213,108 @@ def build_data():
         routes.append({'key': 'pd', 'label': 'Watchlist route (plex_debrid)', 'on': False,
                        'nodes': ['pdwatch', 'plexdebrid', 'rdmount', 'plex']})
 
-    scan_every = _every(_get_interval('LIBRARY_SCAN_INTERVAL'))
+    from utils import scheduled_tasks
+    status_ui = _true('STATUS_UI_ENABLED')          # the library scanner needs it
+    symlinks = _true('BLACKHOLE_SYMLINK_ENABLED')
+    # The scheduler reads intervals and which tasks to register once, at
+    # start, so the running schedule wins over today's settings.  Without
+    # one (a tool or test that never registered tasks) the settings decide.
+    try:
+        from utils.task_scheduler import scheduler
+        tasks = {t['name']: t for t in scheduler.get_status()} or None
+    except Exception:
+        tasks = None
+
+    def gate(task, *requirements):
+        if tasks is None:
+            return _missing(*requirements)
+        t = tasks.get(task)
+        if t is not None and t.get('enabled', True):
+            return None
+        return _missing(*requirements) or 'a restart'
+
+    def interval(task, env_var=None, default=None):
+        if tasks and task in tasks:
+            return _every(tasks[task]['interval'])
+        return _every(_get_interval(env_var) if env_var else default)
     jobs = [
-        {'key': 'scan', 'code': 'S', 'title': 'Library scan', 'when': scan_every, 'off': False,
+        {'key': 'scan', 'code': 'S', 'title': 'Library scan',
+         'when': interval('library_scan', 'LIBRARY_SCAN_INTERVAL'),
+         'needs': gate('library_scan', (status_ui, 'STATUS_UI_ENABLED')),
          'short': 'Links in anything on your cloud folders that Sonarr/Radarr are missing.',
          'text': 'Looks through your cloud folders for anything Sonarr/Radarr are missing and '
                  'links it in, then asks them to rescan. It never links something they already '
-                 'have, don’t track, or are importing right now.',
+                 'have, don\u2019t track, or are importing right now.',
          'links': [['tbmount', 'links'], ['rdmount', 'links'], ['links', 'arr']]},
         {'key': 'wanted', 'code': 'W', 'title': 'Wanted recovery', 'when': 'With each scan',
-         'off': not _search_configured(), 'setting': 'TORRENTIO_URL or Prowlarr',
+         'needs': gate('library_scan', (status_ui, 'STATUS_UI_ENABLED')) or _missing(
+                           (_search_configured(), 'TORRENTIO_URL or Prowlarr'),
+                           (_wanted_leg_enabled(),
+                            'WANTED_TB_RECOVERY_ENABLED or WANTED_RD_RECOVERY_ENABLED')),
          'short': 'Adds a cached copy of things Sonarr/Radarr never grabbed.',
          'text': 'For titles Sonarr/Radarr never managed to grab, it finds a cached release and '
-                 'adds it to TorBox or Real-Debrid directly; the next scan links it. Needs '
-                 'Torrentio or Prowlarr.',
-         'links': [['arr', 'zurgarr'], ['zurgarr', 'tbmount'], ['zurgarr', 'rdmount']]},
-        {'key': 'prefer', 'code': 'P', 'title': 'Prefer cloud / local', 'when': 'With each scan',
-         'off': not _true('LIBRARY_PREFERENCE_AUTO_ENFORCE'),
-         'setting': 'LIBRARY_PREFERENCE_AUTO_ENFORCE',
-         'short': 'Swaps the copy Plex plays to the one you chose.',
-         'text': 'For titles you marked “prefer cloud” or “prefer local” on the '
-                 'Library page, it swaps the copy Plex plays to the one you chose. Before '
-                 'replacing anything it checks with Sonarr/Radarr that both copies are the same '
-                 'title.',
+                 'adds it to TorBox or Real-Debrid directly, without the watch folder, a few per '
+                 'scan; the next scan links it. Needs Torrentio or Prowlarr.',
+         'links': [['arr', 'tbmount'], ['arr', 'rdmount']]},
+        {'key': 'prefer', 'code': 'P', 'title': 'Prefer cloud / local',
+         'when': 'With each scan and ' + interval(
+             'enforce_preferences', 'PREFERENCE_ENFORCE_INTERVAL').lower(),
+         'needs': gate('library_scan', (status_ui, 'STATUS_UI_ENABLED')) or _missing(
+             (_true('LIBRARY_PREFERENCE_AUTO_ENFORCE'), 'LIBRARY_PREFERENCE_AUTO_ENFORCE')),
+         'short': 'Keeps the copy you chose: cloud or local.',
+         'text': 'For titles you marked \u201cprefer cloud\u201d on the Library page, it replaces '
+                 'the local file with a link to the cloud copy, after checking with '
+                 'Sonarr/Radarr that both are the same title. For \u201cprefer local\u201d, once '
+                 'the local copy has arrived it deletes the cloud copy from your debrid account.',
          'links': [['local', 'links'], ['tbmount', 'links'], ['rdmount', 'links']]},
         {'key': 'verify', 'code': 'L', 'title': 'Check links',
-         'when': _every(_get_interval('SYMLINK_VERIFY_INTERVAL')), 'off': False,
-         'short': 'Repairs links whose cloud file has gone.',
-         'text': 'Finds shortcuts whose cloud file has gone and repairs them, or asks '
-                 'Sonarr/Radarr to search again.',
+         'when': interval('verify_symlinks', 'SYMLINK_VERIFY_INTERVAL'),
+         'needs': gate('verify_symlinks', (symlinks, 'BLACKHOLE_SYMLINK_ENABLED')),
+         'short': 'Repairs or removes links whose cloud file has gone.',
+         'text': 'Finds shortcuts whose cloud file has gone. It repairs them where it can, asks '
+                 'Sonarr/Radarr to search again, and removes the ones it can\u2019t repair.',
          'links': [['links', 'tbmount'], ['links', 'rdmount'], ['links', 'arr']]},
         {'key': 'tidy', 'code': 'D', 'title': 'Duplicate tidy',
-         'when': _every(_DUPLICATE_TIDY_INTERVAL), 'off': not _true('LIBRARY_DUPLICATE_TIDY'),
-         'setting': 'LIBRARY_DUPLICATE_TIDY',
+         'when': interval('duplicate_tidy', default=_DUPLICATE_TIDY_INTERVAL),
+         'needs': gate('duplicate_tidy', (symlinks, 'BLACKHOLE_SYMLINK_ENABLED')) or _missing(
+             (_true('LIBRARY_DUPLICATE_TIDY'), 'LIBRARY_DUPLICATE_TIDY')),
+         'stopped': os.path.exists(scheduled_tasks._DUPLICATE_TIDY_HALT),
          'short': 'Removes extra links so Plex shows each episode once.',
          'text': 'Removes extra links that duplicate the copy Sonarr/Radarr track, so Plex shows '
                  'each episode or movie once. Only links, never the media itself; every removal '
-                 'is recorded so it can be undone.',
+                 'is recorded so it can be undone, and it stops by itself if a kept copy ever '
+                 'disappears.',
          'links': [['arr', 'links'], ['links', 'plex']]},
         {'key': 'rescan', 'code': 'R', 'title': 'Plex rescan',
-         'when': _every(_PLEX_RESCAN_INTERVAL), 'off': False,
+         'when': interval('plex_unavailable_rescan', default=_PLEX_RESCAN_INTERVAL),
+         'needs': gate('plex_unavailable_rescan') or _missing(
+             (_true('PLEX_REFRESH'), 'PLEX_REFRESH'),
+             (_plex_configured(), 'a Plex address and token')),
          'short': 'Brings back items Plex marked unavailable during a mount outage.',
          'text': 'If a cloud folder blipped and Plex marked items unavailable, it rescans those '
                  'folders once their files are back.',
          'links': [['tbmount', 'plex'], ['rdmount', 'plex']]},
         {'key': 'mountcheck', 'code': 'M', 'title': 'Mount check',
-         'when': _every(_get_interval('MOUNT_LIVENESS_INTERVAL')), 'off': False,
-         'short': 'Makes sure both cloud folders still respond.',
-         'text': 'Makes sure the cloud folders still respond, and remounts one if it stops.',
+         'when': interval('mount_liveness', 'MOUNT_LIVENESS_INTERVAL'),
+         'needs': gate('mount_liveness', (scheduled_tasks._mount_liveness_wanted(),
+                                          'a cloud mount or local library')),
+         'short': 'Makes sure the cloud folders still respond.',
+         'text': 'Checks that each cloud folder still responds. It remounts one that has '
+                 'disconnected, retries a mount that failed to start, and warns if your local '
+                 'library goes missing.',
          'links': [['zurgarr', 'tbmount'], ['zurgarr', 'rdmount']]},
     ]
+    for job in jobs:
+        needs = job.pop('needs')
+        stopped = job.pop('stopped', False)
+        job['off'] = bool(needs) or stopped
+        job['setting'] = needs
+        if needs:
+            job['status'] = f'Off \u00b7 needs {needs}'
+        elif stopped:
+            job['status'] = 'Stopped \u00b7 see the Tasks tab'
+        else:
+            job['status'] = job['when']
     info = {k: {'kicker': v[0], 'title': v[1], 'text': v[2], 'chips': v[3]}
             for k, v in info_src.items() if k in nodes}
     return {
@@ -231,12 +329,17 @@ def build_data():
 
 def get_how_it_works_html():
     """The section's markup, styles, embedded data and script."""
-    # '</' can't appear inside the data block, or a value could end the tag.
-    data = json.dumps(build_data(), ensure_ascii=False).replace('</', '<\\/')
+    # No raw < > & in the data block, so no value can end the tag or open a
+    # comment; JSON.parse turns the escapes back.  Data goes in last so a
+    # placeholder-like string inside it is never substituted.
+    data = json.dumps(build_data(), ensure_ascii=False)
+    for ch, esc in (('<', '\\u003c'), ('>', '\\u003e'), ('&', '\\u0026'),
+                    (' ', '\\u2028'), (' ', '\\u2029')):
+        data = data.replace(ch, esc)
     return (_HIW_HTML
             .replace('__HIW_CSS__', _HIW_CSS)
-            .replace('__HIW_DATA__', data)
-            .replace('__HIW_JS__', _HIW_JS))
+            .replace('__HIW_JS__', _HIW_JS)
+            .replace('__HIW_DATA__', data))
 
 
 _HIW_CSS = r'''
@@ -265,11 +368,14 @@ _HIW_CSS = r'''
 .hiw-edge.cloud{stroke:var(--hiw-cloud)}.hiw-edge.local{stroke:var(--hiw-local)}.hiw-edge.pd{stroke:var(--hiw-pd)}
 .hiw-edge.dim{opacity:.12}
 .hiw-edge.flow{stroke-width:3}
+.hiw svg.both .hiw-edge.local.shared{stroke-dasharray:8 8}
+.hiw-togs.muted .hiw-tog{opacity:.55}
 .hiw-edge.job{stroke:var(--hiw-job);stroke-width:3;stroke-dasharray:7 9;animation:hiw-flow 1s linear infinite}
 @keyframes hiw-flow{to{stroke-dashoffset:-16}}
 @media (prefers-reduced-motion:reduce){.hiw-edge.job{animation:none}}
 .hiw-tag rect.bg{fill:var(--card);stroke:var(--hiw-job);stroke-width:1.5}
 .hiw-tl{cursor:pointer}.hiw-tl rect{fill:transparent}
+.hiw-tl:focus,.hiw-bj:focus{outline:none}.hiw-tl:focus-visible rect{stroke:var(--blue);stroke-width:2}.hiw-bj:focus-visible circle{stroke:var(--blue)}
 .hiw-tl text{fill:var(--hiw-job);font-size:11px;font-weight:700;pointer-events:none}
 .hiw-tl.hl rect,.hiw-tl:hover rect{fill:var(--hiw-job)}
 .hiw-tl.hl text,.hiw-tl:hover text{fill:var(--card)}
@@ -349,7 +455,8 @@ _HIW_JS = r'''
     return 'M'+A.x+' '+sy+' C'+A.x+' '+my+', '+B.x+' '+my+', '+B.x+' '+ty}
   var edgeEls=[],nodeEls={},jobEls={},count={};
   D.edges.forEach(function(e){var p=pathFor(e[0],e[1]);
-    e[2].forEach(function(r){edgeEls.push(S('path',{d:p,class:'hiw-edge '+r,'data-r':r},svg))})});
+    // a stretch both routes share: the second stroke is dashed so neither hides the other
+    e[2].forEach(function(r,i){edgeEls.push(S('path',{d:p,class:'hiw-edge '+r+(i?' shared':''),'data-r':r},svg))})});
   // A single job's own lines; the all-jobs view uses the letter tags instead.
   var jobLayer=S('g',{},svg);
   JOBS.forEach(function(j){
@@ -358,7 +465,9 @@ _HIW_JS = r'''
       return S('path',{d:pathFor(l[0],l[1]),class:'hiw-edge job',style:'display:none'},jobLayer)})});
   function wire(el,key){
     S('title',{},el).textContent=JOB[key].title;
+    el.setAttribute('tabindex','0');el.setAttribute('role','button');el.setAttribute('aria-label',JOB[key].title);
     el.addEventListener('click',function(ev){ev.stopPropagation();pickJob(key)});
+    el.addEventListener('keydown',function(ev){if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();ev.stopPropagation();pickJob(key)}});
     el.addEventListener('mouseenter',function(){hl(key,true)});
     el.addEventListener('mouseleave',function(){hl(key,false)})}
   Object.keys(N).forEach(function(k){
@@ -383,7 +492,8 @@ _HIW_JS = r'''
     act(g,function(){sel(k)});nodeEls[k]=g});
 
   /* switches */
-  var active={},job=null;
+  // mode: what the explanation panel shows when no single job is picked
+  var active={},job=null,mode='node',selNode='zurgarr';
   D.routes.forEach(function(r){active[r.key]=!!r.on});active.jobs=false;
   var COLORS={cloud:'var(--hiw-cloud)',local:'var(--hiw-local)',pd:'var(--hiw-pd)',jobs:'var(--hiw-job)'};
   D.routes.concat([{key:'jobs',label:'Background jobs'}]).forEach(function(r){
@@ -391,13 +501,13 @@ _HIW_JS = r'''
     b.style.setProperty('--c',COLORS[r.key]);b.setAttribute('aria-pressed',String(!!active[r.key]));
     b.innerHTML='<i></i>'+esc(r.label);
     b.addEventListener('click',function(){active[r.key]=!active[r.key];b.setAttribute('aria-pressed',String(active[r.key]));
-      job=null;if(r.key==='jobs'&&active.jobs)allJobs();apply()});
+      job=null;if(r.key==='jobs')mode=active.jobs?'all':'node';apply()});
     togs.appendChild(b)});
 
   /* job cards */
   cardsEl.innerHTML=JOBS.map(function(j){
     return '<div class="hiw-job'+(j.off?' off':'')+'" data-k="'+esc(j.key)+'"><em'+(j.off?' class="off"':'')+'>'+
-      esc(j.off?'Off · needs '+j.setting:j.when)+'</em><b><span class="hiw-mono">'+esc(j.code)+'</span>'+esc(j.title)+
+      esc(j.status)+'</em><b><span class="hiw-mono">'+esc(j.code)+'</span>'+esc(j.title)+
       '</b><span>'+esc(j.short)+'</span><div class="hiw-touch">'+
       touched(j.key).map(function(n){return '<span>'+esc(N[n].label)+'</span>'}).join('')+'</div></div>'}).join('');
   var cards=cardsEl.querySelectorAll('.hiw-job');
@@ -409,24 +519,28 @@ _HIW_JS = r'''
     cards.forEach(function(c){if(c.dataset.k===j)c.classList.toggle('hl',on)})}
   function show(kicker,title,text,list){
     det.innerHTML='<div class="k">'+esc(kicker)+'</div><h4>'+esc(title)+'</h4><p>'+esc(text)+'</p>'+chips(list||[])}
-  function allJobs(){Object.keys(nodeEls).forEach(function(n){nodeEls[n].classList.remove('sel')});
-    show('Background jobs','Everything zurgarr does by itself','The orange tag on each box lists the jobs that work there, using the letters on the cards below. Hover a letter or a card to match them up; click one to see just that job and its lines.')}
-  function pickJob(k){
-    job=job===k?null:k;
-    Object.keys(nodeEls).forEach(function(n){nodeEls[n].classList.remove('sel')});
-    if(job){var j=JOB[job],c=[['job',j.off?'off':j.when]];if(j.setting)c.push(['',j.setting]);show(j.off?'Off':j.when,j.title,j.text,c)}
-    else if(active.jobs)allJobs();
-    apply()}
-  function sel(k){job=null;Object.keys(nodeEls).forEach(function(n){nodeEls[n].classList.toggle('sel',n===k)});
-    var i=D.info[k];show(i.kicker,i.title,i.text,i.chips);apply()}
+  function detail(){
+    if(job){var j=JOB[job],c=[['job',j.when]];if(j.setting)c.push(['','needs '+j.setting]);
+      show(j.status,j.title,j.text,c);return}
+    if(mode==='all'&&active.jobs){
+      show('Background jobs','Everything zurgarr does by itself','The orange tag on each box lists the jobs that work there, using the letters on the cards below. Hover a letter or a card to match them up; click one to see just that job and its lines.');return}
+    var i=D.info[selNode];show(i.kicker,i.title,i.text,i.chips)}
+  function pickJob(k){job=job===k?null:k;apply()}
+  function sel(k){selNode=k;job=null;mode='node';apply()}
 
   function apply(){
     var all=active.jobs&&!job;
-    cards.forEach(function(c){c.classList.toggle('sel',c.dataset.k===job)});
+    // a hidden element never gets its mouseleave: start every redraw unhighlighted
+    svg.querySelectorAll('.hl').forEach(function(e){e.classList.remove('hl')});
+    cards.forEach(function(c){c.classList.remove('hl');c.classList.toggle('sel',c.dataset.k===job)});
     cardsEl.classList.toggle('lit',all);
+    togs.classList.toggle('muted',!!job);
+    svg.classList.toggle('both',!!(active.cloud&&active.local));
+    Object.keys(nodeEls).forEach(function(n){nodeEls[n].classList.toggle('sel',!job&&mode==='node'&&n===selNode)});
     JOBS.forEach(function(j){jobEls[j.key].forEach(function(el){el.style.display=j.key===job?'':'none'})});
     svg.querySelectorAll('.hiw-tag').forEach(function(t){t.style.display=all?'':'none'});
     svg.querySelectorAll('.hiw-bj').forEach(function(b){b.style.display=b.getAttribute('data-j')===job?'':'none'});
+    detail();
     if(job){
       var t=touched(job);
       edgeEls.forEach(function(el){el.classList.add('dim');el.classList.remove('flow')});
@@ -440,6 +554,6 @@ _HIW_JS = r'''
       el.classList.toggle('dim',anyOn&&!on);el.classList.toggle('flow',on)});
     Object.keys(nodeEls).forEach(function(k){nodeEls[k].classList.toggle('dim',anyOn&&!lit[k])})}
 
-  sel('zurgarr');
+  apply();
 })();
 '''

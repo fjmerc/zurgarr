@@ -55,9 +55,15 @@ def _get_interval(env_var):
     val = os.environ.get(env_var)
     if val:
         try:
-            return int(val)
+            seconds = int(val)
         except ValueError:
             logger.warning(f"[scheduler] Invalid {env_var}={val}, using default")
+        else:
+            # 0 or less would rerun the task on every scheduler tick; only the
+            # backup interval uses 0 (to mean "off"), checked at its call site.
+            if seconds > 0 or env_var == 'CONFIG_BACKUP_INTERVAL':
+                return seconds
+            logger.warning(f"[scheduler] {env_var}={val} must be above 0, using default")
     return _DEFAULTS.get(env_var, 3600)
 
 
