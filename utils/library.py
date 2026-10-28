@@ -7839,12 +7839,14 @@ class LibraryScanner:
             for k in [k for k, (t, _n) in stamps.items()
                       if now - t > 2 * self._MISSING_FILE_RESCAN_INTERVAL]:
                 del stamps[k]
-            last, tries = stamps.get((kind, arr_id), (None, 0))
+            prev = stamps.get((kind, arr_id))
+            last, tries = prev or (None, 0)
             wait = (self._UNLISTED_RESCAN_INTERVAL if tries < self._UNLISTED_RESCAN_TRIES
                     else self._MISSING_FILE_RESCAN_INTERVAL)
             if last is not None and now - last < wait:
                 return 0
             stamps[(kind, arr_id)] = (now, tries + 1)
+            self.__dict__.setdefault('_unlisted_prev', {})[(kind, arr_id)] = prev
             return tries + 1
 
     def _unlisted_forget(self, kind, arr_id, attempt=None):
@@ -7852,12 +7854,14 @@ class LibraryScanner:
         *attempt*, undo that claim (its rescan request failed)."""
         with self._unlisted_lock:
             stamps = self.__dict__.setdefault('_unlisted_rescans', {})
-            if attempt is None or stamps.get((kind, arr_id), (None, 0))[1] == attempt:
+            prev = self.__dict__.setdefault('_unlisted_prev', {}).pop((kind, arr_id), None)
+            if attempt is None:
                 stamps.pop((kind, arr_id), None)
-                if attempt and attempt > 1:
-                    # keep the earlier tries' count, so a failing arr still backs off
-                    stamps[(kind, arr_id)] = (time.monotonic() - self._UNLISTED_RESCAN_INTERVAL,
-                                              attempt - 1)
+            elif stamps.get((kind, arr_id), (None, 0))[1] == attempt:
+                if prev is None:
+                    stamps.pop((kind, arr_id), None)
+                else:
+                    stamps[(kind, arr_id)] = prev      # as before the claim
 
     def _start_import_followup(self, items):
         """Check in the background that Sonarr/Radarr list what was just
@@ -7884,7 +7888,10 @@ class LibraryScanner:
                 try:
                     if it['kind'] == 'show':
                         hf = _sonarr_episode_has_file(it['client'], it['id'], {})
-                        listed = None if hf is None else all(hf.get(e) for e in it['eps'])
+                        # Episodes Sonarr's list lacks (a pack's extra episode,
+                        # other numbering) can never be listed — don't wait on them.
+                        listed = None if hf is None else all(
+                            hf[e] for e in it['eps'] if e in hf)
                     else:
                         movie = it['client'].get_movie(it['id'])
                         listed = bool(movie.get('hasFile')) if isinstance(movie, dict) else None
@@ -8580,6 +8587,8 @@ class LibraryScanner:
                             )
                 if missing_tracked:
                     self._rescan_for_missing_file('show', arr_info, title)
+                if arr_info and title not in _unlisted_shows:
+                    self._unlisted_forget('show', arr_info['id'])   # nothing unlisted now
             if unmatched_shows:
                 logger.info("[library] Skipped linking %d show(s) Sonarr doesn't have",
                             unmatched_shows)

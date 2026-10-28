@@ -1,6 +1,7 @@
 """Tests for automatic debrid symlink creation (_create_debrid_symlinks)."""
 
 import os
+import time
 import threading
 from unittest.mock import MagicMock, patch
 import pytest
@@ -1739,3 +1740,33 @@ class TestArrImportFollowUp:
         _run_show(scanner, client, shows, pidx)
         self._wait(scanner)
         assert not client.rescan_series.called
+
+    def test_follow_up_ignores_episodes_sonarr_does_not_have(self, tmp_dir, monkeypatch):
+        """A pack's S01E13 that Sonarr's list doesn't contain can never be
+        'listed' — the follow-up must not keep rescanning for it."""
+        scanner, local_tv, shows, pidx = _show_fixture(tmp_dir, monkeypatch)
+        client = _sonarr(_SERIES)
+        client.get_episodes.return_value = []            # Sonarr doesn't know S01E01
+        _run_show(scanner, client, shows, pidx)
+        self._wait(scanner)
+        assert client.rescan_series.call_count == 1
+
+    def test_show_limit_resets_once_sonarr_lists_everything(self, tmp_dir, monkeypatch):
+        scanner, local_tv, shows, pidx = _show_fixture(tmp_dir, monkeypatch)
+        season = os.path.join(local_tv, 'Show (2025)', 'Season 01')
+        os.makedirs(season)
+        os.symlink('/mnt/debrid/shows/Show.S01E01.1080p/Show.S01E01.1080p.mkv',
+                   os.path.join(season, 'Show.S01E01.1080p.mkv'))
+        scanner._unlisted_rescans = {('show', 7): (time.monotonic() - 3600, 3)}
+        client = _sonarr(_SERIES, episodes=[{'seasonNumber': 1, 'episodeNumber': 1, 'hasFile': True}])
+        _run_show(scanner, client, shows, pidx)
+        assert ('show', 7) not in scanner._unlisted_rescans
+
+    def test_failed_rescan_on_the_daily_tier_gives_its_day_back(self, tmp_dir, monkeypatch):
+        scanner, movies = self._linked_movie(tmp_dir, monkeypatch)
+        before = (time.monotonic() - 2 * 86400 + 60, 3)       # daily tier, a day is up
+        scanner._unlisted_rescans = {('movie', 3): before}
+        client = _radarr(_film(False))
+        client.rescan_movie.return_value = None
+        _run_movie(scanner, client, movies)
+        assert scanner._unlisted_rescans[('movie', 3)] == before
