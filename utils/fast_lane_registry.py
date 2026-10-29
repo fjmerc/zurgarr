@@ -42,6 +42,7 @@ class FastLaneEntry:
     added_at: float = 0.0
     seen_listed_at: Optional[float] = None
     warned_unmatched: bool = False
+    account_checked_at: Optional[float] = None
 
 
 def webdav_name(name):

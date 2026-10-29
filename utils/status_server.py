@@ -577,12 +577,12 @@ _ACTIVITY_WARN_TYPES = frozenset({
     'failed', 'symlink_failed', 'blocklisted', 'blocklist_added',
     'switched_source', 'duplicate', 'debrid_unavailable', 'uncached_rejected',
     'debrid_add_failed', 'release_incomplete', 'cleanup', 'debrid_expiry',
-    'import_misfiled',
+    'import_misfiled', 'fast_lane_unmatched',
 })
 # Routine periodic summaries — kept off the feed so they don't reintroduce
 # the heartbeat noise we just removed from the scheduler side.  They remain
 # on the Activity page and the scheduler card.
-_ACTIVITY_SKIP_TYPES = frozenset({'task_completed'})
+_ACTIVITY_SKIP_TYPES = frozenset({'task_completed', 'fast_lane_switched'})
 
 
 def _to_local_naive_iso(ts_str):

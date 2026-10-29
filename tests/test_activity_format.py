@@ -476,3 +476,19 @@ def test_plex_unavailable_rescan_counts_versions():
                                          'during a mount outage are back')
     from utils.activity_format import FORMATTER_JS
     assert 'plex_unavailable_rescan:' in FORMATTER_JS
+
+
+def test_fast_lane_switched():
+    ev = _ev('fast_lane_switched', links=3, folder='Show.S01')
+    assert format_event(ev)['short'] == 'Moved from the TorBox fast lane to the TorBox mount (3 links)'
+
+
+def test_fast_lane_unmatched():
+    ev = _ev('fast_lane_unmatched')
+    assert format_event(ev)['short'] == ("Still in the TorBox fast lane after a day — TorBox's WebDAV "
+                                "doesn't list it under a name zurgarr can match")
+
+
+def test_fast_lane_formatters_in_js():
+    from utils.activity_format import FORMATTER_JS
+    assert 'fast_lane_switched:' in FORMATTER_JS and 'fast_lane_unmatched:' in FORMATTER_JS

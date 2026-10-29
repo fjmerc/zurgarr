@@ -309,6 +309,21 @@ def new_request_check():
             'message': f'Wanted recovery started for {len(found)} new request(s)'}
 
 
+_FAST_LANE_SWITCHBACK_INTERVAL = 120
+
+
+def fast_lane_switchback():
+    """TorBox fast lane: move links to the TorBox mount for torrents TorBox's
+    WebDAV now lists stably (utils/fast_lane_switchback.py)."""
+    from utils.fast_lane_switchback import run_switchback
+    done = run_switchback()
+    if not any(done.values()):
+        return {'status': 'success', 'message': 'Fast lane empty'}
+    return {'status': 'success',
+            'message': (f"{done['switched']} moved to the TorBox mount, {done['waiting']} waiting, "
+                        f"{done['dropped']} left the account, {done['unmatched']} unmatched")}
+
+
 def library_scan():
     """Scan debrid mount and local library, auto-create symlinks, trigger rescans."""
     from utils.library import get_scanner
@@ -2123,6 +2138,17 @@ def register_all():
             interval_seconds=_NEW_REQUEST_CHECK_INTERVAL,
             description='Run Wanted recovery for new requests Sonarr/Radarr grabbed nothing for',
             initial_delay=180,
+        )
+
+    # TorBox fast lane — move links to the TorBox mount once it lists them
+    from utils.debrid_routing import fast_lane_enabled
+    if fast_lane_enabled():
+        scheduler.register(
+            'fast_lane_switchback',
+            fast_lane_switchback,
+            interval_seconds=_FAST_LANE_SWITCHBACK_INTERVAL,
+            description='Move TorBox fast lane links to the TorBox mount once TorBox lists them',
+            initial_delay=60,
         )
 
     # Verify Symlinks — only if blackhole symlinks are enabled

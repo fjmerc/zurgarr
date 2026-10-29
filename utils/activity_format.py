@@ -540,6 +540,18 @@ def _fmt_task_verify_symlinks(ev, meta):
     return short, short
 
 
+def _fmt_fast_lane_switched(ev, meta):
+    n = meta.get('links') or 0
+    msg = f"Moved from the TorBox fast lane to the TorBox mount ({n} link{'' if n == 1 else 's'})"
+    return msg, msg
+
+
+def _fmt_fast_lane_unmatched(ev, meta):
+    msg = ("Still in the TorBox fast lane after a day — TorBox's WebDAV doesn't list it "
+           "under a name zurgarr can match")
+    return msg, msg
+
+
 def _fmt_mount_selfheal(ev, meta):
     mount = meta.get('mount', 'mount')
     ok = meta.get('restarted')
@@ -650,6 +662,8 @@ _CAUSE_FORMATTERS = {
     'task_verify_symlinks': _fmt_task_verify_symlinks,
     'library_symlink_cleanup': _fmt_library_symlink_cleanup,
     'mount_selfheal': _fmt_mount_selfheal,
+    'fast_lane_switched': _fmt_fast_lane_switched,
+    'fast_lane_unmatched': _fmt_fast_lane_unmatched,
     'mount_deferred_start': _fmt_mount_deferred_start,
     'debrid_expiry_warning': _fmt_debrid_expiry_warning,
     'seerr_marked_available': _fmt_seerr_marked_available,
@@ -899,6 +913,13 @@ FORMATTER_JS = r"""
       if (m.searched) parts.push('searched ' + m.searched);
       if (m.deleted)  parts.push('deleted ' + m.deleted);
       return 'Library symlink cleanup — ' + (parts.length ? parts.join(', ') : 'nothing to do');
+    },
+    fast_lane_switched: function(ev,m){
+      var n = m.links || 0;
+      return 'Moved from the TorBox fast lane to the TorBox mount (' + n + ' link' + (n === 1 ? '' : 's') + ')';
+    },
+    fast_lane_unmatched: function(ev,m){
+      return "Still in the TorBox fast lane after a day \u2014 TorBox's WebDAV doesn't list it under a name zurgarr can match";
     },
     mount_selfheal: function(ev,m){
       var mount = m.mount || 'mount';
