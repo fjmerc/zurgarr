@@ -300,18 +300,26 @@ def _relist_folder(name, *, _now=None):
             return False
         for k in [k for k, t in _folder_refresh_ts.items() if now - t > 3600]:
             del _folder_refresh_ts[k]
+        first = name not in _folder_refresh_ts
         _folder_refresh_ts[name] = now
         _folder_refresh_last = now
+    if first:
+        logger.info(f"[blackhole] {name} is on the TorBox mount without its files yet — "
+                    f"re-reading it until they show")
     try:
         from utils.rclone_rc import refresh_dir
         from utils import boot_layout
         # recursive: a subfolder (Season 01/) the mount cached empty is kept
         # by a plain re-list of its parent
-        return bool(refresh_dir(name, recursive=True,
+        done = bool(refresh_dir(name, recursive=True,
                                 only_mounts={boot_layout.torbox_mount_name()}))
     except Exception as e:
         logger.debug(f"[blackhole] couldn't re-list {name} on the TorBox mount: {e}")
-        return False
+        done = False
+    if not done and first:
+        logger.info(f"[blackhole] couldn't re-read {name}: no TorBox mount answered — "
+                    f"it may stay empty until the mount re-reads it by itself")
+    return done
 
 
 # After the mount wait times out, keep watching a ready grab this long,
@@ -2565,9 +2573,7 @@ class BlackholeWatcher:
         shows the folder before its files."""
         if _holds_video(path):
             return path, '', name
-        if _relist_folder(name):
-            logger.debug(f"[blackhole] {name} is on the TB mount without its files yet "
-                         f"— re-listing it")
+        _relist_folder(name)
         return None, None, None
 
     # ── Symlink creation ─────────────────────────────────────────────

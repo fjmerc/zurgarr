@@ -8334,6 +8334,22 @@ class TestRelistFolder:
         assert bh._relist_folder('A', _now=1000.0) is False
 
 
+    def test_first_sighting_and_a_failed_relist_show_in_the_log(self, relists, monkeypatch, caplog):
+        """Once per folder at INFO, so the log shows the wait happened — and
+        that the re-read reached no TorBox mount, which would otherwise look
+        exactly like the 2h stale listing it exists to fix."""
+        import logging
+        import utils.blackhole as bh
+        import utils.rclone_rc as rc
+        monkeypatch.setattr(rc, 'refresh_dir', lambda d='', **k: False)
+        with caplog.at_level(logging.INFO):
+            bh._relist_folder('A', _now=1000.0)
+            bh._relist_folder('A', _now=1000.0 + bh._MOUNT_REFRESH_EVERY_S)
+        lines = [r.getMessage() for r in caplog.records if r.levelno >= logging.INFO]
+        assert sum('without its files yet' in m for m in lines) == 1
+        assert sum('no TorBox mount answered' in m for m in lines) == 1
+
+
 class TestHoldsVideo:
     def test_unreadable_folder_is_not_arrival(self, tmp_dir):
         import utils.blackhole as bh
