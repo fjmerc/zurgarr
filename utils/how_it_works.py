@@ -260,7 +260,9 @@ def build_data():
                  'adds it to TorBox or Real-Debrid directly, without the watch folder, a few each '
                  'time; a grab turned down as uncached, or a new request Sonarr/Radarr found nothing '
                  'for, starts a scan that runs it as soon as no other is running (at most one '
-                 'every 10 minutes), new requests first. With the blackhole in symlink mode, a TorBox copy is linked as '
+                 'every 10 minutes), new requests first. It takes a copy in the profile\u2019s '
+                 'language or the title\u2019s original one, never a dub into another. With the '
+                 'blackhole in symlink mode, a TorBox copy is linked as '
                  'soon as TorBox lists it; otherwise the next scan links it. Needs Torrentio or '
                  'Prowlarr.',
          'links': [['arr', 'tbmount'], ['arr', 'rdmount']]},

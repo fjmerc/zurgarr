@@ -2177,3 +2177,52 @@ class TestFindExistingTorrentId:
         with patch('utils.search._urllib_get',
                    return_value=[{'id': 'X', 'hash': 'ab' * 20, 'status': 'magnet_error'}]):
             assert find_existing_torrent_id('realdebrid', 'k', 'ab' * 20) is False
+
+
+class TestReleaseLanguages:
+    """Which audio languages a release says it has: Torrentio's flags line
+    (``flag_languages``) and the language words scene names carry
+    (``release_languages``).  Neither: untagged — the arr reads that as the
+    title's original language."""
+
+    @pytest.mark.parametrize('text, langs, multi', [
+        ('Baby.Reindeer.S01.COMPLETE.1080p.WEBRip.x265-PGW\nfile.mkv\n👤 77 💾 195 MB ⚙️ ThePirateBay',
+         set(), False),
+        ('Baby.Reindeer.S01.ITA.ENG.2160p.NF.WEB-DL\nfile.mkv\n👤 3 ⚙️ ilCorSaRoNeRo\n🇬🇧 / 🇮🇹',
+         {'English', 'Italian'}, False),
+        ('Baby.Reindeer.2024.S01.MULTI.2160p.WEB-DL\nS01/x.mkv\n👤 25 ⚙️ TorrentGalaxy\nMulti Audio / 🇬🇧',
+         {'English'}, True),
+        ('Movie.2020.1080p\nx\n🇫🇷 / 🇧🇷 / 🇲🇽', {'French', 'Portuguese (Brazil)', 'Spanish (Latino)'}, False),
+    ])
+    def test_flag_languages(self, text, langs, multi):
+        from utils.search import flag_languages
+        assert flag_languages(text) == (frozenset(langs), multi)
+
+    @pytest.mark.parametrize('name, title, langs, multi', [
+        ('Das.Boot.1981.GERMAN.1080p.BluRay.x264-GRP', 'Das Boot', {'German'}, False),
+        ('Das.Boot.1981.MULTi.1080p.BluRay.x264-GRP', 'Das Boot', set(), True),
+        ('Baby.Reindeer.S01.ITA.ENG.2160p.NF.WEB-DL', 'Baby Reindeer', {'Italian', 'English'}, False),
+        ('Олененок / Baby Reindeer / Сезон: 1 [2024 WEB-DL 1080p]', 'Baby Reindeer', {'Russian'}, False),
+        ('Greyhound.2020.1080p.WEBRip.x264-GRP', 'Greyhound', set(), False),
+        ('Germany.Year.Zero.1948.1080p.BluRay', 'Germany Year Zero', set(), False),
+        # a language word in the title itself isn't a tag
+        ('The.Italian.Job.2003.1080p.BluRay.x264', 'The Italian Job', set(), False),
+        ('The.Italian.Job.2003.FRENCH.1080p.BluRay', 'The Italian Job', {'French'}, False),
+        ('The.Italian.Job.2003.ITALIAN.1080p.BluRay', 'The Italian Job', {'Italian'}, False),
+    ])
+    def test_release_languages(self, name, title, langs, multi):
+        from utils.search import release_languages
+        assert release_languages(name, title) == (frozenset(langs), multi)
+
+    @patch('utils.search._urllib_get')
+    def test_torrentio_results_carry_their_flags(self, mock_get, monkeypatch):
+        monkeypatch.setenv('TORRENTIO_URL', 'https://torrentio.strem.fun')
+        mock_get.return_value = {'streams': [
+            {'infoHash': 'a' * 40,
+             'title': 'Show.S01.MULTI.1080p.WEB\nx.mkv\n👤 3 💾 4 GB ⚙️ X\nMulti Audio / 🇬🇧 / 🇮🇹'},
+            {'infoHash': 'b' * 40, 'title': 'Show.S01.1080p.WEB-GRP\nx.mkv\n👤 9 💾 2 GB ⚙️ Y'},
+        ]}
+        results = search_torrentio('tt1234567', media_type='series', season=1, episode=1)
+        assert results[0]['languages'] == ['English', 'Italian']
+        assert results[0]['multi'] is True
+        assert results[1]['languages'] == [] and results[1]['multi'] is False

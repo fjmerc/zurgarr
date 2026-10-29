@@ -299,6 +299,23 @@ needs. Options:
 - Try `PLEX_REFRESH=true` with `PLEX_MOUNT_DIR` set to the mount path
   **as Plex sees it** (not the path inside the Zurgarr container).
 
+## A requested title stays Wanted: "result(s) in neither English nor …"
+
+Symptom: a title stays in Wanted although copies exist, and the log says
+`Wanted recovery dropped N/M result(s) in neither English nor Korean` (or
+`not in English`).
+
+Cause: Wanted recovery only adds a copy in the title's quality-profile
+language or the title's original language — never a dub into a third language
+(a Russian copy of an English series, a German dub of a Korean film). Every
+cached copy it found was such a dub. Untagged and MULTi copies count as the
+original language.
+
+Fix: nothing, if you don't want the dub — it looks again after 6 hours and
+Sonarr/Radarr keep searching. To accept other languages for one title, give it
+a profile whose language is "Any" in Radarr (or, in Sonarr, a profile without
+a "Language: Not Original" custom format scored below the minimum).
+
 ## Plex shows a title but Sonarr/Radarr still say it's missing
 
 Symptom: a movie or episode zurgarr linked plays in Plex, but Radarr/Sonarr

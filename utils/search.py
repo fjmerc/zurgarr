@@ -251,6 +251,83 @@ def is_prerelease_source(title):
     return bool(_PRERELEASE_WEAK_RE.search(tags)) and not _REAL_SOURCE_RE.search(title)
 
 
+# Audio languages, named as Sonarr/Radarr name them.  Torrentio ends a
+# stream's title with flags for the languages its name carries; scene
+# names carry the same as words.  Wanted recovery keeps a copy in the
+# profile's language or the title's original one (see
+# LibraryScanner._drop_wrong_language).
+_FLAG_LANGUAGES = {
+    'GB': 'English', 'US': 'English', 'DE': 'German', 'FR': 'French',
+    'IT': 'Italian', 'ES': 'Spanish', 'MX': 'Spanish (Latino)', 'RU': 'Russian',
+    'PT': 'Portuguese', 'BR': 'Portuguese (Brazil)', 'JP': 'Japanese',
+    'KR': 'Korean', 'CN': 'Chinese', 'TW': 'Chinese', 'IN': 'Hindi',
+    'NL': 'Dutch', 'PL': 'Polish', 'UA': 'Ukrainian', 'SE': 'Swedish',
+    'DK': 'Danish', 'NO': 'Norwegian', 'FI': 'Finnish', 'TR': 'Turkish',
+    'CZ': 'Czech', 'HU': 'Hungarian', 'GR': 'Greek', 'RO': 'Romanian',
+    'BG': 'Bulgarian', 'HR': 'Croatian', 'RS': 'Serbian', 'IL': 'Hebrew',
+    'SA': 'Arabic', 'TH': 'Thai', 'VN': 'Vietnamese', 'ID': 'Indonesian',
+    'LT': 'Lithuanian', 'LV': 'Latvian', 'EE': 'Estonian', 'SK': 'Slovak',
+    'IR': 'Persian',
+}
+_FLAG_RE = re.compile('([\U0001F1E6-\U0001F1FF]{2})')
+_MULTI_AUDIO_RE = re.compile(r'\b(?:multi|dual)[ -]audio\b', re.IGNORECASE)
+_NAME_LANGUAGES = {
+    'english': 'English', 'eng': 'English',
+    'german': 'German', 'deutsch': 'German',
+    'french': 'French', 'truefrench': 'French', 'vff': 'French', 'vfq': 'French',
+    'italian': 'Italian', 'ita': 'Italian',
+    'spanish': 'Spanish', 'castellano': 'Spanish', 'esp': 'Spanish', 'spa': 'Spanish',
+    'latino': 'Spanish (Latino)',
+    'russian': 'Russian', 'rus': 'Russian',
+    'portuguese': 'Portuguese', 'japanese': 'Japanese', 'jpn': 'Japanese',
+    'korean': 'Korean', 'kor': 'Korean', 'chinese': 'Chinese', 'hindi': 'Hindi',
+    'dutch': 'Dutch', 'polish': 'Polish', 'swedish': 'Swedish', 'swe': 'Swedish',
+    'danish': 'Danish', 'norwegian': 'Norwegian', 'finnish': 'Finnish',
+    'turkish': 'Turkish', 'czech': 'Czech', 'hungarian': 'Hungarian',
+    'ukrainian': 'Ukrainian', 'ukr': 'Ukrainian',
+}
+_NAME_MULTI = {'multi', 'dual'}
+_NAME_WORD_RE = re.compile(r'[^\W_]+')
+_CYRILLIC_RE = re.compile('[\u0400-\u04FF]')
+
+
+def flag_languages(text):
+    """``(languages, multi)`` from a Torrentio stream title: the flags it
+    ends with, and whether it says "Multi Audio"/"Dual Audio".  A flag
+    outside the table is kept as its country code (still a language that
+    isn't the wanted one)."""
+    text = text or ''
+    langs = set()
+    for pair in _FLAG_RE.findall(text):
+        code = ''.join(chr(ord(c) - 0x1F1E6 + ord('A')) for c in pair)
+        langs.add(_FLAG_LANGUAGES.get(code, code))
+    return frozenset(langs), bool(_MULTI_AUDIO_RE.search(text))
+
+
+def release_languages(name, title=''):
+    """``(languages, multi)`` from a release name's language words (GERMAN,
+    ITA, MULTi…) — words of the media *title* itself don't count (*The
+    Italian Job*) — and Cyrillic in the name (a Russian tracker's copy)."""
+    words = [w.lower() for w in _NAME_WORD_RE.findall(name or '')]
+    title_words = [w.lower() for w in _NAME_WORD_RE.findall(title or '')]
+    n = len(title_words)
+    at = next((i for i in range(len(words) - n + 1) if n and words[i:i + n] == title_words),
+              None)
+    if at is not None:
+        words = words[:at] + words[at + n:]       # the title, once; its tags stay
+    else:
+        words = [w for w in words if w not in set(title_words)]
+    langs, multi = set(), False
+    for w in words:
+        if w in _NAME_LANGUAGES:
+            langs.add(_NAME_LANGUAGES[w])
+        elif w in _NAME_MULTI:
+            multi = True
+    if _CYRILLIC_RE.search(name or '') and not _CYRILLIC_RE.search(title or ''):
+        langs.add('Russian')
+    return frozenset(langs), multi
+
+
 def parse_quality(title):
     """Extract quality label and numeric score from a release title.
 
@@ -377,6 +454,7 @@ def search_torrentio(imdb_id, media_type='movie', season=None, episode=None,
         size_str = _parse_size_from_title(title_text)
         size_bytes = _parse_size_bytes(size_str)
         source_name = _parse_source(title_text)
+        languages, multi = flag_languages(title_text)
 
         results.append({
             'title': release_title,
@@ -385,6 +463,8 @@ def search_torrentio(imdb_id, media_type='movie', season=None, episode=None,
             'seeds': seeds,
             'source_name': source_name,
             'quality': quality,
+            'languages': sorted(languages),
+            'multi': multi,
         })
 
     return results

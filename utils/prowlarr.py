@@ -175,6 +175,9 @@ def search_prowlarr(title, year=None, media_type='movie', season=None,
                 'source_name': _s(item.get('indexer')) or 'Prowlarr',
                 'quality': parse_quality(release_title),
                 'origin': 'prowlarr',
+                # no flags line: the Wanted pass reads the name's words
+                'languages': [],
+                'multi': False,
             })
         except Exception:
             logger.debug("[prowlarr] Skipped malformed result item",

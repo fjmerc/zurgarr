@@ -106,6 +106,7 @@ class TestSearchProwlarr:
         assert first['source_name'] == 'TorrentLeech'
         assert first['quality']['label'] == '1080p'
         assert first['origin'] == 'prowlarr'
+        assert first['languages'] == [] and first['multi'] is False
 
     def test_hash_extracted_from_magnet(self):
         with patch('utils.prowlarr._urllib_get',

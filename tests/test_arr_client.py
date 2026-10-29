@@ -3638,3 +3638,31 @@ class TestSearchingIds:
     def test_unreadable_is_none(self, mock_urlopen, radarr):
         mock_urlopen.return_value = _mock_urlopen({'error': 'x'})
         assert radarr.searching_ids() is None
+
+
+class TestLanguageReaders:
+    """Wanted recovery's language rule reads the arr's custom formats and
+    language list (Sonarr and Radarr alike)."""
+
+    @pytest.mark.parametrize('cls', ['SonarrClient', 'RadarrClient'])
+    def test_custom_formats_and_languages_are_read_and_cached(self, cls):
+        import utils.arr_client as ac
+        client = getattr(ac, cls)('http://arr', 'key')
+        calls = []
+
+        def fake_get(path, **k):
+            calls.append(path)
+            return [{'id': 1, 'name': 'x'}]
+        client._get = fake_get
+        assert client.get_custom_formats() == [{'id': 1, 'name': 'x'}]
+        assert client.get_languages() == [{'id': 1, 'name': 'x'}]
+        client.get_custom_formats(); client.get_languages()
+        assert calls == ['/api/v3/customformat', '/api/v3/language']
+
+    def test_unreadable_is_none_and_not_cached(self):
+        import utils.arr_client as ac
+        client = ac.RadarrClient('http://arr', 'key')
+        answers = [None, [{'id': 1}]]
+        client._get = lambda path, **k: answers.pop(0)
+        assert client.get_custom_formats() is None
+        assert client.get_custom_formats() == [{'id': 1}]

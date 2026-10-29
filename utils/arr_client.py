@@ -367,6 +367,7 @@ class _ArrClientBase:
         # 15 minutes.
         self._profile_cache = {}
         self._profile_cache_lock = threading.Lock()
+        self._list_cache = {}       # API path -> (expires, list), same TTL
 
     @property
     def configured(self):
@@ -482,6 +483,30 @@ class _ArrClientBase:
                 profile,
             )
         return profile
+
+    def _cached_list(self, path):
+        """GET a list endpoint that rarely changes, cached like profiles.
+        None (not cached) when it can't be read."""
+        now = time.monotonic()
+        with self._profile_cache_lock:
+            entry = self._list_cache.get(path)
+            if entry and entry[0] > now:
+                return entry[1]
+        data = self._get(path)
+        if not isinstance(data, list):
+            return None
+        with self._profile_cache_lock:
+            self._list_cache[path] = (time.monotonic() + _PROFILE_CACHE_TTL_SECONDS, data)
+        return data
+
+    def get_custom_formats(self):
+        """Every custom format (``id``, ``name``, ``specifications``)."""
+        return self._cached_list('/api/v3/customformat')
+
+    def get_languages(self):
+        """The arr's language list (``id``, ``name``) — custom-format
+        language specs name languages by id."""
+        return self._cached_list('/api/v3/language')
 
     def get_tier_order(self, profile_id):
         """Return the profile's allowed resolutions in preference order,

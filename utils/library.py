@@ -1936,6 +1936,13 @@ def _sonarr_monitored_missing(series):
     return missing, monitored_total, sorted(unmonitored_nums)
 
 
+def _original_language(entry):
+    """A Sonarr series' / Radarr movie's original language name, or None."""
+    lang = entry.get('originalLanguage')
+    name = lang.get('name') if isinstance(lang, dict) else None
+    return name or None
+
+
 def _apply_sonarr_monitored_filter(shows, degraded=None):
     """Rebase show missing-episode counts against Sonarr's monitored view.
 
@@ -2096,6 +2103,8 @@ def _apply_sonarr_monitored_filter(shows, degraded=None):
         if series.get('qualityProfileId'):
             # Wanted recovery only adds releases this profile allows.
             show['_profile_id'] = series['qualityProfileId']
+        if _original_language(series):
+            show['_original_language'] = _original_language(series)
 
         missing, monitored_total, unmonitored_nums = _sonarr_monitored_missing(series)
         show['missing_episodes'] = missing
@@ -2259,6 +2268,7 @@ def _apply_sonarr_wanted_shows(shows, matched_ids, pending=None, degraded=None):
             '_sonarr_id': sid,
             '_sonarr_tmdb_id': tmdb_id,
             '_profile_id': s.get('qualityProfileId'),
+            '_original_language': _original_language(s),
             '_added': _iso_epoch(s.get('added')),
         }
         if monitored_total > 0:
@@ -2688,6 +2698,7 @@ def _apply_radarr_wanted_movies(movies, pending=None, degraded=None):
             '_radarr_id': rm.get('id'),
             '_radarr_tmdb_id': tmdb_id,
             '_profile_id': rm.get('qualityProfileId'),
+            '_original_language': _original_language(rm),
             '_added': _iso_epoch(rm.get('added')),
         }
         if rm.get('imdbId'):
@@ -5986,6 +5997,98 @@ class LibraryScanner:
         cache[(want, pid)] = allowed
         return allowed
 
+    @classmethod
+    def _profile_language(cls, media_type, item, cache):
+        """The audio language the item's arr profile asks for (``'English'``;
+        a profile set to the original language gives the item's own), None
+        when it asks for none or the original isn't known (nothing is
+        filtered), ``_PROFILE_UNREADABLE`` when the arr didn't answer.
+        *cache* as for ``_profile_resolutions``."""
+        pid = item.get('_profile_id')
+        if not pid:
+            return None
+        kind = 'movie' if media_type == 'movie' else 'show'
+        want = 'radarr' if kind == 'movie' else 'sonarr'
+        key = ('language', want, pid)
+        if key not in cache:
+            try:
+                from utils.arr_client import get_download_service
+                client, svc = get_download_service(kind)
+                if not client or svc != want:
+                    return None
+                profile = client.get_quality_profile(pid)
+                if profile is None:
+                    return cls._PROFILE_UNREADABLE
+                rule = cls._profile_language_rule(client, profile)
+            except Exception as e:
+                logger.debug(f"[library] Could not read {want} profile {pid}'s language: {e}")
+                return cls._PROFILE_UNREADABLE
+            if rule is cls._PROFILE_UNREADABLE:
+                return rule
+            cache[key] = rule
+        rule = cache[key]
+        return item.get('_original_language') if rule == 'Original' else rule
+
+    @classmethod
+    def _profile_language_rule(cls, client, profile):
+        """A profile's language: Radarr's profile language (``'Any'`` is
+        none), else a custom format matching every release not in one
+        language and scored below the profile's minimum — Sonarr's
+        "Language: Not Original".  ``'Original'`` for the title's own."""
+        if not isinstance(profile, dict):
+            return None
+        lang = profile.get('language')
+        if isinstance(lang, dict) and lang.get('id') not in (None, -1):
+            return 'Original' if lang.get('id') == -2 else lang.get('name')
+        floor = profile.get('minFormatScore') or 0
+        low = {fi.get('format') for fi in profile.get('formatItems') or []
+               if isinstance(fi, dict) and (fi.get('score') or 0) < floor}
+        if not low:
+            return None
+        formats = client.get_custom_formats()
+        if formats is None:
+            return cls._PROFILE_UNREADABLE
+        for cf in formats:
+            specs = cf.get('specifications') or [] if isinstance(cf, dict) else []
+            if (cf.get('id') not in low or len(specs) != 1
+                    or specs[0].get('implementation') != 'LanguageSpecification'
+                    or not specs[0].get('negate')):
+                continue
+            value = next((f.get('value') for f in specs[0].get('fields') or []
+                          if f.get('name') == 'value'), None)
+            if value == -2:
+                return 'Original'
+            languages = client.get_languages()
+            if languages is None:
+                return cls._PROFILE_UNREADABLE
+            return next((l.get('name') for l in languages if l.get('id') == value), None)
+        return None
+
+    @staticmethod
+    def _drop_wrong_language(results, want, original, media_title, source=''):
+        """*results* without dubs: a release is kept when it carries the
+        profile's language (*want*) or the title's *original* one — or no
+        language at all, or "multi" (both read as the original, as the arr
+        reads them).  A Korean film on an English profile keeps its Korean
+        copies (subtitles are the viewer's), never a Russian dub."""
+        if not want:
+            return results
+        from utils.search import release_languages
+        ok = {want.lower()} | ({original.lower()} if original else set())
+        kept = []
+        for r in results or []:
+            words, multi = release_languages(r.get('title'), media_title)
+            langs = {l.lower() for l in (r.get('languages') or ())} | {l.lower() for l in words}
+            if not langs or multi or r.get('multi') or langs & ok:
+                kept.append(r)
+        if len(kept) < len(results or []):
+            names = (f"neither {want} nor {original}"
+                     if original and original.lower() != want.lower() else f"not in {want}")
+            logger.info(
+                f"[library] Wanted recovery dropped {len(results) - len(kept)}"
+                f"/{len(results)} {source}result(s) in {names} for '{media_title}'")
+        return kept
+
     @staticmethod
     def _drop_outside_profile(results, allowed, media_title, source=''):
         """*results* without releases above the arr profile's highest
@@ -6468,6 +6571,14 @@ class LibraryScanner:
                             f"pass: its quality profile couldn't be read")
                 continue
             results = self._drop_outside_profile(results, allowed, media_title)
+            # ...and so are dubs into a language nobody asked for
+            want_lang = self._profile_language(media_type, item, profile_cache)
+            if want_lang is self._PROFILE_UNREADABLE:
+                logger.info(f"[library] Wanted recovery skipping '{media_title}' this "
+                            f"pass: its profile's language couldn't be read")
+                continue
+            original = item.get('_original_language')
+            results = self._drop_wrong_language(results, want_lang, original, media_title)
 
             # ---- Prowlarr fallback (acquisition breadth) -------------
             # Fires only when Torrentio produced nothing usable, or when
@@ -6485,9 +6596,11 @@ class LibraryScanner:
                         exclude_hashes={r['info_hash'] for r in results},
                         season_cls=season_cls,
                         is_blocked=_is_blocked)
-                    results.extend(self._drop_outside_profile(
-                        self._drop_prerelease(fallback, media_title, source='Prowlarr '),
-                        allowed, media_title, source='Prowlarr '))
+                    results.extend(self._drop_wrong_language(
+                        self._drop_outside_profile(
+                            self._drop_prerelease(fallback, media_title, source='Prowlarr '),
+                            allowed, media_title, source='Prowlarr '),
+                        want_lang, original, media_title, source='Prowlarr '))
                 except Exception:
                     logger.warning(
                         "[library] Prowlarr fallback failed — continuing "

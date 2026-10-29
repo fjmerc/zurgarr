@@ -4625,11 +4625,13 @@ class TestApplySonarrMonitoredFilter:
                  'statistics': {'episodeCount': 5, 'episodeFileCount': 4}},
             ],
         }]
+        series[0]['originalLanguage'] = {'id': 1, 'name': 'English'}
         with _fake_sonarr(series):
             _apply_sonarr_monitored_filter(shows)
         assert shows[0]['missing_episodes'] == 1
         assert shows[0]['unmonitored_seasons'] == [1]
         assert shows[0]['_profile_id'] == 8   # Wanted recovery's ceiling
+        assert shows[0]['_original_language'] == 'English'
 
     def test_missing_is_monitored_minus_file_count(self):
         """Sum ``episodeCount - episodeFileCount`` across monitored seasons.
@@ -5168,6 +5170,26 @@ class TestWantedGhostImdbId:
         with _fake_radarr(radarr_movies):
             _apply_radarr_wanted_movies(movies)
         assert movies[0]['imdb_id'] == 'tt0099810'
+
+    def test_ghosts_carry_the_original_language(self):
+        """Wanted recovery's language rule reads an untagged release as the
+        title's original language, like the arr does."""
+        from utils.library import _apply_radarr_wanted_movies, _apply_sonarr_wanted_shows
+        movies, shows = [], []
+        with _fake_radarr([{'id': 760, 'tmdbId': 387, 'imdbId': 'tt0082096',
+                            'title': 'Das Boot', 'year': 1981, 'monitored': True,
+                            'hasFile': False, 'isAvailable': True,
+                            'originalLanguage': {'id': 4, 'name': 'German'}}]):
+            _apply_radarr_wanted_movies(movies)
+        with _fake_sonarr([{'id': 5, 'tmdbId': 100, 'imdbId': 'tt123', 'title': 'Dark',
+                            'year': 2017, 'monitored': True, 'qualityProfileId': 8,
+                            'originalLanguage': {'id': 4, 'name': 'German'},
+                            'seasons': [{'seasonNumber': 1, 'monitored': True,
+                                         'statistics': {'episodeCount': 8,
+                                                        'episodeFileCount': 0}}]}]):
+            _apply_sonarr_wanted_shows(shows, set())
+        assert movies[0]['_original_language'] == 'German'
+        assert shows[0]['_original_language'] == 'German'
 
     def test_no_ghost_beside_a_just_delivered_punctuated_title(self):
         """The folder parser drops punctuation Radarr keeps; a release the
@@ -9188,6 +9210,120 @@ class TestRecoverWantedViaTorbox:
                    'imdb_id': 'tt1', 'is_available': True}]
         sc._recover_wanted_via_debrid([], movies, {})
         assert [a['info_hash'] for a in wire['adds']] == ['c' * 40]
+
+    # ── audio language: only copies in the profile's language ────────
+
+    _NOT_ORIGINAL_CF = {'id': 7, 'name': 'Language: Not Original', 'specifications': [
+        {'implementation': 'LanguageSpecification', 'negate': True,
+         'fields': [{'name': 'value', 'value': -2}]}]}
+
+    def _lang_profile(self, monkeypatch, language=None, cf_score=None, svc='radarr'):
+        """Arr whose profile 4 names *language* ({'id', 'name'}) and/or
+        scores the "Language: Not Original" custom format *cf_score*."""
+        import utils.arr_client as ac
+        client = MagicMock()
+        client.get_tier_order.return_value = []
+        profile = {'id': 4, 'minFormatScore': 0, 'formatItems': []}
+        if language is not None:
+            profile['language'] = language
+        if cf_score is not None:
+            profile['formatItems'] = [{'format': 7, 'name': 'Language: Not Original',
+                                       'score': cf_score}]
+        client.get_quality_profile.return_value = profile
+        client.get_custom_formats.return_value = [self._NOT_ORIGINAL_CF]
+        client.get_languages.return_value = [{'id': 1, 'name': 'English'},
+                                             {'id': 4, 'name': 'German'}]
+        monkeypatch.setattr(ac, 'get_download_service', lambda kind: (client, svc))
+        return client
+
+    @staticmethod
+    def _r(h, title, languages=(), multi=False):
+        return {'info_hash': h * 40, 'title': title, 'seeds': 9,
+                'quality': {'label': '1080p', 'score': 100},
+                'languages': sorted(languages), 'multi': multi}
+
+    def _run(self, sc, original, monkeypatch, title='Das Boot'):
+        monkeypatch.setattr(sc, '_prowlarr_fallback_candidates', lambda *a, **k: [])
+        movies = [{'title': title, 'source': 'wanted', '_profile_id': 4, 'imdb_id': 'tt1',
+                   'is_available': True, '_original_language': original}]
+        sc._recover_wanted_via_debrid([], movies, {})
+
+    def test_dub_into_another_language_not_added(self, wire, monkeypatch, caplog):
+        """Hope (Korean) on an English profile: the Korean original is fine
+        (English subtitles, as the requester wanted); a Russian dub isn't."""
+        import logging
+        wire['torrentio'] = [self._r('a', 'Hope.2026.1080p.WEB-DL.RUS', {'Russian'}),
+                             self._r('b', 'Hope.2026.1080p.AMZN.WEB-DL.H.264-playWEB')]
+        self._lang_profile(monkeypatch, {'id': 1, 'name': 'English'})
+        with caplog.at_level(logging.INFO):
+            self._run(self._scanner(), 'Korean', monkeypatch, title='Hope')
+        assert [a['info_hash'] for a in wire['adds']] == ['b' * 40]
+        assert "dropped 1/2 result(s) in neither English nor Korean for 'Hope'" in caplog.text
+
+    def test_original_language_copy_is_kept_on_an_english_profile(self, wire, monkeypatch):
+        """Das Boot: a German copy is the film's own language."""
+        wire['torrentio'] = [self._r('a', 'Das.Boot.1981.GERMAN.1080p', {'German'})]
+        self._lang_profile(monkeypatch, {'id': 1, 'name': 'English'})
+        self._run(self._scanner(), 'German', monkeypatch)
+        assert [a['info_hash'] for a in wire['adds']] == ['a' * 40]
+
+    def test_language_word_in_the_name_counts_but_not_the_title(self, wire, monkeypatch):
+        """Prowlarr copies carry no flags: the name's language words decide —
+        never a word of the title itself."""
+        wire['torrentio'] = [self._r('a', 'The.Italian.Job.2003.ITALIAN.1080p.BluRay'),
+                             self._r('b', 'The.Italian.Job.2003.1080p.BluRay')]
+        self._lang_profile(monkeypatch, {'id': 1, 'name': 'English'})
+        self._run(self._scanner(), 'English', monkeypatch, title='The Italian Job')
+        assert [a['info_hash'] for a in wire['adds']] == ['b' * 40]
+
+    def test_multi_copy_counts_as_holding_the_original(self, wire, monkeypatch):
+        wire['torrentio'] = [self._r('a', 'Greyhound.2020.MULTi.1080p', {'French'}, True),
+                             self._r('b', 'Greyhound.2020.FRENCH.1080p', {'French'})]
+        self._lang_profile(monkeypatch, {'id': 1, 'name': 'English'})
+        self._run(self._scanner(), 'English', monkeypatch, title='Greyhound')
+        assert [a['info_hash'] for a in wire['adds']] == ['a' * 40]
+
+    def test_original_profile_keeps_only_the_original(self, wire, monkeypatch):
+        wire['torrentio'] = [self._r('c', 'Amelie.2001.ENG.1080p', {'English'}),
+                             self._r('b', 'Amelie.2001.1080p.BluRay')]
+        self._lang_profile(monkeypatch, {'id': -2, 'name': 'Original'})
+        self._run(self._scanner(), 'French', monkeypatch, title='Amelie')
+        assert [a['info_hash'] for a in wire['adds']] == ['b' * 40]
+
+    def test_any_language_profile_filters_nothing(self, wire, monkeypatch):
+        wire['torrentio'] = [self._r('a', 'Das.Boot.1981.GERMAN.1080p', {'German'})]
+        self._lang_profile(monkeypatch, {'id': -1, 'name': 'Any'})
+        self._run(self._scanner(), 'German', monkeypatch)
+        assert [a['info_hash'] for a in wire['adds']] == ['a' * 40]
+
+    def test_not_original_custom_format_requires_the_original(self, wire, monkeypatch):
+        """Sonarr has no profile language: its 'Language: Not Original' custom
+        format, scored below the profile's minimum, is the rule."""
+        wire['torrentio'] = [self._r('a', 'Dark.S01.ENG.1080p', {'English'}),
+                             self._r('b', 'Dark.S01.GERMAN.1080p', {'German'})]
+        self._lang_profile(monkeypatch, cf_score=-10000)
+        self._run(self._scanner(), 'German', monkeypatch, title='Dark')
+        assert [a['info_hash'] for a in wire['adds']] == ['b' * 40]
+
+    def test_custom_format_scored_zero_is_no_rule(self, wire, monkeypatch):
+        wire['torrentio'] = [self._r('a', 'Dark.S01.ENG.1080p', {'English'})]
+        self._lang_profile(monkeypatch, cf_score=0)
+        self._run(self._scanner(), 'German', monkeypatch, title='Dark')
+        assert [a['info_hash'] for a in wire['adds']] == ['a' * 40]
+
+    def test_original_language_unknown_filters_nothing(self, wire, monkeypatch):
+        """No original language to judge untagged copies by: don't block
+        recovery on a guess."""
+        wire['torrentio'] = [self._r('a', 'X.2020.1080p')]
+        self._lang_profile(monkeypatch, {'id': -2, 'name': 'Original'})
+        self._run(self._scanner(), None, monkeypatch, title='X')
+        assert [a['info_hash'] for a in wire['adds']] == ['a' * 40]
+
+    def test_sonarr_profile_language_parity(self, monkeypatch):
+        import utils.library as lib
+        self._lang_profile(monkeypatch, cf_score=-10000, svc='sonarr')
+        item = {'_profile_id': 4, '_original_language': 'German'}
+        assert lib.LibraryScanner._profile_language('season', item, {}) == 'German'
 
     def test_profile_resolutions_names_never_carry_filter_nothing(self, wire, monkeypatch):
         wire['torrentio'] = [
