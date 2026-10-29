@@ -49,6 +49,11 @@ def test_season_subfolder_path_kept():
     ['Movie.2020.mkv'],                                    # no folder component
     ['0123456789abcdef0123456789abcdef/x.mkv'],            # obfuscated payload
     ['Movie/../../etc/passwd'],                            # traversal
+    ['Movie/&../&../etc/passwd'],                          # traversal once '&' is dropped
+    ['&../x.mkv'],
+    ['Movie/./x.mkv'],
+    ['Movie/a\\b.mkv'],                                    # backslash
+    ['Movie/a\x00b.mkv'],                                  # NUL
     [],
 ])
 def test_flat_obfuscated_and_traversal_records_not_admitted(files):
@@ -79,3 +84,14 @@ def test_by_folder_accepts_either_spelling_and_remove():
     assert reg.get(3).seen_listed_at == 9.0
     reg.remove(3)
     assert reg.get(3) is None and reg.by_folder('Law  Order S01') is None
+
+
+def test_unsafe_names_in_the_file_are_skipped_on_load(tmp_path):
+    import json
+    good = {'torrent_id': 1, 'folder': 'Movie', 'files': [{'path': 'm.mkv', 'size': 1, 'file_id': 0}],
+            'created_at': 0.0, 'added_at': 0.0}
+    bad = dict(good, torrent_id=2, folder='..')
+    worse = dict(good, torrent_id=3, files=[{'path': '../../x.mkv', 'size': 1, 'file_id': 0}])
+    with open(reg.REGISTRY_PATH, 'w') as fh:
+        json.dump([good, bad, worse], fh)
+    assert [e.torrent_id for e in reg.entries()] == [1]

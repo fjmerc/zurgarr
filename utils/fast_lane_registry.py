@@ -49,6 +49,12 @@ def webdav_name(name):
     return (name or '').replace('&', '')
 
 
+def _safe_component(part):
+    """One path component the fast lane may serve: not empty, not '.' or
+    '..', no backslash or NUL."""
+    return part not in ('', '.', '..') and '\\' not in part and '\x00' not in part
+
+
 def entry_from_record(record, now):
     """A registry entry for a TorBox mylist *record*, or None for one the
     fast lane can't serve: no folder (a bare file at the mount root, which
@@ -62,15 +68,17 @@ def entry_from_record(record, now):
     for f in record.get('files') or []:
         if not isinstance(f, dict) or not isinstance(f.get('name'), str):
             continue
-        parts = [p for p in f['name'].split('/') if p]
-        if len(parts) < 2 or '..' in parts:
+        # Normalise first ('&' dropped), then validate: '&..' would pass a
+        # check made before dropping and climb out of the folder after it.
+        parts = [webdav_name(p) for p in f['name'].split('/') if p]
+        if len(parts) < 2 or not all(_safe_component(p) for p in parts):
             return None
         if folder is None:
             folder = parts[0]
         elif parts[0] != folder:
             return None                        # one torrent, one folder
         size = f.get('size')
-        files.append(FastLaneFile(webdav_name('/'.join(parts[1:])),
+        files.append(FastLaneFile('/'.join(parts[1:]),
                                   size if isinstance(size, int) and size >= 0 else 0,
                                   f.get('id')))
     if not folder or not files or is_obfuscated_name(folder):
@@ -79,7 +87,7 @@ def entry_from_record(record, now):
         tid = int(record['id'])
     except (TypeError, ValueError):
         return None
-    return FastLaneEntry(tid, webdav_name(folder), files,
+    return FastLaneEntry(tid, folder, files,
                          float(_parse_tb_timestamp(record.get('created_at'))), float(now))
 
 
@@ -93,6 +101,12 @@ def _load():
             for raw in json.load(fh):
                 raw['files'] = [FastLaneFile(**f) for f in raw.get('files') or []]
                 e = FastLaneEntry(**raw)
+                if not _safe_component(e.folder) or not all(
+                        p and all(_safe_component(c) for c in p.split('/'))
+                        for p in (f.path for f in e.files)):
+                    logger.warning(f"[fast-lane] skipping a registry entry with an unsafe "
+                                   f"name (torrent {e.torrent_id})")
+                    continue
                 _entries[e.torrent_id] = e
     except FileNotFoundError:
         pass
