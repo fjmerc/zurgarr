@@ -19,6 +19,8 @@ isn't here, open a [GitHub issue](https://github.com/fjmerc/zurgarr/issues).
 - [Plex not seeing debrid content](#plex-not-seeing-debrid-content)
 - [New shows/movies only appear in Plex after a manual scan](#new-showsmovies-only-appear-in-plex-after-a-manual-scan)
 - [A TorBox grab is ready but takes a long time to reach Plex](#a-torbox-grab-is-ready-but-takes-a-long-time-to-reach-plex)
+- [A new TorBox title's link points at `/mnt/debrid_torbox_fast`](#a-new-torbox-titles-link-points-at-mntdebrid_torbox_fast)
+- [A requested title stays Wanted: "result(s) in neither English nor …"](#a-requested-title-stays-wanted-results-in-neither-english-nor-)
 - [Plex shows a title but Sonarr/Radarr still say it's missing](#plex-shows-a-title-but-sonarrradarr-still-say-its-missing)
 - [A download for one show is stuck under a same-name show in Sonarr ("Not an upgrade")](#a-download-for-one-show-is-stuck-under-a-same-name-show-in-sonarr-not-an-upgrade)
 - [Plex shows the same episode or movie two or more times](#plex-shows-the-same-episode-or-movie-two-or-more-times)
@@ -358,6 +360,40 @@ TorBox itself — Wanted recovery and the search page's Add button — are watch
 the same way (they used to wait for the mount's 2-hour re-read); a restart
 mid-watch leaves them to the scheduled scan. To nudge one yourself, run
 `library_scan` from System → Tasks.
+
+To skip the wait altogether, turn on `TORBOX_FAST_LANE` (see the next entry):
+copies zurgarr adds are then linked within about a minute, before TorBox lists
+them.
+
+## A new TorBox title's link points at `/mnt/debrid_torbox_fast`
+
+That's the TorBox fast lane (`TORBOX_FAST_LANE`), working as intended. A copy
+zurgarr adds to TorBox is linked through zurgarr's own folder, built from the
+TorBox API, because TorBox's WebDAV lists it 2–10 minutes later. Once TorBox
+has listed the whole folder on two reads 30 minutes apart, zurgarr moves the
+link to `/mnt/debrid_torbox` — same link path, same file, so Plex and
+Sonarr/Radarr notice nothing — and the System → Tasks `fast_lane_switchback`
+job says so.
+
+If fast-lane titles don't play:
+
+- **The Plex host and the Sonarr/Radarr host both need the fast-lane mount** at
+  `BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX_FAST` (default
+  `<BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX>_fast`). On the Plex host it's
+  zurgarr's own mount (`/data/<TORBOX_MOUNT_NAME>_fast` in the container);
+  the Sonarr/Radarr host mounts zurgarr's fast-lane WebDAV on
+  `TORBOX_FAST_LANE_PORT` (default 9098) with rclone. That WebDAV needs a login:
+  user `zurgarr`, with a password zurgarr generates once and keeps in
+  `/config/fast_lane_auth.json` (the same obscured password is in the
+  `[torbox_fast]` section of `/config/rclone.config`).
+- **A title still in the fast lane after a day** gets a warning in Activity
+  ("Still in the TorBox fast lane after a day"): TorBox's WebDAV doesn't list
+  it under a name zurgarr can match (some unicode or special characters are
+  renamed). It keeps playing from the fast lane. Check the TorBox mount for the
+  folder under another name.
+- A copy zurgarr can't get a TorBox download link for — TorBox errors, or
+  zurgarr's limit of 10 download-link requests a minute — skips the fast lane
+  and takes the normal path.
 
 ## New shows/movies only appear in Plex after a manual scan
 

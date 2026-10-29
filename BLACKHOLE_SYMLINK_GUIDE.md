@@ -219,6 +219,7 @@ Add these to your `.env` file or set them directly in `docker-compose.yml`:
 | `BLACKHOLE_DIR` | No | `/watch` | Directory to watch for `.torrent`/`.magnet` files |
 | `BLACKHOLE_POLL_INTERVAL` | No | `5` | Seconds between scans of the watch directory |
 | `BLACKHOLE_DEBRID` | No | auto-detect | Debrid service: `realdebrid`, `alldebrid`, or `torbox`. Auto-detected from API keys if not set. |
+| `TORBOX_FAST_LANE` | No | `false` | Link TorBox grabs through zurgarr's fast lane within about a minute, before TorBox's WebDAV lists them; links move to the TorBox path once it does. Sonarr/Radarr need the fast-lane mount at `BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX_FAST` (default `/mnt/debrid_torbox_fast` next to `/mnt/debrid_torbox`) — see TROUBLESHOOTING.md. |
 | `BLACKHOLE_SYMLINK_ENABLED` | Yes | `false` | Enable symlink creation after debrid download |
 | `BLACKHOLE_COMPLETED_DIR` | No | `/completed` | Directory where symlinks are created |
 | `BLACKHOLE_RCLONE_MOUNT` | No | `/data` | Path to the rclone mount inside the container. If `RCLONE_MOUNT_NAME` is set (e.g., `zurgarr`), use `/data/<mount_name>` (e.g., `/data/zurgarr`). |

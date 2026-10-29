@@ -121,6 +121,7 @@ def test_cards_follow_each_jobs_prerequisites(hiw_env):
     hiw_env.setenv('LIBRARY_DUPLICATE_TIDY', 'true')
     hiw_env.setenv('LIBRARY_PREFERENCE_AUTO_ENFORCE', 'true')
     hiw_env.setenv('TORRENTIO_URL', 'https://torrentio.example')
+    hiw_env.setenv('TORBOX_FAST_LANE', 'true')
     assert not any(j['off'] for j in _data()['jobs'])
     hiw_env.setenv('STATUS_UI_ENABLED', 'false')
     off = {j['key'] for j in _data()['jobs'] if j['off']}
@@ -128,7 +129,7 @@ def test_cards_follow_each_jobs_prerequisites(hiw_env):
     hiw_env.setenv('STATUS_UI_ENABLED', 'true')
     hiw_env.setenv('BLACKHOLE_SYMLINK_ENABLED', 'false')
     off = {j['key'] for j in _data()['jobs'] if j['off']}
-    assert off == {'scan', 'verify', 'tidy'}    # the scan still runs, but links nothing
+    assert off == {'scan', 'verify', 'tidy', 'fastlane'}    # the scan still runs, but links nothing
     hiw_env.setenv('BLACKHOLE_SYMLINK_ENABLED', 'true')
     hiw_env.setenv('PLEX_REFRESH', 'false')
     assert _job(_data(), 'rescan')['off']
@@ -277,3 +278,15 @@ def test_embedded_data_cannot_close_its_script_tag(hiw_env, monkeypatch):
 def test_wanted_card_shows_its_pace(hiw_env):
     hiw_env.setenv('LIBRARY_SCAN_INTERVAL', '3600')
     assert _job(_data(), 'wanted')['when'] == 'Every hour, with the scan'
+
+
+def test_fast_lane_card_follows_its_setting(hiw_env):
+    """The TorBox fast lane: off until TORBOX_FAST_LANE (and the blackhole's
+    symlink mode, which admits zurgarr's own adds) are on."""
+    data = _data()
+    card = _job(data, 'fastlane')
+    assert card['off']
+    assert ['tbmount', 'links'] in card['links']
+    hiw_env.setenv('TORBOX_FAST_LANE', 'true')
+    hiw_env.setenv('BLACKHOLE_SYMLINK_ENABLED', 'true')
+    assert not _job(_data(), 'fastlane')['off']

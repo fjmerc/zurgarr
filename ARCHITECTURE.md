@@ -539,6 +539,21 @@ This is the most common source of confusion. Symlinks are created inside Zurgarr
 └─────────────────────────────────────┘
 ```
 
+### TorBox fast lane (`TORBOX_FAST_LANE`)
+
+A third (mount, link base) pair next to Zurg's and TorBox's: zurgarr serves a
+read-only WebDAV (`utils/fast_lane_server.py`, Basic auth, port
+`TORBOX_FAST_LANE_PORT`) listing only the TorBox torrents it added whose files
+TorBox's WebDAV doesn't list yet (`utils/fast_lane_registry.py`), named, sized
+and dated exactly as TorBox's WebDAV will show them; file reads are 302s to
+TorBox download links (`utils/fast_lane_links.py`, throttled). zurgarr mounts it
+at `/data/<TORBOX_MOUNT_NAME>_fast`; links into it use
+`BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX_FAST` (`/mnt/debrid_torbox_fast`), which
+the Plex host maps to that mount and the Sonarr/Radarr host mounts over the
+LAN. `fast_lane_switchback` repoints each link to the TorBox base once TorBox
+lists the folder — same link path, identical file — and link checks never touch
+a link whose torrent is still in the lane (`fast_lane.protected`).
+
 ### Path Translation in Code
 
 When **creating** symlinks (blackhole.py, library.py):
@@ -634,6 +649,7 @@ All tasks registered in `scheduled_tasks.register_all()`, executed by `task_sche
 | `clean_stale_queue` | 15min | 2min | Blackhole + (Sonarr or Radarr) | Deletes stale queue items from arr; re-imports blackhole downloads the arr filed under a same-name title (grab matched by the torrent hash recorded on `blackhole_new_import`), warns on ones it already imported there |
 | `library_scan` | 1h | 2min | Status UI enabled | Enforces preferences, escalates stuck pending, warns stalled (24h+), creates symlinks, triggers arr rescans, TMDB API calls |
 | `new_request_check` | 5min | 3min | Status UI enabled; acts only with Wanted recovery on | For titles added to Sonarr/Radarr in the last hour that they grabbed nothing for (missing, past a 2-min grace for their own search), queues the library scan with a Wanted-recovery pass (`blackhole._request_wanted_scan`), once per title |
+| `fast_lane_switchback` | 2min | 1min | `TORBOX_FAST_LANE` on | Moves TorBox fast-lane links to the TorBox mount once TorBox's WebDAV lists the folder complete on two reads 30 minutes apart (`utils/fast_lane_switchback.py`); drops torrents that left the account; warns once for one still unmatched after a day |
 | `verify_symlinks` | 6h | 10min | Blackhole symlinks enabled | Deletes/repairs broken symlinks, cleans empty dirs, optionally triggers arr re-search |
 | `duplicate_tidy` | 6h | 30min | Blackhole symlinks enabled; acts only with `LIBRARY_DUPLICATE_TIDY=true` | Removes debrid symlinks duplicating the arr's tracked file (manifest `/config/duplicate_tidy_manifest.tsv`), deletes the now-unavailable Plex version, restores a changed Plex date added |
 | `plex_unavailable_rescan` | 3h | 10min | Always registered; acts only with `PLEX_REFRESH=true` and a Plex address/token | Touches and partial-scans (up to 100 per run, 10 min of file checks per media type) the folders of versions Plex marked unavailable (`deletedAt`) whose parts all play again — the marks a scan during a mount outage leaves. Skips folders with any link to a mount that isn't answering, root-level files, and the whole run while Plex auto-empties trash; logs `plex_rescan` only for versions Plex's recount shows cleared; folders that don't clear in 2 runs are held 24h, and a run stopped by its cap/budget resumes there next time (both in memory) |

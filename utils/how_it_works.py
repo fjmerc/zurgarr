@@ -58,6 +58,11 @@ def _wanted_leg_enabled():
         return False
 
 
+def _fast_lane_on():
+    from utils.debrid_routing import fast_lane_enabled
+    return fast_lane_enabled()
+
+
 def _missing(*requirements):
     """The first unmet requirement's name, or None when all are met.
     Mirrors the gates in scheduled_tasks.register_all and in each task, so a
@@ -266,6 +271,19 @@ def build_data():
                  'soon as TorBox lists it; otherwise the next scan links it. Needs Torrentio or '
                  'Prowlarr.',
          'links': [['arr', 'tbmount'], ['arr', 'rdmount']]},
+        {'key': 'fastlane', 'code': 'F', 'title': 'TorBox fast lane',
+         'when': 'As each TorBox copy zurgarr adds is ready; links move back '
+                 + interval('fast_lane_switchback', default=scheduled_tasks._FAST_LANE_SWITCHBACK_INTERVAL).lower(),
+         'needs': gate('fast_lane_switchback', (_fast_lane_on(), 'TORBOX_FAST_LANE')) or _missing(
+             (symlinks, 'BLACKHOLE_SYMLINK_ENABLED')),
+         'short': 'Links new TorBox copies in about a minute, before TorBox lists them.',
+         'text': 'TorBox lists a new copy 2\u201310 minutes after it\u2019s ready. For copies zurgarr '
+                 'adds itself (grabs, Wanted recovery, the search page, rescues), it links them '
+                 'through its own folder built from the TorBox API within about a minute, then '
+                 'moves each link to the normal TorBox folder once TorBox lists it there for '
+                 '30 minutes \u2014 the link\u2019s path never changes, so Plex and Sonarr/Radarr '
+                 'notice nothing. A copy it can\u2019t get a download link for takes the normal path.',
+         'links': [['tbmount', 'links'], ['links', 'arr']]},
         {'key': 'prefer', 'code': 'P', 'title': 'Prefer cloud / local',
          'when': 'With each scan and ' + interval(
              'enforce_preferences', 'PREFERENCE_ENFORCE_INTERVAL').lower(),

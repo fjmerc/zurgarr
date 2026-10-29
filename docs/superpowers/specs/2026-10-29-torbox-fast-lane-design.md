@@ -163,6 +163,16 @@ already plays.
    links then dangle exactly as they would today and the existing clean-up
    handles them.
 
+## Login (added during implementation)
+
+The fast lane's WebDAV hands out TorBox download links, and each first read
+spends the TorBox link budget, so every request needs a login: user `zurgarr`
+and a random password zurgarr generates once and keeps in
+`/config/fast_lane_auth.json` (mode 0600). zurgarr's own rclone remote carries
+it obscured; the Sonarr/Radarr host's mount gets it the same way (the host
+setup reads it from zurgarr's `/config/rclone.config`). Raised by the security
+review of the first server commit.
+
 ## TorBox API budget
 
 - Listing: **no new calls.** The registry reuses the add sites' existing

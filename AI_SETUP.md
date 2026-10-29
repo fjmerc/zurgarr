@@ -51,6 +51,7 @@ SETTINGS THIS SETUP NEEDS (names exactly as in CONFIGURATION.md; .env.example ha
 - The Settings page and dashboard buttons that change things: STATUS_UI_AUTH=user:password.
 - TZ (otherwise UTC).
 - TorBox as well: TORBOX_API_KEY, TORBOX_WEBDAV_USER, TORBOX_WEBDAV_PASS.
+- Faster TorBox arrivals (optional): TORBOX_FAST_LANE=true, with blackhole symlink mode on, and the fast-lane mount at BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX_FAST on both the Plex host and the Sonarr/Radarr host (the latter mounts zurgarr's WebDAV on TORBOX_FAST_LANE_PORT; login in /config/fast_lane_auth.json). TROUBLESHOOTING.md: "A new TorBox title's link points at /mnt/debrid_torbox_fast".
 - Sonarr/Radarr blackhole with symlinks:
   - BLACKHOLE_ENABLED=true and BLACKHOLE_SYMLINK_ENABLED=true.
   - BLACKHOLE_SYMLINK_TARGET_BASE: the mount path as Sonarr/Radarr/Plex see it; startup refuses it if it's missing.
