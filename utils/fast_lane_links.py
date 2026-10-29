@@ -38,6 +38,9 @@ FAILED_RETRY_AFTER_S = 300       # a file TorBox refused isn't asked about again
 PREFETCH_MAX = 3                 # admission checks this many videos; the rest on first open
 RETRY_DELAYS = (1, 4, 16)
 _TIMEOUT = 30
+# TorBox's edge refuses Python's default urllib client (bare 403); zurgarr's
+# urllib calls identify themselves, as in search.py.
+_USER_AGENT = 'zurgarr/1.0'
 
 _lock = threading.Lock()          # guards the dicts and the throttle, never held over I/O
 _links = {}                       # (torrent_id, file_id) -> _Link
@@ -71,7 +74,8 @@ def _fetch(params):
     """GET requestdl; ``(status, parsed body or None, Retry-After or None)``."""
     url = _REQUESTDL + '?' + urllib.parse.urlencode(params)
     try:
-        with urllib.request.urlopen(urllib.request.Request(url), timeout=_TIMEOUT) as r:
+        req = urllib.request.Request(url, headers={'User-Agent': _USER_AGENT})
+        with urllib.request.urlopen(req, timeout=_TIMEOUT) as r:
             return r.status, json.loads(r.read().decode('utf-8') or 'null'), None
     except urllib.error.HTTPError as e:
         return e.code, None, e.headers.get('Retry-After') if e.headers else None
@@ -82,7 +86,7 @@ def _fetch(params):
 def _link_works(url):
     """A 1-byte read of the link itself — costs no API call."""
     try:
-        req = urllib.request.Request(url, headers={'Range': 'bytes=0-0'})
+        req = urllib.request.Request(url, headers={'Range': 'bytes=0-0', 'User-Agent': _USER_AGENT})
         with urllib.request.urlopen(req, timeout=15) as r:
             return r.status in (200, 206)
     except (urllib.error.URLError, OSError, ValueError):

@@ -219,3 +219,24 @@ def test_calls_are_counted(wire, monkeypatch):
     monkeypatch.setattr('utils.metrics.metrics.inc', lambda name, *a, **k: counted.append(name))
     fl.link_for(1, 2)
     assert counted == ['fast_lane_requestdl']
+
+
+def test_requests_identify_as_zurgarr(monkeypatch):
+    """TorBox's edge refuses Python's default urllib client with a bare 403
+    (live 2026-10-29); every zurgarr urllib call to TorBox sends its own
+    User-Agent."""
+    seen = []
+
+    class R:
+        status = 200
+        def read(self):
+            return b'{"data": "https://cdn.example/x"}'
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+    monkeypatch.setattr(fl.urllib.request, 'urlopen',
+                        lambda req, timeout=30: seen.append(req.get_header('User-agent')) or R())
+    fl._fetch({'token': 'k', 'torrent_id': 1, 'file_id': 2})
+    fl._link_works('https://cdn.example/x')
+    assert seen == ['zurgarr/1.0', 'zurgarr/1.0']

@@ -359,3 +359,12 @@ def test_task_kept_while_entries_remain_with_the_lane_off(env, monkeypatch):
     _entry()
     st.register_all()
     assert 'fast_lane_switchback' in registered
+
+
+def test_account_check_identifies_as_zurgarr(monkeypatch):
+    seen = []
+    monkeypatch.setattr('base.load_secret_or_env', lambda name: 'k')
+    monkeypatch.setattr(sb.urllib.request, 'urlopen',
+                        lambda req, timeout=30: seen.append(req.get_header('User-agent')) or _Resp({'success': True, 'data': {'id': 1}}))
+    sb._account_has(1)
+    assert seen == ['zurgarr/1.0']

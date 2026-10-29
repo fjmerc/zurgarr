@@ -67,7 +67,8 @@ def _account_has(torrent_id):
         pass
     url = ('https://api.torbox.app/v1/api/torrents/mylist?'
            + urllib.parse.urlencode({'id': torrent_id, 'bypass_cache': 'true'}))
-    req = urllib.request.Request(url, headers={'Authorization': f'Bearer {key}'})
+    req = urllib.request.Request(url, headers={'Authorization': f'Bearer {key}',
+                                               'User-Agent': 'zurgarr/1.0'})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             body = json.loads(r.read().decode('utf-8') or 'null')
