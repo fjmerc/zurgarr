@@ -9260,6 +9260,15 @@ class TestRecoverWantedViaTorbox:
         assert [a['info_hash'] for a in wire['adds']] == ['b' * 40]
         assert "dropped 1/2 result(s) in neither English nor Korean for 'Hope'" in caplog.text
 
+    def test_log_names_the_one_language_when_it_is_the_original(self, wire, monkeypatch, caplog):
+        import logging
+        wire['torrentio'] = [self._r('a', 'The.Night.Of.S01.FRENCH.1080p', {'French'}),
+                             self._r('b', 'The.Night.Of.S01.1080p.BluRay')]
+        self._lang_profile(monkeypatch, {'id': 1, 'name': 'English'})
+        with caplog.at_level(logging.INFO):
+            self._run(self._scanner(), 'English', monkeypatch, title='The Night Of')
+        assert "dropped 1/2 result(s) not in English for 'The Night Of'" in caplog.text
+
     def test_original_language_copy_is_kept_on_an_english_profile(self, wire, monkeypatch):
         """Das Boot: a German copy is the film's own language."""
         wire['torrentio'] = [self._r('a', 'Das.Boot.1981.GERMAN.1080p', {'German'})]

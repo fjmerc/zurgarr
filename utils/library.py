@@ -6096,11 +6096,11 @@ class LibraryScanner:
                     or any(language_matches(l, ok) for l in langs)):
                 kept.append(r)
         if len(kept) < len(results or []):
-            names = (f"neither {want} nor {original}"
+            names = (f"in neither {want} nor {original}"
                      if original and original.lower() != want.lower() else f"not in {want}")
             logger.info(
                 f"[library] Wanted recovery dropped {len(results) - len(kept)}"
-                f"/{len(results)} {source}result(s) in {names} for '{media_title}'")
+                f"/{len(results)} {source}result(s) {names} for '{media_title}'")
         return kept
 
     @staticmethod
