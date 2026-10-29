@@ -3723,6 +3723,39 @@ class LibraryScanner:
         return missing
 
     @staticmethod
+    def _discover_fast_lane_mount(tb_mount):
+        """The TorBox fast lane's mount next to *tb_mount*, or None when the
+        lane is off or its mount isn't up (links there would dangle)."""
+        from utils.debrid_routing import TORBOX_FAST, fast_lane_enabled, mount_for_debrid
+        if not tb_mount or not fast_lane_enabled():
+            return None
+        path = mount_for_debrid(TORBOX_FAST, rclone_mount_base=os.path.dirname(
+            os.path.normpath(tb_mount)))
+        return path if path and os.path.isdir(path) else None
+
+    @classmethod
+    def _debrid_mount_target_pairs(cls, real_mount, symlink_base):
+        """Per-debrid (rclone mount, symlink target base) pairs: Zurg's first
+        (the primary), then TorBox's and the TorBox fast lane's when their
+        mounts are up — so episodes on each get links at their own base,
+        keeping the RD/TB split Plex libraries depend on."""
+        pairs = [(real_mount, symlink_base)]
+        try:
+            from utils.debrid_routing import TORBOX, TORBOX_FAST, symlink_target_base_for_debrid
+            tb_mount = cls._discover_torbox_mount()
+            if tb_mount:
+                tb_base = symlink_target_base_for_debrid(TORBOX)
+                if tb_base:
+                    pairs.append((os.path.realpath(tb_mount), tb_base))
+                fast_mount = cls._discover_fast_lane_mount(tb_mount)
+                fast_base = symlink_target_base_for_debrid(TORBOX_FAST)
+                if fast_mount and fast_base:
+                    pairs.append((os.path.realpath(fast_mount), fast_base))
+        except Exception as e:
+            logger.debug(f"[library] TB symlink pair resolution failed: {e}")
+        return pairs
+
+    @staticmethod
     def _discover_torbox_mount():
         """Return the TorBox rclone-mount path inside the container, or
         ``None`` when TB isn't configured / hasn't come up yet.
@@ -8208,17 +8241,7 @@ class LibraryScanner:
         # skips every TB-source episode and only RD content ever gets
         # symlinked into the local arr library — the load-bearing
         # final step of plan 39 phase 4 that wasn't wired up.
-        _mount_target_pairs = [(real_mount, symlink_base)]
-        try:
-            from utils.debrid_routing import TORBOX, symlink_target_base_for_debrid as _tb_base_for
-            _tb_mount = self._discover_torbox_mount()
-            if _tb_mount:
-                _tb_real = os.path.realpath(_tb_mount)
-                _tb_symlink_base = _tb_base_for(TORBOX)
-                if _tb_symlink_base:
-                    _mount_target_pairs.append((_tb_real, _tb_symlink_base))
-        except Exception as e:
-            logger.debug(f"[library] TB symlink pair resolution failed: {e}")
+        _mount_target_pairs = self._debrid_mount_target_pairs(real_mount, symlink_base)
 
         # Debrid files the blackhole handed to Sonarr/Radarr moments ago:
         # their queue may not list the download yet.
@@ -9938,6 +9961,17 @@ class LibraryScanner:
         # char folders rclone renames, which a FUSE walk wouldn't serve either.
         folders = {}
         folder_created = {}
+        # Torrents in the TorBox fast lane (utils/fast_lane.py) are linked
+        # through its mount, in TorBox's WebDAV spelling, until switch-back.
+        fast_mount = self._discover_fast_lane_mount(tb_mount)
+        fast_folders = {}
+        if fast_mount:
+            from utils import fast_lane
+            from utils.fast_lane_registry import webdav_name
+
+        def _folder_path(folder_name):
+            fast = fast_folders.get(folder_name)
+            return os.path.join(fast_mount, fast) if fast else os.path.join(tb_mount, folder_name)
         for t in torrents:
             # list_torbox_torrents normalizes its output, but guard defensively
             # so one malformed entry degrades to a skip rather than raising and
@@ -9981,6 +10015,12 @@ class LibraryScanner:
                 if not isinstance(size, int) or size < 0:
                     size = 0
                 synth_path = os.path.join(tb_mount, *parts)
+                if fast_mount:
+                    if folder_name not in fast_folders:
+                        fast_folders[folder_name] = fast_lane.registered_folder(folder_name)
+                    if fast_folders[folder_name]:
+                        synth_path = os.path.join(fast_mount, fast_folders[folder_name],
+                                                  *(webdav_name(p) for p in subparts))
                 bucket = folders.setdefault(
                     folder_name, {'files': [], 'season_files': {}})
                 folder_created[folder_name] = max(
@@ -10019,13 +10059,13 @@ class LibraryScanner:
                 key, year = _show_group_key(
                     title, year, collision_bases, episodes)
                 _merge_show_group(show_groups, key, title, year, episodes,
-                                  os.path.join(tb_mount, folder_name))
+                                  _folder_path(folder_name))
                 g = show_groups[key]
                 if created > g.get('date_added', 0):
                     g['date_added'] = created
             else:
                 key = _normalize_title(title)
-                path = os.path.join(tb_mount, folder_name)
+                path = _folder_path(folder_name)
                 if key not in movie_groups:
                     movie_groups[key] = {
                         'title': title,

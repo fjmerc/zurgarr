@@ -8644,6 +8644,51 @@ class TestScanTorboxViaApi:
             self.TB_MOUNT, 'Cool.Show.S01.1080p', 'Cool.Show.S01E01.mkv')
         assert ep['path'].startswith(self.TB_MOUNT + os.sep)
 
+    # ── the TorBox fast lane ──────────────────────────────────────────
+
+    @pytest.fixture
+    def lane(self, tmp_path, monkeypatch):
+        import utils.fast_lane_registry as reg
+        monkeypatch.setenv('TORBOX_FAST_LANE', 'true')
+        monkeypatch.setattr(reg, 'REGISTRY_PATH', str(tmp_path / 'fast_lane.json'))
+        reg._reset_for_tests()
+        monkeypatch.setattr(LibraryScanner, '_discover_fast_lane_mount',
+                            staticmethod(lambda tb_mount: '/data/torbox_fast'))
+        yield reg
+        reg._reset_for_tests()
+
+    def _register(self, reg, folder, tid=1):
+        reg.admit(reg.FastLaneEntry(tid, folder, [reg.FastLaneFile('x.mkv', 1, 1)], 0.0, 0.0))
+
+    def test_registered_movie_path_is_under_the_fast_mount(self, lane):
+        self._register(lane, 'Big.Movie.2021.1080p')
+        torrents = [
+            {'name': 'Big.Movie.2021.1080p',
+             'files': [{'name': 'Big.Movie.2021.1080p/big.mkv', 'size': 10}]},
+            {'name': 'Other.Movie.2020.1080p',
+             'files': [{'name': 'Other.Movie.2020.1080p/other.mkv', 'size': 10}]},
+        ]
+        _, movies, _ = self._scan(torrents)
+        paths = {m['title']: m['path'] for m in movies}
+        assert paths['Big Movie'] == '/data/torbox_fast/Big.Movie.2021.1080p'
+        assert paths['Other Movie'] == os.path.join(self.TB_MOUNT, 'Other.Movie.2020.1080p')
+
+    def test_registered_season_pack_episodes_are_under_the_fast_mount(self, lane):
+        """Sonarr parity, and TorBox's spelling: every '&' dropped."""
+        self._register(lane, 'Law  Order.S01.1080p')
+        torrents = [{'name': 'Law & Order.S01.1080p', 'files': [
+            {'name': 'Law & Order.S01.1080p/Law & Order.S01E01.mkv', 'size': 5}]}]
+        _, _, shows = self._scan(torrents)
+        ep = shows[0]['_episodes'][(1, 1)]
+        assert ep['path'] == '/data/torbox_fast/Law  Order.S01.1080p/Law  Order.S01E01.mkv'
+
+    def test_fast_lane_off_leaves_every_path_on_the_torbox_mount(self, lane, monkeypatch):
+        self._register(lane, 'Big.Movie.2021.1080p')
+        monkeypatch.setenv('TORBOX_FAST_LANE', 'false')
+        _, movies, _ = self._scan([{'name': 'Big.Movie.2021.1080p',
+                                   'files': [{'name': 'Big.Movie.2021.1080p/big.mkv', 'size': 10}]}])
+        assert movies[0]['path'] == os.path.join(self.TB_MOUNT, 'Big.Movie.2021.1080p')
+
     def test_movie_quality_and_size_from_api(self):
         """Movies must carry quality + size derived from the API file data,
         not all-None / 0 (the UI sorts and displays on these)."""
@@ -11623,3 +11668,38 @@ class TestRecentLinks:
             sc.scan()
         assert effects == []
         assert 'skipping this scan' in caplog.text
+
+
+
+class TestFastLaneMountPairs:
+    """The fast lane is a third (mount, link base) pair, so links into it
+    resolve and are checked like the others."""
+
+    def test_pairs_include_the_fast_lane_when_its_mount_is_up(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('TORBOX_FAST_LANE', 'true')
+        monkeypatch.setenv('BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX', '/mnt/debrid_torbox')
+        tb, fast = tmp_path / 'torbox', tmp_path / 'torbox_fast'
+        tb.mkdir(); fast.mkdir()
+        monkeypatch.setattr(LibraryScanner, '_discover_torbox_mount', staticmethod(lambda: str(tb)))
+        monkeypatch.setattr(LibraryScanner, '_discover_fast_lane_mount',
+                            staticmethod(lambda tb_mount: str(fast)))
+        pairs = LibraryScanner._debrid_mount_target_pairs('/data/zurgarr', '/mnt/debrid')
+        assert pairs == [('/data/zurgarr', '/mnt/debrid'),
+                         (os.path.realpath(str(tb)), '/mnt/debrid_torbox'),
+                         (os.path.realpath(str(fast)), '/mnt/debrid_torbox_fast')]
+
+    def test_no_fast_pair_when_the_lane_is_off(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('TORBOX_FAST_LANE', 'false')
+        tb = tmp_path / 'torbox'
+        tb.mkdir()
+        (tmp_path / 'torbox_fast').mkdir()
+        assert LibraryScanner._discover_fast_lane_mount(str(tb)) is None
+
+    def test_fast_mount_found_next_to_the_torbox_mount(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('TORBOX_FAST_LANE', 'true')
+        monkeypatch.setattr('utils.boot_layout.torbox_mount_name', lambda: 'torbox')
+        tb = tmp_path / 'torbox'
+        tb.mkdir()
+        assert LibraryScanner._discover_fast_lane_mount(str(tb)) is None       # not mounted yet
+        (tmp_path / 'torbox_fast').mkdir()
+        assert LibraryScanner._discover_fast_lane_mount(str(tb)) == str(tmp_path / 'torbox_fast')
