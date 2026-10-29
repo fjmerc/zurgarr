@@ -748,7 +748,8 @@ def verify_symlinks():
                     repaired_stranded += 1
                 if stranded:
                     continue          # in the fast lane, or repointed at TorBox
-                if (target.startswith(fast_lane.fast_base() + '/') and not fast_pair):
+                if (fast_lane.fast_base() and not fast_pair
+                        and target.startswith(fast_lane.fast_base() + '/')):
                     continue          # lane off and no TorBox copy: can't judge it
                 checked += 1
                 # Translate the symlink target back to a local mount path

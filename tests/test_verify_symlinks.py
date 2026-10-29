@@ -955,3 +955,14 @@ class TestStrandedFastLaneLinks:
         link = _make_symlink(symlink_env['local_tv'], 'g.mkv', off + '_fast/Gone.S01/g.mkv')
         verify_symlinks()
         assert os.readlink(link) == off + '_fast/Gone.S01/g.mkv'
+
+
+def test_no_fast_lane_base_never_skips_every_link(symlink_env, monkeypatch):
+    """An empty fast-lane base must not turn the check into a no-op ('/'
+    prefixes every link)."""
+    from utils.scheduled_tasks import verify_symlinks
+    monkeypatch.setattr('utils.fast_lane.fast_base', lambda: '')
+    link = _make_symlink(symlink_env['completed'], 'ep.mkv',
+                         os.path.join(symlink_env['mount'], 'shows', 'gone', 'ep.mkv'))
+    verify_symlinks()
+    assert not os.path.lexists(link)
