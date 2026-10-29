@@ -2223,3 +2223,16 @@ class TestRescueThroughTheFastLane:
     def test_non_torbox_alt_is_never_admitted(self, monkeypatch):
         monkeypatch.setattr('utils.fast_lane.admit_record', lambda rec: pytest.fail('not TorBox'))
         assert debrid_health._rescue_link_target('realdebrid', MagicMock(), '5') == 'realdebrid'
+
+
+def test_rescue_retarget_leaves_fast_lane_links_alone(tmp_path, monkeypatch):
+    lib = tmp_path / 'lib'
+    monkeypatch.setenv('BLACKHOLE_SYMLINK_TARGET_BASE', '/mnt/debrid')
+    monkeypatch.setenv('BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX', '/mnt/debrid_torbox')
+    monkeypatch.setenv('BLACKHOLE_LOCAL_LIBRARY_TV', str(lib))
+    monkeypatch.delenv('BLACKHOLE_LOCAL_LIBRARY_MOVIES', raising=False)
+    (lib / 'Show').mkdir(parents=True)
+    link = lib / 'Show' / 'e.mkv'
+    os.symlink('/mnt/debrid_torbox_fast/Show.S01/e.mkv', str(link))
+    assert debrid_health._retarget_symlinks_to_alt('A' * 40, 'x', candidates={'Show.S01'}) == 0
+    assert os.readlink(str(link)) == '/mnt/debrid_torbox_fast/Show.S01/e.mkv'

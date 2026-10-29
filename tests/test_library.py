@@ -8682,6 +8682,16 @@ class TestScanTorboxViaApi:
         ep = shows[0]['_episodes'][(1, 1)]
         assert ep['path'] == '/data/torbox_fast/Law  Order.S01.1080p/Law  Order.S01E01.mkv'
 
+    @pytest.mark.parametrize('subparts, expected', [
+        (['Season 1', 'E01 & More.mkv'], '/data/torbox_fast/F/Season 1/E01  More.mkv'),
+        (['&..', 'x.mkv'], None),              # '..' once TorBox drops the '&'
+        (['.', 'x.mkv'], None),
+        (['a\\b.mkv'], None),
+    ])
+    def test_fast_lane_path_never_climbs_out_of_its_folder(self, subparts, expected):
+        from utils.library import _fast_lane_synth_path
+        assert _fast_lane_synth_path('/data/torbox_fast', 'F', subparts) == expected
+
     def test_fast_lane_off_leaves_every_path_on_the_torbox_mount(self, lane, monkeypatch):
         self._register(lane, 'Big.Movie.2021.1080p')
         monkeypatch.setenv('TORBOX_FAST_LANE', 'false')
@@ -11703,3 +11713,60 @@ class TestFastLaneMountPairs:
         assert LibraryScanner._discover_fast_lane_mount(str(tb)) is None       # not mounted yet
         (tmp_path / 'torbox_fast').mkdir()
         assert LibraryScanner._discover_fast_lane_mount(str(tb)) == str(tmp_path / 'torbox_fast')
+
+
+
+class TestFastLaneCleanupAndPrefixes:
+    @pytest.fixture
+    def fast(self, tmp_dir, monkeypatch):
+        import utils.fast_lane_registry as reg
+        monkeypatch.setenv('TORBOX_FAST_LANE', 'true')
+        monkeypatch.setenv('BLACKHOLE_SYMLINK_TARGET_BASE', '/mnt/debrid')
+        monkeypatch.setenv('BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX', '/mnt/debrid_torbox')
+        monkeypatch.delenv('BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX_FAST', raising=False)
+        monkeypatch.setattr(reg, 'REGISTRY_PATH', os.path.join(tmp_dir, 'fast_lane.json'))
+        reg._reset_for_tests()
+        reg.admit(reg.FastLaneEntry(1, 'Kept.S01', [reg.FastLaneFile('k.mkv', 1, 1)], 0.0, 0.0))
+        yield reg
+        reg._reset_for_tests()
+
+    def test_prefixes_include_the_fast_lane_base(self, fast):
+        from utils.library import _all_debrid_symlink_prefixes
+        assert '/mnt/debrid_torbox_fast/' in _all_debrid_symlink_prefixes()
+
+    def test_fast_lane_link_folder_is_not_local_content(self, fast, tmp_dir):
+        """A folder of fast-lane links is debrid content, not a local copy."""
+        from utils.library import _all_debrid_symlink_prefixes
+        d = os.path.join(tmp_dir, 'Movie (2020)')
+        os.makedirs(d)
+        os.symlink('/mnt/debrid_torbox_fast/Kept.S01/k.mkv', os.path.join(d, 'k.mkv'))
+        assert LibraryScanner._is_debrid_symlink_dir(d, _all_debrid_symlink_prefixes()) is True
+
+    def _cleanup(self, tmp_dir, monkeypatch, target):
+        monkeypatch.setenv('BLACKHOLE_SYMLINK_ENABLED', 'true')
+        rd_mount = os.path.join(tmp_dir, 'rd_mount')
+        os.makedirs(os.path.join(rd_mount, 'shows', '_keep'), exist_ok=True)
+        fast_mount = os.path.join(tmp_dir, 'fast_mount')
+        os.makedirs(fast_mount, exist_ok=True)
+        monkeypatch.setenv('BLACKHOLE_RCLONE_MOUNT', rd_mount)
+        monkeypatch.setattr('utils.fast_lane.mount_pair',
+                            lambda: ('/mnt/debrid_torbox_fast/', fast_mount))
+        local_tv = os.path.join(tmp_dir, 'local_tv')
+        show_dir = os.path.join(local_tv, 'Show', 'Season 01')
+        os.makedirs(show_dir, exist_ok=True)
+        link = os.path.join(show_dir, 'e.mkv')
+        os.symlink(target, link)
+        scanner = LibraryScanner.__new__(LibraryScanner)
+        scanner._local_movies_path = None
+        scanner._local_tv_path = local_tv
+        scanner._discover_torbox_mount = lambda: None
+        scanner._cleanup_broken_debrid_symlinks()
+        return link
+
+    def test_cleanup_keeps_a_registered_fast_lane_link(self, fast, tmp_dir, monkeypatch):
+        link = self._cleanup(tmp_dir, monkeypatch, '/mnt/debrid_torbox_fast/Kept.S01/k.mkv')
+        assert os.path.islink(link)
+
+    def test_cleanup_removes_a_broken_link_no_longer_in_the_lane(self, fast, tmp_dir, monkeypatch):
+        link = self._cleanup(tmp_dir, monkeypatch, '/mnt/debrid_torbox_fast/Gone.S01/g.mkv')
+        assert not os.path.lexists(link)

@@ -161,6 +161,13 @@ def target_mount_pairs():
             pairs.append((os.path.normpath(tb_base) + '/', os.path.realpath(tb_mount)))
     except Exception as e:
         logger.debug("[dedup] TorBox target/mount pair unavailable: %s", e)
+    try:
+        from utils import fast_lane
+        fast_pair = fast_lane.mount_pair()
+        if fast_pair:
+            pairs.append(fast_pair)
+    except Exception as e:
+        logger.debug("[dedup] fast lane target/mount pair unavailable: %s", e)
     return pairs
 
 
@@ -596,7 +603,9 @@ def _removable_link(path, pairs):
     try:
         if time.time() - os.lstat(path).st_mtime < MIN_LINK_AGE:
             return None
-        return os.readlink(path)
+        target = os.readlink(path)
+        from utils import fast_lane
+        return None if fast_lane.protected(target) else target
     except OSError:
         return None
 

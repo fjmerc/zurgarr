@@ -387,7 +387,8 @@ def _all_debrid_symlink_prefixes():
         bases.append(rd)
     try:
         from utils.debrid_routing import VALID_DEBRIDS, symlink_target_base_for_debrid
-        for svc in VALID_DEBRIDS:
+        from utils.debrid_routing import TORBOX_FAST, fast_lane_enabled
+        for svc in VALID_DEBRIDS + ((TORBOX_FAST,) if fast_lane_enabled() else ()):
             try:
                 b = (symlink_target_base_for_debrid(svc) or '').strip()
             except Exception as e:
@@ -1109,6 +1110,19 @@ def _get_folder_mtime(path):
     except OSError as e:
         logger.debug(f"[library] Cannot stat {path}: {e}")
         return 0
+
+
+def _fast_lane_synth_path(fast_mount, fast_folder, subparts):
+    """A TorBox file's path in the fast lane: its parts in TorBox's WebDAV
+    spelling ('&' dropped), or None when a part is unsafe once spelled so
+    ('&..' becomes '..') or the path would leave its folder."""
+    from utils.fast_lane_registry import _safe_component, webdav_name
+    parts = [webdav_name(p) for p in subparts]
+    if not parts or not all(_safe_component(p) for p in parts):
+        return None
+    folder = os.path.join(fast_mount, fast_folder)
+    path = os.path.normpath(os.path.join(folder, *parts))
+    return path if path.startswith(folder + os.sep) else None
 
 
 def _parse_tb_timestamp(value):
@@ -7857,6 +7871,10 @@ class LibraryScanner:
                     debrid_pair_list.append((tb_prefix, tb_real))
         except Exception as exc:
             logger.debug("[library] TB cleanup-pair resolution failed: %s", exc)
+        from utils import fast_lane
+        fast_pair = fast_lane.mount_pair()
+        if fast_pair and fast_pair not in debrid_pair_list:
+            debrid_pair_list.append(fast_pair)
         debrid_prefixes_only = tuple(p for p, _m in debrid_pair_list)
 
         # Per-mount health guard.  A missing or stalled/throttled FUSE mount
@@ -7867,7 +7885,8 @@ class LibraryScanner:
         # deletion below must skip symlinks routed to an unhealthy mount.  The
         # TB mount is flat (no category dirs); RD/Zurg is categorized.
         mount_health = {
-            _m: _mount_has_content(_m, flat=(_m == tb_real))
+            _m: (fast_lane.mount_answers(_m) if fast_pair and _m == fast_pair[1]
+                 else _mount_has_content(_m, flat=(_m == tb_real)))
             for _p, _m in debrid_pair_list
         }
         if not any(mount_health.values()):
@@ -7924,7 +7943,7 @@ class LibraryScanner:
                                         matched_prefix = _p
                                         matched_mount = _m
                                         break
-                                if matched_prefix is None:
+                                if matched_prefix is None or fast_lane.protected(target):
                                     continue
                                 # Translate arr-namespace target to the per-debrid
                                 # rclone mount for existence check.
@@ -9967,7 +9986,6 @@ class LibraryScanner:
         fast_folders = {}
         if fast_mount:
             from utils import fast_lane
-            from utils.fast_lane_registry import webdav_name
 
         def _folder_path(folder_name):
             fast = fast_folders.get(folder_name)
@@ -10019,8 +10037,10 @@ class LibraryScanner:
                     if folder_name not in fast_folders:
                         fast_folders[folder_name] = fast_lane.registered_folder(folder_name)
                     if fast_folders[folder_name]:
-                        synth_path = os.path.join(fast_mount, fast_folders[folder_name],
-                                                  *(webdav_name(p) for p in subparts))
+                        synth_path = _fast_lane_synth_path(
+                            fast_mount, fast_folders[folder_name], subparts)
+                        if synth_path is None:
+                            continue
                 bucket = folders.setdefault(
                     folder_name, {'files': [], 'season_files': {}})
                 folder_created[folder_name] = max(

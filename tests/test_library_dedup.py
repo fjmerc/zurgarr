@@ -2280,3 +2280,23 @@ class TestArrFileMismatchBugHunterPass3:
                                'Daredevil.S01E09.The.End.1080p/Daredevil.S01E09.The.End.1080p.mkv',
                                'X/Daredevil.Born.Again.S01E09.The.End.1080p.mkv', ep=(1, 9))
         assert out == []
+
+
+class TestFastLaneLinks:
+    def test_target_mount_pairs_include_the_fast_lane(self, monkeypatch):
+        from utils import library_dedup
+        monkeypatch.setattr('utils.fast_lane.mount_pair',
+                            lambda: ('/mnt/debrid_torbox_fast/', '/data/torbox_fast'))
+        assert ('/mnt/debrid_torbox_fast/', '/data/torbox_fast') in library_dedup.target_mount_pairs()
+
+    def test_a_link_in_the_fast_lane_is_never_removable(self, tmp_path, monkeypatch):
+        from utils import library_dedup
+        link = tmp_path / 'e.mkv'
+        os.symlink('/mnt/debrid_torbox_fast/Kept.S01/k.mkv', str(link))
+        old = time.time() - 10 * library_dedup.MIN_LINK_AGE
+        os.utime(str(link), (old, old), follow_symlinks=False)
+        pairs = [('/mnt/debrid_torbox_fast/', str(tmp_path))]
+        monkeypatch.setattr('utils.fast_lane.protected', lambda t: True)
+        assert library_dedup._removable_link(str(link), pairs) is None
+        monkeypatch.setattr('utils.fast_lane.protected', lambda t: False)
+        assert library_dedup._removable_link(str(link), pairs) == '/mnt/debrid_torbox_fast/Kept.S01/k.mkv'

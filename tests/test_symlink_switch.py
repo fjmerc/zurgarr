@@ -249,6 +249,26 @@ class TestReplaceLocalWithSymlinks:
 # Pending transitions
 # ---------------------------------------------------------------------------
 
+class TestFastLaneSwitch:
+    def test_episode_in_the_fast_lane_links_to_its_base(self, local_tv, tmp_dir, monkeypatch):
+        """The library reports a fast-lane path for a torrent in the TorBox
+        fast lane; the switch must link it there, not refuse it as outside
+        every mount."""
+        fast = os.path.join(tmp_dir, 'torbox_fast')
+        rel = os.path.join('Show.Name.S01.1080p', 'Show.Name.S01E01.mkv')
+        os.makedirs(os.path.dirname(os.path.join(fast, rel)))
+        open(os.path.join(fast, rel), 'w').close()
+        monkeypatch.setattr('utils.fast_lane.mount_pair',
+                            lambda: ('/mnt/debrid_torbox_fast/', os.path.realpath(fast)))
+        local_path = os.path.join(local_tv, 'Show Name (2025)', 'Season 01',
+                                  'Show Name - S01E01 - Episode Title.mkv')
+        result = lp.replace_local_with_symlinks(
+            [{'local_path': local_path, 'debrid_path': os.path.join(fast, rel)}],
+            local_tv, os.path.join(tmp_dir, 'mount'), '/mnt/debrid')
+        assert result['errors'] == []
+        assert os.readlink(local_path) == '/mnt/debrid_torbox_fast/' + rel
+
+
 class TestPending:
 
     def test_set_and_get_pending(self):

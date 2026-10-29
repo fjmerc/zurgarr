@@ -277,6 +277,14 @@ _folder_refresh_ts = {}  # folder name -> monotonic ts of its last re-list
 _folder_refresh_last = float('-inf')  # monotonic ts of the last re-list of any folder
 
 
+def _fast_lane_protected(target):
+    try:
+        from utils import fast_lane
+        return fast_lane.protected(target)
+    except Exception:
+        return False
+
+
 def _holds_video(path):
     """True when *path* holds a file ``_create_symlinks`` would link (a media
     file that isn't a sample), at any depth."""
@@ -3090,6 +3098,10 @@ class BlackholeWatcher:
                         translations.append((default_base_real, default_mount_real))
                 except OSError:
                     pass
+            from utils import fast_lane
+            fast_pair = fast_lane.mount_pair()
+            if fast_pair:
+                translations.append(fast_pair)
         except Exception as e:
             logger.debug(f"[blackhole] cleanup translation table failed: {e}")
             translations = []
@@ -3119,6 +3131,9 @@ class BlackholeWatcher:
                         target = os.readlink(fp)
                         if not os.path.isabs(target):
                             target = os.path.realpath(os.path.join(os.path.dirname(fp), target))
+                        if _fast_lane_protected(target):
+                            has_valid = True       # in the fast lane: never removed
+                            continue
                         check_target = fp
                         for base_real, mount_real in translations:
                             if target.startswith(base_real):

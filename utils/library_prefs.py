@@ -398,6 +398,13 @@ def replace_local_with_symlinks(episodes, local_tv_path, rclone_mount, symlink_t
             mount_bases.append((os.path.realpath(tb_mount), tb_base))
     except Exception as e:
         logger.debug(f"[library_prefs] TorBox mount pair unavailable: {e}")
+    try:
+        from utils import fast_lane
+        fast_pair = fast_lane.mount_pair()     # (base + '/', mount)
+        if fast_pair:
+            mount_bases.append((fast_pair[1], fast_pair[0].rstrip('/')))
+    except Exception as e:
+        logger.debug(f"[library_prefs] fast lane mount pair unavailable: {e}")
 
     from utils import library as _library
     verdicts = {}

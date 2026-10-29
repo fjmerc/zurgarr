@@ -2600,6 +2600,23 @@ class TestPendingMonitors:
 
 class TestSymlinkCleanup:
 
+    def test_keeps_a_fast_lane_link_while_its_torrent_is_in_the_lane(self, tmp_dir, monkeypatch):
+        """Its target is a host path that doesn't exist in the container:
+        checked as is, every link Radarr/Sonarr are about to import would
+        look broken."""
+        completed = os.path.join(tmp_dir, 'completed')
+        release_dir = os.path.join(completed, 'Rel')
+        os.makedirs(release_dir)
+        link = os.path.join(release_dir, 'e.mkv')
+        os.symlink('/mnt/debrid_torbox_fast/Rel/e.mkv', link)
+        monkeypatch.setattr('utils.fast_lane.protected',
+                            lambda t: t.startswith('/mnt/debrid_torbox_fast/Rel/'))
+        watcher = BlackholeWatcher(tmp_dir, 'key', 'torbox', symlink_enabled=True,
+                                   completed_dir=completed)
+        watcher._cleanup_symlinks()
+        assert os.path.islink(link)
+
+
     def test_removes_broken_symlinks(self, tmp_dir):
         """Should remove symlinks whose targets no longer exist."""
         completed = os.path.join(tmp_dir, 'completed')

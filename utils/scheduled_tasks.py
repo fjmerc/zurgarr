@@ -647,6 +647,12 @@ def verify_symlinks():
             debrid_prefixes.append(tb_mount_real + '/')
             target_mount_pairs.append((tb_target_real, tb_mount_real))
 
+    from utils import fast_lane
+    fast_pair = fast_lane.mount_pair()
+    if fast_pair:
+        debrid_prefixes.append(fast_pair[0])
+        target_mount_pairs.append(fast_pair)
+
     scan_dirs = []
     if os.path.isdir(completed_dir):
         scan_dirs.append(completed_dir)
@@ -697,6 +703,8 @@ def verify_symlinks():
     mount_health = {rclone_mount: zurg_has_content}
     if tb_mount_real:
         mount_health[tb_mount_real] = tb_has_content
+    if fast_pair:
+        mount_health[fast_pair[1]] = fast_lane.mount_answers(fast_pair[1])
 
     # Phase 1: Identify broken symlinks (don't delete yet)
     to_delete = []
@@ -718,6 +726,8 @@ def verify_symlinks():
                            for p in debrid_prefixes):
                     continue
 
+                if fast_lane.protected(target):
+                    continue          # in the fast lane: never removed
                 checked += 1
                 # Translate the symlink target back to a local mount path
                 # before checking existence.  Each (target_base, mount)

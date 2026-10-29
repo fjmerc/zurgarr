@@ -891,3 +891,38 @@ class TestHousekeepingZurgLogPrune:
         result = housekeeping()
         assert result['status'] == 'success'
         assert not os.path.exists(old)
+
+
+class TestFastLaneLinks:
+    """Links into the TorBox fast lane: never removed while their torrent is
+    in it, even if a read fails at that moment; checked like any other once
+    it isn't."""
+
+    @pytest.fixture
+    def fast(self, symlink_env, tmp_dir, monkeypatch):
+        import utils.fast_lane_registry as reg
+        monkeypatch.setenv('TORBOX_FAST_LANE', 'true')
+        monkeypatch.setattr(reg, 'REGISTRY_PATH', os.path.join(tmp_dir, 'fast_lane.json'))
+        reg._reset_for_tests()
+        base = os.path.join(tmp_dir, 'mnt_fast')
+        mount = os.path.join(tmp_dir, 'fast_mount')
+        os.makedirs(mount)
+        monkeypatch.setenv('BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX_FAST', base)
+        monkeypatch.setattr('utils.fast_lane.mount_pair', lambda: (base + '/', mount))
+        reg.admit(reg.FastLaneEntry(1, 'Kept (2020)', [reg.FastLaneFile('k.mkv', 1, 1)], 0.0, 0.0))
+        yield base
+        reg._reset_for_tests()
+
+    def test_registered_fast_lane_link_kept_even_when_unreadable(self, symlink_env, fast):
+        from utils.scheduled_tasks import verify_symlinks
+        link = _make_symlink(symlink_env['local_movies'], 'k.mkv',
+                             os.path.join(fast, 'Kept (2020)', 'k.mkv'))
+        verify_symlinks()
+        assert os.path.islink(link)
+
+    def test_broken_link_to_a_folder_no_longer_in_the_lane_is_removed(self, symlink_env, fast):
+        from utils.scheduled_tasks import verify_symlinks
+        link = _make_symlink(symlink_env['local_tv'], 'g.mkv',
+                             os.path.join(fast, 'Gone (2019)', 'g.mkv'))
+        verify_symlinks()
+        assert not os.path.lexists(link)
