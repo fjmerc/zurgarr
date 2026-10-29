@@ -36,6 +36,9 @@ logger = get_logger()
 REALDEBRID = 'realdebrid'
 ALLDEBRID = 'alldebrid'
 TORBOX = 'torbox'
+# zurgarr's own fast lane for new TorBox arrivals (TORBOX_FAST_LANE): a mount
+# and link base of its own, never a routing target — see utils/fast_lane.py.
+TORBOX_FAST = 'torbox_fast'
 
 # Env var holding each provider's API key.  Not f'{svc.upper()}_API_KEY':
 # AllDebrid's var is AD_API_KEY, not ALLDEBRID_API_KEY.
@@ -164,6 +167,10 @@ def mount_for_debrid(debrid, rclone_mount_base='/data'):
     from utils import boot_layout
     if debrid == TORBOX:
         return os.path.join(rclone_mount_base, boot_layout.torbox_mount_name())
+    if debrid == TORBOX_FAST:
+        if not fast_lane_enabled():
+            return None
+        return os.path.join(rclone_mount_base, boot_layout.torbox_mount_name() + '_fast')
 
     rclonemn = boot_layout.rclone_mount_name()
     if not rclonemn:
@@ -191,6 +198,11 @@ def mount_for_debrid(debrid, rclone_mount_base='/data'):
     return None
 
 
+def fast_lane_enabled():
+    """Whether the TorBox fast lane (TORBOX_FAST_LANE) is on."""
+    return str(os.environ.get('TORBOX_FAST_LANE', 'false')).lower() == 'true'
+
+
 def symlink_target_base_for_debrid(debrid):
     """Return the host-side symlink target base for ``debrid``.
 
@@ -203,7 +215,15 @@ def symlink_target_base_for_debrid(debrid):
         and the RD base is set, falls back to ``<RD base>_torbox``.
         When neither is set, returns ``''`` — callers should refuse to
         create symlinks (logged as an error elsewhere).
+      - The TorBox fast lane → ``BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX_FAST``,
+        else ``<TorBox base>_fast``.
     """
+    if debrid == TORBOX_FAST:
+        explicit = os.environ.get('BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX_FAST') or ''
+        if explicit:
+            return explicit
+        tb_base = symlink_target_base_for_debrid(TORBOX).rstrip('/')
+        return tb_base + '_fast' if tb_base else ''
     if debrid == TORBOX:
         explicit = os.environ.get('BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX') or ''
         if explicit:

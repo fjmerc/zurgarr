@@ -2143,3 +2143,12 @@ def test_every_startup_only_setting_says_so_in_its_help():
     missing = sorted(k for k in STARTUP_KEYS if k in fields
                      and 'container starts' not in fields[k]['help'])
     assert missing == []
+
+
+def test_fast_lane_settings_in_schema_with_defaults():
+    from utils.settings_api import _ALL_KEYS
+    for k in ('TORBOX_FAST_LANE', 'TORBOX_FAST_LANE_PORT', 'BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX_FAST'):
+        assert k in _ALL_KEYS
+    assert _ENV_DEFAULTS.get('TORBOX_FAST_LANE') == 'false'
+    assert _ENV_DEFAULTS.get('TORBOX_FAST_LANE_PORT') == '9098'
+    assert not _ENV_DEFAULTS.get('BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX_FAST')

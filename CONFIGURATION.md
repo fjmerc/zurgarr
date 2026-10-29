@@ -106,6 +106,8 @@ changes to its settings take effect at the next container start.
 | `TORBOX_RCLONE_TPSLIMIT_BURST` | Short-burst allowance on top of `TORBOX_RCLONE_TPSLIMIT`. Lets quick peeks (ffprobe header reads) succeed without blocking. Set to `0` to omit the flag entirely. Lowered from `10` to `3` to avoid an N-way burst tripping TorBox's WebDAV listing rate-limit. | `3` |
 | `TORBOX_RCLONE_DIR_CACHE_TIME` | How long the TB rclone mount caches directory listings (rclone `--dir-cache-time` syntax, e.g. `2h`). Must exceed `LIBRARY_SCAN_INTERVAL`; with a shorter value every cold scan re-lists all TB folders at the throttled tps limit and times out, dropping TB titles (they show as "Wanted"). The blackhole grab hook calls `vfs/refresh`, so newly-grabbed content still appears between expiries. | `2h` |
 | `TORBOX_SCAN_TIMEOUT` | Timeout, in seconds, for each call that lists the TorBox account (the library reads it from the TorBox API in pages of 1000 torrents, separate from the 30s main scan deadline). Raise it if listing a large TorBox account times out. | `180` |
+| `TORBOX_FAST_LANE` | Link new TorBox copies zurgarr adds (blackhole grabs, Wanted recovery, the search page, the Real-Debrid→TorBox rescue) through zurgarr's own "fast lane" folder, built from the TorBox API, within about a minute of TorBox having them — instead of waiting the 2–10 minutes TorBox's WebDAV takes to list them. Each link is moved to the normal TorBox folder once TorBox lists it (the link's path never changes). Needs the fast-lane mount on the Plex host and the Sonarr/Radarr host at `BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX_FAST`. Restart to apply. | `false` |
+| `TORBOX_FAST_LANE_PORT` | Port of the fast lane's read-only WebDAV server (the Sonarr/Radarr host mounts it). Restart to apply. | `9098` |
 
 > **Note**: plex_debrid (`PD_ENABLED=true`) speaks directly to RD via its
 > own client and bypasses pd_zurg's blackhole entirely — multi-debrid
@@ -164,6 +166,7 @@ See the [Blackhole Symlink Guide](BLACKHOLE_SYMLINK_GUIDE.md) for full setup.
 | `BLACKHOLE_DEBRID_ROUTING` | Per-grab routing (plan 39): `cache_aware` (probe both, prefer cached side) or `primary_only` (ignore cache, always use primary). When unset: `cache_aware` if two or more debrids configured, `primary_only` otherwise. | auto |
 | `BLACKHOLE_DEBRID_PRIMARY` | Primary debrid for fallback / tiebreak in cache_aware mode. Defaults to first-configured-of `realdebrid`, `alldebrid`, `torbox`. | auto |
 | `BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX` | Host path for TorBox-routed symlinks. Distinct from `BLACKHOLE_SYMLINK_TARGET_BASE` so Plex sees TorBox content as a separate library (plan 39 Q1). Defaults to `<BLACKHOLE_SYMLINK_TARGET_BASE>_torbox`. | auto |
+| `BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX_FAST` | Host path of the TorBox fast lane mount (`TORBOX_FAST_LANE`), the same on the Plex host and the Sonarr/Radarr host. | `<BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX>_fast` |
 | `BLACKHOLE_SYMLINK_ENABLED` | Enable symlink creation after download | `false` |
 | `BLACKHOLE_COMPLETED_DIR` | Staging directory for completed symlinks. Under per-arr label layout, symlinks are nested (`.../sonarr/`, `.../radarr/`). Flat layout works when no label subdirs | `/completed` |
 | `BLACKHOLE_RCLONE_MOUNT` | rclone mount path inside the container. Append mount name (e.g. `/data/zurgarr`) | `/data` |

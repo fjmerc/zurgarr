@@ -1056,3 +1056,39 @@ class TestBlackholeStripIndexerPrefixAlias:
         # Same inputs, same outputs across both names.
         for inp in ('[a.b] X', 'Y', '', None, '[indexer]  spaced'):
             assert _strip_indexer_prefix(inp) == strip_indexer_prefix(inp)
+
+
+class TestFastLanePair:
+    """The TorBox fast lane is a third (mount, link base) pair next to Zurg
+    and the TorBox WebDAV mount."""
+
+    @pytest.fixture
+    def fast(self, monkeypatch):
+        monkeypatch.setenv('TORBOX_FAST_LANE', 'true')
+        monkeypatch.setenv('TORBOX_MOUNT_NAME', 'torbox')
+        monkeypatch.setenv('BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX', '/mnt/debrid_torbox')
+        monkeypatch.delenv('BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX_FAST', raising=False)
+        from utils import boot_layout
+        monkeypatch.setattr(boot_layout, 'torbox_mount_name', lambda: 'torbox')
+
+    def test_fast_lane_mount_and_base_follow_torbox(self, fast):
+        from utils.debrid_routing import (TORBOX_FAST, fast_lane_enabled, mount_for_debrid,
+                                          symlink_target_base_for_debrid)
+        assert fast_lane_enabled()
+        assert mount_for_debrid(TORBOX_FAST, rclone_mount_base='/data') == '/data/torbox_fast'
+        assert symlink_target_base_for_debrid(TORBOX_FAST) == '/mnt/debrid_torbox_fast'
+
+    def test_fast_lane_explicit_base_wins(self, fast, monkeypatch):
+        from utils.debrid_routing import TORBOX_FAST, symlink_target_base_for_debrid
+        monkeypatch.setenv('BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX_FAST', '/srv/tbfast')
+        assert symlink_target_base_for_debrid(TORBOX_FAST) == '/srv/tbfast'
+
+    def test_fast_lane_off_has_no_mount(self, fast, monkeypatch):
+        from utils.debrid_routing import TORBOX_FAST, fast_lane_enabled, mount_for_debrid
+        monkeypatch.setenv('TORBOX_FAST_LANE', 'false')
+        assert not fast_lane_enabled()
+        assert mount_for_debrid(TORBOX_FAST, rclone_mount_base='/data') is None
+
+    def test_fast_lane_is_not_a_routing_target(self):
+        from utils.debrid_routing import TORBOX_FAST, VALID_DEBRIDS
+        assert TORBOX_FAST not in VALID_DEBRIDS
