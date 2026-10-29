@@ -35,6 +35,12 @@ _USER = 'zurgarr'
 _server = None
 _thread = None
 _ALLOW = 'OPTIONS, PROPFIND, GET, HEAD'
+_READ_WAIT_S = 60
+
+
+class _Server(http.server.ThreadingHTTPServer):
+    allow_reuse_address = True       # rebinding after a restart; this class only
+    daemon_threads = True
 
 
 def fast_lane_credentials():
@@ -44,10 +50,16 @@ def fast_lane_credentials():
     try:
         with open(AUTH_PATH, encoding='utf-8') as fh:
             saved = json.load(fh)
-        if saved.get('user') and saved.get('password'):
+    except FileNotFoundError:
+        saved = None
+    except (OSError, ValueError) as e:
+        # A new password would lock out the Sonarr/Radarr host's mount: no
+        # lane until the file is fixed (or removed, to make a new one).
+        raise RuntimeError(f"can't read {AUTH_PATH}: {e}") from e
+    if saved is not None:
+        if isinstance(saved, dict) and saved.get('user') and saved.get('password'):
             return saved['user'], saved['password']
-    except (OSError, ValueError, AttributeError):
-        pass
+        raise RuntimeError(f"{AUTH_PATH} has no user/password")
     from utils.file_utils import atomic_write
     password = secrets.token_urlsafe(24)
     with atomic_write(AUTH_PATH) as fh:
@@ -121,15 +133,33 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(status)
         for k, v in (headers or {}).items():
             self.send_header(k, v)
-        self.send_header('Content-Length', str(len(body)))
+        if 'Content-Length' not in (headers or {}):
+            self.send_header('Content-Length', str(len(body)))
+        self._send_close_aware()
         self.end_headers()
         if body and self.command != 'HEAD':
             self.wfile.write(body)
 
     def _drain(self):
-        length = int(self.headers.get('Content-Length') or 0)
-        if 0 < length <= 1 << 20:
+        """Read the request body this server never uses; when it can't be
+        read whole (chunked, too big, bad length) close the connection after
+        answering, so leftover bytes are never taken as a next request."""
+        if self.headers.get('Transfer-Encoding'):
+            self.close_connection = True
+            return
+        try:
+            length = int(self.headers.get('Content-Length') or 0)
+        except ValueError:
+            self.close_connection = True
+            return
+        if length < 0 or length > 1 << 20:
+            self.close_connection = True
+        elif length:
             self.rfile.read(length)
+
+    def _send_close_aware(self):
+        if self.close_connection:
+            self.send_header('Connection', 'close')
 
     def do_OPTIONS(self):
         if not self._authorised():
@@ -172,12 +202,23 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if found is None or found[0] != 'file':
             return self._send(404)
         _kind, entry, f = found
-        url = link_for(entry.torrent_id, f.file_id)
+        # a read waits a little for a free TorBox request slot rather than
+        # failing the player outright
+        url = link_for(entry.torrent_id, f.file_id, wait_s=_READ_WAIT_S)
         if not url:
             return self._send(503)
         self._send(302, headers={'Location': url})
 
-    do_HEAD = do_GET
+    def do_HEAD(self):
+        """Answers from the registry: a HEAD must not spend the link budget."""
+        if not self._authorised():
+            return
+        found = _resolve(self.path)
+        if found is None or found[0] != 'file':
+            return self._send(404)
+        _kind, entry, f = found
+        self._send(200, headers={'Content-Length': str(f.size), 'Last-Modified':
+                                 email.utils.formatdate(entry.created_at, usegmt=True)})
 
     def _refuse(self):
         self._drain()
@@ -196,9 +237,7 @@ def start_fast_lane_server(port, bind='0.0.0.0', credentials=None):
     user, password = credentials or fast_lane_credentials()
     token = base64.b64encode(f'{user}:{password}'.encode()).decode()
     handler = type('_AuthedHandler', (_Handler,), {'expected_auth': 'Basic ' + token})
-    http.server.ThreadingHTTPServer.allow_reuse_address = True
-    _server = http.server.ThreadingHTTPServer((bind, int(port)), handler)
-    _server.daemon_threads = True
+    _server = _Server((bind, int(port)), handler)
     _thread = threading.Thread(target=_server.serve_forever, kwargs={'poll_interval': 0.2},
                                name='fast-lane-webdav', daemon=True)
     _thread.start()

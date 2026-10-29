@@ -25,7 +25,7 @@ def server(tmp_path, monkeypatch):
     reg.admit(FastLaneEntry(8, 'Law  Order (1990) Amélie', [FastLaneFile('Law  Order é.mkv', 333, 20)],
                             CREATED, 1.0))
     links = {}
-    monkeypatch.setattr(srv, 'link_for', lambda tid, fid: links.get((tid, fid)))
+    monkeypatch.setattr(srv, 'link_for', lambda tid, fid, **k: links.get((tid, fid)))
     s = srv.start_fast_lane_server(0, bind='127.0.0.1', credentials=('zurgarr', 's3cret'))
     yield s, links
     srv.stop_fast_lane_server()
@@ -89,10 +89,11 @@ def test_get_redirects_to_link(server):
     assert r.status == 302 and r.getheader('Location') == 'https://cdn.example/dl/abc?token=t'
 
 
-def test_head_redirects(server):
-    server[1][(8, 20)] = 'https://cdn.example/dl/x'
+def test_head_answers_the_size_without_a_torbox_call(server, monkeypatch):
+    """A HEAD only asks about the file; it must not spend the link budget."""
+    monkeypatch.setattr(srv, 'link_for', lambda *a, **k: pytest.fail('no TorBox call for HEAD'))
     r, _ = _req(server, 'HEAD', '/Law  Order (1990) Amélie/Law  Order é.mkv')
-    assert r.status == 302
+    assert r.status == 200 and r.getheader('Content-Length') == '333'
 
 
 def test_no_link_is_503(server):
@@ -146,3 +147,46 @@ def test_credentials_generated_once_and_kept(tmp_path, monkeypatch):
     assert srv.fast_lane_credentials() == (user, password)
     import os, stat
     assert stat.S_IMODE(os.stat(srv.AUTH_PATH).st_mode) == 0o600
+
+
+
+def test_a_read_waits_for_a_link_slot(server, monkeypatch):
+    seen = []
+    monkeypatch.setattr(srv, 'link_for', lambda tid, fid, **k: seen.append(k) or 'https://cdn.example/x')
+    r, _ = _req(server, 'GET', '/Show.S01/Season 1/E01.mkv')
+    assert r.status == 302 and seen and seen[0].get('wait_s', 0) > 0
+
+
+@pytest.mark.parametrize('headers', [
+    {'Transfer-Encoding': 'chunked'},
+    {'Content-Length': 'abc'},
+    {'Content-Length': str(5 * 1024 * 1024)},
+])
+def test_an_unread_body_closes_the_connection(server, headers):
+    import base64, socket
+    s, _ = server
+    auth = 'Basic ' + base64.b64encode(b'zurgarr:s3cret').decode()
+    head = ''.join(f'{k}: {v}\r\n' for k, v in headers.items())
+    raw = (f'PUT /Show.S01/info.nfo HTTP/1.1\r\nHost: x\r\nAuthorization: {auth}\r\n'
+           f'{head}\r\n').encode()
+    with socket.create_connection(('127.0.0.1', s.server_address[1]), timeout=5) as c:
+        c.sendall(raw)
+        data = c.recv(4096).decode('latin-1')
+    assert data.startswith('HTTP/1.1 4') and 'Connection: close' in data
+
+
+def test_an_unreadable_login_file_is_not_replaced(tmp_path, monkeypatch):
+    """A new password would lock out the Sonarr/Radarr host's mount."""
+    path = tmp_path / 'fast_lane_auth.json'
+    path.write_text('{corrupt')
+    monkeypatch.setattr(srv, 'AUTH_PATH', str(path))
+    with pytest.raises(RuntimeError):
+        srv.fast_lane_credentials()
+    assert path.read_text() == '{corrupt'
+
+
+def test_port_reuse_is_not_set_on_the_shared_stdlib_class(server):
+    import http.server
+    assert http.server.ThreadingHTTPServer.allow_reuse_address in (False, 0) or \
+        not getattr(http.server.ThreadingHTTPServer, 'allow_reuse_address', False) or \
+        type(server[0]) is not http.server.ThreadingHTTPServer

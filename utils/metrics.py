@@ -112,6 +112,12 @@ class MetricsRegistry:
         _emit(lines, 'blackhole_symlink_failed_total',
               'Symlink creations that failed in the blackhole', 'counter',
               [('', self.get_counter('blackhole_symlink_failed'))])
+        _emit(lines, 'fast_lane_requestdl_total',
+              'TorBox download-link requests made for the TorBox fast lane', 'counter',
+              [('', self.get_counter('fast_lane_requestdl'))])
+        _emit(lines, 'fast_lane_account_check_total',
+              'TorBox account checks made by the TorBox fast lane switch-back', 'counter',
+              [('', self.get_counter('fast_lane_account_check'))])
 
         event_samples = [
             (f'level="{level}"', self.get_counter('events', {'level': level}))

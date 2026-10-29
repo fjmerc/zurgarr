@@ -659,10 +659,11 @@ def _attempt_cross_rescue(torrent_hash, filename, source_debrid='realdebrid',
     # blocked content might not have been imported by the arr yet, and
     # the rescue still made the file accessible going forward.
     if candidates:
+        dst, alt_record = _rescue_link_target(alt, alt_client, alt_tid)
         retargeted = _retarget_symlinks_to_alt(
             torrent_hash, filename,
             src_debrid=source_debrid,
-            dst_debrid=_rescue_link_target(alt, alt_client, alt_tid),
+            dst_debrid=dst, alt_info=alt_record,
             candidates=candidates,
             alt_client=alt_client, alt_torrent_id=alt_tid,
         )
@@ -727,25 +728,27 @@ def _plex_session_active_for_release(release_name):
 
 
 def _rescue_link_target(alt, alt_client, alt_torrent_id):
-    """Where a rescue's links should point: the TorBox fast lane when the
-    rescued TorBox copy is admitted to it (TorBox's own mount lists it
-    minutes later), else *alt* itself."""
+    """``(where a rescue's links should point, the TorBox record read for
+    it or None)``: the TorBox fast lane when the rescued TorBox copy is
+    admitted to it (TorBox's own mount lists it minutes later), else *alt*.
+    With the lane off it asks TorBox nothing."""
     from utils import debrid_routing
-    if alt != debrid_routing.TORBOX:
-        return alt
+    if alt != debrid_routing.TORBOX or not debrid_routing.fast_lane_enabled():
+        return alt, None
+    record = None
     try:
         from utils import fast_lane
         info_fn = getattr(alt_client, 'torrent_info', None)
         record = info_fn(alt_torrent_id) if callable(info_fn) else None
         if fast_lane.admit_record(record):
-            return debrid_routing.TORBOX_FAST
+            return debrid_routing.TORBOX_FAST, record
     except Exception as e:
         logger.warning(f"[debrid_health] fast lane admission failed: {e}")
-    return alt
+    return alt, record
 
 
 def _retarget_symlinks_to_alt(torrent_hash, filename, src_debrid='realdebrid', dst_debrid='torbox',
-                              candidates=None, alt_client=None, alt_torrent_id=None):
+                              candidates=None, alt_client=None, alt_torrent_id=None, alt_info=None):
     """Find symlinks in the arr libraries pointing at the source debrid's
     mount FOR THIS SPECIFIC RELEASE, and atomic-retarget each one to the
     equivalent path under the alt debrid's mount.
@@ -809,10 +812,11 @@ def _retarget_symlinks_to_alt(torrent_hash, filename, src_debrid='realdebrid', d
     # a retarget follows TB's real inner layout even where it differs from
     # Zurg's (a pack flattened on one side, Season dirs on the other).
     alt_rel_by_leaf = {}
-    if alt_client is not None and alt_torrent_id:
+    if alt_info is not None or (alt_client is not None and alt_torrent_id):
         try:
-            info_fn = getattr(alt_client, 'torrent_info', None)
-            alt_info = info_fn(alt_torrent_id) if callable(info_fn) else None
+            if alt_info is None:             # not already read by the caller
+                info_fn = getattr(alt_client, 'torrent_info', None)
+                alt_info = info_fn(alt_torrent_id) if callable(info_fn) else None
             if isinstance(alt_info, dict):
                 files = alt_info.get('files')
                 if isinstance(files, list) and files and isinstance(files[0], dict):

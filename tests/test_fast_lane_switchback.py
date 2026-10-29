@@ -141,7 +141,8 @@ def test_torrent_gone_drops_entry_leaves_links(env):
     _entry()
     link = env.link(env.movies, 'M/movie.mkv', f'{FAST}/Movie (2020)/movie.mkv')
     env.present[7] = False
-    assert sb.run_switchback(now=0.0)['dropped'] == 1
+    sb.run_switchback(now=0.0)
+    assert sb.run_switchback(now=1800.0)['dropped'] == 1
     assert reg.get(7) is None
     assert os.readlink(str(link)) == f'{FAST}/Movie (2020)/movie.mkv'
 
@@ -186,10 +187,9 @@ def test_switches_completed_dir_and_library_links(env):
     assert os.readlink(str(c)) == f'{FAST}/Other.Folder/x.mkv'
 
 
-def test_nothing_to_do_when_the_lane_is_off(env, monkeypatch):
-    _entry()
+def test_nothing_to_do_with_the_lane_off_and_empty(env, monkeypatch):
     monkeypatch.setenv('TORBOX_FAST_LANE', 'false')
-    monkeypatch.setattr(sb, '_account_has', lambda tid: pytest.fail('no TorBox call when off'))
+    monkeypatch.setattr(sb, '_account_has', lambda tid: pytest.fail('no TorBox call when empty'))
     assert sb.run_switchback(now=0.0) == {'switched': 0, 'waiting': 0, 'dropped': 0, 'unmatched': 0}
 
 
@@ -218,3 +218,144 @@ def test_events_are_logged_with_their_causes(monkeypatch):
     sb._log('unmatched', e)
     assert logged == [('fast_lane_switched', 'fast_lane_switched'),
                       ('fast_lane_unmatched', 'fast_lane_unmatched')]
+
+
+# ── final-review fixes ───────────────────────────────────────────────────
+
+class _Resp:
+    def __init__(self, body):
+        self.body = body
+    def read(self):
+        import json
+        return json.dumps(self.body).encode()
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+
+
+@pytest.mark.parametrize('body, expected', [
+    ({'success': True, 'data': {'id': 7}}, True),
+    ({'success': True, 'data': None}, False),
+    ({'success': False, 'error': 'DATABASE_ERROR', 'data': None}, None),
+    ({'success': True, 'data': []}, None),
+    ({}, None),
+])
+def test_only_a_clear_answer_counts_as_gone(monkeypatch, body, expected):
+    monkeypatch.setattr('base.load_secret_or_env', lambda name: 'k')
+    monkeypatch.setattr(sb.urllib.request, 'urlopen', lambda req, timeout=30: _Resp(body))
+    assert sb._account_has(7) is expected
+
+
+def test_two_gone_answers_needed_before_dropping(env):
+    _entry()
+    env.present[7] = False
+    assert sb.run_switchback(now=0.0)['dropped'] == 0
+    assert reg.get(7).gone_strikes == 1
+    assert sb.run_switchback(now=1800.0)['dropped'] == 1
+    assert reg.get(7) is None
+
+
+def test_a_present_answer_resets_the_strikes(env):
+    _entry()
+    env.present[7] = False
+    sb.run_switchback(now=0.0)
+    env.present[7] = True
+    sb.run_switchback(now=1800.0)
+    env.present[7] = False
+    sb.run_switchback(now=3600.0)
+    assert reg.get(7) is not None
+
+
+def test_gone_but_listed_switches_instead_of_stranding(env):
+    _entry()
+    link = env.link(env.movies, 'M/movie.mkv', f'{FAST}/Movie (2020)/movie.mkv')
+    env.list_on_tb('Movie (2020)', [('movie.mkv', 10)])
+    env.present[7] = False
+    sb.run_switchback(now=0.0)
+    sb.run_switchback(now=1800.0)
+    assert os.readlink(str(link)) == f'{TB}/Movie (2020)/movie.mkv'
+    assert reg.get(7) is None
+
+
+def test_lane_off_drains_entries_as_soon_as_torbox_lists_them(env, monkeypatch):
+    """Turned off with titles in the lane: nothing serves it any more, so
+    each moves to TorBox the moment TorBox lists it."""
+    monkeypatch.setenv('TORBOX_FAST_LANE', 'false')
+    _entry()
+    link = env.link(env.movies, 'M/movie.mkv', f'{FAST}/Movie (2020)/movie.mkv')
+    env.list_on_tb('Movie (2020)', [('movie.mkv', 10)])
+    assert sb.run_switchback(now=0.0)['switched'] == 1
+    assert os.readlink(str(link)) == f'{TB}/Movie (2020)/movie.mkv'
+
+
+def test_only_unlisted_entries_are_relisted_in_turn(env, monkeypatch):
+    relisted = []
+    monkeypatch.setattr(sb, '_relist', lambda folder: relisted.append(folder))
+    _entry('A', tid=1)
+    _entry('B', tid=2)
+    _entry('C', tid=3)
+    env.list_on_tb('C', [('movie.mkv', 10)])
+    sb.run_switchback(now=0.0)            # C seen complete: not re-listed after
+    sb.run_switchback(now=120.0)
+    sb.run_switchback(now=240.0)
+    assert relisted[:3] == ['A', 'B', 'C'] or set(relisted[:2]) == {'A', 'B'}
+    assert relisted.count('C') <= 1 and len(relisted) == 3
+
+
+def test_only_video_files_need_to_be_listed(env):
+    _entry(files=(('movie.mkv', 10), ('movie.nfo', 3), ('Sample/sample.mkv', 2)))
+    link = env.link(env.movies, 'M/movie.mkv', f'{FAST}/Movie (2020)/movie.mkv')
+    env.list_on_tb('Movie (2020)', [('movie.mkv', 10)])
+    sb.run_switchback(now=0.0)
+    assert sb.run_switchback(now=1800.0)['switched'] == 1
+
+
+def test_torbox_mount_down_keeps_the_clock(env, monkeypatch):
+    _entry()
+    env.list_on_tb('Movie (2020)', [('movie.mkv', 10)])
+    sb.run_switchback(now=0.0)
+    monkeypatch.setattr(sb, '_tb_mount', lambda: None)
+    sb.run_switchback(now=900.0)
+    assert reg.get(7).seen_listed_at == 0.0
+
+
+def test_entry_marked_switching_before_the_walk(env, monkeypatch):
+    """A scan linking the title mid-walk must link it to TorBox's mount, not
+    into a lane that's about to stop serving it."""
+    _entry()
+    env.list_on_tb('Movie (2020)', [('movie.mkv', 10)])
+    seen = []
+    real = sb._retarget
+    monkeypatch.setattr(sb, '_retarget', lambda ready: seen.append(reg.by_folder('Movie (2020)')) or real(ready))
+    sb.run_switchback(now=0.0)
+    sb.run_switchback(now=1800.0)
+    assert seen == [None]
+
+
+def test_link_roots_include_the_default_completed_dir(monkeypatch, tmp_path):
+    monkeypatch.delenv('BLACKHOLE_COMPLETED_DIR', raising=False)
+    monkeypatch.delenv('BLACKHOLE_LOCAL_LIBRARY_TV', raising=False)
+    monkeypatch.delenv('BLACKHOLE_LOCAL_LIBRARY_MOVIES', raising=False)
+    monkeypatch.setattr('utils.env.completed_dir_from_env', lambda: str(tmp_path))
+    assert sb._link_roots() == [str(tmp_path)]
+
+
+def test_a_drop_is_logged(env):
+    _entry()
+    env.present[7] = False
+    sb.run_switchback(now=0.0)
+    sb.run_switchback(now=1800.0)
+    assert [e[0] for e in env.events] == ['dropped']
+
+
+def test_task_kept_while_entries_remain_with_the_lane_off(env, monkeypatch):
+    import utils.scheduled_tasks as st
+    from utils.task_scheduler import scheduler
+    registered = []
+    monkeypatch.setattr(scheduler, 'register', lambda name, *a, **k: registered.append(name))
+    monkeypatch.setenv('STATUS_UI_ENABLED', 'true')
+    monkeypatch.setenv('TORBOX_FAST_LANE', 'false')
+    _entry()
+    st.register_all()
+    assert 'fast_lane_switchback' in registered

@@ -1170,6 +1170,56 @@
           "displayMode": "list"
         }
       }
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "TorBox fast lane: TorBox API calls (per hour)",
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 0,
+        "y": 36
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "targets": [
+        {
+          "expr": "rate(zurgarr_fast_lane_requestdl_total[1h]) * 3600",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "legendFormat": "download-link requests"
+        },
+        {
+          "expr": "rate(zurgarr_fast_lane_account_check_total[1h]) * 3600",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "legendFormat": "account checks"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {}
     }
   ]
 }

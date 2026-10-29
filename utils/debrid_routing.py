@@ -222,9 +222,9 @@ def symlink_target_base_for_debrid(debrid):
         else ``<TorBox base>_fast``.
     """
     if debrid == TORBOX_FAST:
-        explicit = os.environ.get('BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX_FAST') or ''
+        explicit = (os.environ.get('BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX_FAST') or '').strip()
         if explicit:
-            return explicit
+            return explicit.rstrip('/') or explicit
         tb_base = symlink_target_base_for_debrid(TORBOX).rstrip('/')
         return tb_base + '_fast' if tb_base else ''
     if debrid == TORBOX:

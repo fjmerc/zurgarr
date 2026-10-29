@@ -492,3 +492,9 @@ def test_fast_lane_unmatched():
 def test_fast_lane_formatters_in_js():
     from utils.activity_format import FORMATTER_JS
     assert 'fast_lane_switched:' in FORMATTER_JS and 'fast_lane_unmatched:' in FORMATTER_JS
+
+
+
+def test_fast_lane_dropped():
+    assert format_event(_ev('fast_lane_dropped'))['short'] == \
+        'Left the TorBox account while in the TorBox fast lane'

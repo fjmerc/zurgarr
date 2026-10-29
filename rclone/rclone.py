@@ -432,8 +432,11 @@ def _write_rclone_config(rclone_config_path, mn_rd, mn_ad,
         elif _torbox_mount_configured():
             torbox_remote_written = _write_torbox_remote(f, TORBOX_MOUNT_NAME)
             if torbox_remote_written and _fast_lane_on():
-                _fast_remote_written[0] = _write_fast_lane_remote(
-                    f, f"{TORBOX_MOUNT_NAME}_fast", _fast_lane_port())
+                try:
+                    _fast_remote_written[0] = _write_fast_lane_remote(
+                        f, f"{TORBOX_MOUNT_NAME}_fast", _fast_lane_port())
+                except Exception as e:      # the lane off, never the other mounts
+                    logger.error(f"[fast-lane] no fast lane this start: {e}")
         elif TORBOXAPIKEY:
             logger.warning(
                 "[rclone] TORBOX_API_KEY is set but TORBOX_WEBDAV_USER "
@@ -502,6 +505,8 @@ def setup():
             # content would corrupt the symlink machinery's view of RD.)
             mount_names.append(TORBOX_MOUNT_NAME)
         fast_mn = f"{TORBOX_MOUNT_NAME}_fast" if _fast_remote_written[0] else None
+        from utils import fast_lane
+        fast_lane.set_live(False)
         if fast_mn:
             # zurgarr's own server: up before its mount is probed.
             from utils.fast_lane_server import start_fast_lane_server
@@ -708,6 +713,9 @@ def setup():
                     _rc_urls[mn] = f"http://localhost:{rc_port}"
                     _pending_mounts.pop(mn, None)
                     _pending_last_retry.pop(mn, None)
+                    if mn == fast_mn:
+                        from utils import fast_lane
+                        fast_lane.set_live(True)      # server up, mount started
                     notify('mount_success', 'Rclone Mounted', f'Mount {mn} is ready')
                 else:
                     # WebDAV was up but the rclone process failed to spawn

@@ -387,8 +387,10 @@ def _all_debrid_symlink_prefixes():
         bases.append(rd)
     try:
         from utils.debrid_routing import VALID_DEBRIDS, symlink_target_base_for_debrid
-        from utils.debrid_routing import TORBOX_FAST, fast_lane_enabled
-        for svc in VALID_DEBRIDS + ((TORBOX_FAST,) if fast_lane_enabled() else ()):
+        from utils.debrid_routing import TORBOX_FAST
+        # the fast lane's base even with it off: links it left behind are
+        # debrid content, never local copies
+        for svc in VALID_DEBRIDS + (TORBOX_FAST,):
             try:
                 b = (symlink_target_base_for_debrid(svc) or '').strip()
             except Exception as e:
@@ -3736,6 +3738,16 @@ class LibraryScanner:
                 missing.append(key)
         return missing
 
+    @classmethod
+    def _on_torbox_mounts(cls, path, tb_mount):
+        """Whether *path* is on TorBox's mount or the TorBox fast lane's —
+        either way a TorBox torrent, never one on Real-Debrid/AllDebrid."""
+        if not tb_mount:
+            return False
+        p = os.path.abspath(path)
+        return any(p.startswith(os.path.abspath(mount) + os.sep)
+                   for mount in (tb_mount, cls._discover_fast_lane_mount(tb_mount)) if mount)
+
     @staticmethod
     def _discover_fast_lane_mount(tb_mount):
         """The TorBox fast lane's mount next to *tb_mount*, or None when the
@@ -3745,7 +3757,7 @@ class LibraryScanner:
             return None
         path = mount_for_debrid(TORBOX_FAST, rclone_mount_base=os.path.dirname(
             os.path.normpath(tb_mount)))
-        return path if path and os.path.isdir(path) else None
+        return path if path and os.path.ismount(path) else None
 
     @classmethod
     def _debrid_mount_target_pairs(cls, real_mount, symlink_base):
@@ -5023,8 +5035,7 @@ class LibraryScanner:
             # AD) — never from the item's tag, which can be the configured
             # primary instead, and never across the two.
             folder = _same_release_key(os.path.basename(m['path'].rstrip('/')))
-            on_tb = bool(tb_mount) and os.path.abspath(m['path']).startswith(
-                os.path.abspath(tb_mount) + os.sep)
+            on_tb = self._on_torbox_mounts(m['path'], tb_mount)
             if time.monotonic() - unmatched.get(m['path'], -1e9) < 86400:
                 continue  # no torrent matched it within the day
             own, client = [], None
@@ -7936,6 +7947,8 @@ class LibraryScanner:
                                 # Match the symlink target to one of the configured
                                 # debrid (prefix, mount) pairs so RD and TB symlinks
                                 # both get cleanup against the right mount.
+                                if fast_lane.repair_stranded(fpath, target):
+                                    continue    # in the lane, or repointed at TorBox
                                 matched_prefix = None
                                 matched_mount = None
                                 for _p, _m in debrid_pair_list:
@@ -7943,7 +7956,7 @@ class LibraryScanner:
                                         matched_prefix = _p
                                         matched_mount = _m
                                         break
-                                if matched_prefix is None or fast_lane.protected(target):
+                                if matched_prefix is None:
                                     continue
                                 # Translate arr-namespace target to the per-debrid
                                 # rclone mount for existence check.

@@ -24,19 +24,25 @@ from utils.logger import get_logger
 logger = get_logger()
 
 _REQUESTDL = 'https://api.torbox.app/v1/api/torrents/requestdl'
-# One link was still valid after 0.5 h when this was written (live test,
-# 2026-10-29); the max age gets set from that measurement, minus a margin.
+# One link was still valid after 1.75 h (live test, 2026-10-29, still
+# running); links are re-fetched after LINK_MAX_AGE_S anyway, and one that
+# stopped working sooner is caught by the 1-byte check after
+# LINK_CHECK_AFTER_S.
 LINK_MAX_AGE_S = 3 * 3600
 LINK_CHECK_AFTER_S = 300
 CHECK_CACHE_S = 60
 REQUESTS_PER_MIN = 10
 AUTH_HALT_S = 1800
+RATE_LIMIT_HALT_S = 300          # minimum pause after a 429 (longer when TorBox says so)
+FAILED_RETRY_AFTER_S = 300       # a file TorBox refused isn't asked about again sooner
+PREFETCH_MAX = 3                 # admission checks this many videos; the rest on first open
 RETRY_DELAYS = (1, 4, 16)
 _TIMEOUT = 30
 
 _lock = threading.Lock()          # guards the dicts and the throttle, never held over I/O
 _links = {}                       # (torrent_id, file_id) -> _Link
 _key_locks = {}                   # (torrent_id, file_id) -> Lock: one fetch per file
+_failed = {}                      # (torrent_id, file_id) -> clock until it may be asked again
 _calls = collections.deque()      # clock of each requestdl attempt
 _halt_until = 0.0
 
@@ -62,15 +68,15 @@ def _api_key():
 
 
 def _fetch(params):
-    """GET requestdl; ``(status, parsed body or None)``."""
+    """GET requestdl; ``(status, parsed body or None, Retry-After or None)``."""
     url = _REQUESTDL + '?' + urllib.parse.urlencode(params)
     try:
         with urllib.request.urlopen(urllib.request.Request(url), timeout=_TIMEOUT) as r:
-            return r.status, json.loads(r.read().decode('utf-8') or 'null')
+            return r.status, json.loads(r.read().decode('utf-8') or 'null'), None
     except urllib.error.HTTPError as e:
-        return e.code, None
+        return e.code, None, e.headers.get('Retry-After') if e.headers else None
     except (urllib.error.URLError, OSError, ValueError):
-        return 0, None
+        return 0, None, None
 
 
 def _link_works(url):
@@ -83,45 +89,88 @@ def _link_works(url):
         return False
 
 
-def _request_link(torrent_id, file_id):
-    """A fresh link, or None (halted, over the cap, TorBox said no)."""
-    global _halt_until
-    key = _api_key()
-    if not key:
-        return None
-    params = {'token': key, 'torrent_id': torrent_id, 'file_id': file_id, 'zip_link': 'false'}
-    for attempt in range(len(RETRY_DELAYS) + 1):
+def _slot(wait_s):
+    """Claim one request slot under the per-minute cap; wait up to *wait_s*
+    for one to free.  False when halted or no slot came."""
+    deadline = _clock() + wait_s
+    while True:
         with _lock:
             now = _clock()
             if now < _halt_until:
-                return None
+                return False
             while _calls and now - _calls[0] >= 60:
                 _calls.popleft()
-            if len(_calls) >= REQUESTS_PER_MIN:
-                logger.debug("[fast-lane] TorBox link requests at the per-minute cap — not asking")
-                return None
-            _calls.append(now)
-        status, body = _fetch(params)
-        if status in (401, 403):
+            if len(_calls) < REQUESTS_PER_MIN:
+                _calls.append(now)
+                return True
+            free_in = 60 - (now - _calls[0])
+        if now + free_in > deadline:
+            logger.debug("[fast-lane] TorBox link requests at the per-minute cap — not asking")
+            return False
+        _sleep(free_in)
+
+
+def _budget_left():
+    with _lock:
+        now = _clock()
+        if now < _halt_until:
+            return 0
+        recent = sum(1 for t in _calls if now - t < 60)
+        return REQUESTS_PER_MIN - recent
+
+
+def _retry_after(value):
+    try:
+        return max(int(value), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _count_call():
+    try:
+        from utils.metrics import metrics
+        metrics.inc('fast_lane_requestdl')
+    except Exception:
+        pass
+
+
+def _request_link(torrent_id, file_id, *, retries=True, wait_s=0):
+    """``(link or None, refused)`` — *refused* when TorBox answered and gave
+    no link (not when zurgarr held back: halted, over the cap, no key)."""
+    global _halt_until
+    key = _api_key()
+    if not key:
+        return None, False
+    params = {'token': key, 'torrent_id': torrent_id, 'file_id': file_id, 'zip_link': 'false'}
+    delays = RETRY_DELAYS if retries else ()
+    for attempt in range(len(delays) + 1):
+        if not _slot(wait_s):
+            return None, False
+        _count_call()
+        res = _fetch(params)
+        status, body = res[0], res[1]
+        if status in (401, 403, 429):
+            pause = AUTH_HALT_S if status != 429 else max(RATE_LIMIT_HALT_S,
+                                                          _retry_after(res[2] if len(res) > 2 else None))
             with _lock:
-                _halt_until = _clock() + AUTH_HALT_S
+                _halt_until = _clock() + pause
             logger.warning(f"[fast-lane] TorBox refused a download-link request (HTTP {status}) "
-                           f"— no more for {AUTH_HALT_S // 60} minutes")
-            return None
+                           f"— no more for {pause // 60} minutes")
+            return None, False
         if status == 200 and isinstance(body, dict):
             url = body.get('data')
             if isinstance(url, str) and url.startswith('https://'):
-                return url
-            return None
-        if (status == 0 or status >= 500) and attempt < len(RETRY_DELAYS):
+                return url, False
+            return None, True
+        if (status == 0 or status >= 500) and attempt < len(delays):
             logger.debug(f"[fast-lane] TorBox download-link request failed "
                          f"(HTTP {status or 'error'}); retrying")
-            _sleep(RETRY_DELAYS[attempt])
+            _sleep(delays[attempt])
             continue
         logger.debug(f"[fast-lane] no download link for torrent {torrent_id} file {file_id} "
                      f"(HTTP {status or 'error'})")
-        return None
-    return None
+        return None, True
+    return None, True
 
 
 def _usable(link, now):
@@ -135,14 +184,18 @@ def _usable(link, now):
     return None
 
 
-def link_for(torrent_id, file_id, *, now=None):
+def link_for(torrent_id, file_id, *, now=None, wait_s=0, retries=True):
     """A working download link for one TorBox file, or None.  A file whose
-    link is in hand never waits on another file's TorBox request."""
+    link is in hand never waits on another file's TorBox request; *wait_s*
+    lets a read wait that long for a free request slot instead of failing."""
     k = (torrent_id, file_id)
     with _lock:
-        url = _usable(_links.get(k), _clock() if now is None else now)
+        t = _clock() if now is None else now
+        url = _usable(_links.get(k), t)
         if url:
             return url
+        if _failed.get(k, 0) > t:
+            return None                # TorBox just refused this file
         key_lock = _key_locks.setdefault(k, threading.Lock())
     with key_lock:                     # one fetch per file; others proceed
         with _lock:
@@ -157,10 +210,13 @@ def link_for(torrent_id, file_id, *, now=None):
                 link.check_ok, link.checked_at = ok, now
             if ok:
                 return link.url
-        url = _request_link(torrent_id, file_id)
-        if not url:
-            return None
+        url, refused = _request_link(torrent_id, file_id, retries=retries, wait_s=wait_s)
         with _lock:
+            if not url:
+                if refused:
+                    _failed[k] = _clock() + FAILED_RETRY_AFTER_S
+                return None
+            _failed.pop(k, None)
             _links[k] = _Link(url, _clock())
         return url
 
@@ -173,17 +229,22 @@ def _is_video(path):
 
 
 def prefetch(entry):
-    """True when every video file of *entry* has a working link (the fast
-    lane never serves a torrent it can't play)."""
-    videos = [f for f in entry.files if _is_video(f.path)]
-    return bool(videos) and all(link_for(entry.torrent_id, f.file_id) for f in videos)
+    """True when TorBox hands out links for *entry*: up to ``PREFETCH_MAX``
+    of its videos, fetched now without retries (a grab mustn't wait on
+    TorBox errors); the rest are fetched when first opened.  Spends nothing
+    when the per-minute budget can't cover the check."""
+    videos = [f for f in entry.files if _is_video(f.path)][:PREFETCH_MAX]
+    if not videos or _budget_left() < len(videos):
+        return False
+    return all(link_for(entry.torrent_id, f.file_id, retries=False) for f in videos)
 
 
 def forget(torrent_id):
     """Drop a torrent's cached links (it left the fast lane)."""
     with _lock:
-        for k in [k for k in _links if k[0] == torrent_id]:
-            del _links[k]
+        for k in [k for k in list(_links) + list(_failed) if k[0] == torrent_id]:
+            _links.pop(k, None)
+            _failed.pop(k, None)
             _key_locks.pop(k, None)
 
 
@@ -192,5 +253,6 @@ def reset_for_tests():
     with _lock:
         _links.clear()
         _key_locks.clear()
+        _failed.clear()
         _calls.clear()
         _halt_until = 0.0

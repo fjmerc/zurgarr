@@ -796,7 +796,7 @@ class TestFastLaneMount:
     """The TorBox fast lane: zurgarr's own WebDAV server, mounted next to
     TorBox's like any other mount, started before its mount is probed."""
 
-    def _setup(self, monkeypatch, enabled=True):
+    def _setup(self, monkeypatch, enabled=True, server_error=False, creds_error=False):
         handlers, order = [], []
         monkeypatch.setenv('TORBOX_FAST_LANE', 'true' if enabled else 'false')
         monkeypatch.setenv('TORBOX_FAST_LANE_PORT', '9098')
@@ -822,8 +822,11 @@ class TestFastLaneMount:
              patch('rclone.rclone._dead_fuse_mount_at', return_value=False), \
              patch('rclone.rclone.obscure_password', return_value='obscured'), \
              patch('utils.fast_lane_server.start_fast_lane_server',
-                   side_effect=lambda port, **k: order.append(('server', port))), \
-             patch('utils.fast_lane_server.fast_lane_credentials', return_value=('zurgarr', 'pw')), \
+                   side_effect=(OSError('address in use') if server_error
+                                else lambda port, **k: order.append(('server', port)))), \
+             patch('utils.fast_lane_server.fast_lane_credentials',
+                   side_effect=(RuntimeError("can't read it") if creds_error
+                                else lambda: ('zurgarr', 'pw'))), \
              patch('os.path.exists', return_value=False), \
              patch('os.makedirs'), \
              patch('subprocess.run'), \
@@ -855,6 +858,26 @@ class TestFastLaneMount:
         import rclone.rclone as mod
         monkeypatch.setattr(mod, '_write_fast_lane_remote', lambda f, name, port: False)
         cmds, _ = self._setup(monkeypatch)
+        assert set(cmds) == {'zurgarr', 'torbox'}
+
+    def test_lane_is_live_once_its_server_and_mount_are_up(self, monkeypatch):
+        from utils import fast_lane
+        fast_lane.set_live(False)
+        self._setup(monkeypatch)
+        assert fast_lane.is_live()
+        fast_lane.set_live(False)
+
+    def test_lane_not_live_when_its_server_cannot_start(self, monkeypatch):
+        """Port 9098 taken (Zurg picks a random port when ZURG_PORT is
+        unset): no lane, so nothing is admitted to it."""
+        from utils import fast_lane
+        fast_lane.set_live(False)
+        cmds, _ = self._setup(monkeypatch, server_error=True)
+        assert 'torbox_fast' not in cmds and not fast_lane.is_live()
+
+    def test_an_unreadable_login_only_turns_the_lane_off(self, monkeypatch):
+        """The other mounts must still come up."""
+        cmds, _ = self._setup(monkeypatch, creds_error=True)
         assert set(cmds) == {'zurgarr', 'torbox'}
 
     def test_no_fast_lane_mount_when_disabled(self, monkeypatch):

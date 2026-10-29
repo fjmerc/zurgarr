@@ -398,11 +398,13 @@ def replace_local_with_symlinks(episodes, local_tv_path, rclone_mount, symlink_t
             mount_bases.append((os.path.realpath(tb_mount), tb_base))
     except Exception as e:
         logger.debug(f"[library_prefs] TorBox mount pair unavailable: {e}")
+    # A copy still in the TorBox fast lane waits: a real local file is never
+    # swapped for a link that depends on the lane until switch-back.
+    fast_mount = None
     try:
         from utils import fast_lane
         fast_pair = fast_lane.mount_pair()     # (base + '/', mount)
-        if fast_pair:
-            mount_bases.append((fast_pair[1], fast_pair[0].rstrip('/')))
+        fast_mount = fast_pair[1] if fast_pair else None
     except Exception as e:
         logger.debug(f"[library_prefs] fast lane mount pair unavailable: {e}")
 
@@ -427,6 +429,8 @@ def replace_local_with_symlinks(episodes, local_tv_path, rclone_mount, symlink_t
 
         # Translate debrid path from Zurgarr namespace to Sonarr namespace
         real_debrid = os.path.realpath(debrid_path)
+        if fast_mount and (real_debrid.startswith(fast_mount + os.sep) or real_debrid == fast_mount):
+            continue      # still in the TorBox fast lane: switched on a later pass
         symlink_target = next(
             (base + real_debrid[len(mount):] for mount, base in mount_bases
              if real_debrid.startswith(mount + os.sep) or real_debrid == mount),

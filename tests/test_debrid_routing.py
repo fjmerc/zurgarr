@@ -1092,3 +1092,11 @@ class TestFastLanePair:
     def test_fast_lane_is_not_a_routing_target(self):
         from utils.debrid_routing import TORBOX_FAST, VALID_DEBRIDS
         assert TORBOX_FAST not in VALID_DEBRIDS
+
+
+def test_fast_lane_base_trailing_slash_is_dropped(monkeypatch):
+    """A trailing '/' would make every fast-lane target '//Folder', which
+    protection and switch-back would miss."""
+    from utils.debrid_routing import TORBOX_FAST, symlink_target_base_for_debrid
+    monkeypatch.setenv('BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX_FAST', '/mnt/debrid_torbox_fast/')
+    assert symlink_target_base_for_debrid(TORBOX_FAST) == '/mnt/debrid_torbox_fast'

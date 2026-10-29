@@ -535,3 +535,52 @@ class TestDeferredMountRetry:
         monkeypatch.setattr(rclone_mod, 'retry_pending_mounts', boom)
         result = scheduled_tasks.mount_liveness_probe()
         assert result['status'] == 'success'
+
+
+class TestFastLaneMountLiveness:
+    """The TorBox fast lane's mount is probed and self-healed like the
+    others, and the lane takes no new torrents while it's down."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, monkeypatch):
+        monkeypatch.setattr(scheduled_tasks, '_check_local_library_health', lambda: None)
+        monkeypatch.setenv('TORBOX_API_KEY', 'k')
+        monkeypatch.setenv('TORBOX_WEBDAV_USER', 'u')
+        monkeypatch.setenv('TORBOX_WEBDAV_PASS', 'p')
+        monkeypatch.setenv('TORBOX_FAST_LANE', 'true')
+
+    def _run(self, tmp_path, monkeypatch, fast_dead):
+        from utils import debrid_routing, fast_lane
+        rd, tb, fast = tmp_path / 'rd', tmp_path / 'tb', tmp_path / 'tb_fast'
+        for d in (rd, tb, fast):
+            d.mkdir()
+        monkeypatch.setenv('BLACKHOLE_RCLONE_MOUNT', str(rd))
+        monkeypatch.setattr(os.path, 'ismount', lambda p: True)
+        real_listdir = os.listdir
+
+        def listdir(p):
+            if fast_dead and p == str(fast):
+                raise OSError(107, 'Transport endpoint is not connected')
+            return real_listdir(p)
+        monkeypatch.setattr(os, 'listdir', listdir)
+        healed = []
+        monkeypatch.setattr(scheduled_tasks, '_maybe_selfheal_mount',
+                            lambda path, status, msg: healed.append((path, status)))
+        monkeypatch.setattr(debrid_routing, 'mount_for_debrid',
+                            lambda d, rclone_mount_base='/data': str(fast) if d == 'torbox_fast' else str(tb))
+        fast_lane.set_live(True)
+        result = scheduled_tasks.mount_liveness_probe()
+        return result, healed, str(fast)
+
+    def test_dead_fast_mount_is_healed_and_takes_nothing_new(self, tmp_path, monkeypatch):
+        from utils import fast_lane
+        result, healed, fast = self._run(tmp_path, monkeypatch, fast_dead=True)
+        assert (fast, 'error') in healed
+        assert result['status'] == 'error' and 'Fast lane' in result['message']
+        assert not fast_lane.is_live()
+
+    def test_healthy_fast_mount_keeps_the_lane_live(self, tmp_path, monkeypatch):
+        from utils import fast_lane
+        result, healed, fast = self._run(tmp_path, monkeypatch, fast_dead=False)
+        assert result['status'] == 'success' and fast_lane.is_live()
+        fast_lane.set_live(False)

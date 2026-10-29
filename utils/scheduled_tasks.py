@@ -665,8 +665,9 @@ def verify_symlinks():
     from utils import fast_lane
     fast_pair = fast_lane.mount_pair()
     if fast_pair:
-        debrid_prefixes.append(fast_pair[0])
         target_mount_pairs.append(fast_pair)
+    if fast_lane.fast_base():
+        debrid_prefixes.append(fast_lane.fast_base() + '/')   # even with the lane off
 
     scan_dirs = []
     if os.path.isdir(completed_dir):
@@ -724,6 +725,7 @@ def verify_symlinks():
     # Phase 1: Identify broken symlinks (don't delete yet)
     to_delete = []
     checked = 0
+    repaired_stranded = 0     # fast-lane links repointed at TorBox's copy
 
     for scan_dir in scan_dirs:
         for root, dirs, files in os.walk(scan_dir):
@@ -741,8 +743,13 @@ def verify_symlinks():
                            for p in debrid_prefixes):
                     continue
 
-                if fast_lane.protected(target):
-                    continue          # in the fast lane: never removed
+                stranded = fast_lane.repair_stranded(fpath, target)
+                if stranded == 'repaired':
+                    repaired_stranded += 1
+                if stranded:
+                    continue          # in the fast lane, or repointed at TorBox
+                if (target.startswith(fast_lane.fast_base() + '/') and not fast_pair):
+                    continue          # lane off and no TorBox copy: can't judge it
                 checked += 1
                 # Translate the symlink target back to a local mount path
                 # before checking existence.  Each (target_base, mount)
@@ -834,6 +841,7 @@ def verify_symlinks():
                 logger.warning(f"[scheduler] Repair re-search failed for '{release_name}': {e}")
 
     # Build result message
+    repaired += repaired_stranded
     parts = [f'Checked {checked}']
     if repaired:
         parts.append(f'repaired {repaired}')
@@ -1672,6 +1680,15 @@ _LISTDIR_TIMEOUT_SEC = 15          # hard cap on listdir before we give up
                                     # tier of defense)
 
 
+def _rclone_mount_registered(mount_name):
+    """Whether rclone set up *mount_name* (its RC URL is registered)."""
+    try:
+        from rclone.rclone import _rc_urls
+        return mount_name in _rc_urls
+    except Exception:
+        return False
+
+
 def _listdir_with_timeout(path, timeout):
     """``os.listdir(path)`` with a wall-clock timeout.
 
@@ -1965,6 +1982,24 @@ def mount_liveness_probe():
         tb_status, tb_msg, tb_items = _probe_mount(tb_mount_path, tolerate_timeout=True)
         _maybe_selfheal_mount(tb_mount_path, tb_status, tb_msg)
 
+    # The TorBox fast lane's mount: probed and self-healed like the others;
+    # while it isn't healthy the lane takes no new torrents (grabs then look
+    # on the TorBox mount, as without the lane).
+    fast_status, fast_msg = None, None
+    from utils.debrid_routing import TORBOX_FAST, fast_lane_enabled
+    if tb_mount_path and fast_lane_enabled():
+        from utils import fast_lane
+        from utils.debrid_routing import mount_for_debrid as _mount_for
+        fast_path = _mount_for(TORBOX_FAST, rclone_mount_base=os.path.dirname(
+            os.path.normpath(tb_mount_path)))
+        if fast_path:
+            fast_status, fast_msg, _items = _probe_mount(fast_path, tolerate_timeout=True)
+            _maybe_selfheal_mount(fast_path, fast_status, fast_msg)
+            if fast_status != 'success':
+                fast_lane.set_live(False)
+            elif _rclone_mount_registered(os.path.basename(fast_path)):
+                fast_lane.set_live(True)
+
     # Combine.  TB 'absent' means TB not configured — don't degrade.
     # TB 'error' means TB configured but dead — degrade to error.
     if primary_status == 'error':
@@ -1975,6 +2010,9 @@ def mount_liveness_probe():
     elif tb_status == 'error':
         overall = 'error'
         message = f'TB ({tb_mount_path}): {tb_msg} | RD: {primary_msg}'
+    elif fast_status == 'error':
+        overall = 'error'
+        message = f'Fast lane: {fast_msg} | RD: {primary_msg}'
     else:
         overall = 'success'
         message = primary_msg
@@ -2142,7 +2180,8 @@ def register_all():
 
     # TorBox fast lane — move links to the TorBox mount once it lists them
     from utils.debrid_routing import fast_lane_enabled
-    if fast_lane_enabled():
+    from utils import fast_lane_registry
+    if fast_lane_enabled() or fast_lane_registry.entries():   # drains with the lane off
         scheduler.register(
             'fast_lane_switchback',
             fast_lane_switchback,

@@ -2215,14 +2215,15 @@ class TestRescueThroughTheFastLane:
         seen = []
         monkeypatch.setattr('utils.fast_lane.admit_record',
                             lambda rec: seen.append(rec) or admitted)
+        monkeypatch.setenv('TORBOX_FAST_LANE', 'true')
         client = MagicMock()
         client.torrent_info.return_value = {'id': 5, 'files': []}
-        assert debrid_health._rescue_link_target('torbox', client, '5') == expected
+        assert debrid_health._rescue_link_target('torbox', client, '5')[0] == expected
         assert seen == [{'id': 5, 'files': []}]
 
     def test_non_torbox_alt_is_never_admitted(self, monkeypatch):
         monkeypatch.setattr('utils.fast_lane.admit_record', lambda rec: pytest.fail('not TorBox'))
-        assert debrid_health._rescue_link_target('realdebrid', MagicMock(), '5') == 'realdebrid'
+        assert debrid_health._rescue_link_target('realdebrid', MagicMock(), '5')[0] == 'realdebrid'
 
 
 def test_rescue_retarget_leaves_fast_lane_links_alone(tmp_path, monkeypatch):
@@ -2236,3 +2237,25 @@ def test_rescue_retarget_leaves_fast_lane_links_alone(tmp_path, monkeypatch):
     os.symlink('/mnt/debrid_torbox_fast/Show.S01/e.mkv', str(link))
     assert debrid_health._retarget_symlinks_to_alt('A' * 40, 'x', candidates={'Show.S01'}) == 0
     assert os.readlink(str(link)) == '/mnt/debrid_torbox_fast/Show.S01/e.mkv'
+
+
+def test_rescue_makes_no_extra_torbox_call_with_the_lane_off(monkeypatch):
+    monkeypatch.setenv('TORBOX_FAST_LANE', 'false')
+    client = MagicMock()
+    dst, record = debrid_health._rescue_link_target('torbox', client, '5')
+    assert dst == 'torbox' and record is None
+    client.torrent_info.assert_not_called()
+
+
+def test_rescue_record_is_reused_by_the_retarget(monkeypatch):
+    """One mylist read per rescue: the retarget reuses the record the
+    admission fetched."""
+    monkeypatch.setenv('TORBOX_FAST_LANE', 'true')
+    monkeypatch.setattr('utils.fast_lane.admit_record', lambda rec: False)
+    client = MagicMock()
+    client.torrent_info.return_value = {'id': 5, 'files': [{'name': 'R/e.mkv'}]}
+    dst, record = debrid_health._rescue_link_target('torbox', client, '5')
+    assert record == {'id': 5, 'files': [{'name': 'R/e.mkv'}]}
+    debrid_health._retarget_symlinks_to_alt('A' * 40, 'x', candidates={'R'},
+                                            alt_client=client, alt_torrent_id='5', alt_info=record)
+    assert client.torrent_info.call_count == 1

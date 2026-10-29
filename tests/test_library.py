@@ -11712,6 +11712,7 @@ class TestFastLaneMountPairs:
         tb.mkdir()
         assert LibraryScanner._discover_fast_lane_mount(str(tb)) is None       # not mounted yet
         (tmp_path / 'torbox_fast').mkdir()
+        monkeypatch.setattr('os.path.ismount', lambda p: p == str(tmp_path / 'torbox_fast'))
         assert LibraryScanner._discover_fast_lane_mount(str(tb)) == str(tmp_path / 'torbox_fast')
 
 
@@ -11770,3 +11771,54 @@ class TestFastLaneCleanupAndPrefixes:
     def test_cleanup_removes_a_broken_link_no_longer_in_the_lane(self, fast, tmp_dir, monkeypatch):
         link = self._cleanup(tmp_dir, monkeypatch, '/mnt/debrid_torbox_fast/Gone.S01/g.mkv')
         assert not os.path.lexists(link)
+
+
+
+class TestStrandedFastLaneLinksInTheLibrary:
+    @pytest.fixture
+    def off(self, tmp_dir, monkeypatch):
+        monkeypatch.setenv('TORBOX_FAST_LANE', 'false')
+        monkeypatch.setenv('BLACKHOLE_SYMLINK_TARGET_BASE', '/mnt/debrid')
+        monkeypatch.setenv('BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX', '/mnt/debrid_torbox')
+        tb = os.path.join(tmp_dir, 'tb_mount')
+        os.makedirs(os.path.join(tb, 'Kept.S01'))
+        open(os.path.join(tb, 'Kept.S01', 'e.mkv'), 'w').close()
+        monkeypatch.setattr(LibraryScanner, '_discover_torbox_mount', staticmethod(lambda: tb))
+        return tb
+
+    def test_fast_lane_links_are_debrid_content_even_with_the_lane_off(self, off):
+        from utils.library import _all_debrid_symlink_prefixes
+        assert '/mnt/debrid_torbox_fast/' in _all_debrid_symlink_prefixes()
+
+    def test_cleanup_repairs_a_stranded_link(self, off, tmp_dir, monkeypatch):
+        monkeypatch.setenv('BLACKHOLE_SYMLINK_ENABLED', 'true')
+        rd = os.path.join(tmp_dir, 'rd_mount')
+        os.makedirs(os.path.join(rd, 'shows', '_keep'))
+        monkeypatch.setenv('BLACKHOLE_RCLONE_MOUNT', rd)
+        show = os.path.join(tmp_dir, 'tv', 'Show', 'Season 01')
+        os.makedirs(show)
+        link = os.path.join(show, 'e.mkv')
+        os.symlink('/mnt/debrid_torbox_fast/Kept.S01/e.mkv', link)
+        sc = LibraryScanner.__new__(LibraryScanner)
+        sc._local_movies_path = None
+        sc._local_tv_path = os.path.join(tmp_dir, 'tv')
+        sc._cleanup_broken_debrid_symlinks()
+        assert os.readlink(link) == '/mnt/debrid_torbox/Kept.S01/e.mkv'
+
+    def test_fast_mount_must_be_a_mount(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('TORBOX_FAST_LANE', 'true')
+        monkeypatch.setattr('utils.boot_layout.torbox_mount_name', lambda: 'torbox')
+        (tmp_path / 'torbox').mkdir()
+        (tmp_path / 'torbox_fast').mkdir()         # left behind, nothing mounted
+        assert LibraryScanner._discover_fast_lane_mount(str(tmp_path / 'torbox')) is None
+
+
+
+def test_a_fast_lane_folder_counts_as_torbox_for_the_disc_rip_cleanup(monkeypatch):
+    """Else the clean-up would look for — and could delete — a same-named
+    Real-Debrid torrent."""
+    monkeypatch.setattr(LibraryScanner, '_discover_fast_lane_mount',
+                        staticmethod(lambda tb: '/data/torbox_fast'))
+    assert LibraryScanner._on_torbox_mounts('/data/torbox_fast/Rel', '/data/torbox')
+    assert LibraryScanner._on_torbox_mounts('/data/torbox/Rel', '/data/torbox')
+    assert not LibraryScanner._on_torbox_mounts('/data/zurgarr/movies/Rel', '/data/torbox')

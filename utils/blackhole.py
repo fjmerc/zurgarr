@@ -277,10 +277,15 @@ _folder_refresh_ts = {}  # folder name -> monotonic ts of its last re-list
 _folder_refresh_last = float('-inf')  # monotonic ts of the last re-list of any folder
 
 
-def _fast_lane_protected(target):
+def _fast_lane_stranded(path, target):
+    """A fast-lane link the /completed clean-up must keep: in the lane, or
+    just repointed at TorBox's copy (see fast_lane.repair_stranded)."""
     try:
         from utils import fast_lane
-        return fast_lane.protected(target)
+        if fast_lane.protected(target):
+            return True
+        new = fast_lane.repair_target(target)
+        return bool(new) and fast_lane.retarget_link(path, new)
     except Exception:
         return False
 
@@ -2026,7 +2031,10 @@ class BlackholeWatcher:
         fast_root = self._mount_for('torbox')
         if not fast_root or fast_root == self.rclone_mount:
             return None
-        return mount_for_debrid(TORBOX_FAST, rclone_mount_base=os.path.dirname(fast_root))
+        fast = mount_for_debrid(TORBOX_FAST, rclone_mount_base=os.path.dirname(fast_root))
+        # mounted, not merely a directory: a lane that's down must not make
+        # grabs wait for it (they look on TorBox's mount instead)
+        return fast if fast and os.path.ismount(fast) else None
 
     @staticmethod
     def _admit_to_fast_lane(info):
@@ -3131,8 +3139,8 @@ class BlackholeWatcher:
                         target = os.readlink(fp)
                         if not os.path.isabs(target):
                             target = os.path.realpath(os.path.join(os.path.dirname(fp), target))
-                        if _fast_lane_protected(target):
-                            has_valid = True       # in the fast lane: never removed
+                        if _fast_lane_stranded(fp, target):
+                            has_valid = True       # in the lane, or repointed at TorBox
                             continue
                         check_target = fp
                         for base_real, mount_real in translations:

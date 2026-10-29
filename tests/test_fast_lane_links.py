@@ -28,8 +28,9 @@ def wire(monkeypatch):
     def fetch(params):
         w.calls.append((params['torrent_id'], params['file_id']))
         if w.answers:
-            return w.answers.pop(0)
-        return 200, {'success': True, 'data': f"https://cdn.example/dl/{len(w.calls)}?token=t"}
+            a = w.answers.pop(0)
+            return a if len(a) == 3 else (a[0], a[1], None)
+        return 200, {'success': True, 'data': f"https://cdn.example/dl/{len(w.calls)}?token=t"}, None
     monkeypatch.setattr(fl, '_fetch', fetch)
     monkeypatch.setattr(fl, '_link_works', lambda url: w.checks.append(url) or w.check_ok)
     monkeypatch.setattr(fl, '_sleep', lambda s: w.slept.append(s))
@@ -147,3 +148,74 @@ def test_slow_fetch_does_not_block_cached_links(wire, monkeypatch):
     t.join(5)
     reader.join(5)
     assert answered_while_stuck == [cached]
+
+
+# ── final-review fixes ───────────────────────────────────────────────────
+
+def _pack(n, tid=5):
+    return FastLaneEntry(tid, 'Show.S01', [FastLaneFile(f'E{i:02d}.mkv', 1, 100 + i) for i in range(n)])
+
+
+def test_a_big_pack_is_admitted_with_a_few_links(wire):
+    """A 12-episode pack used to spend 10 calls and fail on the 11th: check
+    a few videos (TorBox serves the torrent), fetch the rest when opened."""
+    assert fl.prefetch(_pack(12)) is True
+    assert len(wire.calls) == fl.PREFETCH_MAX
+
+
+def test_prefetch_spends_nothing_without_the_budget_for_it(wire):
+    for fid in range(fl.REQUESTS_PER_MIN - fl.PREFETCH_MAX + 1):
+        fl.link_for(1, fid)
+    before = len(wire.calls)
+    assert fl.prefetch(_pack(12)) is False
+    assert len(wire.calls) == before
+
+
+def test_prefetch_does_not_retry_torbox_errors(wire):
+    wire.answers = [(500, None)]
+    assert fl.prefetch(_pack(1)) is False
+    assert len(wire.calls) == 1 and wire.slept == []
+
+
+def test_rate_limit_halts_for_at_least_five_minutes(wire):
+    wire.answers = [(429, None, '30')]
+    assert fl.link_for(1, 2) is None
+    wire.now += 299
+    assert fl.link_for(3, 4) is None and len(wire.calls) == 1
+    wire.now += 2
+    assert fl.link_for(3, 4)
+
+
+def test_rate_limit_honours_a_longer_retry_after(wire):
+    wire.answers = [(429, None, '900')]
+    fl.link_for(1, 2)
+    wire.now += 600
+    assert fl.link_for(3, 4) is None and len(wire.calls) == 1
+
+
+def test_a_file_that_failed_is_not_asked_again_for_five_minutes(wire):
+    wire.answers = [(404, None)]
+    assert fl.link_for(1, 2) is None
+    assert fl.link_for(1, 2) is None
+    assert len(wire.calls) == 1
+    wire.now += fl.FAILED_RETRY_AFTER_S
+    assert fl.link_for(1, 2) and len(wire.calls) == 2
+
+
+def test_a_playing_file_waits_for_a_slot_instead_of_failing(wire):
+    for fid in range(fl.REQUESTS_PER_MIN):
+        fl.link_for(1, fid)
+    def sleep(s):
+        wire.slept.append(s)
+        wire.now += s
+    import utils.fast_lane_links as mod
+    mod._sleep = sleep
+    assert fl.link_for(9, 9, wait_s=90)
+    assert wire.slept and wire.slept[0] <= 60
+
+
+def test_calls_are_counted(wire, monkeypatch):
+    counted = []
+    monkeypatch.setattr('utils.metrics.metrics.inc', lambda name, *a, **k: counted.append(name))
+    fl.link_for(1, 2)
+    assert counted == ['fast_lane_requestdl']

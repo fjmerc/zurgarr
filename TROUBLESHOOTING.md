@@ -393,7 +393,12 @@ If fast-lane titles don't play:
   folder under another name.
 - A copy zurgarr can't get a TorBox download link for — TorBox errors, or
   zurgarr's limit of 10 download-link requests a minute — skips the fast lane
-  and takes the normal path.
+  and takes the normal path. So does every new copy while the fast mount is
+  down (System → Tasks, `mount_liveness`, says "Fast lane: …").
+- **Turning the fast lane off is safe:** titles still in it move to the TorBox
+  mount as soon as TorBox lists them (the `fast_lane_switchback` task keeps
+  running until the lane is empty), and link checks repoint any fast-lane link
+  left behind at TorBox's copy.
 
 ## New shows/movies only appear in Plex after a manual scan
 

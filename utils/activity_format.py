@@ -552,6 +552,11 @@ def _fmt_fast_lane_unmatched(ev, meta):
     return msg, msg
 
 
+def _fmt_fast_lane_dropped(ev, meta):
+    msg = 'Left the TorBox account while in the TorBox fast lane'
+    return msg, msg
+
+
 def _fmt_mount_selfheal(ev, meta):
     mount = meta.get('mount', 'mount')
     ok = meta.get('restarted')
@@ -664,6 +669,7 @@ _CAUSE_FORMATTERS = {
     'mount_selfheal': _fmt_mount_selfheal,
     'fast_lane_switched': _fmt_fast_lane_switched,
     'fast_lane_unmatched': _fmt_fast_lane_unmatched,
+    'fast_lane_dropped': _fmt_fast_lane_dropped,
     'mount_deferred_start': _fmt_mount_deferred_start,
     'debrid_expiry_warning': _fmt_debrid_expiry_warning,
     'seerr_marked_available': _fmt_seerr_marked_available,
@@ -917,6 +923,9 @@ FORMATTER_JS = r"""
     fast_lane_switched: function(ev,m){
       var n = m.links || 0;
       return 'Moved from the TorBox fast lane to the TorBox mount (' + n + ' link' + (n === 1 ? '' : 's') + ')';
+    },
+    fast_lane_dropped: function(ev,m){
+      return 'Left the TorBox account while in the TorBox fast lane';
     },
     fast_lane_unmatched: function(ev,m){
       return "Still in the TorBox fast lane after a day \u2014 TorBox's WebDAV doesn't list it under a name zurgarr can match";

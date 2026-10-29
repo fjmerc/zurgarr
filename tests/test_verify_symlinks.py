@@ -926,3 +926,32 @@ class TestFastLaneLinks:
                              os.path.join(fast, 'Gone (2019)', 'g.mkv'))
         verify_symlinks()
         assert not os.path.lexists(link)
+
+
+class TestStrandedFastLaneLinks:
+    """With the lane off (or a torrent no longer in it), a fast-lane link is
+    repaired to TorBox's copy — never deleted for want of a lane."""
+
+    @pytest.fixture
+    def off(self, symlink_env, tmp_dir, monkeypatch):
+        monkeypatch.setenv('TORBOX_FAST_LANE', 'false')
+        tb = os.path.join(tmp_dir, 'tb_mount')
+        os.makedirs(os.path.join(tb, 'Kept.S01'))
+        open(os.path.join(tb, 'Kept.S01', 'e.mkv'), 'w').close()
+        base = os.path.join(tmp_dir, 'mnt_tb')
+        monkeypatch.setenv('BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX', base)
+        monkeypatch.setattr('utils.library.LibraryScanner._discover_torbox_mount',
+                            staticmethod(lambda: tb))
+        return base
+
+    def test_stranded_link_repaired_to_torbox(self, symlink_env, off):
+        from utils.scheduled_tasks import verify_symlinks
+        link = _make_symlink(symlink_env['local_tv'], 'e.mkv', off + '_fast/Kept.S01/e.mkv')
+        verify_symlinks()
+        assert os.readlink(link) == off + '/Kept.S01/e.mkv'
+
+    def test_stranded_link_without_a_torbox_copy_is_left_alone(self, symlink_env, off):
+        from utils.scheduled_tasks import verify_symlinks
+        link = _make_symlink(symlink_env['local_tv'], 'g.mkv', off + '_fast/Gone.S01/g.mkv')
+        verify_symlinks()
+        assert os.readlink(link) == off + '_fast/Gone.S01/g.mkv'

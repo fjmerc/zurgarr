@@ -2600,6 +2600,22 @@ class TestPendingMonitors:
 
 class TestSymlinkCleanup:
 
+    def test_repairs_a_stranded_fast_lane_link(self, tmp_dir, monkeypatch):
+        completed = os.path.join(tmp_dir, 'completed')
+        release_dir = os.path.join(completed, 'Rel')
+        os.makedirs(release_dir)
+        link = os.path.join(release_dir, 'e.mkv')
+        os.symlink('/mnt/debrid_torbox_fast/Rel/e.mkv', link)
+        real = os.path.join(tmp_dir, 'real.mkv')
+        open(real, 'w').close()
+        monkeypatch.setattr('utils.fast_lane.protected', lambda t: False)
+        monkeypatch.setattr('utils.fast_lane.repair_target',
+                            lambda t: real if t.startswith('/mnt/debrid_torbox_fast/') else None)
+        watcher = BlackholeWatcher(tmp_dir, 'key', 'torbox', symlink_enabled=True,
+                                   completed_dir=completed)
+        watcher._cleanup_symlinks()
+        assert os.readlink(link) == real
+
     def test_keeps_a_fast_lane_link_while_its_torrent_is_in_the_lane(self, tmp_dir, monkeypatch):
         """Its target is a host path that doesn't exist in the container:
         checked as is, every link Radarr/Sonarr are about to import would
@@ -6152,6 +6168,7 @@ class TestScannerHandoff:
         return made
 
     def test_ready_torbox_grab_is_admitted_and_linked_via_the_fast_lane(self, tmp_dir, monkeypatch, lane):
+        monkeypatch.setattr('os.path.ismount', lambda p: p.endswith('torbox_fast'))
         watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
         fast = os.path.join(tmp_dir, 'data', 'torbox_fast', 'Rel')
         made = self._spy_links(watcher, monkeypatch)
@@ -6178,7 +6195,19 @@ class TestScannerHandoff:
                             'completed', find=lambda *a, **k: (os.path.join(tmp_dir, 'data', 'x', 'Rel'), '', 'Rel'))
         assert made == ['torbox']
 
-    def test_find_on_mount_prefers_the_registered_fast_lane_folder(self, tmp_dir, lane):
+    def test_registered_folder_falls_back_to_torbox_when_the_lane_is_down(self, tmp_dir, lane, monkeypatch):
+        """A dead or unmounted fast lane must not make grabs wait for it."""
+        watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
+        self._register('Rel')
+        os.makedirs(os.path.join(tmp_dir, 'data', 'torbox_fast', 'Rel'))   # not a mount
+        tb = os.path.join(tmp_dir, 'data', 'torbox', 'Rel')
+        os.makedirs(tb)
+        open(os.path.join(tb, 'v.mkv'), 'w').close()
+        monkeypatch.setattr('os.path.ismount', lambda p: False)
+        assert watcher._find_on_mount('Rel', debrid='torbox') == (tb, '', 'Rel')
+
+    def test_find_on_mount_prefers_the_registered_fast_lane_folder(self, tmp_dir, lane, monkeypatch):
+        monkeypatch.setattr('os.path.ismount', lambda p: p.endswith('torbox_fast'))
         watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
         self._register('Law  Order (1990)')
         fast = os.path.join(tmp_dir, 'data', 'torbox_fast', 'Law  Order (1990)')
@@ -6187,7 +6216,8 @@ class TestScannerHandoff:
         assert watcher._find_on_mount('Law & Order (1990)', debrid='torbox') == \
             (fast, '', 'Law  Order (1990)')
 
-    def test_registered_folder_not_yet_on_the_fast_mount_waits(self, tmp_dir, lane):
+    def test_registered_folder_not_yet_on_the_fast_mount_waits(self, tmp_dir, lane, monkeypatch):
+        monkeypatch.setattr('os.path.ismount', lambda p: p.endswith('torbox_fast'))
         watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
         self._register('Rel')
         assert watcher._find_on_mount('Rel', debrid='torbox') == (None, None, None)

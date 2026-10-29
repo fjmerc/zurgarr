@@ -139,6 +139,9 @@ CAUSE_MOUNT_SELFHEAL = 'mount_selfheal'
 # zurgarr can match (it stays in the fast lane).
 CAUSE_FAST_LANE_SWITCHED = 'fast_lane_switched'
 CAUSE_FAST_LANE_UNMATCHED = 'fast_lane_unmatched'
+# ...or it left the TorBox account while in the fast lane (its links are then
+# repointed at TorBox's copy if one appears, else cleaned up).
+CAUSE_FAST_LANE_DROPPED = 'fast_lane_dropped'
 # A mount skipped at startup (WebDAV unreachable within the timeout) was
 # successfully set up later by the mount_liveness deferred retry.
 CAUSE_MOUNT_DEFERRED_START = 'mount_deferred_start'

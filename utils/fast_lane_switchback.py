@@ -42,10 +42,15 @@ def _tb_mount():
 
 
 def _link_roots():
+    from utils.env import completed_dir_from_env
     roots = [os.environ.get(k, '').strip() for k in
-             ('BLACKHOLE_LOCAL_LIBRARY_TV', 'BLACKHOLE_LOCAL_LIBRARY_MOVIES',
-              'BLACKHOLE_COMPLETED_DIR')]
-    return [r for r in roots if r and os.path.isdir(r)]
+             ('BLACKHOLE_LOCAL_LIBRARY_TV', 'BLACKHOLE_LOCAL_LIBRARY_MOVIES')]
+    roots.append(completed_dir_from_env())
+    out = []
+    for r in roots:
+        if r and os.path.isdir(r) and r not in out:
+            out.append(r)
+    return out
 
 
 def _account_has(torrent_id):
@@ -55,6 +60,11 @@ def _account_has(torrent_id):
     key = load_secret_or_env('torbox_api_key')
     if not key:
         return None
+    try:
+        from utils.metrics import metrics
+        metrics.inc('fast_lane_account_check')
+    except Exception:
+        pass
     url = ('https://api.torbox.app/v1/api/torrents/mylist?'
            + urllib.parse.urlencode({'id': torrent_id, 'bypass_cache': 'true'}))
     req = urllib.request.Request(url, headers={'Authorization': f'Bearer {key}'})
@@ -67,7 +77,14 @@ def _account_has(torrent_id):
         return None
     if not isinstance(body, dict):
         return None
-    return isinstance(body.get('data'), dict)
+    data = body.get('data')
+    if isinstance(data, dict) and data:
+        return True
+    # Only a clear answer is "gone": an error or rate-limit reply also comes
+    # back as HTTP 200 with no data.
+    if body.get('success') is True and (data is None or data == {}):
+        return False
+    return None
 
 
 def _relist(folder):
@@ -86,13 +103,22 @@ def _log(kind, entry, **meta):
     if kind == 'switched':
         history.log_event('fast_lane_switched', entry.folder, source='fast_lane',
                           meta={'cause': history.CAUSE_FAST_LANE_SWITCHED, **meta})
+    elif kind == 'dropped':
+        history.log_event('fast_lane_dropped', entry.folder, source='fast_lane',
+                          meta={'cause': history.CAUSE_FAST_LANE_DROPPED, **meta})
     else:
         history.log_event('fast_lane_unmatched', entry.folder, source='fast_lane',
                           meta={'cause': history.CAUSE_FAST_LANE_UNMATCHED, **meta})
 
 
 def _complete(folder_path, entry):
-    for f in entry.files:
+    """Every video of *entry* listed at its size (other files — .nfo,
+    samples, subtitles — may be missing from TorBox's WebDAV)."""
+    from utils.fast_lane_links import _is_video
+    videos = [f for f in entry.files if _is_video(f.path)]
+    if not videos:
+        return False
+    for f in videos:
         try:
             if os.path.getsize(os.path.join(folder_path, f.path)) != f.size:
                 return False
@@ -104,7 +130,6 @@ def _complete(folder_path, entry):
 def _listed_folder(tb_mount, entry):
     """The name TorBox's mount lists *entry*'s folder under, with every file
     at its size; None when it doesn't (yet), or the match isn't unique."""
-    _relist(entry.folder)
     exact = os.path.join(tb_mount, entry.folder)
     if os.path.isdir(exact):
         return entry.folder if _complete(exact, entry) else None
@@ -157,31 +182,69 @@ def _retarget(ready):
     return {k: tuple(v) for k, v in result.items()}
 
 
+_last_relist = {}     # torrent_id -> clock of its last forced re-list
+GONE_STRIKES = 2
+
+
+def _relist_one(entries, now):
+    """Force one re-read per pass (re-lists are throttled across zurgarr):
+    the least recently re-read entry TorBox hasn't been seen to list —
+    unmatched ones at most hourly."""
+    waiting = [e for e in entries if e.seen_listed_at is None and not e.switching and
+               (not e.warned_unmatched or now - _last_relist.get(e.torrent_id, float('-inf')) >= 3600)]
+    if not waiting:
+        return
+    pick = min(waiting, key=lambda e: _last_relist.get(e.torrent_id, float('-inf')))
+    _last_relist[pick.torrent_id] = now
+    _relist(pick.folder)
+
+
+def _drop(e, out):
+    registry.remove(e.torrent_id)
+    fast_lane_links.forget(e.torrent_id)
+    _last_relist.pop(e.torrent_id, None)
+    logger.info(f"[fast-lane] {e.folder} left the TorBox account — out of the fast lane")
+    _log('dropped', e)
+    out['dropped'] += 1
+
+
 def run_switchback(*, now=None):
-    """One pass over the fast lane; a summary of what it did."""
+    """One pass over the fast lane; a summary of what it did.  Runs with the
+    lane off too while entries remain: nothing serves them then, so each
+    moves to TorBox's mount as soon as TorBox lists it."""
     out = {'switched': 0, 'waiting': 0, 'dropped': 0, 'unmatched': 0}
-    if not fast_lane_enabled():
-        return out
     entries = registry.entries()
     if not entries:
         return out
+    draining = not fast_lane_enabled()
     now = time.time() if now is None else now
     tb_mount = _tb_mount()
+    if tb_mount:
+        _relist_one(entries, now)
     ready = []
     for e in entries:
         if e.account_checked_at is None or now - e.account_checked_at >= ACCOUNT_CHECK_EVERY_S:
             e.account_checked_at = now
+            has = _account_has(e.torrent_id)
+            if has is False:
+                e.gone_strikes += 1
+            elif has is True:
+                e.gone_strikes = 0
             registry.update(e)
-            if _account_has(e.torrent_id) is False:
-                registry.remove(e.torrent_id)
-                fast_lane_links.forget(e.torrent_id)
-                logger.info(f"[fast-lane] {e.folder} left the TorBox account — out of the fast lane")
-                out['dropped'] += 1
+            if e.gone_strikes >= GONE_STRIKES:
+                listed = _listed_folder(tb_mount, e) if tb_mount else None
+                if listed:                   # still listed: switch, don't strand
+                    ready.append((e, listed))
+                else:
+                    _drop(e, out)
                 continue
-        listed = _listed_folder(tb_mount, e) if tb_mount else None
+        if not tb_mount:
+            out['waiting'] += 1              # can't look: keep the clock as it is
+            continue
+        listed = _listed_folder(tb_mount, e)
         if listed is None:
             if e.seen_listed_at is not None:
-                e.seen_listed_at = None          # listing flapped: start over
+                e.seen_listed_at = None      # listing flapped: start over
                 registry.update(e)
             if now - e.added_at >= UNMATCHED_AFTER_S and not e.warned_unmatched:
                 e.warned_unmatched = True
@@ -191,6 +254,9 @@ def run_switchback(*, now=None):
                 _log('unmatched', e)
                 out['unmatched'] += 1
             out['waiting'] += 1
+            continue
+        if draining or e.switching:
+            ready.append((e, listed))
             continue
         if e.seen_listed_at is None:
             e.seen_listed_at = now
@@ -202,14 +268,18 @@ def run_switchback(*, now=None):
             continue
         ready.append((e, listed))
     if ready:
+        for e, _listed in ready:
+            e.switching = True               # new links now go to TorBox's mount
+            registry.update(e)
         moved = _retarget(ready)
         for e, listed in ready:
             count, ok = moved[e.torrent_id]
             if not ok:
-                out['waiting'] += 1
+                out['waiting'] += 1          # tried again next pass
                 continue
             registry.remove(e.torrent_id)
             fast_lane_links.forget(e.torrent_id)
+            _last_relist.pop(e.torrent_id, None)
             logger.info(f"[fast-lane] {e.folder}: TorBox lists it — {count} link(s) moved to the "
                         f"TorBox mount")
             _log('switched', e, links=count, folder=listed)

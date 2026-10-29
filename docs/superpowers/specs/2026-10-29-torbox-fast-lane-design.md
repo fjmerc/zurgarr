@@ -169,9 +169,39 @@ The fast lane's WebDAV hands out TorBox download links, and each first read
 spends the TorBox link budget, so every request needs a login: user `zurgarr`
 and a random password zurgarr generates once and keeps in
 `/config/fast_lane_auth.json` (mode 0600). zurgarr's own rclone remote carries
-it obscured; the Sonarr/Radarr host's mount gets it the same way (the host
-setup reads it from zurgarr's `/config/rclone.config`). Raised by the security
-review of the first server commit.
+it obscured; the Sonarr/Radarr host's mount gets it from the host setup
+playbook, which has zurgarr create it if needed, reads
+`/config/fast_lane_auth.json` and obscures it on stdin. Port 9098 admits only
+the Sonarr/Radarr host (Traefik allow-list) and is published on the Plex
+host's own address. Raised by the security review of the first server commit.
+
+## Changes from the final review (implementation)
+
+- **Admission checks up to 3 videos**, not every one: a season pack larger
+  than the per-minute link budget could never get in. The rest are fetched
+  when first opened; a read waits up to a minute for a free slot instead of
+  failing. Admission spends nothing when the budget can't cover the check,
+  never retries TorBox errors (a grab mustn't wait), and skips torrents
+  TorBox's mount already lists.
+- **The lane must be up to admit**: its server listening and its mount
+  mounted (`fast_lane.set_live`). The mount health check probes and
+  self-heals the fast mount and pauses admission while it's down; grabs for
+  folders in the lane then look on TorBox's mount as before.
+- **Turning the lane off drains it**: switch-back keeps running while
+  entries remain and moves each to TorBox's mount as soon as TorBox lists it.
+  Every link check also repairs a stranded fast-lane link to TorBox's copy
+  when there is one (never deletes it for want of a lane), and fast-lane
+  links always count as cloud content, never local copies.
+- **"Left the account" needs two clear answers** (`success: true` with no
+  data, or a 404), and a torrent TorBox still lists is switched, not dropped.
+- **TorBox 429s pause all link requests** for at least 5 minutes; a file
+  TorBox refused isn't asked about again for 5 minutes.
+- Switch-back marks an entry "switching" before walking the links (new links
+  then go to TorBox's mount), re-reads waiting folders in turn, checks only
+  video files, and runs every 2 minutes (not also on every library scan; the
+  first run 60 s after start replaces a separate startup pass).
+- Prefer-cloud leaves a real local file alone while its cloud copy is still
+  in the lane.
 
 ## TorBox API budget
 
