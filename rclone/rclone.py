@@ -309,6 +309,11 @@ def get_rc_urls_excluding(exclude_names):
     exclude = set(exclude_names or ())
     return [url for name, url in _rc_urls.items() if name not in exclude]
 
+def get_rc_urls_for(names):
+    """Return registered RC URLs for just the mounts named in ``names``."""
+    names = set(names or ())
+    return [url for name, url in _rc_urls.items() if name in names]
+
 def get_port_from_config(config_file_path):
     try:
         with open(config_file_path, 'r') as file:

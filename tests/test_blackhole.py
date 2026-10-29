@@ -1860,6 +1860,7 @@ class TestFindOnMount:
         monkeypatch.delenv('RCLONE_MOUNT_NAME', raising=False)
         import utils.blackhole as bh
         monkeypatch.setattr(bh, '_folder_refresh_ts', {})
+        monkeypatch.setattr(bh, '_folder_refresh_last', float('-inf'))
 
     @staticmethod
     def _video(folder):
@@ -2031,6 +2032,58 @@ class TestFindOnMount:
         assert watcher._find_on_mount('My Show S01E01 1080p WEB-DL-FLUX [TGx]',
                                       debrid='torbox') == (None, None, None)
         assert relisted == [folder]
+
+    def test_torbox_video_deep_in_a_box_set_counts(self, tmp_dir):
+        """Linking walks the whole tree; arrival must too (a complete-series
+        pack: Wrapper/Show/Season 1/Disc 1/*.mkv)."""
+        name = 'Show.Complete.Series'
+        deep = os.path.join(tmp_dir, 'torbox', name, 'Show', 'Season 1', 'Disc 1')
+        os.makedirs(deep)
+        self._video(deep)
+        watcher = BlackholeWatcher('/tmp', 'key', 'torbox', rclone_mount=tmp_dir)
+        assert watcher._find_on_mount(name, debrid='torbox')[0] == os.path.join(tmp_dir, 'torbox', name)
+
+    def test_torbox_sample_alone_is_not_arrival(self, tmp_dir, monkeypatch):
+        """Linking skips samples — a folder holding only one hasn't arrived."""
+        import utils.rclone_rc as rc
+        monkeypatch.setattr(rc, 'refresh_dir', lambda d='', **k: True)
+        name = 'Movie.2020.1080p-GRP'
+        sample = os.path.join(tmp_dir, 'torbox', name, 'Sample')
+        os.makedirs(sample)
+        open(os.path.join(sample, 'movie-sample.mkv'), 'w').close()
+        watcher = BlackholeWatcher('/tmp', 'key', 'torbox', rclone_mount=tmp_dir)
+        assert watcher._find_on_mount(name, debrid='torbox') == (None, None, None)
+
+    def test_torbox_empty_first_candidate_doesnt_hide_the_real_folder(self, tmp_dir, monkeypatch):
+        """An empty folder under the API display name (a leftover, or a
+        placeholder) must not stop the lookup trying the torrent's real
+        folder name."""
+        import utils.rclone_rc as rc
+        monkeypatch.setattr(rc, 'refresh_dir', lambda d='', **k: True)
+        tb = os.path.join(tmp_dir, 'torbox')
+        os.makedirs(os.path.join(tb, 'API Display Name'))
+        real = os.path.join(tb, 'Real.Info.Name.2020')
+        os.makedirs(real)
+        self._video(real)
+        watcher = BlackholeWatcher('/tmp', 'key', 'torbox', rclone_mount=tmp_dir)
+        assert watcher._find_on_mount('API Display Name', debrid='torbox',
+                                      file_names=['Real.Info.Name.2020/video.mkv']) == \
+            (real, '', 'Real.Info.Name.2020')
+
+    def test_torbox_relist_is_torbox_only_and_reaches_subfolders(self, tmp_dir, monkeypatch):
+        """The folder exists only on the TorBox mount; and a subfolder the
+        mount cached empty (Season 01/ shown before its files) needs
+        re-reading too."""
+        import utils.rclone_rc as rc
+        from utils import boot_layout
+        calls = []
+        monkeypatch.setattr(rc, 'refresh_dir', lambda d='', **k: calls.append((d, k)) or True)
+        name = 'Show.S01.1080p-GRP'
+        os.makedirs(os.path.join(tmp_dir, 'torbox', name, 'Season 01'))
+        watcher = BlackholeWatcher('/tmp', 'key', 'torbox', rclone_mount=tmp_dir)
+        watcher._find_on_mount(name, debrid='torbox')
+        assert calls == [(name, {'recursive': True,
+                                 'only_mounts': {boot_layout.torbox_mount_name()}})]
 
     def test_torbox_strips_indexer_prefix(self, tmp_dir):
         """TB API ``data.name`` sometimes has a leading ``[indexer.to] ``
@@ -8243,3 +8296,50 @@ class TestLastFixes:
         monkeypatch.setattr(bh, 'setup', lambda: calls.append('setup'))
         assert cr._apply_service_restarts({'blackhole'}, {'TORBOX_API_KEY'}) == set()
         assert calls == [] and 'not running' not in caplog.text
+
+
+class TestRelistFolder:
+    """Re-reading one TorBox folder: per folder at most every
+    _MOUNT_REFRESH_EVERY_S, and a short gap between any two so a burst of
+    waiting grabs can't hammer TorBox's WebDAV."""
+
+    @pytest.fixture
+    def relists(self, monkeypatch):
+        import utils.blackhole as bh
+        import utils.rclone_rc as rc
+        calls = []
+        monkeypatch.setattr(bh, '_folder_refresh_ts', {})
+        monkeypatch.setattr(bh, '_folder_refresh_last', float('-inf'))
+        monkeypatch.setattr(rc, 'refresh_dir', lambda d='', **k: calls.append(d) or True)
+        return calls
+
+    def test_same_folder_again_after_the_interval(self, relists):
+        import utils.blackhole as bh
+        assert bh._relist_folder('A', _now=1000.0)
+        assert not bh._relist_folder('A', _now=1000.0 + bh._MOUNT_REFRESH_EVERY_S - 1)
+        assert bh._relist_folder('A', _now=1000.0 + bh._MOUNT_REFRESH_EVERY_S)
+        assert relists == ['A', 'A']
+
+    def test_different_folders_are_spaced_apart(self, relists):
+        import utils.blackhole as bh
+        assert bh._relist_folder('A', _now=1000.0)
+        assert not bh._relist_folder('B', _now=1000.0 + bh._FOLDER_REFRESH_MIN_GAP_S / 2)
+        assert bh._relist_folder('B', _now=1000.0 + bh._FOLDER_REFRESH_MIN_GAP_S)
+        assert relists == ['A', 'B']
+
+    def test_reports_false_when_no_mount_answered(self, monkeypatch, relists):
+        import utils.blackhole as bh
+        import utils.rclone_rc as rc
+        monkeypatch.setattr(rc, 'refresh_dir', lambda d='', **k: False)
+        assert bh._relist_folder('A', _now=1000.0) is False
+
+
+class TestHoldsVideo:
+    def test_unreadable_folder_is_not_arrival(self, tmp_dir):
+        import utils.blackhole as bh
+        assert bh._holds_video(os.path.join(tmp_dir, 'gone')) is False
+
+    def test_a_folder_named_like_a_video_is_not_one(self, tmp_dir):
+        import utils.blackhole as bh
+        os.makedirs(os.path.join(tmp_dir, 'R', 'Movie.mkv'))
+        assert bh._holds_video(os.path.join(tmp_dir, 'R')) is False

@@ -268,49 +268,52 @@ _MOUNT_REFRESH_EVERY_S = 30
 # empty for ~10 min), and the root re-list above never re-reads a folder the
 # mount has cached as empty — that listing would stand for the 2h dir-cache.
 # A folder counts as on the mount once a video shows in it; until then it is
-# re-listed itself, once per _MOUNT_REFRESH_EVERY_S.
+# re-listed itself, once per _MOUNT_REFRESH_EVERY_S, and any two re-lists are
+# _FOLDER_REFRESH_MIN_GAP_S apart so a burst of waiting grabs can't hammer
+# TorBox's WebDAV.
+_FOLDER_REFRESH_MIN_GAP_S = 3
 _folder_refresh_lock = threading.Lock()
 _folder_refresh_ts = {}  # folder name -> monotonic ts of its last re-list
+_folder_refresh_last = float('-inf')  # monotonic ts of the last re-list of any folder
 
 
-def _holds_video(path, depth=2):
-    """True when *path* holds a media file, looking *depth* folders down
-    (a pack's release-named subfolder, its season folders)."""
-    try:
-        with os.scandir(path) as it:
-            entries = list(it)
-    except OSError:
-        return False
-    subdirs = []
-    for e in entries:
-        try:
-            is_dir = e.is_dir()
-        except OSError:
-            continue
-        if is_dir:
-            subdirs.append(e.path)
-        elif os.path.splitext(e.name)[1].lower() in MEDIA_EXTENSIONS:
-            return True
-    return depth > 0 and any(_holds_video(d, depth - 1) for d in subdirs)
+def _holds_video(path):
+    """True when *path* holds a file ``_create_symlinks`` would link (a media
+    file that isn't a sample), at any depth."""
+    for _root, _dirs, files in os.walk(path):
+        for f in files:
+            if (os.path.splitext(f)[1].lower() in MEDIA_EXTENSIONS
+                    and 'sample' not in f.lower()):
+                return True
+    return False
 
 
 def _relist_folder(name, *, _now=None):
-    """Re-read one mount folder from TorBox, at most once per
-    ``_MOUNT_REFRESH_EVERY_S`` per folder across every waiting thread.
-    True when this call fired it."""
+    """Re-read one TorBox folder and its subfolders from TorBox.  True when
+    this call re-listed it; False when it was re-listed too recently, another
+    folder was a moment ago, or no TorBox mount answered."""
     now = _now if _now is not None else time.monotonic()
+    global _folder_refresh_last
     with _folder_refresh_lock:
-        if now - _folder_refresh_ts.get(name, float('-inf')) < _MOUNT_REFRESH_EVERY_S:
+        if (now - _folder_refresh_ts.get(name, float('-inf')) < _MOUNT_REFRESH_EVERY_S
+                or now - _folder_refresh_last < _FOLDER_REFRESH_MIN_GAP_S):
             return False
         for k in [k for k, t in _folder_refresh_ts.items() if now - t > 3600]:
             del _folder_refresh_ts[k]
         _folder_refresh_ts[name] = now
+        _folder_refresh_last = now
     try:
         from utils.rclone_rc import refresh_dir
-        refresh_dir(name)
-    except Exception:
-        pass
-    return True
+        from utils import boot_layout
+        # recursive: a subfolder (Season 01/) the mount cached empty is kept
+        # by a plain re-list of its parent
+        return bool(refresh_dir(name, recursive=True,
+                                only_mounts={boot_layout.torbox_mount_name()}))
+    except Exception as e:
+        logger.debug(f"[blackhole] couldn't re-list {name} on the TorBox mount: {e}")
+        return False
+
+
 # After the mount wait times out, keep watching a ready grab this long,
 # checking every _LATE_ARRIVAL_POLL_S, and run the library scan the moment
 # it surfaces instead of leaving it for the next hourly scan.
@@ -2506,7 +2509,11 @@ class BlackholeWatcher:
                 continue
             path = os.path.join(mount_path, name)
             if os.path.isdir(path):
-                return self._tb_folder_if_ready(path, name)
+                hit = self._tb_folder_if_ready(path, name)
+                if hit[0]:
+                    return hit
+                # not filled in yet — another candidate, or the fuzzy match,
+                # may be the torrent's real folder
 
         try:
             from utils.library import norm_for_matching
