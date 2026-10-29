@@ -661,7 +661,8 @@ def _attempt_cross_rescue(torrent_hash, filename, source_debrid='realdebrid',
     if candidates:
         retargeted = _retarget_symlinks_to_alt(
             torrent_hash, filename,
-            src_debrid=source_debrid, dst_debrid=alt,
+            src_debrid=source_debrid,
+            dst_debrid=_rescue_link_target(alt, alt_client, alt_tid),
             candidates=candidates,
             alt_client=alt_client, alt_torrent_id=alt_tid,
         )
@@ -723,6 +724,24 @@ def _plex_session_active_for_release(release_name):
     except Exception as e:
         logger.debug(f"[debrid_health] Plex sessions probe failed: {type(e).__name__} — assuming no active stream")
         return False
+
+
+def _rescue_link_target(alt, alt_client, alt_torrent_id):
+    """Where a rescue's links should point: the TorBox fast lane when the
+    rescued TorBox copy is admitted to it (TorBox's own mount lists it
+    minutes later), else *alt* itself."""
+    from utils import debrid_routing
+    if alt != debrid_routing.TORBOX:
+        return alt
+    try:
+        from utils import fast_lane
+        info_fn = getattr(alt_client, 'torrent_info', None)
+        record = info_fn(alt_torrent_id) if callable(info_fn) else None
+        if fast_lane.admit_record(record):
+            return debrid_routing.TORBOX_FAST
+    except Exception as e:
+        logger.warning(f"[debrid_health] fast lane admission failed: {e}")
+    return alt
 
 
 def _retarget_symlinks_to_alt(torrent_hash, filename, src_debrid='realdebrid', dst_debrid='torbox',
@@ -821,7 +840,7 @@ def _retarget_symlinks_to_alt(torrent_hash, filename, src_debrid='realdebrid', d
         return 0
 
     src_prefix = src_base + '/'
-    to_torbox = dst_debrid == debrid_routing.TORBOX
+    to_torbox = dst_debrid in (debrid_routing.TORBOX, debrid_routing.TORBOX_FAST)
     count = 0
     for root in library_roots:
         for dirpath, _dirs, files in os.walk(root, followlinks=False):

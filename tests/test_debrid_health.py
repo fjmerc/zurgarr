@@ -2187,3 +2187,39 @@ class TestRetargetAmpersandOnTorbox:
             alt_client=tb, alt_torrent_id='T9')
         assert os.readlink(str(link)) == (
             '/mnt/debrid_torbox/Show.S03.Pack/Season 03/Show.S03E08..More.mkv')
+
+
+class TestRescueThroughTheFastLane:
+    """An RD→TorBox rescue admits its TorBox copy to the fast lane and, when
+    admitted, points the links there instead of at TorBox's lagging mount."""
+
+    def test_retarget_to_the_fast_lane_keeps_tb_layout(self, tmp_path, monkeypatch):
+        lib = tmp_path / 'lib'
+        monkeypatch.setenv('BLACKHOLE_SYMLINK_TARGET_BASE', '/mnt/debrid')
+        monkeypatch.setenv('BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX', '/mnt/debrid_torbox')
+        monkeypatch.setenv('BLACKHOLE_LOCAL_LIBRARY_TV', str(lib))
+        monkeypatch.delenv('BLACKHOLE_LOCAL_LIBRARY_MOVIES', raising=False)
+        season = lib / 'Show (2024)' / 'Season 03'
+        season.mkdir(parents=True)
+        link = season / 'ep.mkv'
+        os.symlink('/mnt/debrid/shows/Show S03E08 Upstairs&Downstairs/Show.S03E08.&.mkv', str(link))
+        from utils.debrid_routing import TORBOX_FAST
+        n = debrid_health._retarget_symlinks_to_alt(
+            'A' * 40, 'x', dst_debrid=TORBOX_FAST, candidates={'Show S03E08 Upstairs&Downstairs'})
+        assert n == 1
+        assert os.readlink(str(link)) == (
+            '/mnt/debrid_torbox_fast/Show S03E08 UpstairsDownstairs/Show.S03E08..mkv')
+
+    @pytest.mark.parametrize('admitted, expected', [(True, 'torbox_fast'), (False, 'torbox')])
+    def test_rescue_links_go_where_the_copy_is_admitted(self, monkeypatch, admitted, expected):
+        seen = []
+        monkeypatch.setattr('utils.fast_lane.admit_record',
+                            lambda rec: seen.append(rec) or admitted)
+        client = MagicMock()
+        client.torrent_info.return_value = {'id': 5, 'files': []}
+        assert debrid_health._rescue_link_target('torbox', client, '5') == expected
+        assert seen == [{'id': 5, 'files': []}]
+
+    def test_non_torbox_alt_is_never_admitted(self, monkeypatch):
+        monkeypatch.setattr('utils.fast_lane.admit_record', lambda rec: pytest.fail('not TorBox'))
+        assert debrid_health._rescue_link_target('realdebrid', MagicMock(), '5') == 'realdebrid'

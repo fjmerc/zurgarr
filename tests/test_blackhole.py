@@ -6108,6 +6108,78 @@ class TestScannerHandoff:
 
     # ── zurgarr's own TorBox adds (Wanted recovery, manual search) ────
 
+    # ── the TorBox fast lane ──────────────────────────────────────────
+
+    @pytest.fixture
+    def lane(self, tmp_dir, monkeypatch):
+        import utils.fast_lane_registry as reg
+        monkeypatch.setenv('TORBOX_FAST_LANE', 'true')
+        monkeypatch.setenv('TORBOX_MOUNT_NAME', 'torbox')
+        monkeypatch.setattr(reg, 'REGISTRY_PATH', os.path.join(tmp_dir, 'fast_lane.json'))
+        reg._reset_for_tests()
+        admitted = []
+        monkeypatch.setattr('utils.fast_lane.admit_record',
+                            lambda record: admitted.append(record) or True)
+        yield admitted
+        reg._reset_for_tests()
+
+    def _register(self, folder, tid=9):
+        import utils.fast_lane_registry as reg
+        reg.admit(reg.FastLaneEntry(tid, folder, [reg.FastLaneFile('v.mkv', 1, 1)], 0.0, 0.0))
+
+    def _spy_links(self, watcher, monkeypatch):
+        made = []
+        monkeypatch.setattr(watcher, '_create_symlinks',
+                            lambda *a, **k: made.append(k.get('debrid')) or 1)
+        monkeypatch.setattr(watcher, '_audit_release_completeness', lambda *a, **k: None)
+        return made
+
+    def test_ready_torbox_grab_is_admitted_and_linked_via_the_fast_lane(self, tmp_dir, monkeypatch, lane):
+        watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
+        fast = os.path.join(tmp_dir, 'data', 'torbox_fast', 'Rel')
+        made = self._spy_links(watcher, monkeypatch)
+        self._drive_timeout(watcher, monkeypatch, 'tb-f1', 'Rel.2020.1080p.torrent', 'torbox',
+                            'completed', find=lambda *a, **k: (fast, '', 'Rel'))
+        assert len(lane) == 1
+        assert made == ['torbox_fast']
+
+    def test_unregistered_grab_links_as_today(self, tmp_dir, monkeypatch, lane):
+        watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
+        tb = os.path.join(tmp_dir, 'data', 'torbox', 'Rel')
+        made = self._spy_links(watcher, monkeypatch)
+        self._drive_timeout(watcher, monkeypatch, 'tb-f2', 'Rel.2020.1080p.torrent', 'torbox',
+                            'completed', find=lambda *a, **k: (tb, '', 'Rel'))
+        assert made == ['torbox']
+
+    def test_fast_lane_off_never_classifies_a_path_as_fast(self, tmp_dir, monkeypatch, lane):
+        """With the lane off there is no fast mount — never fall back to the
+        main mount, which would make every path look like a fast-lane one."""
+        monkeypatch.setenv('TORBOX_FAST_LANE', 'false')
+        watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
+        made = self._spy_links(watcher, monkeypatch)
+        self._drive_timeout(watcher, monkeypatch, 'tb-f3', 'Rel.2020.1080p.torrent', 'torbox',
+                            'completed', find=lambda *a, **k: (os.path.join(tmp_dir, 'data', 'x', 'Rel'), '', 'Rel'))
+        assert made == ['torbox']
+
+    def test_find_on_mount_prefers_the_registered_fast_lane_folder(self, tmp_dir, lane):
+        watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
+        self._register('Law  Order (1990)')
+        fast = os.path.join(tmp_dir, 'data', 'torbox_fast', 'Law  Order (1990)')
+        os.makedirs(fast)
+        open(os.path.join(fast, 'v.mkv'), 'w').close()
+        assert watcher._find_on_mount('Law & Order (1990)', debrid='torbox') == \
+            (fast, '', 'Law  Order (1990)')
+
+    def test_registered_folder_not_yet_on_the_fast_mount_waits(self, tmp_dir, lane):
+        watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
+        self._register('Rel')
+        assert watcher._find_on_mount('Rel', debrid='torbox') == (None, None, None)
+
+    def test_own_add_admitted_once_ready(self, tmp_dir, monkeypatch, lane):
+        watcher = self._added_watcher(tmp_dir, monkeypatch)
+        watcher._watch_added_torrent('130129458')
+        assert lane == [{'id': '130129458'}]
+
     def _added_watcher(self, tmp_dir, monkeypatch, status='completed', find=None):
         import utils.blackhole as bh
         monkeypatch.setattr(bh, '_coalesced_root_refresh', lambda **k: True)

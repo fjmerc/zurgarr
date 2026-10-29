@@ -2010,6 +2010,26 @@ class BlackholeWatcher:
         resolved = mount_for_debrid(debrid, rclone_mount_base=base)
         return resolved or self.rclone_mount
 
+    def _fast_mount(self):
+        """The TorBox fast lane's mount, or None when the lane is off —
+        never the main mount (``_mount_for``'s fallback would make every
+        path look like a fast-lane one)."""
+        from utils.debrid_routing import TORBOX_FAST, mount_for_debrid
+        fast_root = self._mount_for('torbox')
+        if not fast_root or fast_root == self.rclone_mount:
+            return None
+        return mount_for_debrid(TORBOX_FAST, rclone_mount_base=os.path.dirname(fast_root))
+
+    @staticmethod
+    def _admit_to_fast_lane(info):
+        """Offer a ready TorBox torrent (its status response) to the fast
+        lane; never lets a fast-lane problem stop the grab."""
+        try:
+            from utils import fast_lane
+            fast_lane.admit_record(info.get('data') if isinstance(info, dict) else None)
+        except Exception as e:
+            logger.warning(f"[blackhole] fast lane admission failed: {e}")
+
     def _symlink_target_base_for(self, debrid):
         """Return the host-side symlink target base for ``debrid``."""
         from utils.debrid_routing import symlink_target_base_for_debrid
@@ -2472,6 +2492,18 @@ class BlackholeWatcher:
             # the API's data.files[].name list).
             from utils.debrid_routing import build_tb_lookup_candidates
             candidates = build_tb_lookup_candidates(release_name, file_names=file_names)
+            fast = self._fast_mount()
+            if fast:
+                from utils import fast_lane
+                for name in candidates:
+                    folder = fast_lane.registered_folder(name)
+                    if folder:
+                        # in the fast lane: found there or not yet (its
+                        # listing is seconds behind) — never via TorBox's
+                        path = os.path.join(fast, folder)
+                        if os.path.isdir(path) and _holds_video(path):
+                            return path, '', folder
+                        return None, None, None
             return self._find_on_torbox_mount(mount_path, release_name, candidates)
 
         # Try both the original name and with video extension stripped
@@ -3457,6 +3489,7 @@ class BlackholeWatcher:
                 return False
             if self._stop_event.wait(self.mount_poll_interval):
                 return False
+        self._admit_to_fast_lane(info)
         release_name = self._extract_release_name(info, debrid='torbox')
         if not release_name:
             logger.info(f"[blackhole] no folder name for added torrent {torrent_id}; the "
@@ -3753,6 +3786,8 @@ class BlackholeWatcher:
                                 level='warning')
                     self._remove_pending(torrent_id)
                     return
+                if debrid == 'torbox':
+                    self._admit_to_fast_lane(info)
                 if _history:
                     _mt, _ep = _enrich_for_history(filename)
                     _history.log_event('cached', filename, episode=_ep, source='blackhole',
@@ -3914,9 +3949,15 @@ class BlackholeWatcher:
         if self._stop_event.is_set():
             return
 
-        # Phase 3: Create symlinks
+        # Phase 3: Create symlinks — through the fast lane's base when the
+        # folder was found there (utils/fast_lane.py)
+        link_debrid = debrid
+        fast = self._fast_mount() if debrid == 'torbox' else None
+        if fast and mount_path and mount_path.startswith(fast + os.sep):
+            from utils.debrid_routing import TORBOX_FAST
+            link_debrid = TORBOX_FAST
         try:
-            count = self._create_symlinks(matched_name, category, mount_path, label=label, debrid=debrid,
+            count = self._create_symlinks(matched_name, category, mount_path, label=label, debrid=link_debrid,
                                           display_name=os.path.splitext(filename)[0],
                                           file_scope=file_scope)
             if count > 0:
