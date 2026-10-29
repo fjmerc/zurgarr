@@ -6031,14 +6031,18 @@ class LibraryScanner:
 
     @classmethod
     def _profile_language_rule(cls, client, profile):
-        """A profile's language: Radarr's profile language (``'Any'`` is
-        none), else a custom format matching every release not in one
-        language and scored below the profile's minimum — Sonarr's
-        "Language: Not Original".  ``'Original'`` for the title's own."""
+        """A profile's language: Radarr's profile language (``'Any'`` sets
+        none — whatever else the profile scores), else a custom format
+        matching every release not in one language and scored below the
+        profile's minimum — Sonarr's "Language: Not Original".
+        ``'Original'`` for the title's own; None for no rule, including a
+        format shape this doesn't understand."""
         if not isinstance(profile, dict):
             return None
         lang = profile.get('language')
-        if isinstance(lang, dict) and lang.get('id') not in (None, -1):
+        if isinstance(lang, dict) and lang.get('id') is not None:
+            if lang.get('id') in (-1, 0):            # Any / Unknown
+                return None
             return 'Original' if lang.get('id') == -2 else lang.get('name')
         floor = profile.get('minFormatScore') or 0
         low = {fi.get('format') for fi in profile.get('formatItems') or []
@@ -6049,19 +6053,28 @@ class LibraryScanner:
         if formats is None:
             return cls._PROFILE_UNREADABLE
         for cf in formats:
-            specs = cf.get('specifications') or [] if isinstance(cf, dict) else []
-            if (cf.get('id') not in low or len(specs) != 1
-                    or specs[0].get('implementation') != 'LanguageSpecification'
-                    or not specs[0].get('negate')):
+            if not isinstance(cf, dict) or cf.get('id') not in low:
                 continue
-            value = next((f.get('value') for f in specs[0].get('fields') or []
-                          if f.get('name') == 'value'), None)
+            specs = cf.get('specifications')
+            if not isinstance(specs, list) or len(specs) != 1 or not isinstance(specs[0], dict):
+                continue
+            spec = specs[0]
+            fields = spec.get('fields')
+            if spec.get('implementation') != 'LanguageSpecification' or not isinstance(fields, list):
+                continue
+            values = {f.get('name'): f.get('value') for f in fields if isinstance(f, dict)}
+            # "not X": negated, or exceptLanguage (matches every language but
+            # X) — both together are "is X", a rule against X, not for it
+            if not (bool(spec.get('negate')) ^ bool(values.get('exceptLanguage'))):
+                continue
+            value = values.get('value')
             if value == -2:
                 return 'Original'
             languages = client.get_languages()
             if languages is None:
                 return cls._PROFILE_UNREADABLE
-            return next((l.get('name') for l in languages if l.get('id') == value), None)
+            return next((l.get('name') for l in languages
+                         if isinstance(l, dict) and l.get('id') == value), None)
         return None
 
     @staticmethod
@@ -6073,13 +6086,14 @@ class LibraryScanner:
         copies (subtitles are the viewer's), never a Russian dub."""
         if not want:
             return results
-        from utils.search import release_languages
-        ok = {want.lower()} | ({original.lower()} if original else set())
+        from utils.search import language_matches, release_languages
+        ok = {want} | ({original} if original else set())
         kept = []
         for r in results or []:
             words, multi = release_languages(r.get('title'), media_title)
-            langs = {l.lower() for l in (r.get('languages') or ())} | {l.lower() for l in words}
-            if not langs or multi or r.get('multi') or langs & ok:
+            langs = set(r.get('languages') or ()) | words
+            if (not langs or multi or r.get('multi')
+                    or any(language_matches(l, ok) for l in langs)):
                 kept.append(r)
         if len(kept) < len(results or []):
             names = (f"neither {want} nor {original}"
@@ -6471,8 +6485,7 @@ class LibraryScanner:
                 # title re-earns a shot roughly monthly.
                 if (prowlarr_ok and imdb
                         and _ledger.get(f'prowlarrtried:{key}') == 0):
-                    prowlarr_rescue = True
-                    _ledger.bump(f'prowlarrtried:{key}')
+                    prowlarr_rescue = True     # spent when Prowlarr is asked, below
                 else:
                     continue
             if key in self._wanted_no_results:
@@ -6589,6 +6602,10 @@ class LibraryScanner:
             # season-targeted, so the downstream ranking → cache gate →
             # add → memo machinery runs on them unchanged.
             if not results or wb_strikes > 0:
+                if prowlarr_rescue:
+                    # the one shot is spent here, not by a pass that skipped
+                    # the title before asking (an arr that didn't answer)
+                    _ledger.bump(f'prowlarrtried:{key}')
                 try:
                     fallback = self._prowlarr_fallback_candidates(
                         media_title, item.get('year'), media_type,

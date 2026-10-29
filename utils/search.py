@@ -255,12 +255,14 @@ def is_prerelease_source(title):
 # stream's title with flags for the languages its name carries; scene
 # names carry the same as words.  Wanted recovery keeps a copy in the
 # profile's language or the title's original one (see
-# LibraryScanner._drop_wrong_language).
+# LibraryScanner._drop_wrong_language).  A flag that can mean several
+# languages names a family (🇮🇳 'Indian' — Torrentio flags Telugu, Tamil,
+# Hindi… alike); Cyrillic in a name says 'Cyrillic', not which language.
 _FLAG_LANGUAGES = {
     'GB': 'English', 'US': 'English', 'DE': 'German', 'FR': 'French',
     'IT': 'Italian', 'ES': 'Spanish', 'MX': 'Spanish (Latino)', 'RU': 'Russian',
     'PT': 'Portuguese', 'BR': 'Portuguese (Brazil)', 'JP': 'Japanese',
-    'KR': 'Korean', 'CN': 'Chinese', 'TW': 'Chinese', 'IN': 'Hindi',
+    'KR': 'Korean', 'CN': 'Chinese', 'TW': 'Chinese', 'HK': 'Chinese', 'IN': 'Indian',
     'NL': 'Dutch', 'PL': 'Polish', 'UA': 'Ukrainian', 'SE': 'Swedish',
     'DK': 'Danish', 'NO': 'Norwegian', 'FI': 'Finnish', 'TR': 'Turkish',
     'CZ': 'Czech', 'HU': 'Hungarian', 'GR': 'Greek', 'RO': 'Romanian',
@@ -269,46 +271,85 @@ _FLAG_LANGUAGES = {
     'LT': 'Lithuanian', 'LV': 'Latvian', 'EE': 'Estonian', 'SK': 'Slovak',
     'IR': 'Persian',
 }
+_LANGUAGE_FAMILIES = {
+    'indian': {'hindi', 'tamil', 'telugu', 'malayalam', 'kannada', 'marathi',
+               'bengali', 'punjabi', 'gujarati', 'urdu'},
+    'cyrillic': {'russian', 'ukrainian', 'bulgarian', 'serbian', 'macedonian',
+                 'belarusian', 'kazakh'},
+    'chinese': {'chinese', 'cantonese', 'mandarin'},
+}
 _FLAG_RE = re.compile('([\U0001F1E6-\U0001F1FF]{2})')
 _MULTI_AUDIO_RE = re.compile(r'\b(?:multi|dual)[ -]audio\b', re.IGNORECASE)
+_MULTI_SUBS_RE = re.compile(r'\bmulti[ -]?subs?\b', re.IGNORECASE)
 _NAME_LANGUAGES = {
     'english': 'English', 'eng': 'English',
-    'german': 'German', 'deutsch': 'German',
+    'german': 'German', 'deutsch': 'German', 'ger': 'German',
     'french': 'French', 'truefrench': 'French', 'vff': 'French', 'vfq': 'French',
+    'fre': 'French', 'fra': 'French',
     'italian': 'Italian', 'ita': 'Italian',
     'spanish': 'Spanish', 'castellano': 'Spanish', 'esp': 'Spanish', 'spa': 'Spanish',
     'latino': 'Spanish (Latino)',
     'russian': 'Russian', 'rus': 'Russian',
-    'portuguese': 'Portuguese', 'japanese': 'Japanese', 'jpn': 'Japanese',
-    'korean': 'Korean', 'kor': 'Korean', 'chinese': 'Chinese', 'hindi': 'Hindi',
+    'portuguese': 'Portuguese', 'por': 'Portuguese',
+    'japanese': 'Japanese', 'jpn': 'Japanese', 'jap': 'Japanese',
+    'korean': 'Korean', 'kor': 'Korean',
+    'chinese': 'Chinese', 'cantonese': 'Chinese', 'mandarin': 'Chinese',
+    'hindi': 'Indian', 'hin': 'Indian', 'tamil': 'Indian', 'tam': 'Indian',
+    'telugu': 'Indian', 'tel': 'Indian', 'malayalam': 'Indian', 'kannada': 'Indian',
+    'marathi': 'Indian', 'bengali': 'Indian', 'punjabi': 'Indian',
     'dutch': 'Dutch', 'polish': 'Polish', 'swedish': 'Swedish', 'swe': 'Swedish',
     'danish': 'Danish', 'norwegian': 'Norwegian', 'finnish': 'Finnish',
     'turkish': 'Turkish', 'czech': 'Czech', 'hungarian': 'Hungarian',
-    'ukrainian': 'Ukrainian', 'ukr': 'Ukrainian',
+    'ukrainian': 'Ukrainian', 'ukr': 'Ukrainian', 'arabic': 'Arabic',
+    'hebrew': 'Hebrew', 'thai': 'Thai', 'vietnamese': 'Vietnamese',
+    'greek': 'Greek', 'romanian': 'Romanian',
 }
-_NAME_MULTI = {'multi', 'dual'}
+# Words that make the copy carry the original audio besides any dub:
+# MULTi / DUAL / "+ Original" / RAW (and German "DL", handled in place).
+_NAME_MULTI = {'multi', 'dual', 'original', 'orig', 'raw'}
+# Subtitle markers: a language word beside one names subtitles, not audio;
+# a name carrying one has its Torrentio flags made of subtitle tags too.
+_SUB_WORDS = {'sub', 'subs', 'subbed', 'subtitle', 'subtitles', 'subtitled',
+              'hardsub', 'hardsubs', 'hardcoded', 'softsub', 'softsubs',
+              'esub', 'esubs', 'vostfr', 'vost', 'vosta', 'fansub', 'nordic'}
 _NAME_WORD_RE = re.compile(r'[^\W_]+')
 _CYRILLIC_RE = re.compile('[\u0400-\u04FF]')
+_GROUP_SUFFIX_RE = re.compile(r'-[A-Za-z0-9]+(?:\[[^\]]*\])?\s*$')
+
+
+def _is_sub_word(w):
+    return w in _SUB_WORDS or (len(w) > 3 and w.endswith(('sub', 'subs')))
 
 
 def flag_languages(text):
     """``(languages, multi)`` from a Torrentio stream title: the flags it
-    ends with, and whether it says "Multi Audio"/"Dual Audio".  A flag
-    outside the table is kept as its country code (still a language that
-    isn't the wanted one)."""
+    ends with, and whether it carries the original besides them ("Multi
+    Audio"/"Dual Audio", or three or more audio flags — a multi-track
+    copy).  Flags after "Multi Subs", or on a release whose name carries a
+    subtitle tag (SWESUB, VOSTFR…), are subtitle languages and say nothing.
+    A flag outside the table is ignored."""
     text = text or ''
+    if _MULTI_SUBS_RE.search(text):
+        return frozenset(), False
+    first = text.split('\n', 1)[0]
+    if any(_is_sub_word(w.lower()) for w in _NAME_WORD_RE.findall(first)):
+        return frozenset(), False
     langs = set()
     for pair in _FLAG_RE.findall(text):
         code = ''.join(chr(ord(c) - 0x1F1E6 + ord('A')) for c in pair)
-        langs.add(_FLAG_LANGUAGES.get(code, code))
-    return frozenset(langs), bool(_MULTI_AUDIO_RE.search(text))
+        if code in _FLAG_LANGUAGES:
+            langs.add(_FLAG_LANGUAGES[code])
+    return frozenset(langs), bool(_MULTI_AUDIO_RE.search(text)) or len(langs) >= 3
 
 
 def release_languages(name, title=''):
     """``(languages, multi)`` from a release name's language words (GERMAN,
-    ITA, MULTi…) — words of the media *title* itself don't count (*The
-    Italian Job*) — and Cyrillic in the name (a Russian tracker's copy)."""
-    words = [w.lower() for w in _NAME_WORD_RE.findall(name or '')]
+    ITA, MULTi…) — not words of the media *title* itself (*The Italian
+    Job*), not a language beside a subtitle marker ("Eng Subs", "Sub ITA"),
+    not the scene group — and Cyrillic in the name (a Russian-script
+    tracker's copy)."""
+    name = name or ''
+    words = [w.lower() for w in _NAME_WORD_RE.findall(_GROUP_SUFFIX_RE.sub('', name))]
     title_words = [w.lower() for w in _NAME_WORD_RE.findall(title or '')]
     n = len(title_words)
     at = next((i for i in range(len(words) - n + 1) if n and words[i:i + n] == title_words),
@@ -316,16 +357,42 @@ def release_languages(name, title=''):
     if at is not None:
         words = words[:at] + words[at + n:]       # the title, once; its tags stay
     else:
-        words = [w for w in words if w not in set(title_words)]
+        tw = set(title_words)
+        words = [w for w in words if w not in tw]
     langs, multi = set(), False
-    for w in words:
+    in_subs = False
+    for i, w in enumerate(words):
+        if _is_sub_word(w):
+            in_subs = True                        # "Sub ITA ENG": the languages after it
+            continue
         if w in _NAME_LANGUAGES:
+            nxt = words[i + 1] if i + 1 < len(words) else ''
+            if in_subs or _is_sub_word(nxt):
+                continue
             langs.add(_NAME_LANGUAGES[w])
-        elif w in _NAME_MULTI:
+            if nxt == 'dl' or (nxt not in ('', 'web') and i + 2 < len(words)
+                               and words[i + 2] == 'dl'):
+                multi = True                      # German.DL / German.DTSD.DL, not WEB-DL
+            continue
+        in_subs = False
+        if w in _NAME_MULTI:
             multi = True
-    if _CYRILLIC_RE.search(name or '') and not _CYRILLIC_RE.search(title or ''):
-        langs.add('Russian')
+    if _CYRILLIC_RE.search(name) and not _CYRILLIC_RE.search(title or ''):
+        langs.add('Cyrillic')
     return frozenset(langs), multi
+
+
+def _language_base(name):
+    return (name or '').split(' (')[0].strip().lower()
+
+
+def language_matches(lang, wanted):
+    """Whether a release language is one of *wanted*: same base name
+    ('Spanish (Latino)' is Spanish), or a family holding it (🇮🇳 'Indian'
+    is Telugu)."""
+    base = _language_base(lang)
+    bases = {_language_base(w) for w in wanted}
+    return base in bases or bool(_LANGUAGE_FAMILIES.get(base, set()) & bases)
 
 
 def parse_quality(title):

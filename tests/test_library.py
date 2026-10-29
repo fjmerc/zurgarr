@@ -9319,6 +9319,87 @@ class TestRecoverWantedViaTorbox:
         self._run(self._scanner(), None, monkeypatch, title='X')
         assert [a['info_hash'] for a in wire['adds']] == ['a' * 40]
 
+    def test_regional_copy_counts_as_its_base_language(self, wire, monkeypatch):
+        """Roma (Mexico): Radarr's original is 'Spanish'; Torrentio flags a
+        Latino copy 🇲🇽 — the original audio, not a dub."""
+        wire['torrentio'] = [self._r('a', 'Roma.2018.1080p.Latino', {'Spanish (Latino)'})]
+        self._lang_profile(monkeypatch, {'id': 1, 'name': 'English'})
+        self._run(self._scanner(), 'Spanish', monkeypatch, title='Roma')
+        assert [a['info_hash'] for a in wire['adds']] == ['a' * 40]
+
+    def test_india_flag_matches_any_indian_original(self, wire, monkeypatch):
+        """Torrentio flags Telugu, Tamil, Hindi… all 🇮🇳."""
+        wire['torrentio'] = [self._r('a', 'RRR.2022.1080p.WEB-DL', {'Indian'})]
+        self._lang_profile(monkeypatch, {'id': 1, 'name': 'English'})
+        self._run(self._scanner(), 'Telugu', monkeypatch, title='RRR')
+        assert [a['info_hash'] for a in wire['adds']] == ['a' * 40]
+
+    def test_any_profile_with_a_not_original_format_filters_nothing(self, wire, monkeypatch):
+        """'Any' is what the docs tell you to set to accept every language."""
+        wire['torrentio'] = [self._r('a', 'Dark.S01.ENG.1080p', {'English'})]
+        self._lang_profile(monkeypatch, {'id': -1, 'name': 'Any'}, cf_score=-10000)
+        self._run(self._scanner(), 'German', monkeypatch, title='Dark')
+        assert [a['info_hash'] for a in wire['adds']] == ['a' * 40]
+
+    def test_custom_format_naming_a_language_by_id(self, monkeypatch):
+        import utils.library as lib
+        client = self._lang_profile(monkeypatch, cf_score=-10000)
+        client.get_custom_formats.return_value = [{'id': 7, 'specifications': [
+            {'implementation': 'LanguageSpecification', 'negate': True,
+             'fields': [{'name': 'value', 'value': 1}]}]}]
+        assert lib.LibraryScanner._profile_language('movie', {'_profile_id': 4}, {}) == 'English'
+
+    @pytest.mark.parametrize('spec', [
+        {'implementation': 'LanguageSpecification', 'negate': False,
+         'fields': [{'name': 'value', 'value': -2}, {'name': 'exceptLanguage', 'value': True}]},
+    ])
+    def test_except_language_shape_is_the_same_rule(self, monkeypatch, spec):
+        import utils.library as lib
+        client = self._lang_profile(monkeypatch, cf_score=-10000, svc='sonarr')
+        client.get_custom_formats.return_value = [{'id': 7, 'specifications': [spec]}]
+        item = {'_profile_id': 4, '_original_language': 'German'}
+        assert lib.LibraryScanner._profile_language('season', item, {}) == 'German'
+
+    def test_negate_and_except_language_cancel_out(self, monkeypatch):
+        """negate + exceptLanguage = "is German": scored low it rejects
+        German, it doesn't require it."""
+        import utils.library as lib
+        client = self._lang_profile(monkeypatch, cf_score=-10000)
+        client.get_custom_formats.return_value = [{'id': 7, 'specifications': [
+            {'implementation': 'LanguageSpecification', 'negate': True,
+             'fields': [{'name': 'value', 'value': 4}, {'name': 'exceptLanguage', 'value': True}]}]}]
+        assert lib.LibraryScanner._profile_language('movie', {'_profile_id': 4}, {}) is None
+
+    @pytest.mark.parametrize('formats', [
+        ['junk', {'id': 7, 'specifications': [None]}],
+        [{'id': 7, 'specifications': [{'implementation': 'LanguageSpecification',
+                                        'negate': True, 'fields': {'value': -2}}]}],
+    ])
+    def test_odd_custom_format_shapes_filter_nothing(self, monkeypatch, formats):
+        """A shape it doesn't understand is no rule — not an unreadable
+        profile that skips every title on it every pass."""
+        import utils.library as lib
+        client = self._lang_profile(monkeypatch, cf_score=-10000)
+        client.get_custom_formats.return_value = formats
+        assert lib.LibraryScanner._profile_language('movie', {'_profile_id': 4}, {}) is None
+
+    def test_unreadable_custom_formats_skip_the_title_this_pass(self, wire, monkeypatch):
+        client = self._lang_profile(monkeypatch, cf_score=-10000)
+        client.get_custom_formats.return_value = None
+        self._run(self._scanner(), 'German', monkeypatch, title='Dark')
+        assert wire['adds'] == []
+
+    def test_prowlarr_dub_is_dropped_too(self, wire, monkeypatch):
+        wire['torrentio'] = []
+        self._lang_profile(monkeypatch, {'id': 1, 'name': 'English'})
+        sc = self._scanner()
+        monkeypatch.setattr(sc, '_prowlarr_fallback_candidates', lambda *a, **k: [
+            self._r('a', 'Greyhound.2020.FRENCH.1080p.WEB'), self._r('b', 'Greyhound.2020.1080p.WEB')])
+        movies = [{'title': 'Greyhound', 'source': 'wanted', '_profile_id': 4, 'imdb_id': 'tt1',
+                   'is_available': True, '_original_language': 'English'}]
+        sc._recover_wanted_via_debrid([], movies, {})
+        assert [a['info_hash'] for a in wire['adds']] == ['b' * 40]
+
     def test_sonarr_profile_language_parity(self, monkeypatch):
         import utils.library as lib
         self._lang_profile(monkeypatch, cf_score=-10000, svc='sonarr')
@@ -11050,6 +11131,22 @@ class TestWantedRecoveryProwlarrFallback:
         sc2._recover_wanted_via_debrid([], self._movie(), {})
         assert len(wire['prowlarr_calls']) == 1
         assert len(wire['adds']) == 1
+
+    def test_rescue_not_used_up_by_a_pass_that_couldnt_read_the_profile(
+            self, wire, ledger, monkeypatch):
+        """The one Prowlarr shot is spent only when Prowlarr is asked —
+        not by a pass that skipped the title because Sonarr/Radarr didn't
+        answer."""
+        from utils.library import LibraryScanner
+        for _ in range(3):
+            ledger.bump('wantedblock:tt1234567')
+        answers = [LibraryScanner._PROFILE_UNREADABLE, None]
+        monkeypatch.setattr(LibraryScanner, '_profile_language',
+                            classmethod(lambda cls, *a: answers.pop(0)))
+        self._scanner()._recover_wanted_via_debrid([], self._movie(), {})
+        assert wire['prowlarr_calls'] == []
+        self._scanner()._recover_wanted_via_debrid([], self._movie(), {})
+        assert len(wire['prowlarr_calls']) == 1
 
     def test_giveup_key_without_prowlarr_stays_skipped(self, wire, ledger):
         wire['prowlarr_configured'] = False

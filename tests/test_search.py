@@ -2192,7 +2192,16 @@ class TestReleaseLanguages:
          {'English', 'Italian'}, False),
         ('Baby.Reindeer.2024.S01.MULTI.2160p.WEB-DL\nS01/x.mkv\n👤 25 ⚙️ TorrentGalaxy\nMulti Audio / 🇬🇧',
          {'English'}, True),
-        ('Movie.2020.1080p\nx\n🇫🇷 / 🇧🇷 / 🇲🇽', {'French', 'Portuguese (Brazil)', 'Spanish (Latino)'}, False),
+        ('Movie.2020.1080p\nx\n🇫🇷 / 🇧🇷', {'French', 'Portuguese (Brazil)'}, False),
+        ('RRR.2022.1080p.WEB\nx\n🇮🇳', {'Indian'}, False),
+        # flags after "Multi Subs" are subtitle languages
+        ('[Erai-raws] Sousou no Frieren - 01 [1080p][Multiple Subtitle]\nx\n👤 49 ⚙️ NyaaSi\n'
+         'Multi Subs / 🇬🇧 / 🇷🇺 / 🇮🇹', set(), False),
+        # …and so are flags Torrentio made of a subtitle tag
+        ('Johnny.English.2003.SWESUB.1080p.BluRay\nx\n🇸🇪', set(), False),
+        ('Dune.Part.Two.2024.FANSUB.VOSTFR.1080p\nx\n🇫🇷', set(), False),
+        # a multi-track copy (three or more audio flags) holds the original
+        ('Your.Name.2016.2160p.HMAX.WEB-DL\nx\n🇬🇧 / 🇫🇷 / 🇩🇪 / 🇮🇹', {'English', 'French', 'German', 'Italian'}, True),
     ])
     def test_flag_languages(self, text, langs, multi):
         from utils.search import flag_languages
@@ -2202,13 +2211,32 @@ class TestReleaseLanguages:
         ('Das.Boot.1981.GERMAN.1080p.BluRay.x264-GRP', 'Das Boot', {'German'}, False),
         ('Das.Boot.1981.MULTi.1080p.BluRay.x264-GRP', 'Das Boot', set(), True),
         ('Baby.Reindeer.S01.ITA.ENG.2160p.NF.WEB-DL', 'Baby Reindeer', {'Italian', 'English'}, False),
-        ('Олененок / Baby Reindeer / Сезон: 1 [2024 WEB-DL 1080p]', 'Baby Reindeer', {'Russian'}, False),
+        ('Олененок / Baby Reindeer / Сезон: 1 [2024 WEB-DL 1080p]', 'Baby Reindeer', {'Cyrillic'}, False),
         ('Greyhound.2020.1080p.WEBRip.x264-GRP', 'Greyhound', set(), False),
         ('Germany.Year.Zero.1948.1080p.BluRay', 'Germany Year Zero', set(), False),
         # a language word in the title itself isn't a tag
         ('The.Italian.Job.2003.1080p.BluRay.x264', 'The Italian Job', set(), False),
         ('The.Italian.Job.2003.FRENCH.1080p.BluRay', 'The Italian Job', {'French'}, False),
         ('The.Italian.Job.2003.ITALIAN.1080p.BluRay', 'The Italian Job', {'Italian'}, False),
+        # subtitle languages aren't audio
+        ('Parasite 2019 1080p [Eng Subs]', 'Parasite', set(), False),
+        ('Movie.2023.1080p.Sub.ITA', 'Movie', set(), False),
+        ('Amelie 2001 English subs BluRay Rip', 'Amelie', set(), False),
+        ('City Of God (2002) - English Hardcoded Subs', 'City Of God', set(), False),
+        ('Pathaan 2023 1080p Hindi WEB-DL ESub', 'Pathaan', {'Indian'}, False),
+        # German DL is German plus the original; WEB-DL isn't
+        ('Oppenheimer.2023.IMAX.German.DTSD.DL.2160p.Remux-QfG', 'Oppenheimer', {'German'}, True),
+        ('Oppenheimer.2023.1080p.WEB-DL.x264', 'Oppenheimer', set(), False),
+        ('Your.Name.2016.BDRemux Ita Eng Jap x265-NAHOM', 'Your Name', {'Italian', 'English', 'Japanese'}, False),
+        ('RRR.2022.1080p.TELUGU.WEB-DL', 'RRR', {'Indian'}, False),
+        ('RRR.2022.2160p.Malayalam.WEB-DL', 'RRR', {'Indian'}, False),
+        # a Russian tracker's multi-track copy that keeps the original
+        ('Сёгун / Shogun [S01] MVO (LostFilm) + Original', 'Shogun', {'Cyrillic'}, True),
+        # RAW: the untouched original audio (here with Russian subtitles)
+        ('Игра в кальмара / Squid Game / Сезон: 1 [2021 WEBRip] [RAW] [1080p] + Sub Rus',
+         'Squid Game', {'Cyrillic'}, True),
+        # a scene group named like a language isn't a tag
+        ('Movie.2020.1080p.BluRay.x264-RUS', 'Movie', set(), False),
     ])
     def test_release_languages(self, name, title, langs, multi):
         from utils.search import release_languages
@@ -2226,3 +2254,25 @@ class TestReleaseLanguages:
         assert results[0]['languages'] == ['English', 'Italian']
         assert results[0]['multi'] is True
         assert results[1]['languages'] == [] and results[1]['multi'] is False
+
+
+class TestLanguageMatches:
+    """A release language matches a wanted one by base name (🇲🇽 Latino is
+    Spanish) or family (🇮🇳 is any Indian language, Cyrillic any Cyrillic-
+    script one)."""
+
+    @pytest.mark.parametrize('lang, wanted, ok', [
+        ('Spanish (Latino)', {'Spanish'}, True),
+        ('Portuguese (Brazil)', {'Portuguese'}, True),
+        ('Portuguese', {'Portuguese (Brazil)'}, True),
+        ('Indian', {'Telugu'}, True),
+        ('Indian', {'English'}, False),
+        ('Cyrillic', {'Ukrainian'}, True),
+        ('Cyrillic', {'English'}, False),
+        ('Chinese', {'Cantonese'}, True),
+        ('French', {'English', 'Korean'}, False),
+        ('english', {'English'}, True),
+    ])
+    def test_matches(self, lang, wanted, ok):
+        from utils.search import language_matches
+        assert language_matches(lang, wanted) is ok
