@@ -88,8 +88,11 @@ already plays.
      refreshes each cached link before it expires (lifetime from the
      measurement below, with a margin), and checks a cached link with a
      1-byte range request (no API call) before redirecting to it when the
-     link is older than a few minutes; a failed check fetches a new link
-     (one API call, throttled). If no working link can be had, the read
+     link is older than a few minutes — the check's result is cached per
+     link for a minute, because a mounted file is read in chunks, one GET
+     per chunk; a failed check fetches a new link (one API call,
+     throttled). Those many GETs per play cost no API calls: each is a
+     redirect to the cached link. If no working link can be had, the read
      fails — for at most the few titles in the lane, and only until step 5
      moves them.
 
