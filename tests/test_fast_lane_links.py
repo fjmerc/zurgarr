@@ -121,3 +121,29 @@ def test_api_key_never_logged(wire, caplog):
         fl.link_for(1, 2)
         fl.link_for(1, 3)
     assert 'SECRETKEY' not in caplog.text and 'token=' not in caplog.text
+
+
+def test_slow_fetch_does_not_block_cached_links(wire, monkeypatch):
+    """A TorBox call that hangs (timeouts, retries) must not stall reads of
+    files whose link is already in hand."""
+    import threading
+    cached = fl.link_for(1, 1)
+    entered, release = threading.Event(), threading.Event()
+
+    def slow_fetch(params):
+        entered.set()
+        release.wait(5)
+        return 200, {'data': 'https://cdn.example/slow'}
+    monkeypatch.setattr(fl, '_fetch', slow_fetch)
+    t = threading.Thread(target=fl.link_for, args=(2, 2))
+    t.start()
+    assert entered.wait(2)
+    got = []
+    reader = threading.Thread(target=lambda: got.append(fl.link_for(1, 1)))
+    reader.start()
+    reader.join(1)
+    answered_while_stuck = list(got)
+    release.set()
+    t.join(5)
+    reader.join(5)
+    assert answered_while_stuck == [cached]

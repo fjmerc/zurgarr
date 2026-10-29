@@ -790,3 +790,92 @@ def test_zurg_setup_never_rereads_settings():
     import inspect
     from zurg import setup as zs
     assert 'refresh_globals(' not in inspect.getsource(zs.zurg_setup)
+
+
+class TestFastLaneMount:
+    """The TorBox fast lane: zurgarr's own WebDAV server, mounted next to
+    TorBox's like any other mount, started before its mount is probed."""
+
+    def _setup(self, monkeypatch, enabled=True):
+        handlers, order = [], []
+        monkeypatch.setenv('TORBOX_FAST_LANE', 'true' if enabled else 'false')
+        monkeypatch.setenv('TORBOX_FAST_LANE_PORT', '9098')
+
+        def make_handler(logger):
+            h = MagicMock()
+            handlers.append(h)
+            return h
+
+        def wfu(url, **kw):
+            order.append(('probe', url, kw.get('method')))
+            if url.endswith(':9098'):
+                assert kw.get('auth') == ('zurgarr', 'pw')
+            return True
+
+        with patch('rclone.rclone.ProcessHandler', side_effect=make_handler), \
+             patch('rclone.rclone.wait_for_url', side_effect=wfu), \
+             patch('rclone.rclone.notify'), \
+             patch('rclone.rclone.atomic_write', MagicMock()), \
+             patch('rclone.rclone.get_port_from_config', return_value='9999'), \
+             patch('rclone.rclone.refresh_globals'), \
+             patch('rclone.rclone.find_available_port', return_value=8080), \
+             patch('rclone.rclone._dead_fuse_mount_at', return_value=False), \
+             patch('rclone.rclone.obscure_password', return_value='obscured'), \
+             patch('utils.fast_lane_server.start_fast_lane_server',
+                   side_effect=lambda port, **k: order.append(('server', port))), \
+             patch('utils.fast_lane_server.fast_lane_credentials', return_value=('zurgarr', 'pw')), \
+             patch('os.path.exists', return_value=False), \
+             patch('os.makedirs'), \
+             patch('subprocess.run'), \
+             patch('builtins.open', MagicMock()):
+            import rclone.rclone as mod
+            for k, v in {'RCLONEMN': 'zurgarr', 'RDAPIKEY': 'rd', 'ADAPIKEY': None, 'NFSMOUNT': None,
+                         'NFSPORT': None, 'PLEXDEBRID': None, 'ZURGUSER': None, 'ZURGPASS': None,
+                         'RCLONELOGLEVEL': 'NOTICE', 'TORBOXAPIKEY': 'tb', 'TORBOXWEBDAVUSER': 'u',
+                         'TORBOXWEBDAVPASS': 'p', 'TORBOX_MOUNT_NAME': 'torbox'}.items():
+                monkeypatch.setattr(mod, k, v)
+            mod.setup()
+        return {h.start_process.call_args[0][3]: h.start_process.call_args[0][2] for h in handlers}, order
+
+    def test_fast_lane_mount_started_when_enabled(self, monkeypatch):
+        cmds, _ = self._setup(monkeypatch)
+        assert set(cmds) == {'zurgarr', 'torbox', 'torbox_fast'}
+        cmd = cmds['torbox_fast']
+        assert cmd[:4] == ['rclone', 'mount', 'torbox_fast:', '/data/torbox_fast']
+        assert _extract_flag(cmd, 'dir-cache-time') == '10s'
+        assert not _has_flag(cmd, 'tpslimit')
+
+    def test_server_started_before_mount(self, monkeypatch):
+        _, order = self._setup(monkeypatch)
+        server_at = order.index(('server', 9098))
+        probe_at = order.index(('probe', 'http://127.0.0.1:9098', 'PROPFIND'))
+        assert server_at < probe_at
+
+    def test_no_fast_lane_mount_when_its_remote_could_not_be_written(self, monkeypatch):
+        import rclone.rclone as mod
+        monkeypatch.setattr(mod, '_write_fast_lane_remote', lambda f, name, port: False)
+        cmds, _ = self._setup(monkeypatch)
+        assert set(cmds) == {'zurgarr', 'torbox'}
+
+    def test_no_fast_lane_mount_when_disabled(self, monkeypatch):
+        cmds, order = self._setup(monkeypatch, enabled=False)
+        assert set(cmds) == {'zurgarr', 'torbox'}
+        assert not any(o[0] == 'server' for o in order)
+
+    def test_fast_lane_remote_written(self, monkeypatch, tmp_path):
+        import rclone.rclone as mod
+        monkeypatch.setenv('TORBOX_FAST_LANE', 'true')
+        monkeypatch.setenv('TORBOX_FAST_LANE_PORT', '9098')
+        monkeypatch.setattr(mod, 'RDAPIKEY', 'k')
+        monkeypatch.setattr(mod, 'ADAPIKEY', None)
+        monkeypatch.setattr(mod, 'TORBOX_MOUNT_NAME', 'torbox')
+        monkeypatch.setattr(mod, '_write_zurg_remote', lambda f, mn, path: '9999')
+        monkeypatch.setattr(mod, '_torbox_mount_configured', lambda: True)
+        monkeypatch.setattr(mod, '_write_torbox_remote', lambda f, name: True)
+        monkeypatch.setattr(mod, 'obscure_password', lambda p: 'obscured-' + p)
+        monkeypatch.setattr('utils.fast_lane_server.fast_lane_credentials', lambda: ('zurgarr', 's3cret'))
+        path = tmp_path / 'rclone.config'
+        mod._write_rclone_config(str(path), 'zurgarr', 'zurgarr', '/zurg/RD/config.yml', '/zurg/AD/config.yml')
+        text = path.read_text()
+        assert ('[torbox_fast]\ntype = webdav\nurl = http://127.0.0.1:9098\nvendor = other\n'
+                'user = zurgarr\npass = obscured-s3cret\n') in text

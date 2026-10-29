@@ -87,6 +87,7 @@ STARTUP_KEYS = frozenset({
     'RCLONE_TRANSFERS', 'RCLONE_POLL_INTERVAL', 'NFS_ENABLED', 'NFS_PORT',
     'TORBOX_MOUNT_NAME', 'TORBOX_WEBDAV_USER', 'TORBOX_WEBDAV_PASS',
     'TORBOX_RCLONE_TPSLIMIT', 'TORBOX_RCLONE_TPSLIMIT_BURST', 'TORBOX_RCLONE_DIR_CACHE_TIME',
+    'TORBOX_FAST_LANE', 'TORBOX_FAST_LANE_PORT',
 })
 # Partly applied at runtime, partly only at start (config_reload.restart_pending
 # has the rules): Zurg's Plex-refresh hook, duplicate cleanup and the
@@ -100,7 +101,7 @@ CONDITIONAL_KEYS = frozenset({
 })
 SNAPSHOT_KEYS = STARTUP_KEYS | CONDITIONAL_KEYS
 _BOOL_KEYS = frozenset({'ZURG_ENABLED', 'NFS_ENABLED', 'PLEX_REFRESH', 'DUPLICATE_CLEANUP',
-                        'ZURG_UPDATE', 'PD_ENABLED', 'PD_UPDATE'})
+                        'ZURG_UPDATE', 'PD_ENABLED', 'PD_UPDATE', 'TORBOX_FAST_LANE'})
 
 
 def startup_value(key, get=None):

@@ -6,11 +6,19 @@ so a link switched from the fast lane to the TorBox mount sees an identical
 file.  A file read is answered with a 302 to a TorBox download link
 (``utils.fast_lane_links``): zurgarr never streams video itself.  It never
 touches the filesystem and ignores request bodies; anything but PROPFIND,
-GET, HEAD and OPTIONS is refused.
+GET, HEAD and OPTIONS is refused.  Every request needs the login from
+``fast_lane_credentials()`` (a password zurgarr generates once and keeps in
+``/config``): the redirects hand out TorBox download links, and a first
+read spends the TorBox link budget.
 """
 
+import base64
 import email.utils
+import hmac
 import http.server
+import json
+import os
+import secrets
 import threading
 import urllib.parse
 from xml.sax.saxutils import escape
@@ -21,9 +29,31 @@ from utils.logger import get_logger
 
 logger = get_logger()
 
+AUTH_PATH = '/config/fast_lane_auth.json'
+_USER = 'zurgarr'
+
 _server = None
 _thread = None
 _ALLOW = 'OPTIONS, PROPFIND, GET, HEAD'
+
+
+def fast_lane_credentials():
+    """``(user, password)`` for the fast lane's WebDAV: generated on first
+    use and kept in ``AUTH_PATH`` (mode 0600) so restarts and the Sonarr/
+    Radarr host's mount keep working."""
+    try:
+        with open(AUTH_PATH, encoding='utf-8') as fh:
+            saved = json.load(fh)
+        if saved.get('user') and saved.get('password'):
+            return saved['user'], saved['password']
+    except (OSError, ValueError, AttributeError):
+        pass
+    from utils.file_utils import atomic_write
+    password = secrets.token_urlsafe(24)
+    with atomic_write(AUTH_PATH) as fh:
+        json.dump({'user': _USER, 'password': password}, fh)
+    os.chmod(AUTH_PATH, 0o600)
+    return _USER, password
 
 
 def _resolve(path):
@@ -74,6 +104,15 @@ def _response(href, is_dir, size=0, mtime=0.0):
 
 class _Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
+    expected_auth = None              # 'Basic <base64>', set by the server
+
+    def _authorised(self):
+        sent = self.headers.get('Authorization') or ''
+        if self.expected_auth and hmac.compare_digest(sent.encode(), self.expected_auth.encode()):
+            return True
+        self._drain()
+        self._send(401, headers={'WWW-Authenticate': 'Basic realm="zurgarr fast lane"'})
+        return False
 
     def log_message(self, fmt, *args):
         pass
@@ -93,9 +132,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.rfile.read(length)
 
     def do_OPTIONS(self):
+        if not self._authorised():
+            return
         self._send(200, headers={'Allow': _ALLOW, 'DAV': '1'})
 
     def do_PROPFIND(self):
+        if not self._authorised():
+            return
         self._drain()
         found = _resolve(self.path)
         if found is None:
@@ -123,6 +166,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self._send(207, body, {'Content-Type': 'application/xml; charset=utf-8'})
 
     def do_GET(self):
+        if not self._authorised():
+            return
         found = _resolve(self.path)
         if found is None or found[0] != 'file':
             return self._send(404)
@@ -141,12 +186,18 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     do_PUT = do_DELETE = do_MKCOL = do_MOVE = do_COPY = do_PROPPATCH = do_POST = do_LOCK = _refuse
 
 
-def start_fast_lane_server(port, bind='0.0.0.0'):
-    """Serve the fast lane on *port*; returns the server."""
+def start_fast_lane_server(port, bind='0.0.0.0', credentials=None):
+    """Serve the fast lane on *port*, behind *credentials* (default:
+    ``fast_lane_credentials()``); returns the server.  Binds every interface:
+    the Sonarr/Radarr host reaches it through Traefik on the Docker
+    network."""
     global _server, _thread
     stop_fast_lane_server()
+    user, password = credentials or fast_lane_credentials()
+    token = base64.b64encode(f'{user}:{password}'.encode()).decode()
+    handler = type('_AuthedHandler', (_Handler,), {'expected_auth': 'Basic ' + token})
     http.server.ThreadingHTTPServer.allow_reuse_address = True
-    _server = http.server.ThreadingHTTPServer((bind, int(port)), _Handler)
+    _server = http.server.ThreadingHTTPServer((bind, int(port)), handler)
     _server.daemon_threads = True
     _thread = threading.Thread(target=_server.serve_forever, kwargs={'poll_interval': 0.2},
                                name='fast-lane-webdav', daemon=True)

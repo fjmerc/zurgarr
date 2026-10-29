@@ -26,16 +26,20 @@ def server(tmp_path, monkeypatch):
                             CREATED, 1.0))
     links = {}
     monkeypatch.setattr(srv, 'link_for', lambda tid, fid: links.get((tid, fid)))
-    s = srv.start_fast_lane_server(0, bind='127.0.0.1')
+    s = srv.start_fast_lane_server(0, bind='127.0.0.1', credentials=('zurgarr', 's3cret'))
     yield s, links
     srv.stop_fast_lane_server()
     reg._reset_for_tests()
 
 
-def _req(server, method, path, depth='1'):
+def _req(server, method, path, depth='1', auth=('zurgarr', 's3cret')):
+    import base64
     s, _ = server
     c = http.client.HTTPConnection('127.0.0.1', s.server_address[1], timeout=5)
-    c.request(method, urllib.parse.quote(path), headers={'Depth': depth})
+    headers = {'Depth': depth}
+    if auth:
+        headers['Authorization'] = 'Basic ' + base64.b64encode(':'.join(auth).encode()).decode()
+    c.request(method, urllib.parse.quote(path), headers=headers)
     r = c.getresponse()
     body = r.read()
     c.close()
@@ -119,5 +123,26 @@ def test_ampersand_and_unicode_hrefs_round_trip(server):
 def test_stopped_server_releases_its_port(server):
     port = server[0].server_address[1]
     srv.stop_fast_lane_server()
-    s2 = srv.start_fast_lane_server(port, bind='127.0.0.1')
+    s2 = srv.start_fast_lane_server(port, bind='127.0.0.1', credentials=('zurgarr', 's3cret'))
     assert s2.server_address[1] == port
+
+
+@pytest.mark.parametrize('auth', [None, ('zurgarr', 'wrong'), ('other', 's3cret')])
+@pytest.mark.parametrize('method', ['PROPFIND', 'GET', 'HEAD'])
+def test_every_request_needs_the_login(server, auth, method):
+    """The redirect hands out TorBox download links, and each first read
+    spends the TorBox link budget: nothing without the login."""
+    server[1][(7, 10)] = 'https://cdn.example/dl/abc'
+    r, body = _req(server, method, '/Show.S01/Season 1/E01.mkv', auth=auth)
+    assert r.status == 401
+    assert r.getheader('WWW-Authenticate', '').startswith('Basic')
+    assert b'cdn.example' not in body and 'cdn.example' not in (r.getheader('Location') or '')
+
+
+def test_credentials_generated_once_and_kept(tmp_path, monkeypatch):
+    monkeypatch.setattr(srv, 'AUTH_PATH', str(tmp_path / 'fast_lane_auth.json'))
+    user, password = srv.fast_lane_credentials()
+    assert user == 'zurgarr' and len(password) >= 24
+    assert srv.fast_lane_credentials() == (user, password)
+    import os, stat
+    assert stat.S_IMODE(os.stat(srv.AUTH_PATH).st_mode) == 0o600

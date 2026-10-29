@@ -288,6 +288,40 @@ def _write_torbox_remote(file_handle, remote_name):
     file_handle.write(f"pass = {obscured}\n")
     return True
 
+_fast_remote_written = [False]   # the last _write_rclone_config wrote the fast lane remote
+
+
+def _fast_lane_port():
+    try:
+        return int(boot_layout.setting_at_start('TORBOX_FAST_LANE_PORT') or 9098)
+    except ValueError:
+        return 9098
+
+
+def _fast_lane_on():
+    from utils.debrid_routing import fast_lane_enabled
+    return fast_lane_enabled()
+
+
+def _write_fast_lane_remote(file_handle, remote_name, port):
+    """Emit the ``[<remote_name>]`` section for zurgarr's own fast-lane
+    WebDAV server (utils/fast_lane_server.py): local, read-only, with its
+    generated login (the password obscure-encoded, like the others)."""
+    from utils.fast_lane_server import fast_lane_credentials
+    user, password = fast_lane_credentials()
+    obscured = obscure_password(password)
+    if not obscured:
+        logger.error("[rclone] Failed to obscure the fast lane password — fast lane mount skipped")
+        return False
+    file_handle.write(f"[{remote_name}]\n")
+    file_handle.write("type = webdav\n")
+    file_handle.write(f"url = http://127.0.0.1:{port}\n")
+    file_handle.write("vendor = other\n")
+    file_handle.write(f"user = {user}\n")
+    file_handle.write(f"pass = {obscured}\n")
+    return True
+
+
 def get_rc_url(mount_name=None):
     """Return the RC URL for a given mount, or the first one if unspecified."""
     if mount_name and mount_name in _rc_urls:
@@ -377,6 +411,7 @@ def _write_rclone_config(rclone_config_path, mn_rd, mn_ad,
 
     rd_port = ad_port = None
     torbox_remote_written = False
+    _fast_remote_written[0] = False
     with atomic_write(rclone_config_path) as f:
         if RDAPIKEY:
             rd_port = _write_zurg_remote(f, mn_rd, config_file_path_rd)
@@ -396,6 +431,9 @@ def _write_rclone_config(rclone_config_path, mn_rd, mn_ad,
             )
         elif _torbox_mount_configured():
             torbox_remote_written = _write_torbox_remote(f, TORBOX_MOUNT_NAME)
+            if torbox_remote_written and _fast_lane_on():
+                _fast_remote_written[0] = _write_fast_lane_remote(
+                    f, f"{TORBOX_MOUNT_NAME}_fast", _fast_lane_port())
         elif TORBOXAPIKEY:
             logger.warning(
                 "[rclone] TORBOX_API_KEY is set but TORBOX_WEBDAV_USER "
@@ -463,6 +501,17 @@ def setup():
             # with a Zurg mount — writing over /data/zurgarr/ with TorBox
             # content would corrupt the symlink machinery's view of RD.)
             mount_names.append(TORBOX_MOUNT_NAME)
+        fast_mn = f"{TORBOX_MOUNT_NAME}_fast" if _fast_remote_written[0] else None
+        if fast_mn:
+            # zurgarr's own server: up before its mount is probed.
+            from utils.fast_lane_server import start_fast_lane_server
+            try:
+                start_fast_lane_server(_fast_lane_port())
+                mount_names.append(fast_mn)
+            except OSError as e:
+                logger.error(f"[fast-lane] couldn't start the WebDAV server on port "
+                             f"{_fast_lane_port()}: {e} — new TorBox copies take the normal path")
+                fast_mn = None
 
         def _configure_mount(idx, mn, probe_timeout=None):
             logger.info(f"Configuring rclone for {mn}")
@@ -515,6 +564,8 @@ def setup():
             # unconfigured — doesn't wrongly inherit the 2h cache.
             if mn == TORBOX_MOUNT_NAME and torbox_remote_written:
                 dir_cache_time = (TORBOX_RCLONE_DIR_CACHE_TIME or '').strip() or '2h'
+            elif mn == fast_mn:
+                dir_cache_time = '10s'           # its listing changes by the minute
             else:
                 dir_cache_time = boot_layout.setting_at_start('RCLONE_DIR_CACHE_TIME') or '10s'
 
@@ -604,6 +655,13 @@ def setup():
                 probe_auth = (TORBOXWEBDAVUSER, TORBOXWEBDAVPASS)
                 probe_label = f"TorBox WebDAV ({mn})"
                 probe_method = "PROPFIND"
+            elif mn == fast_mn:
+                from utils.fast_lane_server import fast_lane_credentials
+                url = f"http://127.0.0.1:{_fast_lane_port()}"
+                probe_endpoint = "/"
+                probe_auth = fast_lane_credentials()
+                probe_label = f"TorBox fast lane WebDAV ({mn})"
+                probe_method = "PROPFIND"
             else:
                 url = f"http://localhost:{rd_port if mn == RCLONEMN_RD else ad_port}"
                 probe_endpoint = "/dav/"
@@ -635,7 +693,8 @@ def setup():
                 process_handler = ProcessHandler(logger)
                 # The TorBox mount uses TorBox's own WebDAV, not Zurg: its
                 # restarts don't wait for Zurg, and it isn't a Zurg mount.
-                process_handler.no_dependencies = bool(mn == TORBOX_MOUNT_NAME and torbox_remote_written)
+                process_handler.no_dependencies = bool(
+                    (mn == TORBOX_MOUNT_NAME and torbox_remote_written) or mn == fast_mn)
                 # Every auto-restart / restart_service relaunch runs the same
                 # `rclone mount` command, so a corpse left by the crashed
                 # instance must be cleared first or the whole restart budget

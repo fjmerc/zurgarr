@@ -34,8 +34,9 @@ AUTH_HALT_S = 1800
 RETRY_DELAYS = (1, 4, 16)
 _TIMEOUT = 30
 
-_lock = threading.Lock()          # one fetch at a time: no duplicate requestdl
+_lock = threading.Lock()          # guards the dicts and the throttle, never held over I/O
 _links = {}                       # (torrent_id, file_id) -> _Link
+_key_locks = {}                   # (torrent_id, file_id) -> Lock: one fetch per file
 _calls = collections.deque()      # clock of each requestdl attempt
 _halt_until = 0.0
 
@@ -90,18 +91,20 @@ def _request_link(torrent_id, file_id):
         return None
     params = {'token': key, 'torrent_id': torrent_id, 'file_id': file_id, 'zip_link': 'false'}
     for attempt in range(len(RETRY_DELAYS) + 1):
-        now = _clock()
-        if now < _halt_until:
-            return None
-        while _calls and now - _calls[0] >= 60:
-            _calls.popleft()
-        if len(_calls) >= REQUESTS_PER_MIN:
-            logger.debug("[fast-lane] TorBox link requests at the per-minute cap — not asking")
-            return None
-        _calls.append(now)
+        with _lock:
+            now = _clock()
+            if now < _halt_until:
+                return None
+            while _calls and now - _calls[0] >= 60:
+                _calls.popleft()
+            if len(_calls) >= REQUESTS_PER_MIN:
+                logger.debug("[fast-lane] TorBox link requests at the per-minute cap — not asking")
+                return None
+            _calls.append(now)
         status, body = _fetch(params)
         if status in (401, 403):
-            _halt_until = now + AUTH_HALT_S
+            with _lock:
+                _halt_until = _clock() + AUTH_HALT_S
             logger.warning(f"[fast-lane] TorBox refused a download-link request (HTTP {status}) "
                            f"— no more for {AUTH_HALT_S // 60} minutes")
             return None
@@ -121,25 +124,44 @@ def _request_link(torrent_id, file_id):
     return None
 
 
+def _usable(link, now):
+    """The cached link's URL when it can be used as is, else None."""
+    if not link or now - link.fetched_at >= LINK_MAX_AGE_S:
+        return None
+    if now - link.fetched_at < LINK_CHECK_AFTER_S:
+        return link.url
+    if now - link.checked_at < CHECK_CACHE_S and link.check_ok:
+        return link.url
+    return None
+
+
 def link_for(torrent_id, file_id, *, now=None):
-    """A working download link for one TorBox file, or None."""
+    """A working download link for one TorBox file, or None.  A file whose
+    link is in hand never waits on another file's TorBox request."""
     k = (torrent_id, file_id)
     with _lock:
-        now = _clock() if now is None else now
-        link = _links.get(k)
+        url = _usable(_links.get(k), _clock() if now is None else now)
+        if url:
+            return url
+        key_lock = _key_locks.setdefault(k, threading.Lock())
+    with key_lock:                     # one fetch per file; others proceed
+        with _lock:
+            now = _clock() if now is None else now
+            link = _links.get(k)
+            url = _usable(link, now)
+        if url:
+            return url
         if link and now - link.fetched_at < LINK_MAX_AGE_S:
-            if now - link.fetched_at < LINK_CHECK_AFTER_S:
-                return link.url
-            if now - link.checked_at < CHECK_CACHE_S and link.check_ok:
-                return link.url
-            link.check_ok = _link_works(link.url)
-            link.checked_at = now
-            if link.check_ok:
+            ok = _link_works(link.url)          # no API call
+            with _lock:
+                link.check_ok, link.checked_at = ok, now
+            if ok:
                 return link.url
         url = _request_link(torrent_id, file_id)
         if not url:
             return None
-        _links[k] = _Link(url, _clock())
+        with _lock:
+            _links[k] = _Link(url, _clock())
         return url
 
 
@@ -162,11 +184,13 @@ def forget(torrent_id):
     with _lock:
         for k in [k for k in _links if k[0] == torrent_id]:
             del _links[k]
+            _key_locks.pop(k, None)
 
 
 def reset_for_tests():
     global _halt_until
     with _lock:
         _links.clear()
+        _key_locks.clear()
         _calls.clear()
         _halt_until = 0.0

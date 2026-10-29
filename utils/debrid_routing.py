@@ -199,8 +199,11 @@ def mount_for_debrid(debrid, rclone_mount_base='/data'):
 
 
 def fast_lane_enabled():
-    """Whether the TorBox fast lane (TORBOX_FAST_LANE) is on."""
-    return str(os.environ.get('TORBOX_FAST_LANE', 'false')).lower() == 'true'
+    """Whether the TorBox fast lane (TORBOX_FAST_LANE) is on — as the
+    container started: its mount exists only then, so a change without a
+    restart must not link into a folder nobody mounted."""
+    from utils import boot_layout
+    return str(boot_layout.setting_at_start('TORBOX_FAST_LANE')).lower() == 'true'
 
 
 def symlink_target_base_for_debrid(debrid):
