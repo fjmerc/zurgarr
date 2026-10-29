@@ -204,3 +204,14 @@ def test_nothing_to_recover_with_does_nothing(env, monkeypatch):
     st.new_request_check()
     assert env['requested'] == []
     assert not env['radarr'].get_all_movies.called
+
+
+def test_scan_log_names_the_new_request_not_a_turned_down_grab(env, monkeypatch):
+    """The scan it starts logs why — 'grab turned down as uncached' would
+    send a reader looking for a grab that never happened."""
+    reasons = []
+    monkeypatch.setattr('utils.blackhole._request_wanted_scan',
+                        lambda stop, **k: reasons.append(k.get('reason')) or True)
+    env['radarr'].get_all_movies.return_value = [_movie()]
+    st.new_request_check()
+    assert reasons and 'new request' in reasons[0]

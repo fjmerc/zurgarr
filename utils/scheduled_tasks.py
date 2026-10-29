@@ -295,7 +295,8 @@ def new_request_check():
     if not found:
         return {'status': 'success', 'message': 'No new requests waiting'}
     from utils.blackhole import _request_wanted_scan
-    if not _request_wanted_scan(None):
+    if not _request_wanted_scan(
+            None, reason='new request(s) Sonarr/Radarr grabbed nothing for'):
         # one is already queued, and may have read the arrs before these
         # titles — look again next run
         return {'status': 'success', 'message': 'A library scan is already queued'}

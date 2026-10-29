@@ -1858,6 +1858,12 @@ class TestFindOnMount:
         # RCLONE_MOUNT_NAME set (the resolver applies its 'zurgarr'
         # default) the search would look under <root>/zurgarr instead.
         monkeypatch.delenv('RCLONE_MOUNT_NAME', raising=False)
+        import utils.blackhole as bh
+        monkeypatch.setattr(bh, '_folder_refresh_ts', {})
+
+    @staticmethod
+    def _video(folder):
+        open(os.path.join(folder, 'video.mkv'), 'w').close()
 
     def test_finds_in_shows(self, tmp_dir):
         """Should find content in the shows category."""
@@ -1966,12 +1972,65 @@ class TestFindOnMount:
         tb_mount = os.path.join(tmp_dir, 'torbox')
         release_dir = os.path.join(tb_mount, 'Show.S01E01.1080p-FLUX')
         os.makedirs(release_dir)
+        self._video(release_dir)
 
         watcher = BlackholeWatcher('/tmp', 'key', 'torbox', rclone_mount=tmp_dir)
         path, category, matched = watcher._find_on_mount('Show.S01E01.1080p-FLUX', debrid='torbox')
         assert path == release_dir
         assert category == ''  # Flat layout — no category subdivision
         assert matched == 'Show.S01E01.1080p-FLUX'
+
+    def test_torbox_folder_without_a_video_is_not_on_the_mount_yet(self, tmp_dir, monkeypatch):
+        """TorBox lists a release folder minutes before its files (Greyhound,
+        2026-10-29: empty for ~10 min) — the folder alone isn't arrival, and
+        the cached empty listing must be re-read, not kept for the 2h
+        dir-cache."""
+        import utils.rclone_rc as rc
+        relisted = []
+        monkeypatch.setattr(rc, 'refresh_dir', lambda d='', **k: relisted.append(d) or True)
+        name = 'Greyhound (2020) [1080p] [WEBRip] [5.1] [YTS.MX]'
+        release_dir = os.path.join(tmp_dir, 'torbox', name)
+        os.makedirs(os.path.join(release_dir, 'Subs'))
+        open(os.path.join(release_dir, 'Subs', 'English.eng.srt'), 'w').close()
+
+        watcher = BlackholeWatcher('/tmp', 'key', 'torbox', rclone_mount=tmp_dir)
+        assert watcher._find_on_mount(name, debrid='torbox') == (None, None, None)
+        assert relisted == [name]
+
+        open(os.path.join(release_dir, 'Greyhound.2020.1080p.WEBRip.mp4'), 'w').close()
+        assert watcher._find_on_mount(name, debrid='torbox') == (release_dir, '', name)
+
+    def test_torbox_video_one_level_down_counts(self, tmp_dir):
+        name = 'Show.S01.1080p-GRP'
+        nested = os.path.join(tmp_dir, 'torbox', name, 'Show.S01.1080p-GRP')
+        os.makedirs(nested)
+        open(os.path.join(nested, 'Show.S01E01.mkv'), 'w').close()
+        watcher = BlackholeWatcher('/tmp', 'key', 'torbox', rclone_mount=tmp_dir)
+        assert watcher._find_on_mount(name, debrid='torbox')[0] == os.path.join(tmp_dir, 'torbox', name)
+
+    def test_torbox_empty_folder_relist_is_spaced_out(self, tmp_dir, monkeypatch):
+        """Every waiting loop polls every few seconds — one re-list of the
+        folder per refresh interval, not one per poll."""
+        import utils.rclone_rc as rc
+        relisted = []
+        monkeypatch.setattr(rc, 'refresh_dir', lambda d='', **k: relisted.append(d) or True)
+        name = 'Empty.Release.2020.1080p-GRP'
+        os.makedirs(os.path.join(tmp_dir, 'torbox', name))
+        watcher = BlackholeWatcher('/tmp', 'key', 'torbox', rclone_mount=tmp_dir)
+        for _ in range(3):
+            watcher._find_on_mount(name, debrid='torbox')
+        assert relisted == [name]
+
+    def test_torbox_fuzzy_match_without_a_video_waits_too(self, tmp_dir, monkeypatch):
+        import utils.rclone_rc as rc
+        relisted = []
+        monkeypatch.setattr(rc, 'refresh_dir', lambda d='', **k: relisted.append(d) or True)
+        folder = '[scraper.to] My Show S01E01 1080p WEB-DL-FLUX [TGx]'
+        os.makedirs(os.path.join(tmp_dir, 'torbox', folder))
+        watcher = BlackholeWatcher('/tmp', 'key', 'torbox', rclone_mount=tmp_dir)
+        assert watcher._find_on_mount('My Show S01E01 1080p WEB-DL-FLUX [TGx]',
+                                      debrid='torbox') == (None, None, None)
+        assert relisted == [folder]
 
     def test_torbox_strips_indexer_prefix(self, tmp_dir):
         """TB API ``data.name`` sometimes has a leading ``[indexer.to] ``
@@ -1988,6 +2047,7 @@ class TestFindOnMount:
             'www.UIndex.org    -    Landman S02E01 Death and a Sunset 1080p AMZN WEB-DL DDP5 1 H 264-FLUX'
         )
         os.makedirs(release_dir)
+        self._video(release_dir)
 
         watcher = BlackholeWatcher('/tmp', 'key', 'torbox', rclone_mount=tmp_dir)
         # API returns name WITH the leading bracket prefix
@@ -2010,6 +2070,7 @@ class TestFindOnMount:
             '[scraper.to] My Show S01E01 1080p WEB-DL-FLUX [TGx]'
         )
         os.makedirs(release_dir)
+        self._video(release_dir)
 
         watcher = BlackholeWatcher('/tmp', 'key', 'torbox', rclone_mount=tmp_dir)
         api_name = 'My Show S01E01 1080p WEB-DL-FLUX [TGx]'

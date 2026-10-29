@@ -263,6 +263,54 @@ _root_refresh_ts = 0.0  # monotonic ts of the last fired root refresh
 # (seen: ~6 min), so one re-list at the start of the mount wait often comes
 # too early.  Re-list this often while waiting (still coalesced above).
 _MOUNT_REFRESH_EVERY_S = 30
+
+# TorBox also lists a release folder before its files (Greyhound, 2026-10-29:
+# empty for ~10 min), and the root re-list above never re-reads a folder the
+# mount has cached as empty — that listing would stand for the 2h dir-cache.
+# A folder counts as on the mount once a video shows in it; until then it is
+# re-listed itself, once per _MOUNT_REFRESH_EVERY_S.
+_folder_refresh_lock = threading.Lock()
+_folder_refresh_ts = {}  # folder name -> monotonic ts of its last re-list
+
+
+def _holds_video(path, depth=2):
+    """True when *path* holds a media file, looking *depth* folders down
+    (a pack's release-named subfolder, its season folders)."""
+    try:
+        with os.scandir(path) as it:
+            entries = list(it)
+    except OSError:
+        return False
+    subdirs = []
+    for e in entries:
+        try:
+            is_dir = e.is_dir()
+        except OSError:
+            continue
+        if is_dir:
+            subdirs.append(e.path)
+        elif os.path.splitext(e.name)[1].lower() in MEDIA_EXTENSIONS:
+            return True
+    return depth > 0 and any(_holds_video(d, depth - 1) for d in subdirs)
+
+
+def _relist_folder(name, *, _now=None):
+    """Re-read one mount folder from TorBox, at most once per
+    ``_MOUNT_REFRESH_EVERY_S`` per folder across every waiting thread.
+    True when this call fired it."""
+    now = _now if _now is not None else time.monotonic()
+    with _folder_refresh_lock:
+        if now - _folder_refresh_ts.get(name, float('-inf')) < _MOUNT_REFRESH_EVERY_S:
+            return False
+        for k in [k for k, t in _folder_refresh_ts.items() if now - t > 3600]:
+            del _folder_refresh_ts[k]
+        _folder_refresh_ts[name] = now
+    try:
+        from utils.rclone_rc import refresh_dir
+        refresh_dir(name)
+    except Exception:
+        pass
+    return True
 # After the mount wait times out, keep watching a ready grab this long,
 # checking every _LATE_ARRIVAL_POLL_S, and run the library scan the moment
 # it surfaces instead of leaving it for the next hourly scan.
@@ -282,7 +330,8 @@ _wanted_scan_ts = float('-inf')    # monotonic ts of the last scan started here
 _wanted_scan_pending = False
 
 
-def _request_wanted_scan(stop_event, *, retry=_WANTED_SCAN_RETRY_S):
+def _request_wanted_scan(stop_event, *, retry=_WANTED_SCAN_RETRY_S,
+                         reason='grab turned down as uncached'):
     """Run the library scan soon so its Wanted pass looks for a cached copy
     of a title whose grab was just turned down as uncached.
 
@@ -291,7 +340,7 @@ def _request_wanted_scan(stop_event, *, retry=_WANTED_SCAN_RETRY_S):
     the Wanted pass's own gap after a TorBox add (a scan inside it skips
     Wanted recovery), then retries while another scan runs or links, up to
     ``_WANTED_SCAN_TRIES`` times.  Rejections while one is queued ride on
-    it.  True when a scan was queued.
+    it.  *reason* goes in the log line.  True when a scan was queued.
     """
     global _wanted_scan_pending
     try:
@@ -335,8 +384,8 @@ def _request_wanted_scan(stop_event, *, retry=_WANTED_SCAN_RETRY_S):
                         and scheduler.run_now('library_scan'):
                     with _wanted_scan_lock:
                         _wanted_scan_ts = time.monotonic()
-                    logger.info("[blackhole] grab turned down as uncached — running the "
-                                "library scan now to look for a cached copy")
+                    logger.info(f"[blackhole] {reason} — running the library scan now "
+                                f"to look for a cached copy")
                     return
                 if stop.wait(retry):
                     return
@@ -2457,7 +2506,7 @@ class BlackholeWatcher:
                 continue
             path = os.path.join(mount_path, name)
             if os.path.isdir(path):
-                return path, '', name
+                return self._tb_folder_if_ready(path, name)
 
         try:
             from utils.library import norm_for_matching
@@ -2488,16 +2537,30 @@ class BlackholeWatcher:
 
         if len(matches) == 1:
             path, name = matches[0]
-            logger.info(
-                f"[blackhole] TB fuzzy mount match: API name {release_name!r} "
-                f"→ folder {name!r}"
-            )
-            return path, '', name
+            hit = self._tb_folder_if_ready(path, name)
+            if hit[0]:
+                logger.info(
+                    f"[blackhole] TB fuzzy mount match: API name {release_name!r} "
+                    f"→ folder {name!r}"
+                )
+            return hit
         if len(matches) > 1:
             logger.warning(
                 f"[blackhole] Multiple TB mount candidates for {release_name!r}: "
                 f"{[m[1] for m in matches]} — refusing to guess"
             )
+        return None, None, None
+
+    @staticmethod
+    def _tb_folder_if_ready(path, name):
+        """``(path, '', name)`` once the TorBox folder holds a video; until
+        then ``(None, None, None)`` and the folder is re-listed — TorBox
+        shows the folder before its files."""
+        if _holds_video(path):
+            return path, '', name
+        if _relist_folder(name):
+            logger.debug(f"[blackhole] {name} is on the TB mount without its files yet "
+                         f"— re-listing it")
         return None, None, None
 
     # ── Symlink creation ─────────────────────────────────────────────
