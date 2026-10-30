@@ -3,6 +3,7 @@
 import json
 import os
 import threading
+from unittest.mock import MagicMock
 import time
 import pytest
 from utils.blackhole import (
@@ -6292,13 +6293,69 @@ class TestScannerHandoff:
         assert watcher._watch_added_torrent('1') is False
         assert time.monotonic() - t0 < 5
 
+    def _no_video_add(self, tmp_dir, monkeypatch):
+        """An own add whose only file is not a video (a fake '.exe' release)."""
+        watcher = self._added_watcher(tmp_dir, monkeypatch)
+        monkeypatch.setattr(watcher, '_extract_filenames_from_info',
+                            lambda *a, **k: ['Greys Anatomy S23E03 1080p HEVC x265-MeGusta.exe'])
+        monkeypatch.setattr(watcher, '_extract_hash_from_info', lambda *a, **k: 'E87B' * 10)
+        self.blocked, self.events = [], []
+        monkeypatch.setattr('utils.blackhole._blocklist', type('B', (), {
+            'add': staticmethod(lambda h, t, **k: self.blocked.append((h, k.get('reason'))))})())
+        monkeypatch.setattr('utils.blackhole._history', type('H', (), {
+            'log_event': staticmethod(lambda *a, **k: self.events.append(
+                (a[0], k.get('meta', {}).get('cause'))))})())
+        monkeypatch.setattr('utils.blackhole._notify', None)
+        self.client = MagicMock()
+        monkeypatch.setattr('utils.debrid_client.get_debrid_client',
+                            lambda service=None, api_key=None: (self.client, service))
+        return watcher
+
+    def test_own_add_with_no_video_is_rejected_and_removed(self, tmp_dir, monkeypatch, lane):
+        """A fake release (one '.exe', no video) zurgarr added itself is
+        blocklisted — so Wanted recovery never picks it again — and removed
+        from TorBox, like a blackhole grab with no media; never admitted to
+        the fast lane or waited for on the mount."""
+        watcher = self._no_video_add(tmp_dir, monkeypatch)
+        assert watcher._watch_added_torrent('131208495', 'Greys Anatomy S23E03', preexisting=False) is False
+        assert self.blocked == [('E87B' * 10, 'disc rip (no usable media files)')]
+        self.client.delete_torrent.assert_called_once_with('131208495')
+        assert ('failed', 'disc_rip_rejected') in self.events
+        assert lane == [] and self.finds == 0 and self.scans == []
+
+    def test_own_add_with_no_video_already_in_the_account_is_kept(self, tmp_dir, monkeypatch, lane):
+        """An add that may have returned a torrent already in the account is
+        blocklisted but never deleted."""
+        watcher = self._no_video_add(tmp_dir, monkeypatch)
+        assert watcher._watch_added_torrent('131208495', 'X', preexisting=True) is False
+        assert len(self.blocked) == 1
+        self.client.delete_torrent.assert_not_called()
+        assert lane == []
+
+    def test_own_add_is_assumed_preexisting_unless_told(self, tmp_dir, monkeypatch, lane):
+        watcher = self._no_video_add(tmp_dir, monkeypatch)
+        assert watcher._watch_added_torrent('131208495') is False
+        self.client.delete_torrent.assert_not_called()
+
+    def test_watch_torbox_add_passes_preexisting_through(self, tmp_dir, monkeypatch):
+        import utils.blackhole as bh
+        watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
+        seen = []
+        done = threading.Event()
+        monkeypatch.setattr(watcher, '_watch_added_torrent',
+                            lambda tid, title='', preexisting=True:
+                            seen.append(preexisting) or done.set() or True)
+        monkeypatch.setattr(bh, '_watcher', watcher)
+        assert bh.watch_torbox_add('11', 'X', preexisting=False) is True
+        assert done.wait(2) and seen == [False]
+
     def test_watch_torbox_add_starts_one_watch_per_torrent(self, tmp_dir, monkeypatch):
         import utils.blackhole as bh
         watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
         started = []
         gate = threading.Event()
         monkeypatch.setattr(watcher, '_watch_added_torrent',
-                            lambda tid, title='': (started.append(tid), gate.wait(2)))
+                            lambda tid, title='', **k: (started.append(tid), gate.wait(2)))
         monkeypatch.setattr(bh, '_watcher', watcher)
         assert bh.watch_torbox_add('7', 'X') is True
         assert bh.watch_torbox_add('7', 'X') is False      # already watched
@@ -6314,7 +6371,7 @@ class TestScannerHandoff:
         watcher = self._make_symlink_watcher(tmp_dir, 'torbox')
         done = threading.Event()
 
-        def boom(tid, title=''):
+        def boom(tid, title='', **k):
             done.set()
             raise RuntimeError('mount gone')
         monkeypatch.setattr(watcher, '_watch_added_torrent', boom)
@@ -6338,12 +6395,12 @@ class TestScannerHandoff:
         monkeypatch.setattr(bh, '_RELOAD_HANDOVER_POLL_S', 0.01)
         on_new = threading.Event()
 
-        def old_watch(tid, title=''):
+        def old_watch(tid, title='', **k):
             old._stop_event.wait(5)
             return False
         monkeypatch.setattr(old, '_watch_added_torrent', old_watch)
         monkeypatch.setattr(new, '_watch_added_torrent',
-                            lambda tid, title='': on_new.set() or True)
+                            lambda tid, title='', **k: on_new.set() or True)
         monkeypatch.setattr(bh, '_watcher', old)
         assert bh.watch_torbox_add('9', 'X') is True
         old._stop_event.set()                  # the reload stops the old watcher...
@@ -6383,13 +6440,13 @@ class TestScannerHandoff:
         swapped = threading.Event()
         monkeypatch.setattr(bh, '_RELOAD_HANDOVER_POLL_S', 0.01)
 
-        def linked_then_stopped(tid, title=''):
+        def linked_then_stopped(tid, title='', **k):
             swapped.wait(2)
             old._stop_event.set()          # the reload lands just as it links
             return True
         monkeypatch.setattr(old, '_watch_added_torrent', linked_then_stopped)
         monkeypatch.setattr(new, '_watch_added_torrent',
-                            lambda tid, title='': reran.append(tid) or True)
+                            lambda tid, title='', **k: reran.append(tid) or True)
         monkeypatch.setattr(bh, '_watcher', old)
         bh.watch_torbox_add('11')
         monkeypatch.setattr(bh, '_watcher', new)

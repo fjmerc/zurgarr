@@ -1438,8 +1438,13 @@ def add_to_debrid(info_hash, title='', media_title=None, episode=None,
     # Dedup — skip hashes already on the account.  Default ON because adding
     # the same magnet twice just creates a second torrent entry pointing at
     # the same hash and leaves the user to clean it up in DMM.
+    # True only once the account list confirmed this hash wasn't there: the
+    # TorBox mount watch may then delete the add if it turns out to hold no
+    # video (a fake release); anything unconfirmed is never deleted.
+    confirmed_new = False
     if str(os.environ.get('SEARCH_DEDUP_ENABLED', 'true')).lower() == 'true':
         existing = _existing_hashes(service, api_key)
+        confirmed_new = existing is not None and lowered not in existing
         if existing is not None and lowered in existing:
             logger.info(f"[search] Skipping add: {title or lowered[:16]} already in {service} account")
             return {'success': False, 'torrent_id': '', 'service': service,
@@ -1499,7 +1504,8 @@ def add_to_debrid(info_hash, title='', media_title=None, episode=None,
     if service == 'torbox' and result.get('success') and result.get('torrent_id'):
         try:
             from utils.blackhole import watch_torbox_add
-            watch_torbox_add(result['torrent_id'], title or media_title or '')
+            watch_torbox_add(result['torrent_id'], title or media_title or '',
+                             preexisting=not confirmed_new)
         except Exception as e:
             logger.debug(f"[search] mount watch for {title or lowered[:16]} not started: {e}")
 

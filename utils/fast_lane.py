@@ -65,6 +65,9 @@ def admit_record(record):
         return True
     if _on_torbox_mount(entry.folder):
         return False
+    if not any(fast_lane_links._is_video(f.path) for f in entry.files):
+        logger.info(f"[fast-lane] {entry.folder} has no video file — not for the fast lane")
+        return False
     if not fast_lane_links.prefetch(entry):
         logger.info(f"[fast-lane] {entry.folder}: TorBox gave no download link — it takes "
                     f"the normal path")

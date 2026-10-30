@@ -49,6 +49,19 @@ def test_admit_noop_when_disabled(monkeypatch):
     assert reg.entries() == []
 
 
+def test_no_video_is_not_admitted_and_says_why(monkeypatch, caplog):
+    """A torrent with no video (a fake '.exe' release) is never the fast
+    lane's — and the log says so, not that TorBox refused a link."""
+    import logging
+    monkeypatch.setattr(links, 'prefetch', lambda e: pytest.fail('no TorBox call for a non-video'))
+    rec = {'id': 7, 'created_at': '2026-10-30T02:01:17Z',
+           'files': [{'id': 1, 'name': 'Fake S01E01/Fake S01E01.exe', 'size': 5}]}
+    with caplog.at_level(logging.INFO):
+        assert fast_lane.admit_record(rec) is False
+    assert 'no video' in caplog.text and 'download link' not in caplog.text
+    assert reg.entries() == []
+
+
 def test_admit_twice_prefetches_once(monkeypatch):
     calls = []
     monkeypatch.setattr(links, 'prefetch', lambda e: calls.append(1) or True)

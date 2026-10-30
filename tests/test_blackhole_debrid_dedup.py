@@ -1155,6 +1155,50 @@ class TestPreexistingTorrentProtection:
         assert captured == [('T9', True)]
 
 
+class TestGrabWithNoMediaRejected:
+    """A grab whose torrent holds no video is blocklisted, removed from the
+    debrid (unless it was already in the account), and recorded as failed."""
+
+    def _run(self, preexisting):
+        from utils.blackhole import BlackholeWatcher
+        w = BlackholeWatcher.__new__(BlackholeWatcher)
+        w.debrid_service = 'realdebrid'
+        w.debrid_api_key = 'k'
+        w.mount_poll_timeout = 60
+        w.mount_poll_interval = 1
+        w._stop_event = threading.Event()
+        w._api_key_for = MagicMock(return_value='k')
+        w._remove_pending = MagicMock()
+        w._load_pending = MagicMock(return_value={})
+        w._check_realdebrid_status = MagicMock(return_value=(
+            'downloaded', {'hash': 'ab' * 20, 'filename': 'Fake.S01E01',
+                           'files': [{'path': '/Fake.S01E01.exe', 'selected': 1}]}))
+        w._find_on_mount = MagicMock(side_effect=AssertionError('never waits on the mount'))
+        blocked, client, hist = [], MagicMock(), MagicMock()
+        stub = type('B', (), {'add': staticmethod(lambda h, t, **k: blocked.append(h))})()
+        with patch('utils.blackhole._blocklist', stub), \
+             patch('utils.blackhole._history', hist), \
+             patch('utils.blackhole._notify', None), \
+             patch('utils.blackhole._enrich_for_history', return_value=(None, None)), \
+             patch('utils.debrid_client.get_debrid_client', return_value=(client, 'realdebrid')):
+            w._monitor_and_symlink('T1', 'Fake.S01E01.magnet', preexisting=preexisting)
+        causes = [c.kwargs.get('meta', {}).get('cause') for c in hist.log_event.call_args_list]
+        return w, blocked, client, causes
+
+    def test_fresh_grab_is_blocklisted_deleted_and_failed(self):
+        w, blocked, client, causes = self._run(preexisting=False)
+        assert blocked == ['AB' * 20]
+        client.delete_torrent.assert_called_once_with('T1')
+        assert 'disc_rip_rejected' in causes and 'auto_blocklist_added' in causes
+        w._remove_pending.assert_called_once_with('T1')
+
+    def test_preexisting_grab_is_blocklisted_but_kept(self):
+        w, blocked, client, causes = self._run(preexisting=True)
+        assert blocked == ['AB' * 20]
+        client.delete_torrent.assert_not_called()
+        assert 'disc_rip_rejected' in causes
+
+
 class TestImportEventRecordsGrabIdentity:
     """The queue sweep ties an arr queue item (keyed by completed folder) to
     its grab (keyed by torrent hash) through the import history event."""

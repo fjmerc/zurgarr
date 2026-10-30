@@ -3475,7 +3475,59 @@ class BlackholeWatcher:
                     f"pick it up")
         return False
 
-    def _watch_added_torrent(self, torrent_id, title=''):
+    def _reject_no_media(self, torrent_id, info, debrid, api_key, label, preexisting):
+        """A ready torrent with no recognized media file (a disc rip, or a
+        fake release such as a lone '.exe'): blocklist its hash so no path
+        picks it again, delete it from the debrid unless it was already in
+        the account, and record the failure."""
+        logger.warning(f"[blackhole] No recognized media files in {label} — "
+                       f"auto-blocklisting and removing from debrid.")
+        _mt, _ep = _enrich_for_history(label) if _history else (None, None)
+        if _blocklist and str(os.environ.get('BLOCKLIST_AUTO_ADD', 'true')).lower() == 'true':
+            bl_hash = self._extract_hash_from_info(info, debrid=debrid)
+            if bl_hash:
+                _blocklist.add(bl_hash, label, reason='disc rip (no usable media files)', source='auto')
+                if _history:
+                    _history.log_event('blocklist_added', label, episode=_ep, source='blackhole',
+                                       detail='Auto-blocklisted: disc rip',
+                                       meta={'cause': 'auto_blocklist_added',
+                                             'blocklist_reason': 'disc rip',
+                                             'info_hash': bl_hash},
+                                       media_title=_mt)
+        try:
+            from utils.debrid_client import get_debrid_client
+            # Route through the torrent's own debrid — see the timeout-delete
+            # block in _monitor_and_symlink for the cross-provider hazard.
+            client, _svc = get_debrid_client(service=debrid, api_key=api_key)
+            # Never a torrent that was in the account before this add.
+            if client and not preexisting:
+                client.delete_torrent(str(torrent_id))
+        except Exception as e:
+            msg = str(e)
+            if api_key and api_key in msg:
+                msg = msg.replace(api_key, '***')
+            logger.debug(f"[blackhole] Failed to delete disc rip from debrid: {msg}")
+        if _history:
+            _history.log_event('failed', label, episode=_ep, source='blackhole',
+                               detail='Rejected: no usable media files',
+                               meta={'cause': 'disc_rip_rejected',
+                                     'provider': debrid,
+                                     'torrent_id': torrent_id},
+                               media_title=_mt)
+        try:
+            from utils.metrics import metrics
+            metrics.inc('blackhole_disc_rip_rejected')
+        except Exception:
+            pass
+        if _notify:
+            _notify('download_error', 'Blackhole: No Media Files',
+                    f'{label} contains no recognized media files. '
+                    + ('Auto-blocklisted (kept on debrid — it was already '
+                       'in the account).' if preexisting
+                       else 'Auto-blocklisted and removed from debrid.'),
+                    level='warning')
+
+    def _watch_added_torrent(self, torrent_id, title='', preexisting=True):
         """Get a TorBox torrent zurgarr added itself (Wanted recovery, the
         search page) into the library as soon as TorBox lists it; True once
         the library scan linked it.
@@ -3489,6 +3541,10 @@ class BlackholeWatcher:
         record, never the release title.  Not persisted: a container
         restart mid-watch leaves it to the scheduled scan (a settings save
         hands it to the new watcher — see ``watch_torbox_add``).
+
+        A ready torrent with no video (a fake release) is rejected like a
+        blackhole grab's: blocklisted, and deleted from TorBox only when
+        *preexisting* is False — the add confirmed it wasn't in the account.
         """
         label = title or torrent_id
         api_key = self._api_key_for('torbox')
@@ -3512,6 +3568,10 @@ class BlackholeWatcher:
                 return False
             if self._stop_event.wait(self.mount_poll_interval):
                 return False
+        if not self._has_usable_media_files(info, debrid='torbox'):
+            self._reject_no_media(torrent_id, info, 'torbox', api_key, label,
+                                  preexisting=preexisting)
+            return False
         self._admit_to_fast_lane(info)
         release_name = self._extract_release_name(info, debrid='torbox')
         if not release_name:
@@ -3757,56 +3817,8 @@ class BlackholeWatcher:
                 logger.info(f"[blackhole] Torrent ready: {filename} (release: {release_name}, via {debrid})")
                 # Disc rip detection: check debrid file list before mount wait
                 if not self._has_usable_media_files(info, debrid=debrid):
-                    logger.warning(f"[blackhole] No recognized media files in {filename} — "
-                                   f"auto-blocklisting and removing from debrid.")
-                    _mt, _ep = _enrich_for_history(filename) if _history else (None, None)
-                    if _blocklist and str(os.environ.get('BLOCKLIST_AUTO_ADD', 'true')).lower() == 'true':
-                        bl_hash = self._extract_hash_from_info(info, debrid=debrid)
-                        if bl_hash:
-                            _blocklist.add(bl_hash, filename, reason='disc rip (no usable media files)', source='auto')
-                            if _history:
-                                _history.log_event('blocklist_added', filename, episode=_ep, source='blackhole',
-                                                   detail='Auto-blocklisted: disc rip',
-                                                   meta={'cause': 'auto_blocklist_added',
-                                                         'blocklist_reason': 'disc rip',
-                                                         'info_hash': bl_hash},
-                                                   media_title=_mt)
-                    try:
-                        from utils.debrid_client import get_debrid_client
-                        # Route through the grab's debrid — see the
-                        # timeout-delete block above for the cross-provider
-                        # hazard this avoids.
-                        client, _svc = get_debrid_client(
-                            service=debrid,
-                            api_key=api_key,
-                        )
-                        # Never a torrent that was in the account before this grab.
-                        if client and not preexisting:
-                            client.delete_torrent(str(torrent_id))
-                    except Exception as e:
-                        msg = str(e)
-                        if api_key and api_key in msg:
-                            msg = msg.replace(api_key, '***')
-                        logger.debug(f"[blackhole] Failed to delete disc rip from debrid: {msg}")
-                    if _history:
-                        _history.log_event('failed', filename, episode=_ep, source='blackhole',
-                                           detail='Rejected: no usable media files',
-                                           meta={'cause': 'disc_rip_rejected',
-                                                 'provider': debrid,
-                                                 'torrent_id': torrent_id},
-                                           media_title=_mt)
-                    try:
-                        from utils.metrics import metrics
-                        metrics.inc('blackhole_disc_rip_rejected')
-                    except Exception:
-                        pass
-                    if _notify:
-                        _notify('download_error', 'Blackhole: No Media Files',
-                                f'{filename} contains no recognized media files. '
-                                + ('Auto-blocklisted (kept on debrid — it was already '
-                                   'in the account).' if preexisting
-                                   else 'Auto-blocklisted and removed from debrid.'),
-                                level='warning')
+                    self._reject_no_media(torrent_id, info, debrid, api_key, filename,
+                                          preexisting=preexisting)
                     self._remove_pending(torrent_id)
                     return
                 if debrid == 'torbox':
@@ -7172,12 +7184,13 @@ def _next_watcher(stopped):
     return None
 
 
-def watch_torbox_add(torrent_id, title=''):
+def watch_torbox_add(torrent_id, title='', preexisting=True):
     """Watch a torrent zurgarr just added to TorBox itself until the library
     scan links it (see ``BlackholeWatcher._watch_added_torrent``), in the
     background.  True when a watch started; False with no blackhole in
     symlink mode (nothing to watch with — the scheduled scan picks it up),
-    no TorBox key, or the torrent already watched.
+    no TorBox key, or the torrent already watched.  *preexisting* False
+    lets the watch delete it from TorBox if it holds no video.
     """
     w = _watcher
     if w is None or not torrent_id:
@@ -7195,7 +7208,7 @@ def watch_torbox_add(torrent_id, title=''):
         current = w
         try:
             while True:
-                if current._watch_added_torrent(tid, title) \
+                if current._watch_added_torrent(tid, title, preexisting=preexisting) \
                         or not current._stop_event.is_set():
                     return
                 # Stopped: a settings save restarts the blackhole — carry on

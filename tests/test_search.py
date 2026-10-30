@@ -486,8 +486,25 @@ class TestAddToDebrid:
         import utils.blackhole as bh
         calls = []
         monkeypatch.setattr(bh, 'watch_torbox_add',
-                            lambda tid, title='': calls.append((tid, title)) or True)
+                            lambda tid, title='', **k: calls.append((tid, title)) or True)
         return calls
+
+    def test_torbox_add_tells_the_watch_whether_the_torrent_is_new(self, monkeypatch):
+        """The watch may delete a fake (no-video) add from TorBox — only one
+        the account-list check confirmed wasn't there before."""
+        import utils.blackhole as bh
+        seen = []
+        monkeypatch.setattr(bh, 'watch_torbox_add',
+                            lambda tid, title='', preexisting=True: seen.append(preexisting) or True)
+        monkeypatch.setattr('utils.search._add_to_tb', lambda magnet, key: {
+            'success': True, 'torrent_id': '1', 'error': ''})
+        monkeypatch.setattr('utils.search._existing_hashes', lambda *a, **kw: {'b' * 40})
+        add_to_debrid('a' * 40, service='torbox', api_key='k')
+        monkeypatch.setattr('utils.search._existing_hashes', lambda *a, **kw: None)  # unknown
+        add_to_debrid('c' * 40, service='torbox', api_key='k')
+        monkeypatch.setenv('SEARCH_DEDUP_ENABLED', 'false')                         # not checked
+        add_to_debrid('d' * 40, service='torbox', api_key='k')
+        assert seen == [False, True, True]
 
     def test_torbox_add_is_watched_until_it_reaches_the_mount(self, monkeypatch, watched):
         monkeypatch.setattr('utils.search._add_to_tb', lambda magnet, key: {
