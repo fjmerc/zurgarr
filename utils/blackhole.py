@@ -3538,8 +3538,8 @@ class BlackholeWatcher:
             fate = f"couldn't be removed from {where} — delete it there by hand"
         else:
             fate = f'kept on {where} (it may have been in the account before this add)'
-        done = ('Blocklisted and ' if blocked else '') + fate
-        logger.warning(f"[blackhole] No recognized media files in {label} — {done[0].lower() + done[1:]}.")
+        done = ('blocklisted and ' if blocked else '') + fate
+        logger.warning(f"[blackhole] No recognized media files in {label} — {done}.")
         if _history:
             _history.log_event('failed', label, episode=_ep, source='blackhole',
                                detail='Rejected: no usable media files',
@@ -3554,7 +3554,7 @@ class BlackholeWatcher:
             pass
         if _notify:
             _notify('download_error', f'{source}: No Media Files',
-                    f'{label} contains no recognized media files. {done}.',
+                    f'{label} contains no recognized media files. {done[0].upper() + done[1:]}.',
                     level='warning')
 
     def _watch_added_torrent(self, torrent_id, title='', preexisting=True, added_at=None):

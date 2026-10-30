@@ -6389,6 +6389,7 @@ class TestScannerHandoff:
         watcher = self._no_video_add(tmp_dir, monkeypatch)
         watcher._watch_added_torrent('131208495', 'X', preexisting=False, added_at=time.time())
         assert self.blocked == [] and 'blocklisted' not in self.notes[0][1].lower()
+        assert 'media files. Removed from TorBox.' in self.notes[0][1]
 
     def test_a_rejected_fake_is_never_added_again(self, tmp_dir, monkeypatch, lane):
         """Even with auto-blocklisting off, zurgarr's own adds never re-add a
