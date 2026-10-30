@@ -443,6 +443,24 @@ class TestZurgRcloneApplyAtStartup:
         monkeypatch.setattr(cr, '_notify_reload', lambda *a, **k: None)
         cr._reload_once()
 
+    @pytest.mark.parametrize('key', ['TORBOX_API_KEY', 'RD_API_KEY', 'AD_API_KEY'])
+    def test_a_debrid_key_change_forgets_the_cached_account_lists(self, boot, monkeypatch, key):
+        """The account hash lists are cached per service, not per key: after
+        a switch to another account they must not answer for the new one."""
+        import utils.search as search
+        cr = boot(**self.RD_BOOT)
+        cleared = []
+        monkeypatch.setattr(search, 'invalidate_existing_hashes_cache', lambda: cleared.append(1))
+        self._reload(cr, monkeypatch, {key})
+        assert cleared == [1]
+
+    def test_other_changes_keep_the_cached_account_lists(self, boot, monkeypatch):
+        import utils.search as search
+        cr = boot(**self.RD_BOOT)
+        monkeypatch.setattr(search, 'invalidate_existing_hashes_cache',
+                            lambda: pytest.fail('nothing to forget'))
+        self._reload(cr, monkeypatch, {'ZURGARR_LOG_LEVEL'})
+
     def test_reload_never_touches_zurg_or_rclone(self, boot, monkeypatch):
         from utils import processes
         cr = boot(**self.RD_BOOT)

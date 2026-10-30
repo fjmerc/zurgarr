@@ -498,3 +498,11 @@ def test_fast_lane_formatters_in_js():
 def test_fast_lane_dropped():
     assert format_event(_ev('fast_lane_dropped'))['short'] == \
         'Left the TorBox account while in the TorBox fast lane'
+
+
+def test_no_media_rejection_names_no_cause_it_cannot_know():
+    """The same cause covers disc rips and fake releases (a lone '.exe')."""
+    s = format_event(_ev('disc_rip_rejected'))['short']
+    assert s == 'Rejected — no usable media files'
+    from utils.activity_format import FORMATTER_JS
+    assert "disc_rip_rejected: function(){ return 'Rejected — no usable media files'; }" in FORMATTER_JS

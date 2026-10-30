@@ -5,6 +5,7 @@ import json
 import os
 import urllib.error
 import sys
+import time
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -493,9 +494,11 @@ class TestAddToDebrid:
         """The watch may delete a fake (no-video) add from TorBox — only one
         the account-list check confirmed wasn't there before."""
         import utils.blackhole as bh
-        seen = []
+        seen, stamps = [], []
+        t0 = time.time()
         monkeypatch.setattr(bh, 'watch_torbox_add',
-                            lambda tid, title='', preexisting=True: seen.append(preexisting) or True)
+                            lambda tid, title='', preexisting=True, added_at=None:
+                            seen.append(preexisting) or stamps.append(added_at) or True)
         monkeypatch.setattr('utils.search._add_to_tb', lambda magnet, key: {
             'success': True, 'torrent_id': '1', 'error': ''})
         monkeypatch.setattr('utils.search._existing_hashes', lambda *a, **kw: {'b' * 40})
@@ -505,6 +508,7 @@ class TestAddToDebrid:
         monkeypatch.setenv('SEARCH_DEDUP_ENABLED', 'false')                         # not checked
         add_to_debrid('d' * 40, service='torbox', api_key='k')
         assert seen == [False, True, True]
+        assert all(t0 <= t <= time.time() for t in stamps)   # when each add began
 
     def test_torbox_add_is_watched_until_it_reaches_the_mount(self, monkeypatch, watched):
         monkeypatch.setattr('utils.search._add_to_tb', lambda magnet, key: {

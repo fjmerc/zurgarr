@@ -454,6 +454,15 @@ def _reload_once():
             logger.error(f"[reload] Failed to reload base config: {e}")
             return
 
+        # The debrid account hash lists are cached per service, not per key:
+        # after a switch to another account they must not answer for it.
+        if changed & {'RD_API_KEY', 'AD_API_KEY', 'TORBOX_API_KEY'}:
+            try:
+                from utils import search as _search
+                _search.invalidate_existing_hashes_cache()
+            except Exception as e:
+                logger.warning(f"[reload] Couldn't clear the debrid account caches: {e}")
+
         note = _zurg_restart_note(changed)
         if note:
             logger.warning(f"[reload] {note}")

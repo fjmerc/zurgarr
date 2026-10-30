@@ -65,6 +65,9 @@ def admit_record(record):
         return True
     if _on_torbox_mount(entry.folder):
         return False
+    # _is_video (MEDIA_EXTENSIONS, samples excluded) is stricter than the
+    # blackhole's _has_usable_media_files, which rejects only torrents with
+    # no media file at all — a samples-only torrent reaches here.
     if not any(fast_lane_links._is_video(f.path) for f in entry.files):
         logger.info(f"[fast-lane] {entry.folder} has no video file — not for the fast lane")
         return False

@@ -582,25 +582,46 @@ def make_preexisting_check(probe_start, grace=_PREEXISTING_GRACE_SECONDS,
         info = info_fn(tid)
         if not isinstance(info, dict):
             return True
-        raw = ''
-        for field in timestamp_fields:
-            v = info.get(field)
-            if isinstance(v, str) and v.strip():
-                raw = v.strip()
-                break
-        if not raw:
+        created = _created_epoch(info, timestamp_fields)
+        if created is None:
             return True
-        try:
-            dt = datetime.fromisoformat(raw.replace('Z', '+00:00'))
-        except (ValueError, TypeError):
-            return True
-        # A naive timestamp has no anchor to compare against a UTC epoch —
-        # treat as unknown rather than guessing the zone.
-        if dt.tzinfo is None:
-            return True
-        return dt.timestamp() < probe_start - grace
+        return created < probe_start - grace
 
     return _check
+
+
+def _created_epoch(record, timestamp_fields=('added', 'created_at')):
+    """A debrid torrent record's creation time (``added`` for RD,
+    ``created_at`` for TB) as a UTC epoch, or None when it is missing,
+    unparseable or naive (tz-less — no anchor to compare against a UTC
+    epoch, so unknown rather than a guessed zone)."""
+    if not isinstance(record, dict):
+        return None
+    raw = ''
+    for field in timestamp_fields:
+        v = record.get(field)
+        if isinstance(v, str) and v.strip():
+            raw = v.strip()
+            break
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace('Z', '+00:00'))
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        return None
+    return dt.timestamp()
+
+
+def created_since(record, since, grace=_PREEXISTING_GRACE_SECONDS):
+    """True only when debrid torrent *record* was created at or after
+    *since* (minus ``grace`` for clock skew) — i.e. by the add that started
+    then, not before it.  An add of a hash the account already holds returns
+    the existing torrent, created earlier.  Unknown creation time → False:
+    never treat as ours what we can't date."""
+    created = _created_epoch(record)
+    return created is not None and since is not None and created >= since - grace
 
 
 def pick_alt_debrid(source_debrid, configured=None):

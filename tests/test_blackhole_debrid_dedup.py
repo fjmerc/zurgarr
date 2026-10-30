@@ -1159,8 +1159,11 @@ class TestGrabWithNoMediaRejected:
     """A grab whose torrent holds no video is blocklisted, removed from the
     debrid (unless it was already in the account), and recorded as failed."""
 
-    def _run(self, preexisting):
+    def _run(self, preexisting, added=None):
+        from datetime import datetime, timezone
         from utils.blackhole import BlackholeWatcher
+        import utils.search as search
+        added = added or datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
         w = BlackholeWatcher.__new__(BlackholeWatcher)
         w.debrid_service = 'realdebrid'
         w.debrid_api_key = 'k'
@@ -1171,7 +1174,7 @@ class TestGrabWithNoMediaRejected:
         w._remove_pending = MagicMock()
         w._load_pending = MagicMock(return_value={})
         w._check_realdebrid_status = MagicMock(return_value=(
-            'downloaded', {'hash': 'ab' * 20, 'filename': 'Fake.S01E01',
+            'downloaded', {'hash': 'ab' * 20, 'filename': 'Fake.S01E01', 'added': added,
                            'files': [{'path': '/Fake.S01E01.exe', 'selected': 1}]}))
         w._find_on_mount = MagicMock(side_effect=AssertionError('never waits on the mount'))
         blocked, client, hist = [], MagicMock(), MagicMock()
@@ -1180,7 +1183,8 @@ class TestGrabWithNoMediaRejected:
              patch('utils.blackhole._history', hist), \
              patch('utils.blackhole._notify', None), \
              patch('utils.blackhole._enrich_for_history', return_value=(None, None)), \
-             patch('utils.debrid_client.get_debrid_client', return_value=(client, 'realdebrid')):
+             patch('utils.debrid_client.get_debrid_client', return_value=(client, 'realdebrid')), \
+             patch.object(search, '_rejected_hashes', {}):
             w._monitor_and_symlink('T1', 'Fake.S01E01.magnet', preexisting=preexisting)
         causes = [c.kwargs.get('meta', {}).get('cause') for c in hist.log_event.call_args_list]
         return w, blocked, client, causes
@@ -1191,6 +1195,13 @@ class TestGrabWithNoMediaRejected:
         client.delete_torrent.assert_called_once_with('T1')
         assert 'disc_rip_rejected' in causes and 'auto_blocklist_added' in causes
         w._remove_pending.assert_called_once_with('T1')
+
+    def test_grab_of_a_torrent_created_before_it_is_kept(self):
+        """A grab of a hash the account already held gets that torrent's id
+        back: created long before the grab, so it is the user's — kept."""
+        w, blocked, client, causes = self._run(preexisting=False, added='2026-10-01T00:00:00.000Z')
+        assert blocked == ['AB' * 20]
+        client.delete_torrent.assert_not_called()
 
     def test_preexisting_grab_is_blocklisted_but_kept(self):
         w, blocked, client, causes = self._run(preexisting=True)

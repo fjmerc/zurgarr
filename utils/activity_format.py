@@ -451,7 +451,7 @@ def _fmt_import_misfiled(ev, meta):
 
 
 def _fmt_disc_rip_rejected(ev, meta):
-    return 'Rejected — disc rip (no usable media files)', 'Rejected — disc rip (no usable media files)'
+    return 'Rejected — no usable media files', 'Rejected — no usable media files'
 
 
 def _fmt_debrid_add_failed(ev, meta):
@@ -885,7 +885,7 @@ FORMATTER_JS = r"""
       var arr = m.arr_service === 'sonarr' ? 'Sonarr' : (m.arr_service === 'radarr' ? 'Radarr' : 'arr');
       return 'Grabbed for ' + (m.grabbed_title || '?') + ' but ' + arr + ' imported it into ' + (m.imported_title || '?');
     },
-    disc_rip_rejected: function(){ return 'Rejected — disc rip (no usable media files)'; },
+    disc_rip_rejected: function(){ return 'Rejected — no usable media files'; },
     debrid_add_failed: function(ev,m){ return 'Debrid add failed — ' + (m.error || 'unknown error'); },
     debrid_add_via_search: function(ev,m){ return 'Added to ' + (m.service || 'debrid') + ' via search'; },
     wanted_tb_recovered: function(ev,m){ return 'Recovered Wanted — added cached copy on ' + (m.service || 'TorBox'); },

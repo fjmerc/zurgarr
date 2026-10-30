@@ -15,7 +15,7 @@ from utils.debrid_routing import (
     mount_for_debrid, symlink_target_base_for_debrid,
     pick_debrid_for_grab,
     classify_add_failure, is_debrid_rejection, is_filter_block_reason,
-    pick_alt_debrid, attempt_add_rescue, make_preexisting_check,
+    pick_alt_debrid, attempt_add_rescue, make_preexisting_check, created_since,
     build_tb_lookup_candidates, strip_indexer_prefix,
 )
 
@@ -1100,3 +1100,25 @@ def test_fast_lane_base_trailing_slash_is_dropped(monkeypatch):
     from utils.debrid_routing import TORBOX_FAST, symlink_target_base_for_debrid
     monkeypatch.setenv('BLACKHOLE_SYMLINK_TARGET_BASE_TORBOX_FAST', '/mnt/debrid_torbox_fast/')
     assert symlink_target_base_for_debrid(TORBOX_FAST) == '/mnt/debrid_torbox_fast'
+
+
+class TestCreatedSince:
+    """created_since(record, since): True only for a record whose creation
+    time is known and not before *since* (minus the clock-skew grace)."""
+
+    def test_fresh_torbox_and_realdebrid_records(self):
+        import time
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        assert created_since({'created_at': now.strftime('%Y-%m-%dT%H:%M:%SZ')}, time.time())
+        assert created_since({'added': now.isoformat()}, time.time())
+
+    def test_old_record_is_not_new(self):
+        import time
+        assert not created_since({'created_at': '2026-10-01T00:00:00Z'}, time.time())
+
+    @pytest.mark.parametrize('record', [None, {}, {'created_at': ''}, {'created_at': 'x'},
+                                        {'created_at': '2026-10-30T02:01:17'}, {'added': 12345}])
+    def test_unknown_creation_time_is_never_new(self, record):
+        import time
+        assert not created_since(record, time.time() - 3600)

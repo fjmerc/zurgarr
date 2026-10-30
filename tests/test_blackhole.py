@@ -6293,22 +6293,30 @@ class TestScannerHandoff:
         assert watcher._watch_added_torrent('1') is False
         assert time.monotonic() - t0 < 5
 
-    def _no_video_add(self, tmp_dir, monkeypatch):
-        """An own add whose only file is not a video (a fake '.exe' release)."""
+    def _no_video_add(self, tmp_dir, monkeypatch, created=None, delete_ok=True):
+        """An own add whose only file is not a video (a fake '.exe' release).
+        *created* is TorBox's created_at for it (default: just now)."""
+        from datetime import datetime, timezone
+        import utils.search as search
         watcher = self._added_watcher(tmp_dir, monkeypatch)
+        created = created or datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        monkeypatch.setattr(watcher, '_check_torbox_status', lambda tid, api_key=None: (
+            'completed', {'data': {'id': tid, 'hash': 'e87b' * 10, 'created_at': created}}))
         monkeypatch.setattr(watcher, '_extract_filenames_from_info',
                             lambda *a, **k: ['Greys Anatomy S23E03 1080p HEVC x265-MeGusta.exe'])
-        monkeypatch.setattr(watcher, '_extract_hash_from_info', lambda *a, **k: 'E87B' * 10)
-        self.blocked, self.events = [], []
+        self.blocked, self.events, self.notes = [], [], []
         monkeypatch.setattr('utils.blackhole._blocklist', type('B', (), {
             'add': staticmethod(lambda h, t, **k: self.blocked.append((h, k.get('reason'))))})())
         monkeypatch.setattr('utils.blackhole._history', type('H', (), {
             'log_event': staticmethod(lambda *a, **k: self.events.append(
                 (a[0], k.get('meta', {}).get('cause'))))})())
-        monkeypatch.setattr('utils.blackhole._notify', None)
+        monkeypatch.setattr('utils.blackhole._notify',
+                            lambda event, title, body, level=None: self.notes.append((title, body)))
         self.client = MagicMock()
+        self.client.delete_torrent.return_value = delete_ok
         monkeypatch.setattr('utils.debrid_client.get_debrid_client',
                             lambda service=None, api_key=None: (self.client, service))
+        monkeypatch.setattr(search, '_rejected_hashes', {})
         return watcher
 
     def test_own_add_with_no_video_is_rejected_and_removed(self, tmp_dir, monkeypatch, lane):
@@ -6317,25 +6325,82 @@ class TestScannerHandoff:
         from TorBox, like a blackhole grab with no media; never admitted to
         the fast lane or waited for on the mount."""
         watcher = self._no_video_add(tmp_dir, monkeypatch)
-        assert watcher._watch_added_torrent('131208495', 'Greys Anatomy S23E03', preexisting=False) is False
-        assert self.blocked == [('E87B' * 10, 'disc rip (no usable media files)')]
+        assert watcher._watch_added_torrent('131208495', 'Greys Anatomy S23E03', preexisting=False,
+                                            added_at=time.time()) is False
+        assert self.blocked == [('E87B' * 10, 'no usable media files')]
         self.client.delete_torrent.assert_called_once_with('131208495')
         assert ('failed', 'disc_rip_rejected') in self.events
         assert lane == [] and self.finds == 0 and self.scans == []
+        assert self.notes and self.notes[0][0] == 'TorBox add: No Media Files'
+        assert 'removed from TorBox' in self.notes[0][1]
 
     def test_own_add_with_no_video_already_in_the_account_is_kept(self, tmp_dir, monkeypatch, lane):
         """An add that may have returned a torrent already in the account is
         blocklisted but never deleted."""
         watcher = self._no_video_add(tmp_dir, monkeypatch)
-        assert watcher._watch_added_torrent('131208495', 'X', preexisting=True) is False
+        assert watcher._watch_added_torrent('131208495', 'X', preexisting=True,
+                                            added_at=time.time()) is False
         assert len(self.blocked) == 1
         self.client.delete_torrent.assert_not_called()
-        assert lane == []
+        assert lane == [] and 'kept on TorBox' in self.notes[0][1]
+
+    def test_own_add_created_before_the_add_is_kept(self, tmp_dir, monkeypatch, lane):
+        """TorBox answers an add of a hash the account already holds with that
+        torrent: created long before the add, so it is the user's — even when
+        a stale account list said the hash was new."""
+        watcher = self._no_video_add(tmp_dir, monkeypatch, created='2026-10-01T00:00:00Z')
+        assert watcher._watch_added_torrent('131208495', 'X', preexisting=False,
+                                            added_at=time.time()) is False
+        self.client.delete_torrent.assert_not_called()
+        assert len(self.blocked) == 1
+
+    @pytest.mark.parametrize('created', ['', 'not a date', '2026-10-30T02:01:17'])
+    def test_own_add_without_a_usable_creation_time_is_kept(self, tmp_dir, monkeypatch, lane, created):
+        watcher = self._no_video_add(tmp_dir, monkeypatch)
+        monkeypatch.setattr(watcher, '_check_torbox_status', lambda tid, api_key=None: (
+            'completed', {'data': {'id': tid, 'hash': 'e87b' * 10, 'created_at': created}}))
+        watcher._watch_added_torrent('131208495', 'X', preexisting=False, added_at=time.time())
+        self.client.delete_torrent.assert_not_called()
 
     def test_own_add_is_assumed_preexisting_unless_told(self, tmp_dir, monkeypatch, lane):
         watcher = self._no_video_add(tmp_dir, monkeypatch)
         assert watcher._watch_added_torrent('131208495') is False
         self.client.delete_torrent.assert_not_called()
+
+    def test_a_failed_delete_is_reported_as_such(self, tmp_dir, monkeypatch, lane, caplog):
+        import logging
+        watcher = self._no_video_add(tmp_dir, monkeypatch, delete_ok=False)
+        with caplog.at_level(logging.WARNING):
+            watcher._watch_added_torrent('131208495', 'X', preexisting=False, added_at=time.time())
+        assert "couldn't be removed from TorBox" in self.notes[0][1]
+        assert "couldn't be removed from TorBox" in caplog.text
+
+    def test_a_delete_error_is_a_warning_without_the_key(self, tmp_dir, monkeypatch, lane, caplog):
+        import logging
+        watcher = self._no_video_add(tmp_dir, monkeypatch)
+        self.client.delete_torrent.side_effect = RuntimeError('boom for key')
+        with caplog.at_level(logging.WARNING):
+            watcher._watch_added_torrent('131208495', 'X', preexisting=False, added_at=time.time())
+        assert 'boom for ***' in caplog.text and 'boom for key' not in caplog.text
+        assert "couldn't be removed from TorBox" in self.notes[0][1]
+
+    def test_with_auto_blocklist_off_nothing_claims_it_was_blocklisted(self, tmp_dir, monkeypatch, lane):
+        monkeypatch.setenv('BLOCKLIST_AUTO_ADD', 'false')
+        watcher = self._no_video_add(tmp_dir, monkeypatch)
+        watcher._watch_added_torrent('131208495', 'X', preexisting=False, added_at=time.time())
+        assert self.blocked == [] and 'blocklisted' not in self.notes[0][1].lower()
+
+    def test_a_rejected_fake_is_never_added_again(self, tmp_dir, monkeypatch, lane):
+        """Even with auto-blocklisting off, zurgarr's own adds never re-add a
+        hash it has rejected — no add/delete churn every cooldown."""
+        import utils.search as search
+        monkeypatch.setenv('BLOCKLIST_AUTO_ADD', 'false')
+        watcher = self._no_video_add(tmp_dir, monkeypatch)
+        watcher._watch_added_torrent('131208495', 'X', preexisting=False, added_at=time.time())
+        monkeypatch.setattr(search, '_add_to_tb',
+                            lambda *a: pytest.fail('a rejected fake must not be re-added'))
+        r = search.add_to_debrid('e87b' * 10, service='torbox', api_key='key')
+        assert r['success'] is False and 'no usable media' in r['error']
 
     def test_watch_torbox_add_passes_preexisting_through(self, tmp_dir, monkeypatch):
         import utils.blackhole as bh
@@ -6343,11 +6408,11 @@ class TestScannerHandoff:
         seen = []
         done = threading.Event()
         monkeypatch.setattr(watcher, '_watch_added_torrent',
-                            lambda tid, title='', preexisting=True:
-                            seen.append(preexisting) or done.set() or True)
+                            lambda tid, title='', preexisting=True, added_at=None:
+                            seen.append((preexisting, added_at)) or done.set() or True)
         monkeypatch.setattr(bh, '_watcher', watcher)
-        assert bh.watch_torbox_add('11', 'X', preexisting=False) is True
-        assert done.wait(2) and seen == [False]
+        assert bh.watch_torbox_add('11', 'X', preexisting=False, added_at=123.0) is True
+        assert done.wait(2) and seen == [(False, 123.0)]
 
     def test_watch_torbox_add_starts_one_watch_per_torrent(self, tmp_dir, monkeypatch):
         import utils.blackhole as bh

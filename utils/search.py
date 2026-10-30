@@ -931,6 +931,27 @@ def remember_added_hash(service, info_hash):
             cached[1].add(h)
 
 
+# (service, lowercase hash) of torrents found to hold no usable media file —
+# in memory: a restart forgets them, and the blocklist (when on) remembers.
+_rejected_hashes = {}
+
+
+def remember_rejected_hash(service, info_hash):
+    """Record that *info_hash* on *service* held no usable media, so
+    ``add_to_debrid`` never adds it again."""
+    if not service or not info_hash:
+        return
+    h = info_hash.strip().lower()
+    if _HASH_RE.match(h):
+        with _existing_hashes_lock:
+            _rejected_hashes[(service, h)] = time.time()
+
+
+def was_rejected(service, info_hash):
+    with _existing_hashes_lock:
+        return (service, (info_hash or '').strip().lower()) in _rejected_hashes
+
+
 def invalidate_existing_hashes_cache(service=None):
     """Drop the dedup caches for one service (or all if None)."""
     with _existing_hashes_lock:
@@ -1434,6 +1455,16 @@ def add_to_debrid(info_hash, title='', media_title=None, episode=None,
         return {'success': False, 'torrent_id': '', 'service': service or '', 'error': 'No debrid service configured'}
 
     lowered = info_hash.lower()
+    add_started = time.time()
+
+    # A hash found to hold no video (a fake release, a disc rip) is never
+    # added again, even with BLOCKLIST_AUTO_ADD off — otherwise every
+    # Wanted cooldown would re-add and re-delete it.
+    if was_rejected(service, lowered):
+        logger.info(f"[search] Skipping add: {title or lowered[:16]} was rejected earlier "
+                    f"(no usable media files)")
+        return {'success': False, 'torrent_id': '', 'service': service,
+                'error': 'Rejected earlier: no usable media files'}
 
     # Dedup — skip hashes already on the account.  Default ON because adding
     # the same magnet twice just creates a second torrent entry pointing at
@@ -1505,7 +1536,7 @@ def add_to_debrid(info_hash, title='', media_title=None, episode=None,
         try:
             from utils.blackhole import watch_torbox_add
             watch_torbox_add(result['torrent_id'], title or media_title or '',
-                             preexisting=not confirmed_new)
+                             preexisting=not confirmed_new, added_at=add_started)
         except Exception as e:
             logger.debug(f"[search] mount watch for {title or lowered[:16]} not started: {e}")
 
